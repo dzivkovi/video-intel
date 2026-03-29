@@ -122,6 +122,12 @@ python scripts/video_intel.py scan
 
 Or in Claude Code, just say: **"scan my channels"**
 
+For detailed installation across all platforms (Gemini CLI, Cursor, Copilot,
+Codex, Databricks, NPX, symlinks), see
+[INSTALLATION.md](INSTALLATION.md). Tested locally with Claude Code -
+other platforms follow the same Agent Skills spec but are not yet validated.
+Community feedback welcome.
+
 ## Configuration
 
 ### config.yaml

@@ -19,3 +19,9 @@ channels:
     prompt: mindmap-light
     auto_transcript: all
     since: 120d
+
+  - name: samwitteveenai
+    url: https://youtube.com/@samwitteveenai
+    prompt: mindmap-light
+    auto_transcript: none
+    since: 120d
