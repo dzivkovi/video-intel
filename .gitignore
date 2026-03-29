@@ -1,5 +1,6 @@
 .env*
 consolidated_chat.md
+.claude/
 video-intel/
 __pycache__/
 *.pyc
