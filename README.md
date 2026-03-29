@@ -23,15 +23,32 @@ what was said AND what was shown on screen.
 
 ## How It Works
 
-```text
-YouTube Data API          Gemini Multimodal API         Your filesystem
-───────────────          ──────────────────────         ───────────────
-Discover new videos  →   Watch frames + audio      →   mindmap.md
-(per-channel config)     Generate mind maps (parallel)  meta.json
+The architecture is a narrowing funnel - like fishing, where you look for
+birds before you cast a line and read the water before you commit to a spot.
 
-                         [optional, per-channel]
-                         Fuse speech + screen content → transcript.md
-                         (three-task decoupled prompt)
+```text
+┌─────────────────────────────────────────────────────────────────┐
+│  SCAN (the birds)                          Cost: ~$0.20/video   │
+│  ┌───────────────┐    ┌───────────────────┐    ┌─────────────┐  │
+│  │ YouTube Data  │───>│ Gemini Multimodal │───>│ mindmap.md  │  │
+│  │ API: discover │    │ API: watch frames │    │ meta.json   │  │
+│  │ new videos    │    │ + audio (parallel)│    │ per video   │  │
+│  └───────────────┘    └───────────────────┘    └─────────────┘  │
+├─────────────────────────────────────────────────────────────────┤
+│  TRIAGE (the drop-off)                     Cost: $0 (no API)    │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │ You + Claude read mind maps. No Gemini needed.           │   │
+│  │ "Which of these 15 videos matter for agentic patterns?"  │   │
+│  └──────────────────────────────────────────────────────────┘   │
+├─────────────────────────────────────────────────────────────────┤
+│  TRANSCRIPT (the catch)                    Cost: ~$0.50/video   │
+│  ┌────────────────────┐    ┌─────────────────────────────────┐  │
+│  │ Gemini: 3-task     │───>│ transcript.md                   │  │
+│  │ decoupled prompt   │    │ Diarized speech interleaved     │  │
+│  │ (audio + vision +  │    │ with SCREEN sections describing │  │
+│  │  speaker ID)       │    │ slides, diagrams, code, demos   │  │
+│  └────────────────────┘    └─────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 **scan** - Fetch new videos from configured channels, generate thematic mind
@@ -46,6 +63,43 @@ Speaker names identified from visual cues with evidence.
 
 > "Read the mind maps in ~/video-intel/natebjones/ from this week and tell me
 > which videos are worth watching for agentic AI patterns."
+
+## What a Fused Transcript Looks Like
+
+Traditional transcripts lose everything visual. When a presenter says "as you
+can see here," you see nothing. The fused transcript captures both channels:
+
+```text
+[01:09] Ray (Developer and Instructor): "But then this introduced
+a brand new problem whereby in session one you would have a pretty
+fresh, clean, and relevant memory. And then as you go on, you would
+notice that Claude Code decides to add more and more stuff to its
+memory and you get noise and contradictions and stuff like that."
+
+  SCREEN [01:09-01:31] [diagram]: Excalidraw diagram titled
+  'THE PROBLEM WITH AI MEMORY', illustrating how memory accumulates
+  noise and contradictions over multiple sessions (Session 1 to
+  Session 20).
+
+[01:32] Ray (Developer and Instructor): "And Claude did have some
+instructions in the system prompt telling it to verify that the
+memory is still correct and up-to-date, but that didn't really
+do a good job."
+```
+
+This is real output from scanning [Ray Amjad's](https://youtube.com/@ramjad)
+channel. Speaker names are identified from visual cues (Zoom labels, name
+cards, badges, slide footers) with evidence provided for each identification.
+
+## Why This Architecture
+
+- **Gemini watches, Claude thinks.** Best tool for each job, not competing models.
+- **Mind maps first, transcripts second.** 30-second scan before 15-minute commitment.
+- **Three decoupled tasks, not one prompt.** Tokens compete for attention - split audio, vision, and speaker ID for better quality.
+- **One model replaces four.** Gemini Flash 3.x does what Whisper + pyannote + Claude + Gemini did separately - and captures visual content they never could.
+- **Prompts are fuel, the skill is the engine.** External, self-contained, swappable. No hidden prefix assembly.
+- **Per-channel config.** Daily creators get `since: 10d`. Monthly creators get `since: 120d`. Each channel captures your relationship with that creator.
+- **The skill only does Gemini work.** Triage and deep-dive are conversations with Claude, not API calls. They were in the design, then deliberately cut.
 
 ## Quick Start
 
@@ -77,7 +131,7 @@ output_dir: ~/video-intel
 default_since: 10d
 default_prompt: mindmap-light
 model: gemini-3-flash-preview
-max_parallel: 5
+max_parallel: 10
 
 channels:
   - name: natebjones
@@ -93,7 +147,7 @@ channels:
 | default_since | 10d | Default lookback window |
 | default_prompt | mindmap-light | Default prompt for mind maps |
 | model | gemini-3-flash-preview | Gemini model to use |
-| max_parallel | 5 | Concurrent Gemini requests |
+| max_parallel | 10 | Concurrent Gemini requests (paid tier can go 50+) |
 
 ### Channel Settings
 
@@ -126,10 +180,9 @@ python scripts/video_intel.py scan --since 30d
 # Preview what would be scanned (no API calls)
 python scripts/video_intel.py scan --dry-run
 
-# Transcribe a specific video
+# Transcribe a specific video (channel auto-detected)
 python scripts/video_intel.py transcript \
-  --url "https://www.youtube.com/watch?v=XXXXX" \
-  --channel natebjones
+  --url "https://www.youtube.com/watch?v=XXXXX"
 ```
 
 ## Prompt Customization
@@ -174,6 +227,13 @@ Using Gemini 3 Flash ($0.50/M input tokens, $1.00/M audio, $3.00/M output):
 
 Free tier: 8 hours of YouTube video per day at no cost.
 
+**Rate limits:** Free tier has lower requests-per-minute limits. The script
+retries automatically with backoff on 429 errors, but if you hit throttling,
+reduce `max_parallel` in config.yaml (try 3-5). Paid tier users have
+generous limits (20,000+ RPM) and can increase parallelism freely. Check
+your limits at [Google AI Studio](https://aistudio.google.com/apikey) or
+the [rate limits docs](https://ai.google.dev/gemini-api/docs/rate-limits).
+
 ## Cross-Platform Compatibility
 
 This skill uses the open Agent Skills format (SKILL.md + scripts/).
@@ -186,6 +246,14 @@ To package for distribution, tell Claude Code: "Package my video-intel skill."
 
 ## Design Influences & Sources
 
+[Gemini API Development Skill](https://github.com/google-gemini/gemini-skills/blob/main/skills/gemini-api-dev/SKILL.md)
+is a knowledge skill - it gives coding agents correct model names and
+SDK patterns so they write working Gemini code. It doesn't watch videos. The
+video-watching capability is built into Gemini itself. Video-intel is the
+execution skill that wraps that capability: you say "scan my channels" and
+it calls the API, produces mind maps, saves files. Google published the
+cookbook. This is the kitchen.
+
 | What shaped it | Source | Key takeaway |
 | -------------- | ------ | ------------ |
 | Decoupled task prompting | Laurent Picard ([TDS](https://towardsdatascience.com/unlocking-multimodal-video-transcription-with-gemini/), [GCC](https://medium.com/@PicardParis/unlocking-multimodal-video-transcription-with-gemini-part4-3381b61aaaec)) | Split transcription from speaker ID to preserve attention quality |
@@ -195,8 +263,9 @@ To package for distribution, tell Claude Code: "Package my video-intel skill."
 | Gemini vs Whisper | [Voice Writer](https://voicewriter.io/blog/best-speech-recognition-api-2025), [Brown CCV](https://docs.ccv.brown.edu/ai-tools/services/transcribe/comparing-speech-to-text-models) | Single-model Gemini beats multi-model Whisper + pyannote pipeline |
 | Skills ecosystem | Mark Kashef, [Early AI-dopters](https://www.skool.com/earlyaidopters) community | Pointed to Google's [gemini-skills](https://github.com/google-gemini/gemini-skills) repo; built on the open cross-platform [Agent Skills format](https://code.claude.com/docs/en/skills) |
 
-Co-designed iteratively with Claude (Anthropic) across a single session
-spanning use case discovery, research synthesis, and build.
+Architected through iterative conversation with [Claude Desktop](https://claude.ai/) -
+from use case discovery through research synthesis to working prototype.
+Engineered and shipped in [Claude Code](https://claude.ai/code).
 
 ## License
 

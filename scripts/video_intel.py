@@ -14,6 +14,7 @@ Prerequisites:
 import argparse
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -119,6 +120,7 @@ def get_channel_id(youtube, channel_url):
 def fetch_channel_videos(youtube, channel_id, since_dt, max_results=50):
     """Fetch videos published after since_dt from a channel."""
     videos = []
+    seen_ids = set()
     next_page = None
 
     while True:
@@ -133,11 +135,15 @@ def fetch_channel_videos(youtube, channel_id, since_dt, max_results=50):
         ).execute()
 
         for item in resp.get("items", []):
+            video_id = item["id"]["videoId"]
+            if video_id in seen_ids:
+                continue
+            seen_ids.add(video_id)
             vid = {
-                "video_id": item["id"]["videoId"],
+                "video_id": video_id,
                 "title": unescape(item["snippet"]["title"]),
                 "published": item["snippet"]["publishedAt"][:10],
-                "url": f"https://www.youtube.com/watch?v={item['id']['videoId']}",
+                "url": f"https://www.youtube.com/watch?v={video_id}",
             }
             videos.append(vid)
 
@@ -151,7 +157,7 @@ def fetch_channel_videos(youtube, channel_id, since_dt, max_results=50):
 # File naming and idempotency
 # ---------------------------------------------------------------------------
 
-def slugify(text, max_len=50):
+def slugify(text, max_len=80):
     """Create a filesystem-safe slug from a title."""
     text = text.lower().strip()
     text = re.sub(r"[^\w\s-]", "", text)
@@ -175,7 +181,7 @@ def is_processed(output_dir, channel_name, video, mode):
 # ---------------------------------------------------------------------------
 
 def call_gemini(client, types, video_url, prompt_text, model, response_json=False):
-    """Send a video to Gemini for multimodal analysis."""
+    """Send a video to Gemini for multimodal analysis with retry on rate limits."""
     config_kwargs = {"temperature": 0.3}
     if response_json:
         config_kwargs["response_mime_type"] = "application/json"
@@ -187,12 +193,25 @@ def call_gemini(client, types, video_url, prompt_text, model, response_json=Fals
         ]
     )
 
-    response = client.models.generate_content(
-        model=model,
-        contents=contents,
-        config=types.GenerateContentConfig(**config_kwargs),
-    )
-    return response.text
+    max_retries = 3
+    for attempt in range(max_retries + 1):
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=types.GenerateContentConfig(**config_kwargs),
+            )
+            return response.text
+        except Exception as e:
+            error_str = str(e).lower()
+            is_rate_limit = "429" in error_str or "resource exhausted" in error_str
+            is_server_error = "503" in error_str or "overloaded" in error_str
+            if (is_rate_limit or is_server_error) and attempt < max_retries:
+                wait = (15 * (2 ** attempt)) + random.uniform(0, 5)
+                print(f"      Rate limited, retrying in {wait:.0f}s...")
+                time.sleep(wait)
+            else:
+                raise
 
 # ---------------------------------------------------------------------------
 # Mind map processing
@@ -245,6 +264,10 @@ def process_mindmap(client, types, video, prompt_text, model, output_dir, channe
 
 def merge_transcript_json(raw_json, speakers_map):
     """Merge three-task JSON into a fused markdown transcript."""
+    # Gemini sometimes wraps the response in an array
+    if isinstance(raw_json, list):
+        raw_json = raw_json[0] if raw_json else {}
+
     lines = []
 
     # Build voice-to-name mapping
@@ -393,7 +416,7 @@ def cmd_scan(args, config):
     youtube = yt_build("youtube", "v3", developerKey=yt_key)
     output_dir = resolve_output_dir(config)
     model = config.get("model", "gemini-3-flash-preview")
-    max_parallel = config.get("max_parallel", 5)
+    max_parallel = config.get("max_parallel", 10)
 
     # Filter channels if --channel specified
     channels = config.get("channels", [])
@@ -438,34 +461,34 @@ def cmd_scan(args, config):
                 print(f"    {v['published']} - {v['title']}")
             continue
 
-        if not new_videos:
-            continue
-
         # Load prompt
         prompt_name = ch.get("prompt") or config.get("default_prompt", "mindmap-light")
         prompt_text = load_prompt(prompt_name)
 
-        # Process mind maps in parallel
-        print(f"  Generating mind maps ({prompt_name})...")
-        with ThreadPoolExecutor(max_workers=max_parallel) as executor:
-            futures = {
-                executor.submit(
-                    process_mindmap,
-                    client, types, v, prompt_text, model, output_dir, ch_name,
-                ): v
-                for v in new_videos
-            }
-            for future in as_completed(futures):
-                v = futures[future]
-                prefix, status = future.result()
-                print(f"    {prefix}: {status}")
+        if not new_videos:
+            print("  All mind maps up to date.")
+        else:
+            # Process mind maps in parallel
+            print(f"  Generating mind maps ({prompt_name})...")
+            with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+                futures = {
+                    executor.submit(
+                        process_mindmap,
+                        client, types, v, prompt_text, model, output_dir, ch_name,
+                    ): v
+                    for v in new_videos
+                }
+                for future in as_completed(futures):
+                    v = futures[future]
+                    prefix, status = future.result()
+                    print(f"    {prefix}: {status}")
 
         # Auto-transcript if configured
         auto = ch.get("auto_transcript", "none")
         if auto == "all":
             transcript_prompt = load_prompt("transcript")
             transcript_videos = [
-                v for v in new_videos
+                v for v in videos
                 if not is_processed(output_dir, ch_name, v, "transcript")
             ]
             if transcript_videos:
@@ -507,14 +530,42 @@ def cmd_transcript(args, config):
         sys.exit(1)
 
     video_id = video_id_match.group(1)
+    channel_name = args.channel
+    title = args.title
+    date = args.date
+
+    # Fetch video metadata from YouTube API
+    if not channel_name or not title or not date:
+        yt_key = os.environ.get("YOUTUBE_API_KEY")
+        if yt_key:
+            yt_build = require_youtube()
+            youtube = yt_build("youtube", "v3", developerKey=yt_key)
+            resp = youtube.videos().list(
+                part="snippet", id=video_id
+            ).execute()
+            if resp.get("items"):
+                snippet = resp["items"][0]["snippet"]
+                title = title or unescape(snippet["title"])
+                date = date or snippet["publishedAt"][:10]
+                if not channel_name:
+                    # Match against configured channels by channel ID
+                    yt_channel_id = snippet["channelId"]
+                    for ch in config.get("channels", []):
+                        ch_id, _ = get_channel_id(youtube, ch["url"])
+                        if ch_id == yt_channel_id:
+                            channel_name = ch["name"]
+                            break
+                    if not channel_name:
+                        channel_name = slugify(snippet["channelTitle"])
+
+    channel_name = channel_name or "_standalone"
+
     video = {
         "video_id": video_id,
         "url": f"https://www.youtube.com/watch?v={video_id}",
-        "title": args.title or video_id,
-        "published": args.date or datetime.now().strftime("%Y-%m-%d"),
+        "title": title or video_id,
+        "published": date or datetime.now().strftime("%Y-%m-%d"),
     }
-
-    channel_name = args.channel or "_standalone"
 
     print(f"Transcribing: {video['url']}")
     prefix, status = process_transcript(
