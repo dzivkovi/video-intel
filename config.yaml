@@ -1,0 +1,21 @@
+# Video Intel configuration
+# Edit this file to add/remove channels and adjust settings.
+
+output_dir: ./video-intel
+default_since: 10d
+default_prompt: mindmap-light
+model: gemini-3-flash-preview
+max_parallel: 5
+
+channels:
+  - name: natebjones
+    url: https://youtube.com/@natebjones
+    prompt: mindmap-light
+    auto_transcript: all
+    since: 10d
+
+  - name: ramjad
+    url: https://youtube.com/@ramjad
+    prompt: mindmap-light
+    auto_transcript: all
+    since: 120d
