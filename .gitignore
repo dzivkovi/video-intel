@@ -1,4 +1,5 @@
 .env*
+*.skill
 consolidated_chat.md
 .claude/settings.local.json
 video-intel/

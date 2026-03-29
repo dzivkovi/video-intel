@@ -70,4 +70,27 @@ Dev artifacts that must NOT be present when packaging:
 
 - `.env*`, `.gitignore`, `CLAUDE.md`, `README.md`, output directories (`video-intel/`), `__pycache__/`
 
-If developing in-place (skill folder is also the repo), remove or move dev files before packaging. The `output_dir` in config should point outside the skill folder (e.g. `~/video-intel`) for production use.
+If developing in-place (skill folder is also the repo), package from a clean temp copy:
+
+```bash
+# Create clean copy with only shippable files
+mkdir -p /tmp/video-intel-clean
+cp SKILL.md config.yaml README.md /tmp/video-intel-clean/
+cp -r scripts prompts /tmp/video-intel-clean/
+
+# Package from clean copy (run from skill-creator directory)
+cd ~/.claude/skills/skill-creator
+python -m scripts.package_skill /tmp/video-intel-clean
+```
+
+The `output_dir` in config should point outside the skill folder (e.g. `~/video-intel`) for production use.
+
+## Release Process
+
+1. Commit changes and tag: `git tag -a v1.x.0 -m "description"`
+2. Package the skill (see Packaging above)
+3. Copy `.skill` file to project: `cp ~/.claude/skills/skill-creator/video-intel-clean.skill ./video-intel.skill`
+4. Push commits and tag: `git push origin main --tags`
+5. Create GitHub release with asset: `gh release create v1.x.0 video-intel.skill --title "v1.x.0 - Title" --notes "description"`
+
+The `.skill` file is a build artifact (like a Docker image) - it lives in GitHub Releases, not in git. It's in `.gitignore`.
