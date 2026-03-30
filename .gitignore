@@ -1,7 +1,9 @@
 .env*
 *.skill
-consolidated_chat.md
+consolidated_chat*.md
 work/
+plans/*.md
+!plans/.gitkeep
 .claude/settings.local.json
 video-intel/
 __pycache__/

@@ -2,6 +2,14 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## System Instructions
+
+Before executing any task, you MUST read and strictly adhere to the constraints defined in `specs/agent-rules.md`.
+
+## Backlog
+
+Use GitHub Issues for feature requests and bugs. Do not create file-based todos.
+
 ## What This Is
 
 A Claude Code skill (open Agent Skills format) that uses Gemini's multimodal API as a proxy to analyze YouTube videos. Gemini sees video frames at 1 FPS, reads on-screen text, and hears audio simultaneously. Claude's role is triage and conversation over the resulting markdown artifacts — it never calls Gemini directly during triage.
@@ -94,3 +102,34 @@ The `output_dir` in config should point outside the skill folder (e.g. `~/video-
 5. Create GitHub release with asset: `gh release create v1.x.0 video-intel.skill --title "v1.x.0 - Title" --notes "description"`
 
 The `.skill` file is a build artifact (like a Docker image) - it lives in GitHub Releases, not in git. It's in `.gitignore`.
+
+## Development
+
+```bash
+# Install dev dependencies
+pip install -e ".[dev]"
+
+# Run tests
+pytest tests/ -v
+
+# Run tests with coverage
+pytest --cov=scripts --cov-report=term-missing -v
+
+# Lint and format
+ruff format .
+ruff check . --fix
+```
+
+Config in `pyproject.toml`. Run ruff before declaring any task complete.
+
+## Workflows
+
+This project uses the [Compound Engineering plugin](https://github.com/EveryInc/compound-engineering-plugin/) for structured workflows:
+
+- `/workflows:work` — Execute tasks with progress tracking
+- `/workflows:review` — Code review with multi-agent analysis
+- `/workflows:compound` — Document solved problems (produces `docs/solutions/` entries)
+
+Session plans are stored in `plans/` (configured via `.claude/settings.json`). Plans are session artifacts — historical, not living docs.
+
+Solved problems are recorded in `docs/solutions/` following the three-bucket rule (living / historical / decision records).

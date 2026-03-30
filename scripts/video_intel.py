@@ -19,7 +19,7 @@ import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from html import unescape
 from pathlib import Path
 
@@ -29,29 +29,35 @@ import yaml
 # Lazy imports with clear error messages
 # ---------------------------------------------------------------------------
 
+
 def require_gemini():
     try:
         from google import genai
         from google.genai import types
+
         return genai, types
     except ImportError:
         print("ERROR: google-genai not installed. Run: pip install google-genai")
         sys.exit(1)
 
+
 def require_youtube():
     try:
         from googleapiclient.discovery import build
+
         return build
     except ImportError:
         print("ERROR: google-api-python-client not installed.")
         print("Run: pip install google-api-python-client")
         sys.exit(1)
 
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
+
 
 def load_config():
     config_path = SKILL_DIR / "config.yaml"
@@ -62,12 +68,14 @@ def load_config():
     with open(config_path) as f:
         return yaml.safe_load(f)
 
+
 def resolve_output_dir(config):
     output_dir = Path(config.get("output_dir", "~/video-intel")).expanduser()
     if not output_dir.is_absolute():
         output_dir = SKILL_DIR / output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
+
 
 def load_prompt(prompt_name):
     prompt_path = SKILL_DIR / "prompts" / f"{prompt_name}.md"
@@ -76,22 +84,25 @@ def load_prompt(prompt_name):
         sys.exit(1)
     return prompt_path.read_text(encoding="utf-8")
 
+
 def parse_since(since_str):
     """Parse '10d', '120d', '2026-03-01' into a datetime."""
     match = re.match(r"^(\d+)d$", since_str)
     if match:
         days = int(match.group(1))
-        return datetime.now(timezone.utc) - timedelta(days=days)
+        return datetime.now(UTC) - timedelta(days=days)
     try:
-        return datetime.fromisoformat(since_str).replace(tzinfo=timezone.utc)
+        return datetime.fromisoformat(since_str).replace(tzinfo=UTC)
     except ValueError:
         print(f"ERROR: Invalid since format: {since_str}")
         print("Use '10d' for relative days or 'YYYY-MM-DD' for absolute date.")
         sys.exit(1)
 
+
 # ---------------------------------------------------------------------------
 # YouTube Data API
 # ---------------------------------------------------------------------------
+
 
 def get_channel_id(youtube, channel_url):
     """Resolve @handle or channel URL to channel ID."""
@@ -100,10 +111,7 @@ def get_channel_id(youtube, channel_url):
         handle = handle[1:]
 
     # Try handle-based lookup
-    resp = youtube.channels().list(
-        part="id,snippet",
-        forHandle=handle
-    ).execute()
+    resp = youtube.channels().list(part="id,snippet", forHandle=handle).execute()
 
     if resp.get("items"):
         ch = resp["items"][0]
@@ -117,6 +125,7 @@ def get_channel_id(youtube, channel_url):
 
     return None, None
 
+
 def fetch_channel_videos(youtube, channel_id, since_dt):
     """Fetch all videos published after since_dt from a channel."""
     videos = []
@@ -124,15 +133,19 @@ def fetch_channel_videos(youtube, channel_id, since_dt):
     next_page = None
 
     while True:
-        resp = youtube.search().list(
-            part="id,snippet",
-            channelId=channel_id,
-            type="video",
-            order="date",
-            publishedAfter=since_dt.isoformat(),
-            maxResults=50,
-            pageToken=next_page,
-        ).execute()
+        resp = (
+            youtube.search()
+            .list(
+                part="id,snippet",
+                channelId=channel_id,
+                type="video",
+                order="date",
+                publishedAfter=since_dt.isoformat(),
+                maxResults=50,
+                pageToken=next_page,
+            )
+            .execute()
+        )
 
         for item in resp.get("items", []):
             video_id = item["id"]["videoId"]
@@ -153,9 +166,11 @@ def fetch_channel_videos(youtube, channel_id, since_dt):
 
     return videos
 
+
 # ---------------------------------------------------------------------------
 # File naming and idempotency
 # ---------------------------------------------------------------------------
+
 
 def slugify(text, max_len=80):
     """Create a filesystem-safe slug from a title."""
@@ -165,9 +180,11 @@ def slugify(text, max_len=80):
     text = re.sub(r"-+", "-", text).strip("-")
     return text[:max_len].rstrip("-")
 
+
 def video_file_prefix(video):
     """Generate the date-slug prefix for a video's output files."""
     return f"{video['published']}-{slugify(video['title'])}"
+
 
 def is_processed(output_dir, channel_name, video, mode):
     """Check if a video has already been processed for a given mode."""
@@ -175,6 +192,7 @@ def is_processed(output_dir, channel_name, video, mode):
     ext = "mindmap.md" if mode == "scan" else "transcript.md"
     target = output_dir / channel_name / f"{prefix}.{ext}"
     return target.exists() and target.stat().st_size > 0
+
 
 def is_skipped(output_dir, channel_name, video):
     """Check if a video is marked to skip permanently."""
@@ -185,9 +203,11 @@ def is_skipped(output_dir, channel_name, video):
         return meta.get("skip", False)
     return False
 
+
 # ---------------------------------------------------------------------------
 # Gemini API calls
 # ---------------------------------------------------------------------------
+
 
 def call_gemini(client, types, video_url, prompt_text, model, response_json=False):
     """Send a video to Gemini for multimodal analysis with retry on rate limits."""
@@ -216,15 +236,17 @@ def call_gemini(client, types, video_url, prompt_text, model, response_json=Fals
             is_rate_limit = "429" in error_str or "resource exhausted" in error_str
             is_server_error = "503" in error_str or "overloaded" in error_str
             if (is_rate_limit or is_server_error) and attempt < max_retries:
-                wait = (15 * (2 ** attempt)) + random.uniform(0, 5)
+                wait = (15 * (2**attempt)) + random.uniform(0, 5)
                 print(f"      Rate limited, retrying in {wait:.0f}s...")
                 time.sleep(wait)
             else:
                 raise
 
+
 # ---------------------------------------------------------------------------
 # Mind map processing
 # ---------------------------------------------------------------------------
+
 
 def process_mindmap(client, types, video, prompt_text, model, output_dir, channel_name):
     """Generate a mind map for a single video."""
@@ -256,7 +278,7 @@ def process_mindmap(client, types, video, prompt_text, model, output_dir, channe
             "channel": channel_name,
             "title": video["title"],
             "published": video["published"],
-            "processed": datetime.now(timezone.utc).isoformat(),
+            "processed": datetime.now(UTC).isoformat(),
             "model": model,
             "modes_completed": ["scan"],
             "last_error": None,
@@ -271,22 +293,26 @@ def process_mindmap(client, types, video, prompt_text, model, output_dir, channe
         meta = {}
         if meta_path.exists():
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        meta.update({
-            "video_url": video["url"],
-            "video_id": video["video_id"],
-            "channel": channel_name,
-            "title": video["title"],
-            "published": video["published"],
-            "model": model,
-            "modes_completed": meta.get("modes_completed", []),
-            "last_error": str(e),
-        })
+        meta.update(
+            {
+                "video_url": video["url"],
+                "video_id": video["video_id"],
+                "channel": channel_name,
+                "title": video["title"],
+                "published": video["published"],
+                "model": model,
+                "modes_completed": meta.get("modes_completed", []),
+                "last_error": str(e),
+            }
+        )
         meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
         return prefix, f"error: {e}"
+
 
 # ---------------------------------------------------------------------------
 # Transcript processing
 # ---------------------------------------------------------------------------
+
 
 def merge_transcript_json(raw_json, speakers_map):
     """Merge three-task JSON into a fused markdown transcript."""
@@ -302,9 +328,7 @@ def merge_transcript_json(raw_json, speakers_map):
     for s in raw_json.get("speakers", []):
         voice_names[s["voice"]] = s.get("name", f"Speaker {s['voice']}")
         if s.get("evidence"):
-            evidence_notes.append(
-                f"- **{voice_names[s['voice']]}**: {s['evidence']}"
-            )
+            evidence_notes.append(f"- **{voice_names[s['voice']]}**: {s['evidence']}")
         if s.get("role"):
             voice_names[s["voice"]] += f" ({s['role']})"
 
@@ -312,32 +336,36 @@ def merge_transcript_json(raw_json, speakers_map):
     entries = []
 
     for t in raw_json.get("transcripts", []):
-        entries.append({
-            "type": "speech",
-            "start": t["start"],
-            "sort_key": timestamp_to_seconds(t["start"]),
-            "voice": t.get("voice"),
-            "text": t.get("text", ""),
-        })
+        entries.append(
+            {
+                "type": "speech",
+                "start": t["start"],
+                "sort_key": timestamp_to_seconds(t["start"]),
+                "voice": t.get("voice"),
+                "text": t.get("text", ""),
+            }
+        )
 
     for sc in raw_json.get("screen_content", []):
-        entries.append({
-            "type": "screen",
-            "start": sc["start"],
-            "end": sc.get("end", sc["start"]),
-            "sort_key": timestamp_to_seconds(sc["start"]),
-            "screen_type": sc.get("type", "other"),
-            "description": sc.get("description", ""),
-            "code": sc.get("code"),
-            "transcribed_text": sc.get("transcribed_text"),
-        })
+        entries.append(
+            {
+                "type": "screen",
+                "start": sc["start"],
+                "end": sc.get("end", sc["start"]),
+                "sort_key": timestamp_to_seconds(sc["start"]),
+                "screen_type": sc.get("type", "other"),
+                "description": sc.get("description", ""),
+                "code": sc.get("code"),
+                "transcribed_text": sc.get("transcribed_text"),
+            }
+        )
 
     entries.sort(key=lambda e: e["sort_key"])
 
     for entry in entries:
         if entry["type"] == "speech":
             name = voice_names.get(entry["voice"], f"Speaker {entry['voice']}")
-            lines.append(f"[{entry['start']}] {name}: \"{entry['text']}\"\n")
+            lines.append(f'[{entry["start"]}] {name}: "{entry["text"]}"\n')
         else:
             desc = entry["description"]
             st = entry["screen_type"]
@@ -350,7 +378,7 @@ def merge_transcript_json(raw_json, speakers_map):
             if entry.get("code"):
                 lines.append(f"  ```\n  {entry['code']}\n  ```")
             if entry.get("transcribed_text"):
-                lines.append(f"  On-screen text: \"{entry['transcribed_text']}\"")
+                lines.append(f'  On-screen text: "{entry["transcribed_text"]}"')
             lines.append("")
 
     # Add evidence footer
@@ -360,6 +388,7 @@ def merge_transcript_json(raw_json, speakers_map):
 
     return "\n".join(lines)
 
+
 def timestamp_to_seconds(ts):
     """Convert MM:SS or H:MM:SS to seconds for sorting."""
     parts = ts.split(":")
@@ -368,6 +397,7 @@ def timestamp_to_seconds(ts):
     elif len(parts) == 3:
         return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
     return 0
+
 
 def process_transcript(client, types, video, prompt_text, model, output_dir, channel_name):
     """Generate a fused transcript for a single video."""
@@ -382,9 +412,7 @@ def process_transcript(client, types, video, prompt_text, model, output_dir, cha
         return prefix, "skipped (exists)"
 
     try:
-        raw = call_gemini(
-            client, types, video["url"], prompt_text, model, response_json=True
-        )
+        raw = call_gemini(client, types, video["url"], prompt_text, model, response_json=True)
 
         # Parse JSON response
         raw_json = json.loads(raw)
@@ -397,7 +425,7 @@ def process_transcript(client, types, video, prompt_text, model, output_dir, cha
             f"# Transcript: {video['title']}\n\n"
             f"**Source:** {video['url']}\n"
             f"**Published:** {video['published']}\n"
-            f"**Processed:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+            f"**Processed:** {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}\n\n"
             f"---\n\n"
         )
         transcript_path.write_text(header + fused, encoding="utf-8")
@@ -425,9 +453,11 @@ def process_transcript(client, types, video, prompt_text, model, output_dir, cha
             meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
         return prefix, f"error: {e}"
 
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
+
 
 def cmd_scan(args, config):
     """Scan channels for new videos and generate mind maps."""
@@ -487,9 +517,9 @@ def cmd_scan(args, config):
 
         # Filter already processed or skipped
         new_videos = [
-            v for v in videos
-            if not is_processed(output_dir, ch_name, v, "scan")
-            and not is_skipped(output_dir, ch_name, v)
+            v
+            for v in videos
+            if not is_processed(output_dir, ch_name, v, "scan") and not is_skipped(output_dir, ch_name, v)
         ]
         print(f"  Found {len(videos)} videos, {len(new_videos)} new.")
 
@@ -511,7 +541,13 @@ def cmd_scan(args, config):
                 futures = {
                     executor.submit(
                         process_mindmap,
-                        client, types, v, prompt_text, model, output_dir, ch_name,
+                        client,
+                        types,
+                        v,
+                        prompt_text,
+                        model,
+                        output_dir,
+                        ch_name,
                     ): v
                     for v in new_videos
                 }
@@ -527,9 +563,9 @@ def cmd_scan(args, config):
         if auto == "all":
             transcript_prompt = load_prompt("transcript")
             transcript_videos = [
-                v for v in videos
-                if not is_processed(output_dir, ch_name, v, "transcript")
-                and not is_skipped(output_dir, ch_name, v)
+                v
+                for v in videos
+                if not is_processed(output_dir, ch_name, v, "transcript") and not is_skipped(output_dir, ch_name, v)
             ]
             if transcript_videos:
                 print(f"  Generating transcripts ({len(transcript_videos)} videos)...")
@@ -537,8 +573,13 @@ def cmd_scan(args, config):
                     futures = {
                         executor.submit(
                             process_transcript,
-                            client, types, v, transcript_prompt,
-                            model, output_dir, ch_name,
+                            client,
+                            types,
+                            v,
+                            transcript_prompt,
+                            model,
+                            output_dir,
+                            ch_name,
                         ): v
                         for v in transcript_videos
                     }
@@ -554,9 +595,10 @@ def cmd_scan(args, config):
         for ch, prefix, status in errors:
             print(f"  [{ch}] {prefix}: {status}")
         print("Failed items will retry on next run.")
-        print("To skip permanently: set \"skip\": true in the video's .meta.json")
+        print('To skip permanently: set "skip": true in the video\'s .meta.json')
 
     print("\nDone.")
+
 
 def cmd_transcript(args, config):
     """Generate a transcript for a single video."""
@@ -589,9 +631,7 @@ def cmd_transcript(args, config):
         if yt_key:
             yt_build = require_youtube()
             youtube = yt_build("youtube", "v3", developerKey=yt_key)
-            resp = youtube.videos().list(
-                part="snippet", id=video_id
-            ).execute()
+            resp = youtube.videos().list(part="snippet", id=video_id).execute()
             if resp.get("items"):
                 snippet = resp["items"][0]["snippet"]
                 title = title or unescape(snippet["title"])
@@ -617,18 +657,18 @@ def cmd_transcript(args, config):
     }
 
     print(f"Transcribing: {video['url']}")
-    prefix, status = process_transcript(
-        client, types, video, prompt_text, model, output_dir, channel_name
-    )
+    prefix, status = process_transcript(client, types, video, prompt_text, model, output_dir, channel_name)
     print(f"  {prefix}: {status}")
 
     if status == "done":
         out_path = output_dir / channel_name / f"{prefix}.transcript.md"
         print(f"  Saved: {out_path}")
 
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -665,6 +705,7 @@ Examples:
         cmd_scan(args, config)
     elif args.command == "transcript":
         cmd_transcript(args, config)
+
 
 if __name__ == "__main__":
     main()

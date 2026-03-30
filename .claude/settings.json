@@ -3,5 +3,6 @@
     "allow": [
       "mcp__exa__crawling_exa"
     ]
-  }
+  },
+  "plansDirectory": "./plans/"
 }

@@ -39,6 +39,7 @@ Files are named: `ADR-NNNN-title-with-dashes.md`
 | [ADR-0005](ADR-0005-error-tracking-via-meta-json.md) | Error tracking via meta.json (DLQ pattern) | accepted | 2026-03-29 |
 | [ADR-0006](ADR-0006-idempotency-via-filename.md) | Idempotency via filename convention | accepted | 2026-03-28 |
 | [ADR-0007](ADR-0007-per-channel-config.md) | Per-channel configuration | accepted | 2026-03-28 |
+| [ADR-0008](ADR-0008-developer-tooling-and-specs.md) | Developer tooling, specs, and Compound Engineering adoption | accepted | 2026-03-30 |
 
 ## Process
 
