@@ -186,7 +186,7 @@ python scripts/video_intel.py scan --since 30d
 # Preview what would be scanned (no API calls)
 python scripts/video_intel.py scan --dry-run
 
-# Transcribe a specific video (channel auto-detected)
+# Transcribe a specific video (channel auto-detected from config)
 python scripts/video_intel.py transcript \
   --url "https://www.youtube.com/watch?v=XXXXX"
 ```

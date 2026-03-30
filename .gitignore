@@ -1,6 +1,7 @@
 .env*
 *.skill
 consolidated_chat.md
+work/
 .claude/settings.local.json
 video-intel/
 __pycache__/

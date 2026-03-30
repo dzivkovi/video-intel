@@ -12,7 +12,7 @@ channels:
     url: https://youtube.com/@natebjones
     prompt: mindmap-light
     auto_transcript: all
-    since: 10d
+    since: 90d
 
   - name: ramjad
     url: https://youtube.com/@ramjad
@@ -25,3 +25,15 @@ channels:
     prompt: mindmap-light
     auto_transcript: none
     since: 120d
+
+  - name: mark_kashef
+    url: https://youtube.com/@Mark_Kashef
+    prompt: mindmap-light
+    auto_transcript: all
+    since: 30d
+
+  - name: graceleungyl
+    url: https://youtube.com/@graceleungyl
+    prompt: mindmap-light
+    auto_transcript: all
+    since: 270d

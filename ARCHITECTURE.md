@@ -7,35 +7,35 @@ proxy for video understanding and produces markdown artifacts for Claude to
 reason about.
 
 ```text
-                    ┌─────────────────────────────────────┐
-                    │           config.yaml                │
-                    │  channels, prompts, output_dir       │
-                    └──────────────┬──────────────────────┘
+                    ┌───────────────────────────────────────┐
+                    │           config.yaml                 │
+                    │  channels, prompts, output_dir        │
+                    └──────────────┬────────────────────────┘
                                    │
-                    ┌──────────────v──────────────────────┐
+                    ┌──────────────v────────────────────────┐
                     │       video_intel.py                  │
-                    │                                      │
-  YouTube Data API  │  fetch_channel_videos()              │
-  (discover)  ──────>  get_channel_id()                    │
-                    │         │                            │
-                    │         v                            │
-  Gemini API        │  process_mindmap()    ──> mindmap.md │
+                    │                                       │
+  YouTube Data API  │  fetch_channel_videos()               │
+  (discover)  ──────>  get_channel_id()                     │
+                    │         │                             │
+                    │         v                             │
+  Gemini API        │  process_mindmap()    ──> mindmap.md  │
   (understand) ─────>  process_transcript() ──> transcript.md
-                    │  call_gemini()        ──> meta.json  │
-                    │                                      │
-                    └──────────────────────────────────────┘
+                    │  call_gemini()        ──> meta.json   │
+                    │                                       │
+                    └───────────────────────────────────────┘
                                    │
-                    ┌──────────────v──────────────────────┐
+                    ┌──────────────v────────────────────────┐
                     │      ~/video-intel/{channel}/         │
                     │  {date}-{slug}.mindmap.md             │
                     │  {date}-{slug}.transcript.md          │
                     │  {date}-{slug}.meta.json              │
-                    └──────────────────────────────────────┘
+                    └───────────────────────────────────────┘
                                    │
-                    ┌──────────────v──────────────────────┐
+                    ┌──────────────v────────────────────────┐
                     │  Claude (triage, reasoning)           │
                     │  No API calls - reads markdown files  │
-                    └──────────────────────────────────────┘
+                    └───────────────────────────────────────┘
 ```
 
 **Current state:** Everything runs locally. One Python script, two external

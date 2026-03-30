@@ -21,8 +21,8 @@ python scripts/video_intel.py scan --dry-run
 # Override lookback window
 python scripts/video_intel.py scan --since 30d
 
-# Transcribe a specific video
-python scripts/video_intel.py transcript --url "https://www.youtube.com/watch?v=XXXXX" --channel natebjones
+# Transcribe a specific video (channel auto-detected from config)
+python scripts/video_intel.py transcript --url "https://www.youtube.com/watch?v=XXXXX"
 
 # Install dependencies
 pip install google-genai google-api-python-client pyyaml
