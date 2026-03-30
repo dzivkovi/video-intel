@@ -117,8 +117,8 @@ def get_channel_id(youtube, channel_url):
 
     return None, None
 
-def fetch_channel_videos(youtube, channel_id, since_dt, max_results=50):
-    """Fetch videos published after since_dt from a channel."""
+def fetch_channel_videos(youtube, channel_id, since_dt):
+    """Fetch all videos published after since_dt from a channel."""
     videos = []
     seen_ids = set()
     next_page = None
@@ -130,7 +130,7 @@ def fetch_channel_videos(youtube, channel_id, since_dt, max_results=50):
             type="video",
             order="date",
             publishedAfter=since_dt.isoformat(),
-            maxResults=min(max_results - len(videos), 50),
+            maxResults=50,
             pageToken=next_page,
         ).execute()
 
@@ -148,7 +148,7 @@ def fetch_channel_videos(youtube, channel_id, since_dt, max_results=50):
             videos.append(vid)
 
         next_page = resp.get("nextPageToken")
-        if not next_page or len(videos) >= max_results:
+        if not next_page:
             break
 
     return videos
