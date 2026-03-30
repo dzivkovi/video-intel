@@ -176,6 +176,15 @@ def is_processed(output_dir, channel_name, video, mode):
     target = output_dir / channel_name / f"{prefix}.{ext}"
     return target.exists() and target.stat().st_size > 0
 
+def is_skipped(output_dir, channel_name, video):
+    """Check if a video is marked to skip permanently."""
+    prefix = video_file_prefix(video)
+    meta_path = output_dir / channel_name / f"{prefix}.meta.json"
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        return meta.get("skip", False)
+    return False
+
 # ---------------------------------------------------------------------------
 # Gemini API calls
 # ---------------------------------------------------------------------------
@@ -250,12 +259,29 @@ def process_mindmap(client, types, video, prompt_text, model, output_dir, channe
             "processed": datetime.now(timezone.utc).isoformat(),
             "model": model,
             "modes_completed": ["scan"],
+            "last_error": None,
         }
         meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
         return prefix, "done"
 
     except Exception as e:
+        # Record failure in meta.json
+        channel_dir.mkdir(parents=True, exist_ok=True)
+        meta = {}
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta.update({
+            "video_url": video["url"],
+            "video_id": video["video_id"],
+            "channel": channel_name,
+            "title": video["title"],
+            "published": video["published"],
+            "model": model,
+            "modes_completed": meta.get("modes_completed", []),
+            "last_error": str(e),
+        })
+        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
         return prefix, f"error: {e}"
 
 # ---------------------------------------------------------------------------
@@ -381,13 +407,22 @@ def process_transcript(client, types, video, prompt_text, model, output_dir, cha
             meta = json.loads(meta_path.read_text())
             if "transcript" not in meta.get("modes_completed", []):
                 meta["modes_completed"].append("transcript")
+            meta["last_error"] = None
             meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
         return prefix, "done"
 
     except json.JSONDecodeError as e:
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text())
+            meta["last_error"] = f"JSON parse error: {e}"
+            meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
         return prefix, f"error parsing JSON: {e}"
     except Exception as e:
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text())
+            meta["last_error"] = str(e)
+            meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
         return prefix, f"error: {e}"
 
 # ---------------------------------------------------------------------------
@@ -396,6 +431,7 @@ def process_transcript(client, types, video, prompt_text, model, output_dir, cha
 
 def cmd_scan(args, config):
     """Scan channels for new videos and generate mind maps."""
+    errors = []
     genai, types = require_gemini()
     yt_build = require_youtube()
 
@@ -449,10 +485,11 @@ def cmd_scan(args, config):
             print("  No new videos found.")
             continue
 
-        # Filter already processed
+        # Filter already processed or skipped
         new_videos = [
             v for v in videos
             if not is_processed(output_dir, ch_name, v, "scan")
+            and not is_skipped(output_dir, ch_name, v)
         ]
         print(f"  Found {len(videos)} videos, {len(new_videos)} new.")
 
@@ -482,6 +519,8 @@ def cmd_scan(args, config):
                     v = futures[future]
                     prefix, status = future.result()
                     print(f"    {prefix}: {status}")
+                    if status.startswith("error"):
+                        errors.append((ch_name, prefix, status))
 
         # Auto-transcript if configured
         auto = ch.get("auto_transcript", "none")
@@ -490,6 +529,7 @@ def cmd_scan(args, config):
             transcript_videos = [
                 v for v in videos
                 if not is_processed(output_dir, ch_name, v, "transcript")
+                and not is_skipped(output_dir, ch_name, v)
             ]
             if transcript_videos:
                 print(f"  Generating transcripts ({len(transcript_videos)} videos)...")
@@ -506,6 +546,15 @@ def cmd_scan(args, config):
                         v = futures[future]
                         prefix, status = future.result()
                         print(f"    {prefix}: {status}")
+                        if status.startswith("error"):
+                            errors.append((ch_name, prefix, status))
+
+    if errors:
+        print(f"\n--- {len(errors)} FAILED ---")
+        for ch, prefix, status in errors:
+            print(f"  [{ch}] {prefix}: {status}")
+        print("Failed items will retry on next run.")
+        print("To skip permanently: set \"skip\": true in the video's .meta.json")
 
     print("\nDone.")
 
