@@ -1,0 +1,5 @@
+# Development tools: linters, formatters, and testing libraries.
+# Install with: pip install -r requirements-dev.txt
+ruff
+pytest
+pytest-cov

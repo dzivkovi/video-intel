@@ -14,3 +14,4 @@ dist/
 build/
 .venv/
 venv/
+.coverage
