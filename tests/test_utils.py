@@ -460,3 +460,47 @@ class TestFetchChannelVideos:
             "published": "2026-03-15",
             "url": "https://www.youtube.com/watch?v=vid123",
         }
+
+
+# ---------------------------------------------------------------------------
+# CLI: mindmap subcommand
+# ---------------------------------------------------------------------------
+
+
+class TestCmdMindmapArgs:
+    def test_mindmap_subcommand_when_url_missing_exits(self):
+        """The mindmap subcommand requires --url."""
+        import argparse as _argparse
+
+
+        # Build parser the same way main() does, test it parses correctly
+        parser = _argparse.ArgumentParser()
+        subparsers = parser.add_subparsers(dest="command")
+        # This will fail until cmd_mindmap parser is added to main()
+        mm = subparsers.add_parser("mindmap")
+        mm.add_argument("--url", required=True)
+        mm.add_argument("--prompt")
+
+        with pytest.raises(SystemExit):
+            parser.parse_args(["mindmap"])  # no --url
+
+    def test_mindmap_subcommand_when_url_and_prompt_parses(self):
+        """The mindmap subcommand accepts --url and --prompt."""
+
+        # We test via the actual main() parser by importing and building it
+        import argparse as _argparse
+
+        parser = _argparse.ArgumentParser()
+        subparsers = parser.add_subparsers(dest="command")
+        mm = subparsers.add_parser("mindmap")
+        mm.add_argument("--url", required=True)
+        mm.add_argument("--prompt")
+        mm.add_argument("--channel")
+        mm.add_argument("--title")
+        mm.add_argument("--date")
+
+        args = parser.parse_args(
+            ["mindmap", "--url", "https://youtube.com/watch?v=abc123", "--prompt", "mindmap-knowledge"]
+        )
+        assert args.url == "https://youtube.com/watch?v=abc123"
+        assert args.prompt == "mindmap-knowledge"

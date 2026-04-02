@@ -667,6 +667,76 @@ def cmd_scan(args, config):
     print("\nDone.")
 
 
+def cmd_mindmap(args, config):
+    """Generate a mind map for a single video with a specific prompt."""
+    genai, types = require_gemini()
+
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    if not gemini_key:
+        print("ERROR: GEMINI_API_KEY not set.")
+        sys.exit(1)
+
+    client = genai.Client(api_key=gemini_key)
+    output_dir = resolve_output_dir(config)
+    model = config.get("model", "gemini-3-flash-preview")
+
+    # Resolve prompt
+    prompt_name = normalize_prompt_name(args.prompt or config.get("default_prompt", "mindmap-light"))
+    prompt_text = load_prompt(prompt_name)
+
+    # Build video object from URL
+    video_id_match = re.search(r"(?:v=|/)([a-zA-Z0-9_-]{11})", args.url)
+    if not video_id_match:
+        print(f"ERROR: Could not extract video ID from: {args.url}")
+        sys.exit(1)
+
+    video_id = video_id_match.group(1)
+    channel_name = args.channel
+    title = args.title
+    date = args.date
+
+    # Fetch video metadata from YouTube API
+    if not channel_name or not title or not date:
+        yt_key = os.environ.get("YOUTUBE_API_KEY")
+        if yt_key:
+            yt_build = require_youtube()
+            youtube = yt_build("youtube", "v3", developerKey=yt_key)
+            resp = youtube.videos().list(part="snippet", id=video_id).execute()
+            if resp.get("items"):
+                snippet = resp["items"][0]["snippet"]
+                title = title or unescape(snippet["title"])
+                date = date or snippet["publishedAt"][:10]
+                if not channel_name:
+                    yt_channel_id = snippet["channelId"]
+                    for ch in config.get("channels", []):
+                        ch_id, _ = get_channel_id(youtube, ch["url"])
+                        if ch_id == yt_channel_id:
+                            channel_name = ch["name"]
+                            break
+                    if not channel_name:
+                        channel_name = slugify(snippet["channelTitle"])
+
+    channel_name = channel_name or "_standalone"
+
+    video = {
+        "video_id": video_id,
+        "url": f"https://www.youtube.com/watch?v={video_id}",
+        "title": title or video_id,
+        "published": date or datetime.now().strftime("%Y-%m-%d"),
+    }
+
+    print(f"Generating mind map ({prompt_name}): {video['url']}")
+    prefix, status = process_mindmap(
+        client, types, video, prompt_text, model, output_dir, channel_name, prompt_name=prompt_name
+    )
+    print(f"  {prefix}: {status}")
+
+    if status == "done":
+        suffix = prompt_suffix(prompt_name)
+        out_path = output_dir / channel_name / f"{prefix}.mindmap.{suffix}.md"
+        print(f"  Saved: {out_path}")
+
+
 def cmd_transcript(args, config):
     """Generate a transcript for a single video."""
     genai, types = require_gemini()
@@ -748,6 +818,7 @@ Examples:
   %(prog)s scan --since 30d               # Override lookback window
   %(prog)s scan --dry-run                 # Preview without processing
   %(prog)s transcript --url URL           # Transcribe a specific video
+  %(prog)s mindmap --url URL --prompt P   # Mind map a single video with a specific prompt
         """,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -757,6 +828,14 @@ Examples:
     scan_parser.add_argument("--channel", help="Scan only this channel name")
     scan_parser.add_argument("--since", help="Override lookback window (e.g. 14d, 2026-01-01)")
     scan_parser.add_argument("--dry-run", action="store_true", help="Preview without processing")
+
+    # mindmap command
+    mm_parser = subparsers.add_parser("mindmap", help="Generate mind map for a specific video")
+    mm_parser.add_argument("--url", required=True, help="YouTube video URL")
+    mm_parser.add_argument("--prompt", help="Prompt name (default: config default_prompt)")
+    mm_parser.add_argument("--channel", help="Channel name for output folder")
+    mm_parser.add_argument("--title", help="Video title (auto-detected if omitted)")
+    mm_parser.add_argument("--date", help="Publish date YYYY-MM-DD (defaults to today)")
 
     # transcript command
     tx_parser = subparsers.add_parser("transcript", help="Transcribe a specific video")
@@ -770,6 +849,8 @@ Examples:
 
     if args.command == "scan":
         cmd_scan(args, config)
+    elif args.command == "mindmap":
+        cmd_mindmap(args, config)
     elif args.command == "transcript":
         cmd_transcript(args, config)
 
