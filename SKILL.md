@@ -115,10 +115,10 @@ Options:
 
 ```bash
 # Extract concepts from all mindmaps that don't have concepts yet
-python "${SKILL_DIR}/scripts/video_intel.py" concepts --backfill
+python "${SKILL_DIR}/scripts/video_intel.py" concepts
 
 # Re-extract for a specific channel
-python "${SKILL_DIR}/scripts/video_intel.py" concepts --backfill --channel natebjones --force
+python "${SKILL_DIR}/scripts/video_intel.py" concepts --channel natebjones --force
 
 # Rebuild master taxonomy from all concept files
 python "${SKILL_DIR}/scripts/video_intel.py" taxonomy-build

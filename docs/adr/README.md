@@ -41,6 +41,8 @@ Files are named: `ADR-NNNN-title-with-dashes.md`
 | [ADR-0007](ADR-0007-per-channel-config.md) | Per-channel configuration | accepted | 2026-03-28 |
 | [ADR-0008](ADR-0008-developer-tooling-and-specs.md) | Developer tooling, specs, and Compound Engineering adoption | accepted | 2026-03-30 |
 | [ADR-0009](ADR-0009-deterministic-video-discovery.md) | Deterministic video discovery via uploads playlist | accepted | 2026-04-01 |
+| [ADR-0010](ADR-0010-llm-concept-normalization.md) | LLM-powered concept normalization (thesaurus layer) | accepted | 2026-04-01 |
+| [ADR-0011](ADR-0011-structured-logging.md) | Structured logging via Python logging module | accepted | 2026-04-02 |
 
 ## Process
 

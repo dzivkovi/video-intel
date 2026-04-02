@@ -13,6 +13,7 @@ Prerequisites:
 
 import argparse
 import json
+import logging
 import os
 import random
 import re
@@ -24,6 +25,8 @@ from html import unescape
 from pathlib import Path
 
 import yaml
+
+log = logging.getLogger("video_intel")
 
 # ---------------------------------------------------------------------------
 # Lazy imports with clear error messages
@@ -37,7 +40,7 @@ def require_gemini():
 
         return genai, types
     except ImportError:
-        print("ERROR: google-genai not installed. Run: pip install google-genai")
+        log.error("google-genai not installed. Run: pip install google-genai")
         sys.exit(1)
 
 
@@ -47,8 +50,7 @@ def require_youtube():
 
         return build
     except ImportError:
-        print("ERROR: google-api-python-client not installed.")
-        print("Run: pip install google-api-python-client")
+        log.error("google-api-python-client not installed. Run: pip install google-api-python-client")
         sys.exit(1)
 
 
@@ -62,8 +64,7 @@ SKILL_DIR = Path(__file__).resolve().parent.parent
 def load_config():
     config_path = SKILL_DIR / "config.yaml"
     if not config_path.exists():
-        print(f"ERROR: Config not found at {config_path}")
-        print("Copy config.yaml.example to config.yaml and edit it.")
+        log.error("Config not found at %s. Copy config.yaml.example to config.yaml and edit it.", config_path)
         sys.exit(1)
     with open(config_path) as f:
         return yaml.safe_load(f)
@@ -131,7 +132,7 @@ def load_prompt(prompt_name: str) -> str:
     prompt_name = normalize_prompt_name(prompt_name)
     prompt_path = SKILL_DIR / "prompts" / f"{prompt_name}.md"
     if not prompt_path.exists():
-        print(f"ERROR: Prompt file not found: {prompt_path}")
+        log.error("Prompt file not found: %s", prompt_path)
         sys.exit(1)
     return prompt_path.read_text(encoding="utf-8")
 
@@ -145,8 +146,7 @@ def parse_since(since_str):
     try:
         return datetime.fromisoformat(since_str).replace(tzinfo=UTC)
     except ValueError:
-        print(f"ERROR: Invalid since format: {since_str}")
-        print("Use '10d' for relative days or 'YYYY-MM-DD' for absolute date.")
+        log.error("Invalid since format: %s. Use '10d' for relative days or 'YYYY-MM-DD' for absolute date.", since_str)
         sys.exit(1)
 
 
@@ -289,7 +289,7 @@ def is_skipped(output_dir, channel_name, video):
 
 def call_gemini(client, types, video_url, prompt_text, model, response_json=False):
     """Send a video to Gemini for multimodal analysis with retry on rate limits."""
-    config_kwargs = {"temperature": 0.3}
+    config_kwargs = {"temperature": 0.3, "max_output_tokens": 16384}
     if response_json:
         config_kwargs["response_mime_type"] = "application/json"
 
@@ -315,7 +315,7 @@ def call_gemini(client, types, video_url, prompt_text, model, response_json=Fals
             is_server_error = "503" in error_str or "overloaded" in error_str
             if (is_rate_limit or is_server_error) and attempt < max_retries:
                 wait = (15 * (2**attempt)) + random.uniform(0, 5)
-                print(f"      Rate limited, retrying in {wait:.0f}s...")
+                log.warning("Rate limited, retrying in %ds...", wait)
                 time.sleep(wait)
             else:
                 raise
@@ -349,7 +349,9 @@ def process_mindmap(
             f"<!-- title: {video['title']} -->\n"
             f"<!-- published: {video['published']} -->\n\n"
         )
-        mindmap_path.write_text(header + result, encoding="utf-8")
+        tmp_path = mindmap_path.with_suffix(".md.tmp")
+        tmp_path.write_text(header + result, encoding="utf-8")
+        tmp_path.replace(mindmap_path)
 
         # Save or update metadata (merge, don't overwrite)
         meta_fields = {
@@ -508,7 +510,9 @@ def process_transcript(client, types, video, prompt_text, model, output_dir, cha
             f"**Processed:** {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}\n\n"
             f"---\n\n"
         )
-        transcript_path.write_text(header + fused, encoding="utf-8")
+        tmp_path = transcript_path.with_suffix(".md.tmp")
+        tmp_path.write_text(header + fused, encoding="utf-8")
+        tmp_path.replace(transcript_path)
 
         # Update metadata (merge, don't overwrite)
         update_meta(meta_path, {"processed": datetime.now(UTC).isoformat()}, "transcript")
@@ -554,7 +558,7 @@ def call_gemini_text(client, types, text_content, model):
             is_server_error = "503" in error_str or "overloaded" in error_str
             if (is_rate_limit or is_server_error) and attempt < max_retries:
                 wait = (15 * (2**attempt)) + random.uniform(0, 5)
-                print(f"      Rate limited, retrying in {wait:.0f}s...")
+                log.warning("Rate limited, retrying in %ds...", wait)
                 time.sleep(wait)
             else:
                 raise
@@ -609,7 +613,11 @@ def process_concepts(
             "concepts": result["concepts"],
         }
 
-        concepts_path.write_text(json.dumps(output, indent=2), encoding="utf-8")
+        # Atomic write: temp file then rename, so a killed process can't leave
+        # a half-written .concepts.json that the next run silently skips.
+        tmp_path = concepts_path.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(output, indent=2), encoding="utf-8")
+        tmp_path.replace(concepts_path)
         update_meta(meta_path, {"processed": datetime.now(UTC).isoformat()}, "concepts")
 
         n_new = sum(1 for c in result["concepts"] if c.get("status") == "new")
@@ -687,7 +695,9 @@ def build_taxonomy(output_dir: Path) -> dict:
         }
 
     taxonomy_path = output_dir / "taxonomy.json"
-    taxonomy_path.write_text(json.dumps(taxonomy, indent=2), encoding="utf-8")
+    tmp_path = taxonomy_path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(taxonomy, indent=2), encoding="utf-8")
+    tmp_path.replace(taxonomy_path)
     return taxonomy
 
 
@@ -706,13 +716,12 @@ def cmd_scan(args, config):
     gemini_key = os.environ.get("GEMINI_API_KEY")
     yt_key = os.environ.get("YOUTUBE_API_KEY")
     if not gemini_key:
-        print("ERROR: GEMINI_API_KEY not set.")
-        print("Get a free key at https://aistudio.google.com/apikey")
+        log.error("GEMINI_API_KEY not set. Get a free key at https://aistudio.google.com/apikey")
         sys.exit(1)
     if not yt_key:
-        print("ERROR: YOUTUBE_API_KEY not set.")
-        print("Get a free key at https://console.cloud.google.com/apis/credentials")
-        print("Enable 'YouTube Data API v3'.")
+        log.error(
+            "YOUTUBE_API_KEY not set. Get a free key at https://console.cloud.google.com/apis/credentials (enable YouTube Data API v3)"
+        )
         sys.exit(1)
 
     client = genai.Client(api_key=gemini_key)
@@ -726,7 +735,7 @@ def cmd_scan(args, config):
     if args.channel:
         channels = [c for c in channels if c["name"] == args.channel]
         if not channels:
-            print(f"ERROR: Channel '{args.channel}' not found in config.yaml")
+            log.error("Channel '%s' not found in config.yaml", args.channel)
             sys.exit(1)
 
     for ch in channels:
@@ -736,20 +745,20 @@ def cmd_scan(args, config):
         # Resolve channel
         channel_id, channel_title = get_channel_id(youtube, ch_url)
         if not channel_id:
-            print(f"[{ch_name}] ERROR: Channel not found: {ch_url}")
+            log.warning("[%s] Channel not found: %s", ch_name, ch_url)
             continue
 
-        print(f"\n[{ch_name}] {channel_title}")
+        log.info("[%s] %s", ch_name, channel_title)
 
         # Determine time window
         since_str = args.since or ch.get("since") or config.get("default_since", "10d")
         since_dt = parse_since(since_str)
-        print(f"  Looking back to {since_dt.strftime('%Y-%m-%d')}")
+        log.info("  Looking back to %s", since_dt.strftime("%Y-%m-%d"))
 
         # Fetch videos
         videos = fetch_channel_videos(youtube, channel_id, since_dt)
         if not videos:
-            print("  No new videos found.")
+            log.info("  No new videos found.")
             continue
 
         # Filter already processed or skipped (any_variant=True prevents backfill)
@@ -763,21 +772,21 @@ def cmd_scan(args, config):
                 and not is_skipped(output_dir, ch_name, v)
             ]
         label = "to regenerate" if args.force else "new"
-        print(f"  Found {len(videos)} videos, {len(new_videos)} {label}.")
+        log.info("  Found %d videos, %d %s.", len(videos), len(new_videos), label)
 
         if args.dry_run:
             for v in new_videos:
-                print(f"    {v['published']} - {v['title']}")
+                log.info("    %s - %s", v["published"], v["title"])
             continue
 
         prompt_name = ch.get("prompt") or config.get("default_prompt", "mindmap-light")
         prompt_text = load_prompt(prompt_name)
 
         if not new_videos:
-            print("  All mind maps up to date.")
+            log.info("  All mind maps up to date.")
         else:
             # Process mind maps in parallel
-            print(f"  Generating mind maps ({prompt_name})...")
+            log.info("  Generating mind maps (%s)...", prompt_name)
             with ThreadPoolExecutor(max_workers=max_parallel) as executor:
                 futures = {
                     executor.submit(
@@ -797,7 +806,7 @@ def cmd_scan(args, config):
                 for future in as_completed(futures):
                     v = futures[future]
                     prefix, status = future.result()
-                    print(f"    {prefix}: {status}")
+                    log.info("    %s: %s", prefix, status)
                     if status.startswith("error"):
                         errors.append((ch_name, prefix, status))
 
@@ -811,7 +820,7 @@ def cmd_scan(args, config):
                 if not is_processed(output_dir, ch_name, v, "transcript") and not is_skipped(output_dir, ch_name, v)
             ]
             if transcript_videos:
-                print(f"  Generating transcripts ({len(transcript_videos)} videos)...")
+                log.info("  Generating transcripts (%d videos)...", len(transcript_videos))
                 with ThreadPoolExecutor(max_workers=max_parallel) as executor:
                     futures = {
                         executor.submit(
@@ -829,7 +838,7 @@ def cmd_scan(args, config):
                     for future in as_completed(futures):
                         v = futures[future]
                         prefix, status = future.result()
-                        print(f"    {prefix}: {status}")
+                        log.info("    %s: %s", prefix, status)
                         if status.startswith("error"):
                             errors.append((ch_name, prefix, status))
 
@@ -849,7 +858,7 @@ def cmd_scan(args, config):
                     concept_videos.append((v, mindmap_path))
 
             if concept_videos:
-                print(f"  Extracting concepts ({len(concept_videos)} videos)...")
+                log.info("  Extracting concepts (%d videos)...", len(concept_videos))
                 for v, mindmap_path in concept_videos:
                     mindmap_text = mindmap_path.read_text(encoding="utf-8")
                     prefix, status = process_concepts(
@@ -864,18 +873,18 @@ def cmd_scan(args, config):
                         source_file=mindmap_path.name,
                         source_prompt=prompt_name,
                     )
-                    print(f"    {prefix}: {status}")
+                    log.info("    %s: %s", prefix, status)
                     if status.startswith("error"):
                         errors.append((ch_name, prefix, status))
 
     if errors:
-        print(f"\n--- {len(errors)} FAILED ---")
+        log.warning("--- %d FAILED ---", len(errors))
         for ch, prefix, status in errors:
-            print(f"  [{ch}] {prefix}: {status}")
-        print("Failed items will retry on next run.")
-        print('To skip permanently: set "skip": true in the video\'s .meta.json')
+            log.warning("  [%s] %s: %s", ch, prefix, status)
+        log.warning("Failed items will retry on next run.")
+        log.warning('To skip permanently: set "skip": true in the video\'s .meta.json')
 
-    print("\nDone.")
+    log.info("Done.")
 
 
 def cmd_mindmap(args, config):
@@ -884,7 +893,7 @@ def cmd_mindmap(args, config):
 
     gemini_key = os.environ.get("GEMINI_API_KEY")
     if not gemini_key:
-        print("ERROR: GEMINI_API_KEY not set.")
+        log.error("GEMINI_API_KEY not set.")
         sys.exit(1)
 
     client = genai.Client(api_key=gemini_key)
@@ -898,7 +907,7 @@ def cmd_mindmap(args, config):
     # Build video object from URL
     video_id_match = re.search(r"(?:v=|/)([a-zA-Z0-9_-]{11})", args.url)
     if not video_id_match:
-        print(f"ERROR: Could not extract video ID from: {args.url}")
+        log.error("Could not extract video ID from: %s", args.url)
         sys.exit(1)
 
     video_id = video_id_match.group(1)
@@ -936,15 +945,15 @@ def cmd_mindmap(args, config):
         "published": date or datetime.now().strftime("%Y-%m-%d"),
     }
 
-    print(f"Generating mind map ({prompt_name}): {video['url']}")
+    log.info("Generating mind map (%s): %s", prompt_name, video["url"])
     prefix, status = process_mindmap(
         client, types, video, prompt_text, model, output_dir, channel_name, prompt_name=prompt_name, force=args.force
     )
-    print(f"  {prefix}: {status}")
+    log.info("  %s: %s", prefix, status)
 
     if status == "done":
         out_path = output_dir / channel_name / f"{prefix}.mindmap.md"
-        print(f"  Saved: {out_path}")
+        log.info("  Saved: %s", out_path)
 
 
 def cmd_transcript(args, config):
@@ -953,7 +962,7 @@ def cmd_transcript(args, config):
 
     gemini_key = os.environ.get("GEMINI_API_KEY")
     if not gemini_key:
-        print("ERROR: GEMINI_API_KEY not set.")
+        log.error("GEMINI_API_KEY not set.")
         sys.exit(1)
 
     client = genai.Client(api_key=gemini_key)
@@ -964,7 +973,7 @@ def cmd_transcript(args, config):
     # Build video object from URL
     video_id_match = re.search(r"(?:v=|/)([a-zA-Z0-9_-]{11})", args.url)
     if not video_id_match:
-        print(f"ERROR: Could not extract video ID from: {args.url}")
+        log.error("Could not extract video ID from: %s", args.url)
         sys.exit(1)
 
     video_id = video_id_match.group(1)
@@ -1003,15 +1012,15 @@ def cmd_transcript(args, config):
         "published": date or datetime.now().strftime("%Y-%m-%d"),
     }
 
-    print(f"Transcribing: {video['url']}")
+    log.info("Transcribing: %s", video["url"])
     prefix, status = process_transcript(
         client, types, video, prompt_text, model, output_dir, channel_name, force=args.force
     )
-    print(f"  {prefix}: {status}")
+    log.info("  %s: %s", prefix, status)
 
     if status == "done":
         out_path = output_dir / channel_name / f"{prefix}.transcript.md"
-        print(f"  Saved: {out_path}")
+        log.info("  Saved: %s", out_path)
 
 
 def cmd_concepts(args, config):
@@ -1020,7 +1029,7 @@ def cmd_concepts(args, config):
 
     gemini_key = os.environ.get("GEMINI_API_KEY")
     if not gemini_key:
-        print("ERROR: GEMINI_API_KEY not set.")
+        log.error("GEMINI_API_KEY not set.")
         sys.exit(1)
 
     client = genai.Client(api_key=gemini_key)
@@ -1062,17 +1071,19 @@ def cmd_concepts(args, config):
             to_process.append((ch_name, video, mindmap_path, meta.get("prompt")))
 
     if not to_process:
-        print("All concepts up to date.")
+        log.info("All concepts up to date.")
         return
 
-    print(f"Extracting concepts from {len(to_process)} mindmaps...")
+    total = len(to_process)
+    log.info("Extracting concepts from %d mindmaps...", total)
 
     if args.dry_run:
         for ch_name, video, _mindmap_path, _ in to_process:
-            print(f"  [{ch_name}] {video['published']} - {video['title']}")
+            log.info("  [%s] %s - %s", ch_name, video["published"], video["title"])
         return
 
-    for ch_name, video, mindmap_path, source_prompt in to_process:
+    t0 = time.monotonic()
+    for i, (ch_name, video, mindmap_path, source_prompt) in enumerate(to_process, 1):
         mindmap_text = mindmap_path.read_text(encoding="utf-8")
         source_file = mindmap_path.name
 
@@ -1089,7 +1100,7 @@ def cmd_concepts(args, config):
             source_prompt=source_prompt,
             force=args.force,
         )
-        print(f"  [{ch_name}] {prefix}: {status}")
+        log.info("[%d/%d] [%s] %s: %s", i, total, ch_name, prefix, status)
 
         # Accumulate new concepts into in-memory taxonomy so the next video
         # can normalize against concepts discovered in earlier videos.
@@ -1105,7 +1116,11 @@ def cmd_concepts(args, config):
                         "domain": c.get("domain", ""),
                     }
 
-    print("\nDone. Run 'taxonomy-build' to rebuild the master taxonomy.")
+    elapsed = time.monotonic() - t0
+    minutes, seconds = divmod(int(elapsed), 60)
+    log.info(
+        "Done. %d videos in %dm %ds. Run 'taxonomy-build' to rebuild the master taxonomy.", total, minutes, seconds
+    )
 
 
 def cmd_status(args, config):
@@ -1296,11 +1311,17 @@ Examples:
   %(prog)s scan --dry-run                 # Preview without processing
   %(prog)s transcript --url URL           # Transcribe a specific video
   %(prog)s mindmap --url URL --prompt P   # Mind map a single video with a specific prompt
-  %(prog)s concepts --backfill            # Extract concepts from all existing mindmaps
+  %(prog)s concepts                       # Extract concepts from all existing mindmaps
   %(prog)s taxonomy-build                 # Rebuild taxonomy.json from concept files
   %(prog)s search "skills standard"       # Search corpus by concept
   %(prog)s search "context window" --channel natebjones
         """,
+    )
+    parser.add_argument(
+        "--log-level",
+        default="warning",
+        choices=["debug", "info", "warning", "error"],
+        help="Set logging verbosity (default: warning)",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -1330,7 +1351,6 @@ Examples:
 
     # concepts command
     concepts_parser = subparsers.add_parser("concepts", help="Extract concepts from existing mindmaps")
-    concepts_parser.add_argument("--backfill", action="store_true", help="Process all mindmaps missing concepts")
     concepts_parser.add_argument("--channel", help="Process only this channel")
     concepts_parser.add_argument("--force", action="store_true", help="Re-extract even if concepts.json exists")
     concepts_parser.add_argument("--dry-run", action="store_true", help="Preview without processing")
@@ -1348,6 +1368,12 @@ Examples:
     subparsers.add_parser("status", help="Show corpus status: output dir, channels, artifact counts")
 
     args = parser.parse_args()
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(asctime)s %(levelname)-7s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    log.setLevel(getattr(logging, args.log_level.upper()))
     config = load_config()
 
     if args.command == "scan":

@@ -208,10 +208,10 @@ python scripts/video_intel.py transcript \
   --url "https://www.youtube.com/watch?v=XXXXX"
 
 # Extract concepts from all existing mindmaps
-python scripts/video_intel.py concepts --backfill
+python scripts/video_intel.py concepts
 
 # Extract concepts for one channel
-python scripts/video_intel.py concepts --backfill --channel natebjones
+python scripts/video_intel.py concepts --channel natebjones
 
 # Rebuild master taxonomy from all concept files
 python scripts/video_intel.py taxonomy-build
@@ -357,7 +357,7 @@ python scripts/video_intel.py mindmap \
 
 ```bash
 # Re-extract concepts for one channel
-python scripts/video_intel.py concepts --backfill --channel natebjones --force
+python scripts/video_intel.py concepts --channel natebjones --force
 
 # Rebuild taxonomy from all concept files
 python scripts/video_intel.py taxonomy-build
@@ -380,7 +380,7 @@ should also be regenerated. The recommended order:
 python scripts/video_intel.py scan --force
 
 # 2. Re-extract concepts from the new mindmaps
-python scripts/video_intel.py concepts --backfill --force
+python scripts/video_intel.py concepts --force
 
 # 3. Rebuild the master taxonomy
 python scripts/video_intel.py taxonomy-build

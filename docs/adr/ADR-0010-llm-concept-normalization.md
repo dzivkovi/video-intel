@@ -36,7 +36,7 @@ Key design decisions:
 - **Search/retrieval engine** — concepts are retrieval metadata over transcript chunk embeddings, not a standalone browsable index. Use Chroma, LanceDB, or external tools for the retrieval layer.
 - **Multiple structured facets** (tasks, problems, tools, claims) — concepts are the ONE structured facet. Transcript embeddings handle unpredictable query intents. Add explicit facets only when benchmarks show a retrieval gap.
 
-New subcommands: `concepts --backfill` (extract) and `taxonomy-build` (aggregate).
+New subcommands: `concepts` (extract) and `taxonomy-build` (aggregate).
 
 ## Consequences
 
