@@ -86,6 +86,14 @@ def normalize_prompt_name(name: str) -> str:
     return Path(name).stem
 
 
+def prompt_suffix(prompt_name: str) -> str:
+    """Derive filename suffix from prompt name. 'mindmap-knowledge' -> 'knowledge'."""
+    suffix = prompt_name.removeprefix("mindmap-")
+    if not suffix:
+        raise ValueError(f"Empty suffix from prompt name: {prompt_name}")
+    return suffix
+
+
 def update_meta(meta_path: Path, fields: dict, mode: str) -> None:
     """Read existing meta.json, merge fields, ensure mode in modes_completed, write back."""
     meta: dict = {}
@@ -211,11 +219,44 @@ def video_file_prefix(video):
     return f"{video['published']}-{slugify(video['title'])}"
 
 
-def is_processed(output_dir, channel_name, video, mode):
-    """Check if a video has already been processed for a given mode."""
+def is_processed(
+    output_dir: Path,
+    channel_name: str,
+    video: dict,
+    mode: str,
+    *,
+    prompt_name: str | None = None,
+    any_variant: bool = False,
+) -> bool:
+    """Check if a video has already been processed for a given mode.
+
+    For scan mode with any_variant=True: checks for ANY .mindmap*.md file (prevents backfill).
+    For scan mode with prompt_name: checks only for .mindmap.{suffix}.md (allows A/B testing).
+    For transcript mode: checks for .transcript.md (unchanged).
+    """
     prefix = video_file_prefix(video)
-    ext = "mindmap.md" if mode == "scan" else "transcript.md"
-    target = output_dir / channel_name / f"{prefix}.{ext}"
+    channel_dir = output_dir / channel_name
+
+    if mode == "transcript":
+        target = channel_dir / f"{prefix}.transcript.md"
+        return target.exists() and target.stat().st_size > 0
+
+    # mode == "scan"
+    if any_variant:
+        # Glob for any mindmap file — legacy .mindmap.md or .mindmap.*.md
+        return (
+            any(f.stat().st_size > 0 for f in channel_dir.glob(f"{prefix}.mindmap*.md"))
+            if channel_dir.exists()
+            else False
+        )
+
+    if prompt_name:
+        suffix = prompt_suffix(prompt_name)
+        target = channel_dir / f"{prefix}.mindmap.{suffix}.md"
+        return target.exists() and target.stat().st_size > 0
+
+    # Legacy fallback: no prompt_name, no any_variant
+    target = channel_dir / f"{prefix}.mindmap.md"
     return target.exists() and target.stat().st_size > 0
 
 
@@ -273,13 +314,17 @@ def call_gemini(client, types, video_url, prompt_text, model, response_json=Fals
 # ---------------------------------------------------------------------------
 
 
-def process_mindmap(client, types, video, prompt_text, model, output_dir, channel_name):
+def process_mindmap(client, types, video, prompt_text, model, output_dir, channel_name, *, prompt_name=None):
     """Generate a mind map for a single video."""
     prefix = video_file_prefix(video)
     channel_dir = output_dir / channel_name
     channel_dir.mkdir(parents=True, exist_ok=True)
 
-    mindmap_path = channel_dir / f"{prefix}.mindmap.md"
+    if prompt_name:
+        suffix = prompt_suffix(prompt_name)
+        mindmap_path = channel_dir / f"{prefix}.mindmap.{suffix}.md"
+    else:
+        mindmap_path = channel_dir / f"{prefix}.mindmap.md"
     meta_path = channel_dir / f"{prefix}.meta.json"
 
     if mindmap_path.exists():
@@ -536,11 +581,12 @@ def cmd_scan(args, config):
             print("  No new videos found.")
             continue
 
-        # Filter already processed or skipped
+        # Filter already processed or skipped (any_variant=True prevents backfill)
         new_videos = [
             v
             for v in videos
-            if not is_processed(output_dir, ch_name, v, "scan") and not is_skipped(output_dir, ch_name, v)
+            if not is_processed(output_dir, ch_name, v, "scan", any_variant=True)
+            and not is_skipped(output_dir, ch_name, v)
         ]
         print(f"  Found {len(videos)} videos, {len(new_videos)} new.")
 
@@ -568,6 +614,7 @@ def cmd_scan(args, config):
                         model,
                         output_dir,
                         ch_name,
+                        prompt_name=prompt_name,
                     ): v
                     for v in new_videos
                 }
