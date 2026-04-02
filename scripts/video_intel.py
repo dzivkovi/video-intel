@@ -86,14 +86,6 @@ def normalize_prompt_name(name: str) -> str:
     return Path(name).stem
 
 
-def prompt_suffix(prompt_name: str) -> str:
-    """Derive filename suffix from prompt name. 'mindmap-knowledge' -> 'knowledge'."""
-    suffix = prompt_name.removeprefix("mindmap-")
-    if not suffix:
-        raise ValueError(f"Empty suffix from prompt name: {prompt_name}")
-    return suffix
-
-
 def update_meta(meta_path: Path, fields: dict, mode: str) -> None:
     """Read existing meta.json, merge fields, ensure mode in modes_completed, write back."""
     meta: dict = {}
@@ -225,13 +217,11 @@ def is_processed(
     video: dict,
     mode: str,
     *,
-    prompt_name: str | None = None,
     any_variant: bool = False,
 ) -> bool:
     """Check if a video has already been processed for a given mode.
 
     For scan mode with any_variant=True: checks for ANY .mindmap*.md file (prevents backfill).
-    For scan mode with prompt_name: checks only for .mindmap.{suffix}.md (allows A/B testing).
     For transcript mode: checks for .transcript.md (unchanged).
     """
     prefix = video_file_prefix(video)
@@ -250,12 +240,7 @@ def is_processed(
             else False
         )
 
-    if prompt_name:
-        suffix = prompt_suffix(prompt_name)
-        target = channel_dir / f"{prefix}.mindmap.{suffix}.md"
-        return target.exists() and target.stat().st_size > 0
-
-    # Legacy fallback: no prompt_name, no any_variant
+    # Default: check for standard .mindmap.md
     target = channel_dir / f"{prefix}.mindmap.md"
     return target.exists() and target.stat().st_size > 0
 
@@ -320,11 +305,7 @@ def process_mindmap(client, types, video, prompt_text, model, output_dir, channe
     channel_dir = output_dir / channel_name
     channel_dir.mkdir(parents=True, exist_ok=True)
 
-    if prompt_name:
-        suffix = prompt_suffix(prompt_name)
-        mindmap_path = channel_dir / f"{prefix}.mindmap.{suffix}.md"
-    else:
-        mindmap_path = channel_dir / f"{prefix}.mindmap.md"
+    mindmap_path = channel_dir / f"{prefix}.mindmap.md"
     meta_path = channel_dir / f"{prefix}.meta.json"
 
     if mindmap_path.exists():
@@ -342,19 +323,18 @@ def process_mindmap(client, types, video, prompt_text, model, output_dir, channe
         mindmap_path.write_text(header + result, encoding="utf-8")
 
         # Save or update metadata (merge, don't overwrite)
-        update_meta(
-            meta_path,
-            {
-                "video_url": video["url"],
-                "video_id": video["video_id"],
-                "channel": channel_name,
-                "title": video["title"],
-                "published": video["published"],
-                "processed": datetime.now(UTC).isoformat(),
-                "model": model,
-            },
-            "scan",
-        )
+        meta_fields = {
+            "video_url": video["url"],
+            "video_id": video["video_id"],
+            "channel": channel_name,
+            "title": video["title"],
+            "published": video["published"],
+            "processed": datetime.now(UTC).isoformat(),
+            "model": model,
+        }
+        if prompt_name:
+            meta_fields["prompt"] = prompt_name
+        update_meta(meta_path, meta_fields, "scan")
 
         return prefix, "done"
 
@@ -732,8 +712,7 @@ def cmd_mindmap(args, config):
     print(f"  {prefix}: {status}")
 
     if status == "done":
-        suffix = prompt_suffix(prompt_name)
-        out_path = output_dir / channel_name / f"{prefix}.mindmap.{suffix}.md"
+        out_path = output_dir / channel_name / f"{prefix}.mindmap.md"
         print(f"  Saved: {out_path}")
 
 

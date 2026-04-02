@@ -12,7 +12,6 @@ from video_intel import (
     merge_transcript_json,
     normalize_prompt_name,
     parse_since,
-    prompt_suffix,
     slugify,
     timestamp_to_seconds,
     update_meta,
@@ -276,101 +275,43 @@ class TestUpdateMeta:
 
 
 # ---------------------------------------------------------------------------
-# prompt_suffix
+# is_processed
 # ---------------------------------------------------------------------------
 
 
-class TestPromptSuffix:
-    def test_prompt_suffix_when_mindmap_prefix_strips_prefix(self):
-        assert prompt_suffix("mindmap-knowledge") == "knowledge"
-
-    def test_prompt_suffix_when_no_prefix_returns_as_is(self):
-        assert prompt_suffix("custom") == "custom"
-
-    def test_prompt_suffix_when_empty_result_raises(self):
-        with pytest.raises(ValueError):
-            prompt_suffix("mindmap-")
-
-
-# ---------------------------------------------------------------------------
-# is_processed (two-tier idempotency)
-# ---------------------------------------------------------------------------
-
-
-class TestIsProcessedScan:
-    """Scan mode: skip if ANY mindmap variant exists (prevent backfill)."""
+class TestIsProcessed:
+    """Scan mode with any_variant: skip if ANY mindmap variant exists (prevent backfill)."""
 
     def _make_video(self) -> dict:
         return {"published": "2026-03-30", "title": "Test Video"}
 
     def test_is_processed_scan_when_legacy_file_exists_returns_true(self, tmp_path):
-        # Arrange — old-style .mindmap.md exists
         channel_dir = tmp_path / "test_channel"
         channel_dir.mkdir()
         (channel_dir / "2026-03-30-test-video.mindmap.md").write_text("content")
 
-        # Act & Assert
         assert is_processed(tmp_path, "test_channel", self._make_video(), "scan", any_variant=True) is True
 
     def test_is_processed_scan_when_suffixed_file_exists_returns_true(self, tmp_path):
-        # Arrange — new-style .mindmap.knowledge.md exists
+        # Old manually-renamed files like .mindmap.knowledge.md should still be caught
         channel_dir = tmp_path / "test_channel"
         channel_dir.mkdir()
         (channel_dir / "2026-03-30-test-video.mindmap.knowledge.md").write_text("content")
 
-        # Act & Assert
         assert is_processed(tmp_path, "test_channel", self._make_video(), "scan", any_variant=True) is True
 
     def test_is_processed_scan_when_no_mindmap_returns_false(self, tmp_path):
-        # Arrange — channel dir exists but no mindmap files
         channel_dir = tmp_path / "test_channel"
         channel_dir.mkdir()
 
-        # Act & Assert
         assert is_processed(tmp_path, "test_channel", self._make_video(), "scan", any_variant=True) is False
 
-    def test_is_processed_scan_when_different_suffix_still_found(self, tmp_path):
-        # Arrange — .mindmap.heavy.md exists, scan doesn't care which prompt
+    def test_is_processed_transcript_when_file_exists_returns_true(self, tmp_path):
         channel_dir = tmp_path / "test_channel"
         channel_dir.mkdir()
-        (channel_dir / "2026-03-30-test-video.mindmap.heavy.md").write_text("content")
+        (channel_dir / "2026-03-30-test-video.transcript.md").write_text("content")
 
-        # Act & Assert
-        assert is_processed(tmp_path, "test_channel", self._make_video(), "scan", any_variant=True) is True
-
-
-class TestIsProcessedMindmap:
-    """Mindmap subcommand: only skip if the exact prompt variant exists."""
-
-    def _make_video(self) -> dict:
-        return {"published": "2026-03-30", "title": "Test Video"}
-
-    def test_is_processed_mindmap_when_exact_suffix_exists_returns_true(self, tmp_path):
-        channel_dir = tmp_path / "test_channel"
-        channel_dir.mkdir()
-        (channel_dir / "2026-03-30-test-video.mindmap.knowledge.md").write_text("content")
-
-        assert (
-            is_processed(tmp_path, "test_channel", self._make_video(), "scan", prompt_name="mindmap-knowledge") is True
-        )
-
-    def test_is_processed_mindmap_when_different_suffix_returns_false(self, tmp_path):
-        channel_dir = tmp_path / "test_channel"
-        channel_dir.mkdir()
-        (channel_dir / "2026-03-30-test-video.mindmap.heavy.md").write_text("content")
-
-        assert (
-            is_processed(tmp_path, "test_channel", self._make_video(), "scan", prompt_name="mindmap-knowledge") is False
-        )
-
-    def test_is_processed_mindmap_when_legacy_exists_returns_false(self, tmp_path):
-        channel_dir = tmp_path / "test_channel"
-        channel_dir.mkdir()
-        (channel_dir / "2026-03-30-test-video.mindmap.md").write_text("content")
-
-        assert (
-            is_processed(tmp_path, "test_channel", self._make_video(), "scan", prompt_name="mindmap-knowledge") is False
-        )
+        assert is_processed(tmp_path, "test_channel", self._make_video(), "transcript") is True
 
 
 # ---------------------------------------------------------------------------
@@ -471,7 +412,6 @@ class TestCmdMindmapArgs:
     def test_mindmap_subcommand_when_url_missing_exits(self):
         """The mindmap subcommand requires --url."""
         import argparse as _argparse
-
 
         # Build parser the same way main() does, test it parses correctly
         parser = _argparse.ArgumentParser()
