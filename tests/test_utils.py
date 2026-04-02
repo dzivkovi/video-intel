@@ -1,5 +1,6 @@
 """Tests for pure utility functions in video_intel.py."""
 
+import json
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
@@ -10,6 +11,7 @@ from video_intel import (
     parse_since,
     slugify,
     timestamp_to_seconds,
+    update_meta,
     video_file_prefix,
 )
 
@@ -204,6 +206,69 @@ class TestMergeTranscriptJson:
     def test_merge_transcript_json_empty_input_returns_empty(self):
         result = merge_transcript_json({}, {})
         assert result == ""
+
+
+# ---------------------------------------------------------------------------
+# update_meta
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateMeta:
+    def test_update_meta_when_no_file_creates_fresh(self, tmp_path):
+        # Arrange
+        meta_path = tmp_path / "test.meta.json"
+        fields = {"video_url": "https://example.com", "channel": "test"}
+
+        # Act
+        update_meta(meta_path, fields, "scan")
+
+        # Assert
+        meta = json.loads(meta_path.read_text())
+        assert meta["video_url"] == "https://example.com"
+        assert meta["modes_completed"] == ["scan"]
+        assert meta["last_error"] is None
+
+    def test_update_meta_when_existing_merges_modes(self, tmp_path):
+        # Arrange — pre-existing meta with transcript completed
+        meta_path = tmp_path / "test.meta.json"
+        existing = {"channel": "test", "modes_completed": ["transcript"], "last_error": None}
+        meta_path.write_text(json.dumps(existing))
+
+        # Act — add scan mode
+        update_meta(meta_path, {"video_url": "https://example.com"}, "scan")
+
+        # Assert — both modes present
+        meta = json.loads(meta_path.read_text())
+        assert "transcript" in meta["modes_completed"]
+        assert "scan" in meta["modes_completed"]
+        assert meta["video_url"] == "https://example.com"
+
+    def test_update_meta_when_duplicate_mode_does_not_repeat(self, tmp_path):
+        # Arrange
+        meta_path = tmp_path / "test.meta.json"
+        existing = {"modes_completed": ["scan"]}
+        meta_path.write_text(json.dumps(existing))
+
+        # Act
+        update_meta(meta_path, {}, "scan")
+
+        # Assert
+        meta = json.loads(meta_path.read_text())
+        assert meta["modes_completed"] == ["scan"]
+
+    def test_update_meta_when_existing_preserves_unrelated_fields(self, tmp_path):
+        # Arrange
+        meta_path = tmp_path / "test.meta.json"
+        existing = {"channel": "test", "title": "Original Title", "modes_completed": []}
+        meta_path.write_text(json.dumps(existing))
+
+        # Act — update with new fields, don't touch title
+        update_meta(meta_path, {"model": "gemini-3"}, "scan")
+
+        # Assert
+        meta = json.loads(meta_path.read_text())
+        assert meta["title"] == "Original Title"
+        assert meta["model"] == "gemini-3"
 
 
 # ---------------------------------------------------------------------------

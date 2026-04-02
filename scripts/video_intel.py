@@ -86,6 +86,20 @@ def normalize_prompt_name(name: str) -> str:
     return Path(name).stem
 
 
+def update_meta(meta_path: Path, fields: dict, mode: str) -> None:
+    """Read existing meta.json, merge fields, ensure mode in modes_completed, write back."""
+    meta: dict = {}
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta.update(fields)
+    modes = meta.get("modes_completed", [])
+    if mode not in modes:
+        modes.append(mode)
+    meta["modes_completed"] = modes
+    meta["last_error"] = None
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+
 def load_prompt(prompt_name: str) -> str:
     prompt_name = normalize_prompt_name(prompt_name)
     prompt_path = SKILL_DIR / "prompts" / f"{prompt_name}.md"
@@ -282,26 +296,27 @@ def process_mindmap(client, types, video, prompt_text, model, output_dir, channe
         )
         mindmap_path.write_text(header + result, encoding="utf-8")
 
-        # Save or update metadata
-        meta = {
-            "video_url": video["url"],
-            "video_id": video["video_id"],
-            "channel": channel_name,
-            "title": video["title"],
-            "published": video["published"],
-            "processed": datetime.now(UTC).isoformat(),
-            "model": model,
-            "modes_completed": ["scan"],
-            "last_error": None,
-        }
-        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        # Save or update metadata (merge, don't overwrite)
+        update_meta(
+            meta_path,
+            {
+                "video_url": video["url"],
+                "video_id": video["video_id"],
+                "channel": channel_name,
+                "title": video["title"],
+                "published": video["published"],
+                "processed": datetime.now(UTC).isoformat(),
+                "model": model,
+            },
+            "scan",
+        )
 
         return prefix, "done"
 
     except Exception as e:
-        # Record failure in meta.json
+        # Record failure in meta.json (also merge-safe)
         channel_dir.mkdir(parents=True, exist_ok=True)
-        meta = {}
+        meta: dict = {}
         if meta_path.exists():
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
         meta.update(
@@ -441,13 +456,8 @@ def process_transcript(client, types, video, prompt_text, model, output_dir, cha
         )
         transcript_path.write_text(header + fused, encoding="utf-8")
 
-        # Update metadata
-        if meta_path.exists():
-            meta = json.loads(meta_path.read_text())
-            if "transcript" not in meta.get("modes_completed", []):
-                meta["modes_completed"].append("transcript")
-            meta["last_error"] = None
-            meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        # Update metadata (merge, don't overwrite)
+        update_meta(meta_path, {"processed": datetime.now(UTC).isoformat()}, "transcript")
 
         return prefix, "done"
 
