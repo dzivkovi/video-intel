@@ -227,11 +227,19 @@ Using Gemini 3 Flash ($0.50/M input tokens, $1.00/M audio, $3.00/M output):
 | --------- | ----------- |
 | Mind map for a 15-min video | ~$0.15-0.25 |
 | Mind map for a 45-min video | ~$0.40-0.60 |
-| Full transcript for a 30-min video | ~$0.50-0.80 |
+| Full transcript for a 30-min video | ~$0.30-0.50 |
 | Weekly scan of 5 channels (30 videos) | ~$5-10 |
 | Batch API (async, 50% discount) | Half the above |
 
-Free tier: 8 hours of YouTube video per day at no cost.
+**Free tier** covers 8 hours of input video per day. When active, input tokens
+cost nothing and output tokens ($3/M) become nearly the entire bill — about
+$0.05 per video. Steady-state weekly scans of 30 videos fit comfortably within
+the daily free quota.
+
+**First-run backfill:** If you configure channels with long lookback windows
+(e.g., `since: 90d`), the first scan processes every video in that window.
+Start with `--dry-run` to preview volume, or use short `since` values and
+widen them gradually.
 
 **Rate limits:** Free tier has lower requests-per-minute limits. The script
 retries automatically with backoff on 429 errors, but if you hit throttling,
