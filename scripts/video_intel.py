@@ -100,6 +100,33 @@ def update_meta(meta_path: Path, fields: dict, mode: str) -> None:
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
 
+def load_taxonomy(output_dir: Path) -> dict:
+    """Load existing taxonomy.json as normalization context, or return empty structure."""
+    taxonomy_path = output_dir / "taxonomy.json"
+    if taxonomy_path.exists():
+        return json.loads(taxonomy_path.read_text(encoding="utf-8"))
+    return {"version": 1, "built_from": 0, "concepts": {}}
+
+
+def find_mindmap_source(channel_dir: Path, prefix: str) -> Path | None:
+    """Find the best mindmap file for concept extraction.
+
+    Prefers canonical .mindmap.md, falls back to .mindmap.knowledge.md,
+    then any .mindmap*.md variant.
+    """
+    canonical = channel_dir / f"{prefix}.mindmap.md"
+    if canonical.exists() and canonical.stat().st_size > 0:
+        return canonical
+    knowledge = channel_dir / f"{prefix}.mindmap.knowledge.md"
+    if knowledge.exists() and knowledge.stat().st_size > 0:
+        return knowledge
+    variants = sorted(channel_dir.glob(f"{prefix}.mindmap*.md"))
+    for v in variants:
+        if v.stat().st_size > 0:
+            return v
+    return None
+
+
 def load_prompt(prompt_name: str) -> str:
     prompt_name = normalize_prompt_name(prompt_name)
     prompt_path = SKILL_DIR / "prompts" / f"{prompt_name}.md"
@@ -299,7 +326,9 @@ def call_gemini(client, types, video_url, prompt_text, model, response_json=Fals
 # ---------------------------------------------------------------------------
 
 
-def process_mindmap(client, types, video, prompt_text, model, output_dir, channel_name, *, prompt_name=None):
+def process_mindmap(
+    client, types, video, prompt_text, model, output_dir, channel_name, *, prompt_name=None, force=False
+):
     """Generate a mind map for a single video."""
     prefix = video_file_prefix(video)
     channel_dir = output_dir / channel_name
@@ -308,7 +337,7 @@ def process_mindmap(client, types, video, prompt_text, model, output_dir, channe
     mindmap_path = channel_dir / f"{prefix}.mindmap.md"
     meta_path = channel_dir / f"{prefix}.meta.json"
 
-    if mindmap_path.exists():
+    if mindmap_path.exists() and not force:
         return prefix, "skipped (exists)"
 
     try:
@@ -450,7 +479,7 @@ def timestamp_to_seconds(ts):
     return 0
 
 
-def process_transcript(client, types, video, prompt_text, model, output_dir, channel_name):
+def process_transcript(client, types, video, prompt_text, model, output_dir, channel_name, *, force=False):
     """Generate a fused transcript for a single video."""
     prefix = video_file_prefix(video)
     channel_dir = output_dir / channel_name
@@ -459,7 +488,7 @@ def process_transcript(client, types, video, prompt_text, model, output_dir, cha
     transcript_path = channel_dir / f"{prefix}.transcript.md"
     meta_path = channel_dir / f"{prefix}.meta.json"
 
-    if transcript_path.exists():
+    if transcript_path.exists() and not force:
         return prefix, "skipped (exists)"
 
     try:
@@ -498,6 +527,168 @@ def process_transcript(client, types, video, prompt_text, model, output_dir, cha
             meta["last_error"] = str(e)
             meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
         return prefix, f"error: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Concept extraction
+# ---------------------------------------------------------------------------
+
+
+def call_gemini_text(client, types, text_content, model):
+    """Send text-only content to Gemini and get a JSON response."""
+    config_kwargs = {"temperature": 0.3, "response_mime_type": "application/json"}
+    contents = types.Content(parts=[types.Part(text=text_content)])
+
+    max_retries = 3
+    for attempt in range(max_retries + 1):
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=types.GenerateContentConfig(**config_kwargs),
+            )
+            return response.text
+        except Exception as e:
+            error_str = str(e).lower()
+            is_rate_limit = "429" in error_str or "resource exhausted" in error_str
+            is_server_error = "503" in error_str or "overloaded" in error_str
+            if (is_rate_limit or is_server_error) and attempt < max_retries:
+                wait = (15 * (2**attempt)) + random.uniform(0, 5)
+                print(f"      Rate limited, retrying in {wait:.0f}s...")
+                time.sleep(wait)
+            else:
+                raise
+
+
+def process_concepts(
+    client,
+    types,
+    video,
+    mindmap_text,
+    taxonomy,
+    model,
+    output_dir,
+    channel_name,
+    *,
+    source_file=None,
+    source_prompt=None,
+    force=False,
+):
+    """Extract and normalize concepts from a mindmap against the taxonomy."""
+    prefix = video_file_prefix(video)
+    channel_dir = output_dir / channel_name
+    channel_dir.mkdir(parents=True, exist_ok=True)
+
+    concepts_path = channel_dir / f"{prefix}.concepts.json"
+    meta_path = channel_dir / f"{prefix}.meta.json"
+
+    if concepts_path.exists() and not force:
+        return prefix, "skipped (exists)"
+
+    try:
+        # Build the prompt with taxonomy context
+        prompt_text = load_prompt("concepts")
+        taxonomy_context = json.dumps(taxonomy.get("concepts", {}), indent=2)
+        prompt_with_taxonomy = prompt_text.replace("{{taxonomy}}", taxonomy_context)
+
+        full_text = f"{prompt_with_taxonomy}\n\n---\n\n## Mind Map to Analyze\n\n{mindmap_text}"
+        raw = call_gemini_text(client, types, full_text, model)
+        result = json.loads(raw)
+
+        # Normalize: ensure it has the expected structure
+        if isinstance(result, list):
+            result = result[0] if result else {"concepts": []}
+        if "concepts" not in result:
+            result = {"concepts": result} if isinstance(result, list) else {"concepts": []}
+
+        # Build the output
+        output = {
+            "video_id": video["video_id"],
+            "extracted_from": source_file or "mindmap.md",
+            "source_prompt": source_prompt or "unknown",
+            "concepts": result["concepts"],
+        }
+
+        concepts_path.write_text(json.dumps(output, indent=2), encoding="utf-8")
+        update_meta(meta_path, {"processed": datetime.now(UTC).isoformat()}, "concepts")
+
+        n_new = sum(1 for c in result["concepts"] if c.get("status") == "new")
+        n_uncertain = sum(1 for c in result["concepts"] if c.get("status") == "uncertain")
+        summary = f"done ({len(result['concepts'])} concepts"
+        if n_new:
+            summary += f", {n_new} new"
+        if n_uncertain:
+            summary += f", {n_uncertain} uncertain"
+        summary += ")"
+        return prefix, summary
+
+    except json.JSONDecodeError as e:
+        return prefix, f"error parsing JSON: {e}"
+    except Exception as e:
+        return prefix, f"error: {e}"
+
+
+def build_taxonomy(output_dir: Path) -> dict:
+    """Rebuild taxonomy.json from all concepts.json files. Returns the taxonomy."""
+    all_concepts: dict[str, dict] = {}
+    file_count = 0
+
+    for concepts_file in output_dir.rglob("*.concepts.json"):
+        file_count += 1
+        data = json.loads(concepts_file.read_text(encoding="utf-8"))
+        video_id = data.get("video_id", "")
+
+        # Try to find published date from sibling meta.json
+        meta_file = concepts_file.with_suffix("").with_suffix(".meta.json")
+        published = None
+        if meta_file.exists():
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            published = meta.get("published")
+
+        for concept in data.get("concepts", []):
+            cid = concept.get("concept_id", "")
+            if not cid:
+                continue
+
+            if cid not in all_concepts:
+                all_concepts[cid] = {
+                    "preferred_label": concept.get("preferred_label", cid),
+                    "aliases": set(),
+                    "domain": concept.get("domain", ""),
+                    "first_seen": published,
+                    "video_ids": set(),
+                }
+
+            entry = all_concepts[cid]
+            # Collect alias from as_mentioned
+            mentioned = concept.get("as_mentioned", "")
+            if mentioned and mentioned != entry["preferred_label"]:
+                entry["aliases"].add(mentioned)
+            # Track video
+            if video_id:
+                entry["video_ids"].add(video_id)
+            # Update first_seen
+            if published and (entry["first_seen"] is None or published < entry["first_seen"]):
+                entry["first_seen"] = published
+
+    # Convert sets to sorted lists for JSON serialization
+    taxonomy = {
+        "version": 1,
+        "built_from": file_count,
+        "concepts": {},
+    }
+    for cid, entry in sorted(all_concepts.items()):
+        taxonomy["concepts"][cid] = {
+            "preferred_label": entry["preferred_label"],
+            "aliases": sorted(entry["aliases"]),
+            "domain": entry["domain"],
+            "first_seen": entry["first_seen"],
+            "video_count": len(entry["video_ids"]),
+        }
+
+    taxonomy_path = output_dir / "taxonomy.json"
+    taxonomy_path.write_text(json.dumps(taxonomy, indent=2), encoding="utf-8")
+    return taxonomy
 
 
 # ---------------------------------------------------------------------------
@@ -562,13 +753,17 @@ def cmd_scan(args, config):
             continue
 
         # Filter already processed or skipped (any_variant=True prevents backfill)
-        new_videos = [
-            v
-            for v in videos
-            if not is_processed(output_dir, ch_name, v, "scan", any_variant=True)
-            and not is_skipped(output_dir, ch_name, v)
-        ]
-        print(f"  Found {len(videos)} videos, {len(new_videos)} new.")
+        if args.force:
+            new_videos = [v for v in videos if not is_skipped(output_dir, ch_name, v)]
+        else:
+            new_videos = [
+                v
+                for v in videos
+                if not is_processed(output_dir, ch_name, v, "scan", any_variant=True)
+                and not is_skipped(output_dir, ch_name, v)
+            ]
+        label = "to regenerate" if args.force else "new"
+        print(f"  Found {len(videos)} videos, {len(new_videos)} {label}.")
 
         if args.dry_run:
             for v in new_videos:
@@ -595,6 +790,7 @@ def cmd_scan(args, config):
                         output_dir,
                         ch_name,
                         prompt_name=prompt_name,
+                        force=args.force,
                     ): v
                     for v in new_videos
                 }
@@ -636,6 +832,41 @@ def cmd_scan(args, config):
                         print(f"    {prefix}: {status}")
                         if status.startswith("error"):
                             errors.append((ch_name, prefix, status))
+
+        # Auto-concepts if configured
+        auto_concepts = ch.get("auto_concepts", config.get("auto_concepts", False))
+        if auto_concepts:
+            taxonomy = load_taxonomy(output_dir)
+            prompt_name = ch.get("prompt") or config.get("default_prompt", "mindmap-knowledge")
+            concept_videos = []
+            for v in videos:
+                prefix = video_file_prefix(v)
+                concepts_path = output_dir / ch_name / f"{prefix}.concepts.json"
+                if concepts_path.exists():
+                    continue
+                mindmap_path = find_mindmap_source(output_dir / ch_name, prefix)
+                if mindmap_path:
+                    concept_videos.append((v, mindmap_path))
+
+            if concept_videos:
+                print(f"  Extracting concepts ({len(concept_videos)} videos)...")
+                for v, mindmap_path in concept_videos:
+                    mindmap_text = mindmap_path.read_text(encoding="utf-8")
+                    prefix, status = process_concepts(
+                        client,
+                        types,
+                        v,
+                        mindmap_text,
+                        taxonomy,
+                        model,
+                        output_dir,
+                        ch_name,
+                        source_file=mindmap_path.name,
+                        source_prompt=prompt_name,
+                    )
+                    print(f"    {prefix}: {status}")
+                    if status.startswith("error"):
+                        errors.append((ch_name, prefix, status))
 
     if errors:
         print(f"\n--- {len(errors)} FAILED ---")
@@ -707,7 +938,7 @@ def cmd_mindmap(args, config):
 
     print(f"Generating mind map ({prompt_name}): {video['url']}")
     prefix, status = process_mindmap(
-        client, types, video, prompt_text, model, output_dir, channel_name, prompt_name=prompt_name
+        client, types, video, prompt_text, model, output_dir, channel_name, prompt_name=prompt_name, force=args.force
     )
     print(f"  {prefix}: {status}")
 
@@ -773,12 +1004,147 @@ def cmd_transcript(args, config):
     }
 
     print(f"Transcribing: {video['url']}")
-    prefix, status = process_transcript(client, types, video, prompt_text, model, output_dir, channel_name)
+    prefix, status = process_transcript(
+        client, types, video, prompt_text, model, output_dir, channel_name, force=args.force
+    )
     print(f"  {prefix}: {status}")
 
     if status == "done":
         out_path = output_dir / channel_name / f"{prefix}.transcript.md"
         print(f"  Saved: {out_path}")
+
+
+def cmd_concepts(args, config):
+    """Extract and normalize concepts from existing mindmaps."""
+    genai, types = require_gemini()
+
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    if not gemini_key:
+        print("ERROR: GEMINI_API_KEY not set.")
+        sys.exit(1)
+
+    client = genai.Client(api_key=gemini_key)
+    output_dir = resolve_output_dir(config)
+    model = config.get("model", "gemini-3-flash-preview")
+    taxonomy = load_taxonomy(output_dir)
+
+    # Collect all videos that have mindmaps but no concepts.json
+    to_process = []
+    channels = config.get("channels", [])
+    if args.channel:
+        channels = [c for c in channels if c["name"] == args.channel]
+
+    for ch in channels:
+        ch_name = ch["name"]
+        channel_dir = output_dir / ch_name
+        if not channel_dir.exists():
+            continue
+
+        for meta_file in sorted(channel_dir.glob("*.meta.json")):
+            prefix = meta_file.name.replace(".meta.json", "")
+            concepts_path = channel_dir / f"{prefix}.concepts.json"
+
+            if concepts_path.exists() and not args.force:
+                continue
+
+            mindmap_path = find_mindmap_source(channel_dir, prefix)
+            if not mindmap_path:
+                continue
+
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            video = {
+                "video_id": meta.get("video_id", ""),
+                "url": meta.get("video_url", ""),
+                "title": meta.get("title", prefix),
+                "published": meta.get("published", ""),
+            }
+
+            to_process.append((ch_name, video, mindmap_path, meta.get("prompt")))
+
+    if not to_process:
+        print("All concepts up to date.")
+        return
+
+    print(f"Extracting concepts from {len(to_process)} mindmaps...")
+
+    if args.dry_run:
+        for ch_name, video, _mindmap_path, _ in to_process:
+            print(f"  [{ch_name}] {video['published']} - {video['title']}")
+        return
+
+    for ch_name, video, mindmap_path, source_prompt in to_process:
+        mindmap_text = mindmap_path.read_text(encoding="utf-8")
+        source_file = mindmap_path.name
+
+        prefix, status = process_concepts(
+            client,
+            types,
+            video,
+            mindmap_text,
+            taxonomy,
+            model,
+            output_dir,
+            ch_name,
+            source_file=source_file,
+            source_prompt=source_prompt,
+            force=args.force,
+        )
+        print(f"  [{ch_name}] {prefix}: {status}")
+
+        # Accumulate new concepts into in-memory taxonomy so the next video
+        # can normalize against concepts discovered in earlier videos.
+        concepts_path = output_dir / ch_name / f"{prefix}.concepts.json"
+        if concepts_path.exists():
+            data = json.loads(concepts_path.read_text(encoding="utf-8"))
+            for c in data.get("concepts", []):
+                cid = c.get("concept_id", "")
+                if cid and cid not in taxonomy.get("concepts", {}):
+                    taxonomy.setdefault("concepts", {})[cid] = {
+                        "preferred_label": c.get("preferred_label", cid),
+                        "aliases": [],
+                        "domain": c.get("domain", ""),
+                    }
+
+    print("\nDone. Run 'taxonomy-build' to rebuild the master taxonomy.")
+
+
+def cmd_status(args, config):
+    """Show corpus status: output directory, channels, and artifact counts."""
+    output_dir = resolve_output_dir(config)
+    print(f"Output directory: {output_dir}")
+
+    taxonomy_path = output_dir / "taxonomy.json"
+    if taxonomy_path.exists():
+        taxonomy = json.loads(taxonomy_path.read_text(encoding="utf-8"))
+        print(f"Taxonomy: {len(taxonomy.get('concepts', {}))} concepts from {taxonomy.get('built_from', 0)} files")
+        print(f"Taxonomy path: {taxonomy_path}")
+    else:
+        print("Taxonomy: not yet built (run 'taxonomy-build')")
+
+    print("\nChannels:")
+    for ch in config.get("channels", []):
+        ch_name = ch["name"]
+        ch_dir = output_dir / ch_name
+        if ch_dir.exists():
+            mindmaps = len(list(ch_dir.glob("*.mindmap*.md")))
+            transcripts = len(list(ch_dir.glob("*.transcript.md")))
+            concepts = len(list(ch_dir.glob("*.concepts.json")))
+            print(f"  {ch_name}: {mindmaps} mindmaps, {transcripts} transcripts, {concepts} concepts")
+        else:
+            print(f"  {ch_name}: not yet scanned")
+
+
+def cmd_taxonomy_build(args, config):
+    """Rebuild taxonomy.json from all concepts.json files."""
+    output_dir = resolve_output_dir(config)
+    taxonomy = build_taxonomy(output_dir)
+
+    n_concepts = len(taxonomy["concepts"])
+    n_files = taxonomy["built_from"]
+    n_with_aliases = sum(1 for c in taxonomy["concepts"].values() if c.get("aliases"))
+    print(f"Taxonomy built from {n_files} concept files.")
+    print(f"  {n_concepts} canonical concepts ({n_with_aliases} with aliases)")
+    print(f"  Saved: {output_dir / 'taxonomy.json'}")
 
 
 # ---------------------------------------------------------------------------
@@ -798,6 +1164,8 @@ Examples:
   %(prog)s scan --dry-run                 # Preview without processing
   %(prog)s transcript --url URL           # Transcribe a specific video
   %(prog)s mindmap --url URL --prompt P   # Mind map a single video with a specific prompt
+  %(prog)s concepts --backfill            # Extract concepts from all existing mindmaps
+  %(prog)s taxonomy-build                 # Rebuild taxonomy.json from concept files
         """,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -807,6 +1175,7 @@ Examples:
     scan_parser.add_argument("--channel", help="Scan only this channel name")
     scan_parser.add_argument("--since", help="Override lookback window (e.g. 14d, 2026-01-01)")
     scan_parser.add_argument("--dry-run", action="store_true", help="Preview without processing")
+    scan_parser.add_argument("--force", action="store_true", help="Regenerate mindmaps even if they exist")
 
     # mindmap command
     mm_parser = subparsers.add_parser("mindmap", help="Generate mind map for a specific video")
@@ -815,6 +1184,7 @@ Examples:
     mm_parser.add_argument("--channel", help="Channel name for output folder")
     mm_parser.add_argument("--title", help="Video title (auto-detected if omitted)")
     mm_parser.add_argument("--date", help="Publish date YYYY-MM-DD (defaults to today)")
+    mm_parser.add_argument("--force", action="store_true", help="Regenerate even if mindmap exists")
 
     # transcript command
     tx_parser = subparsers.add_parser("transcript", help="Transcribe a specific video")
@@ -822,6 +1192,20 @@ Examples:
     tx_parser.add_argument("--channel", help="Channel name for output folder")
     tx_parser.add_argument("--title", help="Video title (auto-detected if omitted)")
     tx_parser.add_argument("--date", help="Publish date YYYY-MM-DD (defaults to today)")
+    tx_parser.add_argument("--force", action="store_true", help="Regenerate even if transcript exists")
+
+    # concepts command
+    concepts_parser = subparsers.add_parser("concepts", help="Extract concepts from existing mindmaps")
+    concepts_parser.add_argument("--backfill", action="store_true", help="Process all mindmaps missing concepts")
+    concepts_parser.add_argument("--channel", help="Process only this channel")
+    concepts_parser.add_argument("--force", action="store_true", help="Re-extract even if concepts.json exists")
+    concepts_parser.add_argument("--dry-run", action="store_true", help="Preview without processing")
+
+    # taxonomy-build command
+    subparsers.add_parser("taxonomy-build", help="Rebuild taxonomy.json from all concept files")
+
+    # status command
+    subparsers.add_parser("status", help="Show corpus status: output dir, channels, artifact counts")
 
     args = parser.parse_args()
     config = load_config()
@@ -832,6 +1216,12 @@ Examples:
         cmd_mindmap(args, config)
     elif args.command == "transcript":
         cmd_transcript(args, config)
+    elif args.command == "concepts":
+        cmd_concepts(args, config)
+    elif args.command == "taxonomy-build":
+        cmd_taxonomy_build(args, config)
+    elif args.command == "status":
+        cmd_status(args, config)
 
 
 if __name__ == "__main__":

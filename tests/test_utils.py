@@ -7,8 +7,11 @@ from unittest.mock import MagicMock
 import pytest
 
 from video_intel import (
+    build_taxonomy,
     fetch_channel_videos,
+    find_mindmap_source,
     is_processed,
+    load_taxonomy,
     merge_transcript_json,
     normalize_prompt_name,
     parse_since,
@@ -444,3 +447,175 @@ class TestCmdMindmapArgs:
         )
         assert args.url == "https://youtube.com/watch?v=abc123"
         assert args.prompt == "mindmap-knowledge"
+
+
+# ---------------------------------------------------------------------------
+# load_taxonomy
+# ---------------------------------------------------------------------------
+
+
+class TestLoadTaxonomy:
+    def test_load_taxonomy_when_no_file_returns_empty_structure(self, tmp_path):
+        result = load_taxonomy(tmp_path)
+        assert result["version"] == 1
+        assert result["concepts"] == {}
+        assert result["built_from"] == 0
+
+    def test_load_taxonomy_when_file_exists_returns_content(self, tmp_path):
+        taxonomy = {"version": 1, "built_from": 5, "concepts": {"ai_eng.rag": {"preferred_label": "RAG"}}}
+        (tmp_path / "taxonomy.json").write_text(json.dumps(taxonomy))
+
+        result = load_taxonomy(tmp_path)
+        assert result["built_from"] == 5
+        assert "ai_eng.rag" in result["concepts"]
+
+
+# ---------------------------------------------------------------------------
+# find_mindmap_source
+# ---------------------------------------------------------------------------
+
+
+class TestFindMindmapSource:
+    def test_find_mindmap_source_prefers_canonical(self, tmp_path):
+        (tmp_path / "2026-03-30-test.mindmap.md").write_text("canonical")
+        (tmp_path / "2026-03-30-test.mindmap.knowledge.md").write_text("knowledge")
+
+        result = find_mindmap_source(tmp_path, "2026-03-30-test")
+        assert result.name == "2026-03-30-test.mindmap.md"
+
+    def test_find_mindmap_source_falls_back_to_knowledge(self, tmp_path):
+        (tmp_path / "2026-03-30-test.mindmap.knowledge.md").write_text("knowledge")
+
+        result = find_mindmap_source(tmp_path, "2026-03-30-test")
+        assert result.name == "2026-03-30-test.mindmap.knowledge.md"
+
+    def test_find_mindmap_source_falls_back_to_any_variant(self, tmp_path):
+        (tmp_path / "2026-03-30-test.mindmap.heavy.md").write_text("heavy")
+
+        result = find_mindmap_source(tmp_path, "2026-03-30-test")
+        assert result.name == "2026-03-30-test.mindmap.heavy.md"
+
+    def test_find_mindmap_source_when_no_mindmap_returns_none(self, tmp_path):
+        result = find_mindmap_source(tmp_path, "2026-03-30-test")
+        assert result is None
+
+    def test_find_mindmap_source_skips_empty_files(self, tmp_path):
+        (tmp_path / "2026-03-30-test.mindmap.md").write_text("")
+        (tmp_path / "2026-03-30-test.mindmap.knowledge.md").write_text("content")
+
+        result = find_mindmap_source(tmp_path, "2026-03-30-test")
+        assert result.name == "2026-03-30-test.mindmap.knowledge.md"
+
+
+# ---------------------------------------------------------------------------
+# build_taxonomy
+# ---------------------------------------------------------------------------
+
+
+class TestBuildTaxonomy:
+    def _write_concepts(self, channel_dir, prefix, concepts, video_id="vid1", published="2026-03-30"):
+        """Helper to write a concepts.json and its sibling meta.json."""
+        data = {"video_id": video_id, "extracted_from": "mindmap.md", "concepts": concepts}
+        (channel_dir / f"{prefix}.concepts.json").write_text(json.dumps(data))
+        meta = {"video_id": video_id, "published": published}
+        (channel_dir / f"{prefix}.meta.json").write_text(json.dumps(meta))
+
+    def test_build_taxonomy_aggregates_concepts(self, tmp_path):
+        ch = tmp_path / "ch1"
+        ch.mkdir()
+        self._write_concepts(
+            ch,
+            "2026-03-30-video-a",
+            [
+                {
+                    "concept_id": "ai.rag",
+                    "preferred_label": "RAG",
+                    "as_mentioned": "RAG",
+                    "status": "new",
+                    "domain": "ai",
+                },
+            ],
+            video_id="vid1",
+        )
+        self._write_concepts(
+            ch,
+            "2026-03-31-video-b",
+            [
+                {
+                    "concept_id": "ai.rag",
+                    "preferred_label": "RAG",
+                    "as_mentioned": "Retrieval Augmented Gen",
+                    "status": "matched",
+                    "domain": "ai",
+                },
+            ],
+            video_id="vid2",
+            published="2026-03-31",
+        )
+
+        taxonomy = build_taxonomy(tmp_path)
+
+        assert taxonomy["built_from"] == 2
+        rag = taxonomy["concepts"]["ai.rag"]
+        assert rag["preferred_label"] == "RAG"
+        assert "Retrieval Augmented Gen" in rag["aliases"]
+        assert rag["video_count"] == 2
+        assert rag["first_seen"] == "2026-03-30"
+
+    def test_build_taxonomy_writes_file(self, tmp_path):
+        ch = tmp_path / "ch1"
+        ch.mkdir()
+        self._write_concepts(
+            ch,
+            "2026-03-30-test",
+            [
+                {"concept_id": "ai.test", "preferred_label": "Testing", "as_mentioned": "Testing", "domain": "ai"},
+            ],
+        )
+
+        build_taxonomy(tmp_path)
+
+        taxonomy_path = tmp_path / "taxonomy.json"
+        assert taxonomy_path.exists()
+        data = json.loads(taxonomy_path.read_text())
+        assert "ai.test" in data["concepts"]
+
+    def test_build_taxonomy_is_rebuildable(self, tmp_path):
+        """Running build twice produces identical output."""
+        ch = tmp_path / "ch1"
+        ch.mkdir()
+        self._write_concepts(
+            ch,
+            "2026-03-30-test",
+            [
+                {"concept_id": "ai.rag", "preferred_label": "RAG", "as_mentioned": "RAG", "domain": "ai"},
+            ],
+        )
+
+        build_taxonomy(tmp_path)
+        first = (tmp_path / "taxonomy.json").read_text()
+
+        build_taxonomy(tmp_path)
+        second = (tmp_path / "taxonomy.json").read_text()
+
+        assert first == second
+
+    def test_build_taxonomy_empty_dir_produces_empty(self, tmp_path):
+        taxonomy = build_taxonomy(tmp_path)
+        assert taxonomy["built_from"] == 0
+        assert taxonomy["concepts"] == {}
+
+    def test_build_taxonomy_alias_excludes_preferred_label(self, tmp_path):
+        """as_mentioned matching preferred_label should not appear in aliases."""
+        ch = tmp_path / "ch1"
+        ch.mkdir()
+        self._write_concepts(
+            ch,
+            "2026-03-30-test",
+            [
+                {"concept_id": "ai.rag", "preferred_label": "RAG", "as_mentioned": "RAG", "domain": "ai"},
+            ],
+        )
+
+        taxonomy = build_taxonomy(tmp_path)
+        assert taxonomy["concepts"]["ai.rag"]["aliases"] == []

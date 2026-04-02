@@ -48,6 +48,14 @@ birds before you cast a line and read the water before you commit to a spot.
 │  │ (audio + vision +  │    │ with SCREEN sections describing │  │
 │  │  speaker ID)       │    │ slides, diagrams, code, demos   │  │
 │  └────────────────────┘    └─────────────────────────────────┘  │
+├─────────────────────────────────────────────────────────────────┤
+│  CONCEPTS (the index)                      Cost: ~$0.001/video  │
+│  ┌────────────────────┐    ┌─────────────────────────────────┐  │
+│  │ Gemini: text-only  │───>│ concepts.json per video         │  │
+│  │ reads mindmap.md + │    │ Canonical IDs + synonyms        │  │
+│  │ existing taxonomy  │    │                                 │  │
+│  └────────────────────┘    │ taxonomy.json (derived master)  │  │
+│                            └─────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -58,6 +66,15 @@ where you want everything.
 **transcript** - Fused document for a single video: diarized speech interleaved
 with timestamped SCREEN sections describing slides, diagrams, code, and demos.
 Speaker names identified from visual cues with evidence.
+
+**concepts** - Extract and normalize key concepts from each mindmap against a
+growing canonical vocabulary. One video calls it "Agent-Centric Engineering,"
+another calls it "Multi-Agent Orchestration" — the concept layer resolves
+them to the same canonical ID.
+
+**taxonomy-build** - Rebuild the master vocabulary (`taxonomy.json`) from all
+per-video concept files. This is a derived artifact — always rebuildable,
+never manually edited.
 
 **triage** - After scanning, ask Claude (no Gemini cost):
 
@@ -189,6 +206,15 @@ python scripts/video_intel.py scan --dry-run
 # Transcribe a specific video (channel auto-detected from config)
 python scripts/video_intel.py transcript \
   --url "https://www.youtube.com/watch?v=XXXXX"
+
+# Extract concepts from all existing mindmaps
+python scripts/video_intel.py concepts --backfill
+
+# Extract concepts for one channel
+python scripts/video_intel.py concepts --backfill --channel natebjones
+
+# Rebuild master taxonomy from all concept files
+python scripts/video_intel.py taxonomy-build
 ```
 
 ## Prompt Customization
@@ -197,9 +223,11 @@ Prompts live in `prompts/`. Each file is self-contained.
 
 | File | Purpose |
 | ---- | ------- |
+| mindmap-knowledge.md | Thematic mind map with domain terminology + timestamps (default) |
 | mindmap-light.md | Fast thematic scan (4-6 branches, tight bullets) |
 | mindmap-heavy.md | Comprehensive extraction (6-10 branches, resources, perspectives) |
 | transcript.md | Three-task diarized transcript with screen content |
+| concepts.md | Concept extraction + normalization against taxonomy |
 
 Add a `.md` file to `prompts/` and reference it in config.yaml by filename
 (without extension).
@@ -208,16 +236,69 @@ Add a `.md` file to `prompts/` and reference it in config.yaml by filename
 
 ```text
 ~/video-intel/
+├── taxonomy.json                                    # Master vocabulary (derived)
 ├── natebjones/
 │   ├── 2026-03-20-building-mcp-agents.mindmap.md
 │   ├── 2026-03-20-building-mcp-agents.transcript.md
+│   ├── 2026-03-20-building-mcp-agents.concepts.json
 │   ├── 2026-03-20-building-mcp-agents.meta.json
 │   └── ...
 ```
 
 - **mindmap.md** - Thematic mind map with timestamps. Obsidian-compatible.
 - **transcript.md** - Fused diarized transcript with SCREEN sections.
+- **concepts.json** - Normalized concepts with canonical IDs, aliases, confidence.
 - **meta.json** - Video metadata, source URL, processing history.
+- **taxonomy.json** - Master vocabulary derived from all concept files. Rebuildable.
+
+## Working with Concepts
+
+The concept layer solves the vocabulary control problem: different videos use
+different words for the same idea. The pipeline produces a **thesaurus** —
+canonical terms with synonyms — not a full knowledge graph.
+
+### The workflow
+
+```text
+mindmap.md ──> Gemini (text-only) ──> concepts.json ──> taxonomy-build ──> taxonomy.json
+  (per video)    reads mindmap +         (per video)       aggregates all      (master)
+                 existing taxonomy       source of truth    concept files       derived
+```
+
+Each video's `concepts.json` is the source of truth. `taxonomy.json` is always
+derived — delete it and rebuild from scratch with `taxonomy-build`.
+
+### What you can do with taxonomy.json today
+
+```bash
+# Top concepts across your corpus
+jq '.concepts | to_entries | sort_by(-.value.video_count) | .[0:15] |
+  .[] | "\(.value.video_count)x  \(.value.preferred_label)"' \
+  video-intel/taxonomy.json
+
+# Which videos cover a specific concept?
+grep -rl "multi_agent_orchestration" video-intel/*/  --include="*.concepts.json"
+
+# What does natebjones cover that ramjad doesn't?
+diff <(jq -r '.concepts[].concept_id' video-intel/natebjones/*.concepts.json | sort -u) \
+     <(jq -r '.concepts[].concept_id' video-intel/ramjad/*.concepts.json | sort -u)
+
+# Find all aliases for a concept
+jq '.concepts["ai-engineering.context_window_optimization"]' video-intel/taxonomy.json
+
+# Review uncertain normalizations
+grep -rl '"uncertain"' video-intel/*/ --include="*.concepts.json"
+```
+
+### Future: concepts as retrieval metadata
+
+The planned next step (not yet implemented) is to use concepts as structured
+metadata over embedded transcript chunks — enabling queries like "find all
+videos about context window problems" to match across different terminology.
+
+See [ADR-0010](docs/adr/ADR-0010-llm-concept-normalization.md) for the full
+architectural rationale, alternatives evaluated (Cognee, LightRAG, Neo4j
+GraphRAG), and the phased roadmap.
 
 ## Cost
 
@@ -247,6 +328,62 @@ reduce `max_parallel` in config.yaml (try 3-5). Paid tier users have
 generous limits (20,000+ RPM) and can increase parallelism freely. Check
 your limits at [Google AI Studio](https://aistudio.google.com/apikey) or
 the [rate limits docs](https://ai.google.dev/gemini-api/docs/rate-limits).
+
+## Regeneration Workflow
+
+Over time you will improve prompts, switch models, or want to rebuild artifacts.
+All commands support `--force` to regenerate even when output files already exist.
+
+### Regenerate mindmaps (e.g., after changing prompt)
+
+```bash
+# Preview what would be regenerated
+python scripts/video_intel.py scan --channel natebjones --dry-run
+
+# Regenerate all mindmaps for a channel with the current prompt
+python scripts/video_intel.py scan --channel natebjones --force
+
+# Regenerate a single video's mindmap with a specific prompt
+python scripts/video_intel.py mindmap \
+  --url "https://www.youtube.com/watch?v=XXXXX" \
+  --prompt mindmap-knowledge --force
+```
+
+### Regenerate concepts (e.g., after tuning concepts prompt)
+
+```bash
+# Re-extract concepts for one channel
+python scripts/video_intel.py concepts --backfill --channel natebjones --force
+
+# Rebuild taxonomy from all concept files
+python scripts/video_intel.py taxonomy-build
+```
+
+### Regenerate transcripts
+
+```bash
+python scripts/video_intel.py transcript \
+  --url "https://www.youtube.com/watch?v=XXXXX" --force
+```
+
+### Full regeneration sequence
+
+When changing the mindmap prompt, the downstream artifacts (concepts, taxonomy)
+should also be regenerated. The recommended order:
+
+```bash
+# 1. Regenerate mindmaps with new prompt
+python scripts/video_intel.py scan --force
+
+# 2. Re-extract concepts from the new mindmaps
+python scripts/video_intel.py concepts --backfill --force
+
+# 3. Rebuild the master taxonomy
+python scripts/video_intel.py taxonomy-build
+```
+
+Transcripts are independent of mindmaps and concepts — they only need
+regeneration if you change the transcript prompt.
 
 ## Cross-Platform Compatibility
 

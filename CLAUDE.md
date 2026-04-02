@@ -42,20 +42,29 @@ Required env vars: `GEMINI_API_KEY`, `YOUTUBE_API_KEY`.
 
 **Skill entry point:** `SKILL.md` — the YAML frontmatter `description` field controls when Claude Code triggers this skill. The body tells Claude how to invoke the scripts and manage config.
 
-**Single script:** `scripts/video_intel.py` — all logic in one file, two subcommands:
-- `scan` — uses YouTube Data API to discover new videos per channel, then calls Gemini in parallel (`ThreadPoolExecutor`) to generate mind maps. Optionally chains transcript generation for channels with `auto_transcript: all`.
+**Single script:** `scripts/video_intel.py` — all logic in one file, subcommands:
+- `scan` — uses YouTube Data API to discover new videos per channel, then calls Gemini in parallel (`ThreadPoolExecutor`) to generate mind maps. Optionally chains transcript and concept generation.
 - `transcript` — calls Gemini with `response_json=True`, parses the three-task JSON response (speech + screen_content + speakers), and merges them into a fused markdown document via `merge_transcript_json()`.
+- `mindmap` — generate a mind map for a single video URL with a specific prompt.
+- `concepts` — extract and normalize concepts from existing mindmaps against a growing canonical vocabulary (thesaurus). Text-only Gemini calls reading mindmap markdown, not video.
+- `taxonomy-build` — rebuild `taxonomy.json` by aggregating all per-video `concepts.json` files. This is a derived artifact, always rebuildable.
 
-**Prompt templates:** `prompts/*.md` — self-contained, referenced by name (without extension) in `config.yaml`. Three shipped:
+All commands support `--force` to regenerate existing output files.
+
+**Prompt templates:** `prompts/*.md` — self-contained, referenced by name (without extension) in `config.yaml`:
+- `mindmap-knowledge` — thematic mind map with domain terminology + timestamps (default)
 - `mindmap-light` — fast scan, 4-6 branches
 - `mindmap-heavy` — comprehensive, 6-10 branches with resources/perspectives
 - `transcript` — three-task decoupled prompt returning structured JSON
+- `concepts` — concept extraction + normalization against taxonomy, with `{{taxonomy}}` template slot
 
 **Config:** `config.yaml` — channels, output directory, model, parallelism, per-channel prompt/since overrides.
 
-**Idempotency:** `is_processed()` checks for existing output files by `{date}-{slug}.{mode}.md` naming. Re-running scan safely skips already-processed videos.
+**Idempotency:** `is_processed()` checks for existing output files by `{date}-{slug}.{mode}.md` naming. Re-running scan safely skips already-processed videos. All commands support `--force` to regenerate.
 
-**Output goes to** `~/video-intel/{channel_name}/` (configurable via `output_dir`), not into this repo.
+**Output goes to** `~/video-intel/{channel_name}/` (configurable via `output_dir`), not into this repo. Master `taxonomy.json` lives at the output root.
+
+**Concept layer:** Per-video `concepts.json` is the source of truth. `taxonomy.json` is derived (rebuilt by `taxonomy-build`). During batch extraction, new concepts accumulate in memory so each video normalizes against concepts discovered in earlier videos. See ADR-0010.
 
 ## Key Design Decisions
 

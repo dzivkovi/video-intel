@@ -2,17 +2,22 @@
 name: video-intel
 description: >
   Multimodal video intelligence via Gemini API. Use this skill whenever the
-  user wants to: scan a YouTube channel for new videos and get mind maps of
-  each; triage which videos are worth watching; get a full diarized transcript
-  with on-screen content (slides, diagrams, code) captured; add or remove
-  channels to monitor; change scan settings. Trigger phrases include "scan
-  channel", "what's new from [creator]", "watch this for me", "transcribe
-  this video", "add [channel] to my watchlist", "what should I watch",
-  "summarize this video", "is this worth watching", any YouTube URL followed
-  by a question, or "show my channels". This skill calls the Gemini API as a
-  multimodal proxy - it sees video frames, reads on-screen text, and hears
-  audio simultaneously. It also uses the YouTube Data API to discover new
-  videos from configured channels.
+  user wants to: find videos about a topic across multiple channels; browse
+  what concepts are covered in the video library; scan a YouTube channel for
+  new videos and get mind maps of each; triage which videos are worth
+  watching; get a full diarized transcript with on-screen content (slides,
+  diagrams, code) captured; add or remove channels to monitor; change scan
+  settings. Trigger phrases include "what videos cover [topic]", "find videos
+  about [concept]", "which creators talk about [subject]", "scan channel",
+  "what's new from [creator]", "watch this for me", "transcribe this video",
+  "add [channel] to my watchlist", "what should I watch", "summarize this
+  video", "is this worth watching", any YouTube URL followed by a question,
+  "show my channels", "what concepts are in my library", or "what topics
+  recur across channels". This skill calls the Gemini API as a multimodal
+  proxy - it sees video frames, reads on-screen text, and hears audio
+  simultaneously. It also uses the YouTube Data API to discover new videos
+  from configured channels. A concept layer (taxonomy.json) enables
+  cross-video topic lookup without reading every file.
 ---
 
 # Video Intel
@@ -21,20 +26,26 @@ Multimodal video scanning and transcription powered by Gemini.
 
 ## What This Skill Does
 
-Two operations, designed as a funnel:
+Three layers, designed as a narrowing funnel:
 
 1. **scan** - Fetch new videos from configured YouTube channels, generate
    thematic mind maps for each video in parallel via Gemini's multimodal API.
-   Optionally auto-generate full transcripts for channels where the user
-   wants everything.
+   Optionally auto-generate transcripts and concept extraction.
 
 2. **transcript** - Generate a fused document for a single video: diarized
    speech interleaved with timestamped SCREEN sections describing what was
    shown (slides, diagrams, code, demos). Uses a three-task decoupled prompt
    for best quality.
 
-After scanning, the user typically triages results in conversation with
-Claude (no Gemini needed for that step).
+3. **concepts** - Extract and normalize key concepts from mind maps into a
+   canonical vocabulary (taxonomy.json). Different videos use different words
+   for the same idea — the concept layer resolves synonyms so cross-video
+   queries work without reading every file.
+
+**Triage workflow:** When the user asks about topics, read `taxonomy.json`
+first to find matching concepts and which videos cover them. Only read
+specific mindmaps/transcripts for the relevant videos — don't scan the
+entire corpus.
 
 ## Prerequisites
 
@@ -54,6 +65,27 @@ If prerequisites are missing, tell the user what's needed and where to get it.
 
 ## How to Use
 
+### Find videos about a topic (start here)
+
+Before scanning or reading files, check what's already indexed:
+
+```bash
+# Show output directory, channels, and what's been processed
+python "${SKILL_DIR}/scripts/video_intel.py" status
+```
+
+This prints the resolved output directory path, taxonomy size, and per-channel
+artifact counts. Use the output directory path to read `taxonomy.json`:
+
+```bash
+# Read the master vocabulary to find concepts (path from status output)
+cat "OUTPUT_DIR/taxonomy.json" | python -m json.tool
+```
+
+Look up the concept, find its `video_count` and aliases, then grep for the
+`concept_id` in per-video concepts.json files to find which videos cover it.
+Read only those mindmaps/transcripts — don't scan the entire corpus.
+
 ### Scan channels for new videos
 
 ```bash
@@ -68,6 +100,7 @@ Options:
 - `--since 14d` - Override the time window for this run
 - `--channel natebjones` - Scan only this channel
 - `--dry-run` - Show what would be processed without calling Gemini
+- `--force` - Regenerate even if output files exist
 
 ### Transcribe a specific video
 
@@ -79,6 +112,20 @@ python "${SKILL_DIR}/scripts/video_intel.py" transcript \
 Options:
 - `--channel natebjones` - Save output under this channel's folder
 - `--url` - YouTube URL to transcribe
+- `--force` - Regenerate even if transcript exists
+
+### Extract and normalize concepts
+
+```bash
+# Extract concepts from all mindmaps that don't have concepts yet
+python "${SKILL_DIR}/scripts/video_intel.py" concepts --backfill
+
+# Re-extract for a specific channel
+python "${SKILL_DIR}/scripts/video_intel.py" concepts --backfill --channel natebjones --force
+
+# Rebuild master taxonomy from all concept files
+python "${SKILL_DIR}/scripts/video_intel.py" taxonomy-build
+```
 
 ### Manage channels
 
@@ -92,12 +139,12 @@ Configuration lives in `${SKILL_DIR}/config.yaml`. Key settings:
 ```yaml
 output_dir: ~/video-intel          # Where output files are saved
 default_since: 10d                 # Default lookback window
-default_prompt: mindmap-light      # Which prompt to use by default
+default_prompt: mindmap-knowledge  # Which prompt to use by default
+auto_concepts: true                # Extract concepts after mindmap generation
 
 channels:
   - name: natebjones               # Folder name for output
     url: https://youtube.com/@natebjones
-    prompt: mindmap-light           # Override default prompt
     auto_transcript: all            # all | none
     since: 10d                      # Override default lookback
 ```
@@ -105,9 +152,11 @@ channels:
 ### Prompt files
 
 Prompt templates live in `${SKILL_DIR}/prompts/`:
-- `mindmap-light.md` - Fast thematic scan (default)
+- `mindmap-knowledge.md` - Thematic mind map with domain terminology + timestamps (default)
+- `mindmap-light.md` - Fast thematic scan (4-6 branches)
 - `mindmap-heavy.md` - Comprehensive conceptual extraction
 - `transcript.md` - Full diarized transcript with screen content
+- `concepts.md` - Concept extraction + normalization against taxonomy
 
 Each prompt is self-contained. Users can modify or add their own.
 
@@ -115,13 +164,21 @@ Each prompt is self-contained. Users can modify or add their own.
 
 ```
 ~/video-intel/
+├── taxonomy.json                                    # Master vocabulary (derived)
 ├── natebjones/
 │   ├── 2026-03-20-building-mcp-agents.mindmap.md
 │   ├── 2026-03-20-building-mcp-agents.transcript.md
+│   ├── 2026-03-20-building-mcp-agents.concepts.json
 │   ├── 2026-03-20-building-mcp-agents.meta.json
 │   └── ...
 └── ramjad/
     └── ...
 ```
 
+- **taxonomy.json** - Master vocabulary at the output root. Read this first for any topic query.
+- **concepts.json** - Per-video normalized concepts with canonical IDs and aliases.
+- **mindmap.md** - Thematic mind map with timestamps. Read for detail after finding via concepts.
+- **transcript.md** - Full diarized transcript. Read for evidence/quotes after finding via concepts.
+
 Files are idempotent. Re-running a scan skips already-processed videos.
+Use `--force` on any command to regenerate.
