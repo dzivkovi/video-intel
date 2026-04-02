@@ -1,9 +1,12 @@
 """Tests for pure utility functions in video_intel.py."""
 
 from datetime import UTC, datetime, timedelta
+from unittest.mock import MagicMock
 
 from video_intel import (
+    fetch_channel_videos,
     merge_transcript_json,
+    normalize_prompt_name,
     parse_since,
     slugify,
     timestamp_to_seconds,
@@ -201,3 +204,92 @@ class TestMergeTranscriptJson:
     def test_merge_transcript_json_empty_input_returns_empty(self):
         result = merge_transcript_json({}, {})
         assert result == ""
+
+
+# ---------------------------------------------------------------------------
+# normalize_prompt_name
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizePromptName:
+    def test_normalize_prompt_name_when_bare_name_returns_unchanged(self):
+        assert normalize_prompt_name("mindmap-knowledge") == "mindmap-knowledge"
+
+    def test_normalize_prompt_name_when_path_with_extension_strips_both(self):
+        assert normalize_prompt_name("prompts\\mindmap-knowledge.md") == "mindmap-knowledge"
+
+    def test_normalize_prompt_name_when_forward_slash_path_strips(self):
+        assert normalize_prompt_name("prompts/mindmap-knowledge.md") == "mindmap-knowledge"
+
+    def test_normalize_prompt_name_when_extension_only_strips_extension(self):
+        assert normalize_prompt_name("mindmap-light.md") == "mindmap-light"
+
+
+# ---------------------------------------------------------------------------
+# fetch_channel_videos
+# ---------------------------------------------------------------------------
+
+
+class TestFetchChannelVideos:
+    def test_fetch_channel_videos_when_channel_id_given_derives_uploads_playlist(self):
+        # Arrange
+        youtube = MagicMock()
+        youtube.playlistItems.return_value.list.return_value.execute.return_value = {
+            "items": [],
+        }
+        since_dt = datetime(2026, 1, 1, tzinfo=UTC)
+
+        # Act
+        fetch_channel_videos(youtube, "UCxxxxxxxxxxxxxxxxxxxxxx", since_dt)
+
+        # Assert
+        call_kwargs = youtube.playlistItems.return_value.list.call_args[1]
+        assert call_kwargs["playlistId"] == "UUxxxxxxxxxxxxxxxxxxxxxx"
+
+    def test_fetch_channel_videos_when_old_video_hit_stops_early(self):
+        # Arrange
+        youtube = MagicMock()
+        youtube.playlistItems.return_value.list.return_value.execute.return_value = {
+            "items": [
+                {
+                    "snippet": {"title": "New Video", "publishedAt": "2026-03-15T00:00:00Z"},
+                    "contentDetails": {"videoId": "abc123", "videoPublishedAt": "2026-03-15T00:00:00Z"},
+                },
+                {
+                    "snippet": {"title": "Old Video", "publishedAt": "2025-12-01T00:00:00Z"},
+                    "contentDetails": {"videoId": "def456", "videoPublishedAt": "2025-12-01T00:00:00Z"},
+                },
+            ],
+        }
+        since_dt = datetime(2026, 1, 1, tzinfo=UTC)
+
+        # Act
+        videos = fetch_channel_videos(youtube, "UCxxxxxxxxxxxxxxxxxxxxxx", since_dt)
+
+        # Assert — only the newer video is returned
+        assert len(videos) == 1
+        assert videos[0]["video_id"] == "abc123"
+
+    def test_fetch_channel_videos_when_video_found_returns_correct_format(self):
+        # Arrange
+        youtube = MagicMock()
+        youtube.playlistItems.return_value.list.return_value.execute.return_value = {
+            "items": [
+                {
+                    "snippet": {"title": "Test &amp; Video", "publishedAt": "2026-03-15T10:00:00Z"},
+                    "contentDetails": {"videoId": "vid123", "videoPublishedAt": "2026-03-15T10:00:00Z"},
+                },
+            ],
+        }
+        since_dt = datetime(2026, 1, 1, tzinfo=UTC)
+
+        # Act
+        videos = fetch_channel_videos(youtube, "UCxxxxxxxxxxxxxxxxxxxxxx", since_dt)
+
+        # Assert
+        assert videos[0] == {
+            "video_id": "vid123",
+            "title": "Test & Video",
+            "published": "2026-03-15",
+            "url": "https://www.youtube.com/watch?v=vid123",
+        }

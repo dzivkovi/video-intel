@@ -40,6 +40,7 @@ Files are named: `ADR-NNNN-title-with-dashes.md`
 | [ADR-0006](ADR-0006-idempotency-via-filename.md) | Idempotency via filename convention | accepted | 2026-03-28 |
 | [ADR-0007](ADR-0007-per-channel-config.md) | Per-channel configuration | accepted | 2026-03-28 |
 | [ADR-0008](ADR-0008-developer-tooling-and-specs.md) | Developer tooling, specs, and Compound Engineering adoption | accepted | 2026-03-30 |
+| [ADR-0009](ADR-0009-deterministic-video-discovery.md) | Deterministic video discovery via uploads playlist | accepted | 2026-04-01 |
 
 ## Process
 

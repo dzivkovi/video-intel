@@ -77,7 +77,17 @@ def resolve_output_dir(config):
     return output_dir
 
 
-def load_prompt(prompt_name):
+def normalize_prompt_name(name: str) -> str:
+    """Strip path prefixes and .md extension from prompt name.
+
+    Accepts 'mindmap-knowledge', 'prompts/mindmap-knowledge.md',
+    or 'prompts\\mindmap-knowledge.md' and returns 'mindmap-knowledge'.
+    """
+    return Path(name).stem
+
+
+def load_prompt(prompt_name: str) -> str:
+    prompt_name = normalize_prompt_name(prompt_name)
     prompt_path = SKILL_DIR / "prompts" / f"{prompt_name}.md"
     if not prompt_path.exists():
         print(f"ERROR: Prompt file not found: {prompt_path}")
@@ -127,20 +137,17 @@ def get_channel_id(youtube, channel_url):
 
 
 def fetch_channel_videos(youtube, channel_id, since_dt):
-    """Fetch all videos published after since_dt from a channel."""
+    """Fetch all videos published after since_dt from a channel's uploads playlist."""
+    uploads_id = "UU" + channel_id[2:]
     videos = []
-    seen_ids = set()
     next_page = None
 
     while True:
         resp = (
-            youtube.search()
+            youtube.playlistItems()
             .list(
-                part="id,snippet",
-                channelId=channel_id,
-                type="video",
-                order="date",
-                publishedAfter=since_dt.isoformat(),
+                part="snippet,contentDetails",
+                playlistId=uploads_id,
                 maxResults=50,
                 pageToken=next_page,
             )
@@ -148,17 +155,21 @@ def fetch_channel_videos(youtube, channel_id, since_dt):
         )
 
         for item in resp.get("items", []):
-            video_id = item["id"]["videoId"]
-            if video_id in seen_ids:
-                continue
-            seen_ids.add(video_id)
-            vid = {
-                "video_id": video_id,
-                "title": unescape(item["snippet"]["title"]),
-                "published": item["snippet"]["publishedAt"][:10],
-                "url": f"https://www.youtube.com/watch?v={video_id}",
-            }
-            videos.append(vid)
+            published_str = item["contentDetails"].get("videoPublishedAt", item["snippet"]["publishedAt"])
+            published_dt = datetime.fromisoformat(published_str.replace("Z", "+00:00"))
+
+            if published_dt < since_dt:
+                return videos
+
+            video_id = item["contentDetails"]["videoId"]
+            videos.append(
+                {
+                    "video_id": video_id,
+                    "title": unescape(item["snippet"]["title"]),
+                    "published": published_str[:10],
+                    "url": f"https://www.youtube.com/watch?v={video_id}",
+                }
+            )
 
         next_page = resp.get("nextPageToken")
         if not next_page:
@@ -528,7 +539,6 @@ def cmd_scan(args, config):
                 print(f"    {v['published']} - {v['title']}")
             continue
 
-        # Load prompt
         prompt_name = ch.get("prompt") or config.get("default_prompt", "mindmap-light")
         prompt_text = load_prompt(prompt_name)
 
