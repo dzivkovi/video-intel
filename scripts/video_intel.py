@@ -1134,6 +1134,138 @@ def cmd_status(args, config):
             print(f"  {ch_name}: not yet scanned")
 
 
+def search_corpus(output_dir: Path, query: str, *, channel_filter: str | None = None, limit: int = 20) -> dict:
+    """Search taxonomy + concepts for matching videos. Returns structured results."""
+    taxonomy = load_taxonomy(output_dir)
+    query_lower = query.lower()
+    query_terms = query_lower.split()
+
+    # Search concepts by preferred_label and aliases
+    matching_concepts = []
+    for cid, concept in taxonomy.get("concepts", {}).items():
+        label = concept.get("preferred_label", "")
+        aliases = concept.get("aliases", [])
+        searchable = f"{label} {' '.join(aliases)}".lower()
+
+        # Score: count how many query terms match
+        matched_terms = sum(1 for term in query_terms if term in searchable)
+        if matched_terms > 0:
+            matching_concepts.append(
+                {
+                    "concept_id": cid,
+                    "preferred_label": label,
+                    "aliases": aliases,
+                    "video_count": concept.get("video_count", 0),
+                    "domain": concept.get("domain", ""),
+                    "_match_score": matched_terms / len(query_terms),  # 1.0 = all terms matched
+                }
+            )
+
+    # Sort by match score (exact > partial), then video_count
+    matching_concepts.sort(key=lambda c: (-c["_match_score"], -c["video_count"]))
+
+    # If we have exact matches (1.0), only use those for video lookup.
+    # If no exact matches, fall back to partial matches (top 5 to limit noise).
+    exact = [c for c in matching_concepts if c["_match_score"] == 1.0]
+    if exact:
+        concepts_for_videos = exact
+    else:
+        concepts_for_videos = matching_concepts[:5]
+
+    # Find videos that contain these concepts
+    matching_cids = {c["concept_id"] for c in concepts_for_videos}
+    matching_videos = []
+    seen_video_ids = set()
+
+    channels = [d for d in output_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+    for channel_dir in sorted(channels):
+        ch_name = channel_dir.name
+        if channel_filter and ch_name != channel_filter:
+            continue
+
+        for concepts_file in sorted(channel_dir.glob("*.concepts.json")):
+            data = json.loads(concepts_file.read_text(encoding="utf-8"))
+            video_id = data.get("video_id", "")
+            if video_id in seen_video_ids:
+                continue
+
+            # Check if this video has any matching concepts
+            video_concepts = data.get("concepts", [])
+            matched_in_video = [c for c in video_concepts if c.get("concept_id") in matching_cids]
+
+            if not matched_in_video:
+                continue
+
+            seen_video_ids.add(video_id)
+
+            # Find artifact paths
+            prefix = concepts_file.name.replace(".concepts.json", "")
+            mindmap_path = find_mindmap_source(channel_dir, prefix)
+            transcript_path = channel_dir / f"{prefix}.transcript.md"
+            meta_path = channel_dir / f"{prefix}.meta.json"
+
+            title = prefix
+            published = ""
+            if meta_path.exists():
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                title = meta.get("title", prefix)
+                published = meta.get("published", "")
+
+            matching_videos.append(
+                {
+                    "channel": ch_name,
+                    "title": title,
+                    "published": published,
+                    "video_id": video_id,
+                    "matched_concepts": [c.get("concept_id") for c in matched_in_video],
+                    "mindmap": str(mindmap_path) if mindmap_path else None,
+                    "transcript": str(transcript_path) if transcript_path.exists() else None,
+                }
+            )
+
+    # Sort by number of matched concepts (most relevant first), then date
+    matching_videos.sort(key=lambda v: (-len(v["matched_concepts"]), v.get("published", "")))
+
+    return {
+        "query": query,
+        "concepts": matching_concepts[:limit],
+        "videos": matching_videos[:limit],
+    }
+
+
+def cmd_search(args, config):
+    """Search the corpus for videos matching a query."""
+    output_dir = resolve_output_dir(config)
+    results = search_corpus(output_dir, args.query, channel_filter=args.channel, limit=args.limit)
+
+    if not results["concepts"]:
+        print(f'No concepts matching "{args.query}".')
+        print("Try broader terms, or run 'taxonomy-build' if concepts are stale.")
+        return
+
+    print("Matching concepts:")
+    for c in results["concepts"]:
+        aliases_str = ", ".join(c["aliases"][:5]) if c["aliases"] else "(no aliases)"
+        match_pct = int(c.get("_match_score", 1.0) * 100)
+        match_label = "" if match_pct == 100 else f" [partial {match_pct}%]"
+        print(f"  {c['concept_id']} ({c['video_count']} videos){match_label}")
+        print(f"    Label: {c['preferred_label']}")
+        print(f"    Aliases: {aliases_str}")
+        print()
+
+    if not results["videos"]:
+        print("No videos found with these concepts.")
+        return
+
+    print(f"Videos ({len(results['videos'])}):")
+    for v in results["videos"]:
+        print(f"  [{v['channel']}] {v['published']}  {v['title']}")
+        if v["mindmap"]:
+            print(f"    mindmap:    {v['mindmap']}")
+        if v["transcript"]:
+            print(f"    transcript: {v['transcript']}")
+
+
 def cmd_taxonomy_build(args, config):
     """Rebuild taxonomy.json from all concepts.json files."""
     output_dir = resolve_output_dir(config)
@@ -1166,6 +1298,8 @@ Examples:
   %(prog)s mindmap --url URL --prompt P   # Mind map a single video with a specific prompt
   %(prog)s concepts --backfill            # Extract concepts from all existing mindmaps
   %(prog)s taxonomy-build                 # Rebuild taxonomy.json from concept files
+  %(prog)s search "skills standard"       # Search corpus by concept
+  %(prog)s search "context window" --channel natebjones
         """,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1204,6 +1338,12 @@ Examples:
     # taxonomy-build command
     subparsers.add_parser("taxonomy-build", help="Rebuild taxonomy.json from all concept files")
 
+    # search command
+    search_parser = subparsers.add_parser("search", help="Search corpus by concept")
+    search_parser.add_argument("query", help="Search terms (matched against concept labels and aliases)")
+    search_parser.add_argument("--channel", help="Filter results to this channel")
+    search_parser.add_argument("--limit", type=int, default=20, help="Max results (default: 20)")
+
     # status command
     subparsers.add_parser("status", help="Show corpus status: output dir, channels, artifact counts")
 
@@ -1220,6 +1360,8 @@ Examples:
         cmd_concepts(args, config)
     elif args.command == "taxonomy-build":
         cmd_taxonomy_build(args, config)
+    elif args.command == "search":
+        cmd_search(args, config)
     elif args.command == "status":
         cmd_status(args, config)
 

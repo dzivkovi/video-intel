@@ -67,24 +67,21 @@ If prerequisites are missing, tell the user what's needed and where to get it.
 
 ### Find videos about a topic (start here)
 
-Before scanning or reading files, check what's already indexed:
-
 ```bash
-# Show output directory, channels, and what's been processed
+# Search the corpus by concept — returns matching videos with artifact paths
+python "${SKILL_DIR}/scripts/video_intel.py" search "skills standard"
+
+# Filter to a specific channel
+python "${SKILL_DIR}/scripts/video_intel.py" search "context window" --channel natebjones
+
+# Check corpus status
 python "${SKILL_DIR}/scripts/video_intel.py" status
 ```
 
-This prints the resolved output directory path, taxonomy size, and per-channel
-artifact counts. Use the output directory path to read `taxonomy.json`:
-
-```bash
-# Read the master vocabulary to find concepts (path from status output)
-cat "OUTPUT_DIR/taxonomy.json" | python -m json.tool
-```
-
-Look up the concept, find its `video_count` and aliases, then grep for the
-`concept_id` in per-video concepts.json files to find which videos cover it.
-Read only those mindmaps/transcripts — don't scan the entire corpus.
+The `search` command matches query terms against concept labels and aliases
+in `taxonomy.json`, then returns the videos that contain those concepts along
+with paths to their mindmap and transcript files. Read only the returned
+files — don't scan the entire corpus.
 
 ### Scan channels for new videos
 

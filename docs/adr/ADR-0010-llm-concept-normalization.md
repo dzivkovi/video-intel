@@ -67,10 +67,17 @@ New subcommands: `concepts --backfill` (extract) and `taxonomy-build` (aggregate
 
 ## Affects
 
-- `scripts/video_intel.py` — `process_concepts()`, `build_taxonomy()`, `load_taxonomy()`, `find_mindmap_source()`, `call_gemini_text()`, `cmd_concepts()`, `cmd_taxonomy_build()`
+- `scripts/video_intel.py` — `process_concepts()`, `build_taxonomy()`, `load_taxonomy()`, `find_mindmap_source()`, `call_gemini_text()`, `cmd_concepts()`, `cmd_taxonomy_build()`, `search_corpus()`, `cmd_search()`, `cmd_status()`
 - `prompts/concepts.md` — extraction prompt with duration-aware guidance
 - `config.yaml` — `auto_concepts` key
-- `tests/test_utils.py` — `TestLoadTaxonomy`, `TestFindMindmapSource`, `TestBuildTaxonomy`
+- `tests/test_utils.py` — `TestLoadTaxonomy`, `TestFindMindmapSource`, `TestBuildTaxonomy`, `TestSearchCorpus`
+- `SKILL.md` — taxonomy-first triage workflow, search command as primary entry point
+
+## Notes
+
+**2026-04-02 update:** Added `search` subcommand for deterministic concept-based retrieval. Searches taxonomy labels + aliases, returns matching videos with artifact paths. Uses scored matching: exact matches (all query terms) ranked above partial matches (some terms). This is Phase 1 of the retrieval roadmap — Phase 2 (vector search via LanceDB + Voyage 4 embeddings) is planned but deferred until the search command proves its value and an eval set is built.
+
+**Known limitation:** Multi-word queries where the concept uses different terminology (e.g., "prompt engineering" when taxonomy has "Prompt Optimization") produce partial matches instead of exact. This is the gap that Phase 2 (semantic vector search) is designed to fill.
 
 ## Research References
 
@@ -82,3 +89,6 @@ New subcommands: `concepts --backfill` (extract) and `taxonomy-build` (aggregate
 - "Graph RAG in 2026: What Works in Production" (Paperclipped, Mar 2026)
 - "Knowledge Ontologies and Taxonomies Explained" (Knowledge Systems Authority, Mar 2026)
 - RAG systematic review (MDPI, Dec 2025), OG-RAG (EMNLP 2025), HippoRAG 2 (ICML 2025)
+- Embedding models comparison: [Best Embedding Models for RAG 2026](https://blog.premai.io/best-embedding-models-for-rag-2026-ranked-by-mteb-score-cost-and-self-hosting/)
+- Voyage 4 announcement: [blog.voyageai.com](https://blog.voyageai.com/2026/01/15/voyage-4/)
+- Cognee + LanceDB architecture: [lancedb.com/blog/case-study-cognee](https://lancedb.com/blog/case-study-cognee/)

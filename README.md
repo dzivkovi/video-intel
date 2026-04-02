@@ -215,6 +215,10 @@ python scripts/video_intel.py concepts --backfill --channel natebjones
 
 # Rebuild master taxonomy from all concept files
 python scripts/video_intel.py taxonomy-build
+
+# Search corpus by concept (matches labels + aliases)
+python scripts/video_intel.py search "skills standard"
+python scripts/video_intel.py search "context window" --channel natebjones --limit 5
 ```
 
 ## Prompt Customization

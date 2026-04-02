@@ -15,6 +15,7 @@ from video_intel import (
     merge_transcript_json,
     normalize_prompt_name,
     parse_since,
+    search_corpus,
     slugify,
     timestamp_to_seconds,
     update_meta,
@@ -619,3 +620,109 @@ class TestBuildTaxonomy:
 
         taxonomy = build_taxonomy(tmp_path)
         assert taxonomy["concepts"]["ai.rag"]["aliases"] == []
+
+
+# ---------------------------------------------------------------------------
+# search_corpus
+# ---------------------------------------------------------------------------
+
+
+class TestSearchCorpus:
+    def _setup_corpus(self, tmp_path):
+        """Create a minimal corpus with taxonomy + concepts + meta files."""
+        # Build taxonomy
+        taxonomy = {
+            "version": 1,
+            "built_from": 2,
+            "concepts": {
+                "ai.multi_agent": {
+                    "preferred_label": "Multi-Agent Orchestration",
+                    "aliases": ["Agent Teams", "Agent Swarm"],
+                    "domain": "ai",
+                    "first_seen": "2026-03-01",
+                    "video_count": 2,
+                },
+                "ai.context_window": {
+                    "preferred_label": "Context Window Management",
+                    "aliases": ["Context Optimization"],
+                    "domain": "ai",
+                    "first_seen": "2026-03-05",
+                    "video_count": 1,
+                },
+            },
+        }
+        (tmp_path / "taxonomy.json").write_text(json.dumps(taxonomy))
+
+        # Channel with 2 videos
+        ch = tmp_path / "testchannel"
+        ch.mkdir()
+
+        # Video 1: has multi_agent concept
+        (ch / "2026-03-01-video-one.concepts.json").write_text(
+            json.dumps(
+                {
+                    "video_id": "vid1",
+                    "concepts": [
+                        {"concept_id": "ai.multi_agent", "preferred_label": "Multi-Agent Orchestration"},
+                    ],
+                }
+            )
+        )
+        (ch / "2026-03-01-video-one.meta.json").write_text(
+            json.dumps({"video_id": "vid1", "title": "Video One", "published": "2026-03-01"})
+        )
+        (ch / "2026-03-01-video-one.mindmap.md").write_text("# Video One mindmap")
+
+        # Video 2: has both concepts
+        (ch / "2026-03-05-video-two.concepts.json").write_text(
+            json.dumps(
+                {
+                    "video_id": "vid2",
+                    "concepts": [
+                        {"concept_id": "ai.multi_agent", "preferred_label": "Multi-Agent Orchestration"},
+                        {"concept_id": "ai.context_window", "preferred_label": "Context Window Management"},
+                    ],
+                }
+            )
+        )
+        (ch / "2026-03-05-video-two.meta.json").write_text(
+            json.dumps({"video_id": "vid2", "title": "Video Two", "published": "2026-03-05"})
+        )
+        (ch / "2026-03-05-video-two.mindmap.md").write_text("# Video Two mindmap")
+
+    def test_search_finds_concept_by_label(self, tmp_path):
+        self._setup_corpus(tmp_path)
+        results = search_corpus(tmp_path, "multi agent")
+        assert len(results["concepts"]) == 1
+        assert results["concepts"][0]["concept_id"] == "ai.multi_agent"
+        assert len(results["videos"]) == 2
+
+    def test_search_finds_concept_by_alias(self, tmp_path):
+        self._setup_corpus(tmp_path)
+        results = search_corpus(tmp_path, "agent teams")
+        assert len(results["concepts"]) == 1
+        assert results["concepts"][0]["preferred_label"] == "Multi-Agent Orchestration"
+
+    def test_search_returns_empty_for_no_match(self, tmp_path):
+        self._setup_corpus(tmp_path)
+        results = search_corpus(tmp_path, "nonexistent gibberish")
+        assert results["concepts"] == []
+        assert results["videos"] == []
+
+    def test_search_channel_filter_restricts_results(self, tmp_path):
+        self._setup_corpus(tmp_path)
+        results = search_corpus(tmp_path, "multi agent", channel_filter="nonexistent")
+        assert results["concepts"]  # concepts still match
+        assert results["videos"] == []  # but no videos in that channel
+
+    def test_search_includes_artifact_paths(self, tmp_path):
+        self._setup_corpus(tmp_path)
+        results = search_corpus(tmp_path, "context")
+        assert len(results["videos"]) == 1
+        assert results["videos"][0]["mindmap"] is not None
+        assert "mindmap.md" in results["videos"][0]["mindmap"]
+
+    def test_search_respects_limit(self, tmp_path):
+        self._setup_corpus(tmp_path)
+        results = search_corpus(tmp_path, "multi agent", limit=1)
+        assert len(results["videos"]) == 1

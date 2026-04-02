@@ -48,6 +48,7 @@ Required env vars: `GEMINI_API_KEY`, `YOUTUBE_API_KEY`.
 - `mindmap` — generate a mind map for a single video URL with a specific prompt.
 - `concepts` — extract and normalize concepts from existing mindmaps against a growing canonical vocabulary (thesaurus). Text-only Gemini calls reading mindmap markdown, not video.
 - `taxonomy-build` — rebuild `taxonomy.json` by aggregating all per-video `concepts.json` files. This is a derived artifact, always rebuildable.
+- `search` — search corpus by concept label/alias. Returns matching videos with artifact paths. Use this FIRST when the user asks about topics — avoids reading the entire corpus.
 
 All commands support `--force` to regenerate existing output files.
 
