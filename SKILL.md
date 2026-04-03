@@ -42,10 +42,16 @@ Three layers, designed as a narrowing funnel:
    for the same idea — the concept layer resolves synonyms so cross-video
    queries work without reading every file.
 
-**Triage workflow:**
-- **"Which videos cover X?"** → `search "X"` (concept match, no API calls)
-- **"What did someone say about X?"** → `search "X" --vector` (semantic match over transcripts)
-- **"What themes recur across channels?"** → `search` with broad terms, or read taxonomy.json directly
+**Triage workflow — pick the right mode first:**
+
+| Query type | Examples | Command |
+|------------|----------|---------|
+| **Evidence** (who/what/when/how) | "which companies adopted X?", "what did they say about Y?" | `search "X" --vector` |
+| **Discovery** (which videos / themes) | "which videos cover X?", "what themes recur?" | `search "X"` (no flag) |
+
+- `--vector` uses **hybrid search** (BM25 keyword + vector semantic + RRF fusion).
+  Results include full transcript passages — follow-up reads usually unnecessary.
+- Concept search (no flag) matches taxonomy labels/aliases. Fast, no API calls.
 - Read only the files returned by search — don't scan the entire corpus.
 
 ## Prerequisites
@@ -85,19 +91,15 @@ python "${SKILL_DIR}/scripts/video_intel.py" search "context window" --channel n
 python "${SKILL_DIR}/scripts/video_intel.py" status
 ```
 
-**When to use which:**
-- **`search "X"`** — topic lookup. Matches concept labels and aliases in
-  taxonomy.json. Fast, no API calls. Use for "which videos cover X?" or
-  "what themes recur?"
-- **`search "X" --vector`** — evidence lookup. Finds relevant transcript
-  passages by meaning. Returns up to 3000 chars of each matched chunk with
-  preserved structure (speaker turns, SCREEN blocks). Use for "what did
-  someone say about X?" or queries where the exact words aren't in any
-  concept label. Requires `VOYAGE_API_KEY`. Add `--preview` for compact
-  200-char output.
-- Vector results include the matched evidence directly — follow-up transcript
-  reads are usually unnecessary. Only read the full source file if you need
-  broader context around the matched passage.
+**Mode reference:**
+- **`search "X"`** — concept match. Matches labels/aliases in taxonomy.json.
+  Fast, no API calls. Returns video list with artifact paths.
+- **`search "X" --vector`** — hybrid search (BM25 + vector + RRF fusion).
+  Returns full transcript passages (up to 3000 chars) with speaker turns and
+  SCREEN blocks preserved. Searches both video titles and transcript text.
+  Requires `VOYAGE_API_KEY`. Add `--preview` for compact 200-char output.
+- Hybrid results include evidence directly — follow-up transcript reads are
+  usually unnecessary. Only read the source file if you need surrounding context.
 
 ### Scan channels for new videos
 
@@ -127,28 +129,22 @@ Options:
 - `--url` - YouTube URL to transcribe
 - `--force` - Regenerate even if transcript exists
 
-### Vector search (semantic / evidence queries)
+### Hybrid search (evidence queries)
 
 ```bash
-# Build the vector search index from all transcripts (requires VOYAGE_API_KEY)
+# Build the search index from all transcripts (requires VOYAGE_API_KEY)
 python "${SKILL_DIR}/scripts/video_intel.py" index
 
-# Semantic search — finds relevant transcript passages by meaning
+# Hybrid search — BM25 keyword + vector semantic, merged by RRF
 python "${SKILL_DIR}/scripts/video_intel.py" search "permission problems" --vector
 
-# Filter vector search to a channel
+# Filter to a channel
 python "${SKILL_DIR}/scripts/video_intel.py" search "150-line skill limit" --vector --channel natebjones
 ```
 
-Vector search requires: `pip install 'video-intel[vector]'` and `VOYAGE_API_KEY`
-(free at https://dash.voyageai.com/).
-
-Use `--vector` for evidence queries ("what did they say about X?") that keyword
-matching can't handle. Vector results show full chunk text (up to 3000 chars)
-with preserved newlines — the evidence is in the output, no need to read the
-source file unless you need more surrounding context. Add `--preview` for
-compact 200-char single-line output. Use plain `search` (without `--vector`)
-for concept lookups ("which videos cover agent skills?").
+Hybrid search requires: `pip install 'video-intel[vector]'` and `VOYAGE_API_KEY`
+(free at https://dash.voyageai.com/). See the triage workflow table above for
+when to use `--vector` vs plain concept search.
 
 ### Extract and normalize concepts
 

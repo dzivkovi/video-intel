@@ -58,8 +58,8 @@ Optional: `VOYAGE_API_KEY` (for vector search, free at https://dash.voyageai.com
 - `mindmap` — generate a mind map for a single video URL with a specific prompt.
 - `concepts` — extract and normalize concepts from existing mindmaps against a growing canonical vocabulary (thesaurus). Text-only Gemini calls reading mindmap markdown, not video.
 - `taxonomy-build` — rebuild `taxonomy.json` by aggregating all per-video `concepts.json` files. This is a derived artifact, always rebuildable.
-- `search` — search corpus by concept label/alias (default) or vector similarity (`--vector`). Concept search returns matching videos with artifact paths. Vector search returns ranked transcript chunks by semantic similarity. Use this FIRST when the user asks about topics — avoids reading the entire corpus.
-- `index` — build vector search index from all transcripts using LanceDB + Voyage AI embeddings. Required before `search --vector`. Rebuildable at any time.
+- `search` — search corpus by concept label/alias (default) or hybrid BM25+vector (`--vector`). Concept search returns matching videos with artifact paths. Hybrid search returns ranked transcript chunks by combined keyword and semantic relevance (RRF fusion). Use this FIRST when the user asks about topics — avoids reading the entire corpus.
+- `index` — build search index (vector embeddings + FTS on title/text) from all transcripts using LanceDB + Voyage AI. Required before `search --vector`. Rebuildable at any time.
 
 All commands support `--force` to regenerate existing output files.
 

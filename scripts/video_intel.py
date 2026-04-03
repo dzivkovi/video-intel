@@ -1375,19 +1375,23 @@ def build_search_index(output_dir: Path, *, channel_filter: str | None = None, f
     if len(all_records) >= 256:
         table.create_index(metric="cosine", vector_column_name="vector")
     table.create_fts_index("text")
+    table.create_fts_index("title")
 
     log.info("Indexed %d chunks into %s", len(all_records), db_path)
     return len(all_records)
 
 
-def vector_search(
+def hybrid_search(
     output_dir: Path,
     query: str,
     *,
     channel_filter: str | None = None,
     limit: int = 10,
 ) -> list[dict]:
-    """Search the LanceDB index with Voyage AI embeddings. Returns ranked chunks."""
+    """Search the LanceDB index with hybrid BM25 + vector + RRF fusion.
+
+    Returns ranked chunks deduplicated by video.
+    """
     lancedb = require_lancedb()
     voyageai = require_voyageai()
 
@@ -1409,14 +1413,20 @@ def vector_search(
     vo = voyageai.Client()
     query_embedding = vo.embed([query], model=VOYAGE_QUERY_MODEL, input_type="query").embeddings[0]
 
-    # Fetch extra candidates for video-level dedup headroom
-    search_builder = table.search(query_embedding).metric("cosine").limit(limit * 5)
+    # Hybrid search: BM25 (FTS on title+text) + vector, merged by RRF (K=60 default)
+    fetch_count = max(50, limit * 5)
+    search_builder = (
+        table.search(query_type="hybrid", fts_columns=["title", "text"])
+        .vector(query_embedding)
+        .text(query)
+        .limit(fetch_count)
+    )
     if channel_filter:
         search_builder = search_builder.where(f"channel = '{channel_filter}'")
 
     results = search_builder.to_pandas()
 
-    # Convert rows to dicts
+    # Convert rows to dicts — hybrid returns _relevance_score (higher = better)
     raw_hits = []
     for _, row in results.iterrows():
         raw_hits.append(
@@ -1429,7 +1439,7 @@ def vector_search(
                 "published": row.get("published", ""),
                 "source_file": row.get("source_file", ""),
                 "concept_ids": row.get("concept_ids", "[]"),
-                "distance": float(row.get("_distance", 999)),
+                "relevance": float(row.get("_relevance_score", 0.0)),
             }
         )
 
@@ -1443,11 +1453,11 @@ def _dedup_by_video(hits: list[dict], limit: int) -> list[dict]:
         vid = hit.get("video_id", "")
         if not vid:
             vid = hit.get("source_file", "")  # fallback key
-        dist = hit["distance"]
-        if vid not in best_per_video or dist < best_per_video[vid]["distance"]:
+        score = hit["relevance"]
+        if vid not in best_per_video or score > best_per_video[vid]["relevance"]:
             best_per_video[vid] = hit
 
-    deduped = sorted(best_per_video.values(), key=lambda h: h["distance"])
+    deduped = sorted(best_per_video.values(), key=lambda h: h["relevance"], reverse=True)
     return deduped[:limit]
 
 
@@ -1574,28 +1584,27 @@ def cmd_search(args, config):
     if args.limit is None:
         args.limit = 10 if getattr(args, "vector", False) else 20
 
-    # Vector search mode
+    # Hybrid search mode (BM25 + vector + RRF)
     if getattr(args, "vector", False):
-        hits = vector_search(output_dir, args.query, channel_filter=args.channel, limit=args.limit)
+        hits = hybrid_search(output_dir, args.query, channel_filter=args.channel, limit=args.limit)
         if not hits:
             print(f'No results for "{args.query}". Is the index built? Run: video_intel.py index')
             return
 
-        # Filter out weak matches below similarity threshold
-        min_sim = getattr(args, "min_similarity", 0.0)
-        strong_hits = [h for h in hits if (1 - h["distance"]) >= min_sim]
+        # Filter out weak matches below relevance threshold
+        min_rel = getattr(args, "min_relevance", 0.0)
+        strong_hits = [h for h in hits if h["relevance"] >= min_rel]
 
         if not strong_hits:
-            print(f'No strong matches for "{args.query}" (best similarity: {1 - hits[0]["distance"]:.3f}).')
-            print("Try broader terms, lower --min-similarity, or use concept search without --vector.")
+            print(f'No strong matches for "{args.query}" (best relevance: {hits[0]["relevance"]:.4f}).')
+            print("Try broader terms, lower --min-relevance, or use concept search without --vector.")
             return
 
-        print(f'Vector results for "{args.query}" ({len(strong_hits)} videos):\n')
+        print(f'Hybrid results for "{args.query}" ({len(strong_hits)} videos):\n')
         preview_mode = getattr(args, "preview", False)
         for i, hit in enumerate(strong_hits, 1):
-            similarity = 1 - hit["distance"]
             print(f"  [{i}] [{hit['channel']}] {hit['published']}  {hit['title']}")
-            print(f"      Timestamp: [{hit['timestamp']}]  Similarity: {similarity:.3f}")
+            print(f"      Timestamp: [{hit['timestamp']}]  Relevance: {hit['relevance']:.4f}")
             if preview_mode:
                 display = hit["text"][:200].replace("\n", " ")
                 if len(hit["text"]) > 200:
@@ -1736,11 +1745,11 @@ Examples:
         "--preview", action="store_true", help="Show compact 200-char previews instead of full chunk text"
     )
     search_parser.add_argument(
-        "--min-similarity",
+        "--min-relevance",
         type=float,
         default=0.0,
-        dest="min_similarity",
-        help="Minimum cosine similarity for vector results (default: 0.0)",
+        dest="min_relevance",
+        help="Minimum relevance score for hybrid results (default: 0.0, RRF scale)",
     )
 
     # index command

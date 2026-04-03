@@ -865,7 +865,7 @@ class TestLoadConceptsForVideo:
 
 
 class TestDedupByVideo:
-    def _hit(self, video_id, distance, title="Test"):
+    def _hit(self, video_id, relevance, title="Test"):
         return {
             "text": f"chunk from {video_id}",
             "timestamp": "00:00",
@@ -875,43 +875,43 @@ class TestDedupByVideo:
             "published": "2026-01-01",
             "source_file": f"{video_id}.transcript.md",
             "concept_ids": "[]",
-            "distance": distance,
+            "relevance": relevance,
         }
 
     def test_keeps_best_chunk_per_video(self):
         hits = [
-            self._hit("vid1", 0.3),
-            self._hit("vid1", 0.1),  # best
-            self._hit("vid1", 0.5),
+            self._hit("vid1", 0.02),
+            self._hit("vid1", 0.05),  # best (highest relevance)
+            self._hit("vid1", 0.01),
         ]
         result = _dedup_by_video(hits, limit=10)
         assert len(result) == 1
-        assert result[0]["distance"] == 0.1
+        assert result[0]["relevance"] == 0.05
 
     def test_preserves_distinct_videos(self):
         hits = [
-            self._hit("vid1", 0.1),
-            self._hit("vid2", 0.2),
-            self._hit("vid3", 0.3),
+            self._hit("vid1", 0.03),
+            self._hit("vid2", 0.02),
+            self._hit("vid3", 0.01),
         ]
         result = _dedup_by_video(hits, limit=10)
         assert len(result) == 3
         assert [r["video_id"] for r in result] == ["vid1", "vid2", "vid3"]
 
     def test_respects_limit(self):
-        hits = [self._hit(f"vid{i}", i * 0.1) for i in range(5)]
+        hits = [self._hit(f"vid{i}", (5 - i) * 0.01) for i in range(5)]
         result = _dedup_by_video(hits, limit=3)
         assert len(result) == 3
 
-    def test_sorts_by_best_distance(self):
+    def test_sorts_by_best_relevance(self):
         hits = [
-            self._hit("vid_far", 0.9),
-            self._hit("vid_close", 0.05),
-            self._hit("vid_mid", 0.4),
+            self._hit("vid_low", 0.005),
+            self._hit("vid_high", 0.033),
+            self._hit("vid_mid", 0.018),
         ]
         result = _dedup_by_video(hits, limit=10)
-        assert result[0]["video_id"] == "vid_close"
-        assert result[-1]["video_id"] == "vid_far"
+        assert result[0]["video_id"] == "vid_high"
+        assert result[-1]["video_id"] == "vid_low"
 
     def test_empty_input_returns_empty(self):
         assert _dedup_by_video([], limit=10) == []
