@@ -1433,6 +1433,7 @@ def hybrid_search(
             {
                 "text": row["text"],
                 "timestamp": row["timestamp"],
+                "timestamp_seconds": int(row.get("timestamp_seconds", 0)),
                 "video_id": row.get("video_id", ""),
                 "channel": row.get("channel", ""),
                 "title": row.get("title", ""),
@@ -1603,8 +1604,14 @@ def cmd_search(args, config):
         print(f'Hybrid results for "{args.query}" ({len(strong_hits)} videos):\n')
         preview_mode = getattr(args, "preview", False)
         for i, hit in enumerate(strong_hits, 1):
+            vid_url = f"https://www.youtube.com/watch?v={hit['video_id']}" if hit.get("video_id") else ""
+            ts_secs = hit.get("timestamp_seconds", 0)
+            if vid_url and ts_secs:
+                vid_url += f"&t={ts_secs}"
             print(f"  [{i}] [{hit['channel']}] {hit['published']}  {hit['title']}")
             print(f"      Timestamp: [{hit['timestamp']}]  Relevance: {hit['relevance']:.4f}")
+            if vid_url:
+                print(f"      Video: {vid_url}")
             if preview_mode:
                 display = hit["text"][:200].replace("\n", " ")
                 if len(hit["text"]) > 200:

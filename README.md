@@ -56,6 +56,16 @@ birds before you cast a line and read the water before you commit to a spot.
 │  │ existing taxonomy  │    │                                 │  │
 │  └────────────────────┘    │ taxonomy.json (derived master)  │  │
 │                            └─────────────────────────────────┘  │
+├─────────────────────────────────────────────────────────────────┤
+│  SEARCH (the retrieval)                    Cost: ~$0.02/query   │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │ Concept search: taxonomy.json labels + aliases (free)      │  │
+│  │ Hybrid search: BM25 keyword + vector semantic + RRF fusion │  │
+│  │   Voyage AI embeds (voyage-4-large docs, voyage-4-lite     │  │
+│  │   queries), LanceDB stores + searches, BM25 matches exact  │  │
+│  │   words in titles + text. Results include full transcript   │  │
+│  │   passages + clickable YouTube URLs with timestamp links.   │  │
+│  └────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -219,6 +229,13 @@ python scripts/video_intel.py taxonomy-build
 # Search corpus by concept (matches labels + aliases)
 python scripts/video_intel.py search "skills standard"
 python scripts/video_intel.py search "context window" --channel natebjones --limit 5
+
+# Hybrid search — BM25 keyword + vector semantic + RRF fusion
+# (requires VOYAGE_API_KEY — free at https://dash.voyageai.com/)
+pip install lancedb voyageai
+python scripts/video_intel.py index                          # build index (one-time)
+python scripts/video_intel.py search "helium supply chain" --vector
+python scripts/video_intel.py search "code beats markdown" --vector --preview
 ```
 
 ## Prompt Customization
@@ -294,15 +311,20 @@ jq '.concepts["ai-engineering.context_window_optimization"]' video-intel/taxonom
 grep -rl '"uncertain"' video-intel/*/ --include="*.concepts.json"
 ```
 
-### Future: concepts as retrieval metadata
+### Concepts + hybrid search
 
-The planned next step (not yet implemented) is to use concepts as structured
-metadata over embedded transcript chunks — enabling queries like "find all
-videos about context window problems" to match across different terminology.
+Concept IDs are attached to each transcript chunk in the vector index, enabling
+two complementary search modes:
 
-See [ADR-0010](docs/adr/ADR-0010-llm-concept-normalization.md) for the full
-architectural rationale, alternatives evaluated (Cognee, LightRAG, Neo4j
-GraphRAG), and the phased roadmap.
+- **Concept search** (`search "query"`) — matches taxonomy labels/aliases.
+  Returns video-level groupings. Use for "which videos cover X?"
+- **Hybrid search** (`search "query" --vector`) — BM25 keyword + vector
+  semantic + RRF fusion. Returns ranked transcript passages with full text,
+  YouTube URLs with timestamp deep-links. Use for "what did someone say about X?"
+
+See [ADR-0012](docs/adr/ADR-0012-vector-search-lancedb-voyage.md) for
+embedding choices and [ADR-0013](docs/adr/ADR-0013-hybrid-search-rrf-fusion.md)
+for the hybrid search decision. Evaluation queries in `evals/`.
 
 ## Cost
 
