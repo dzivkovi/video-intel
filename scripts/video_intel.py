@@ -1158,7 +1158,7 @@ LANCEDB_TABLE = "transcript_chunks"
 VOYAGE_DOC_MODEL = "voyage-4-large"
 VOYAGE_QUERY_MODEL = "voyage-4-lite"
 VOYAGE_DIMS = 1024
-VOYAGE_BATCH_SIZE = 10
+VOYAGE_BATCH_SIZE = 128
 
 
 def require_lancedb():
