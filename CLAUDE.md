@@ -34,9 +34,19 @@ python scripts/video_intel.py transcript --url "https://www.youtube.com/watch?v=
 
 # Install dependencies
 pip install google-genai google-api-python-client pyyaml
+
+# Optional: vector search
+pip install lancedb voyageai
+
+# Build vector search index (requires VOYAGE_API_KEY)
+python scripts/video_intel.py index
+
+# Semantic search over transcript chunks
+python scripts/video_intel.py search "permission problems" --vector
 ```
 
 Required env vars: `GEMINI_API_KEY`, `YOUTUBE_API_KEY`.
+Optional: `VOYAGE_API_KEY` (for vector search, free at https://dash.voyageai.com/).
 
 ## Architecture
 
@@ -48,7 +58,8 @@ Required env vars: `GEMINI_API_KEY`, `YOUTUBE_API_KEY`.
 - `mindmap` — generate a mind map for a single video URL with a specific prompt.
 - `concepts` — extract and normalize concepts from existing mindmaps against a growing canonical vocabulary (thesaurus). Text-only Gemini calls reading mindmap markdown, not video.
 - `taxonomy-build` — rebuild `taxonomy.json` by aggregating all per-video `concepts.json` files. This is a derived artifact, always rebuildable.
-- `search` — search corpus by concept label/alias. Returns matching videos with artifact paths. Use this FIRST when the user asks about topics — avoids reading the entire corpus.
+- `search` — search corpus by concept label/alias (default) or vector similarity (`--vector`). Concept search returns matching videos with artifact paths. Vector search returns ranked transcript chunks by semantic similarity. Use this FIRST when the user asks about topics — avoids reading the entire corpus.
+- `index` — build vector search index from all transcripts using LanceDB + Voyage AI embeddings. Required before `search --vector`. Rebuildable at any time.
 
 All commands support `--force` to regenerate existing output files.
 

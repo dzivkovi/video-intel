@@ -43,6 +43,7 @@ Files are named: `ADR-NNNN-title-with-dashes.md`
 | [ADR-0009](ADR-0009-deterministic-video-discovery.md) | Deterministic video discovery via uploads playlist | accepted | 2026-04-01 |
 | [ADR-0010](ADR-0010-llm-concept-normalization.md) | LLM-powered concept normalization (thesaurus layer) | accepted | 2026-04-01 |
 | [ADR-0011](ADR-0011-structured-logging.md) | Structured logging via Python logging module | accepted | 2026-04-02 |
+| [ADR-0012](ADR-0012-vector-search-lancedb-voyage.md) | Vector search via LanceDB + Voyage AI embeddings | accepted | 2026-04-02 |
 
 ## Process
 

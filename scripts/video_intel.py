@@ -1149,6 +1149,324 @@ def cmd_status(args, config):
             print(f"  {ch_name}: not yet scanned")
 
 
+# ---------------------------------------------------------------------------
+# Vector search (Phase 2): LanceDB + Voyage AI
+# ---------------------------------------------------------------------------
+
+LANCEDB_DIR = ".lancedb"
+LANCEDB_TABLE = "transcript_chunks"
+VOYAGE_DOC_MODEL = "voyage-4-large"
+VOYAGE_QUERY_MODEL = "voyage-4-lite"
+VOYAGE_DIMS = 1024
+VOYAGE_BATCH_SIZE = 10
+
+
+def require_lancedb():
+    try:
+        import lancedb
+
+        return lancedb
+    except ImportError:
+        log.error("lancedb not installed. Run: pip install 'video-intel[vector]'")
+        sys.exit(1)
+
+
+def require_voyageai():
+    try:
+        import voyageai
+
+        return voyageai
+    except ImportError:
+        log.error("voyageai not installed. Run: pip install 'video-intel[vector]'")
+        sys.exit(1)
+
+
+def _parse_timestamp_seconds(ts: str) -> int:
+    """Convert 'MM:SS' or 'HH:MM:SS' to seconds."""
+    parts = ts.split(":")
+    if len(parts) == 2:
+        return int(parts[0]) * 60 + int(parts[1])
+    if len(parts) == 3:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+    return 0
+
+
+def chunk_transcript(transcript_path: Path, chunk_size: int = 5) -> list[dict]:
+    """Split a transcript into timestamped chunks of ~chunk_size entries.
+
+    Each entry is a [MM:SS] speech line or SCREEN block. Returns list of dicts
+    with keys: text, timestamp, timestamp_seconds.
+    """
+    text = transcript_path.read_text(encoding="utf-8")
+    lines = text.split("\n")
+
+    # Parse into entries: each starts with [MM:SS] or '  SCREEN ['
+    entries = []
+    current_entry = []
+    current_ts = None
+
+    for line in lines:
+        # Speech line: [MM:SS] Speaker: "text"
+        speech_match = re.match(r"^\[(\d{1,2}:\d{2}(?::\d{2})?)\]", line)
+        # Screen line:   SCREEN [MM:SS-MM:SS]
+        screen_match = re.match(r"^\s+SCREEN \[(\d{1,2}:\d{2}(?::\d{2})?)", line)
+
+        if speech_match or screen_match:
+            # Save previous entry
+            if current_entry:
+                entries.append({"text": "\n".join(current_entry), "timestamp": current_ts or "00:00"})
+            current_entry = [line]
+            current_ts = (speech_match or screen_match).group(1)
+        elif current_entry:
+            # Continuation of current entry
+            current_entry.append(line)
+        # Skip header lines before first entry
+
+    # Don't forget last entry
+    if current_entry:
+        entries.append({"text": "\n".join(current_entry), "timestamp": current_ts or "00:00"})
+
+    if not entries:
+        return []
+
+    # Group entries into chunks of chunk_size
+    chunks = []
+    for i in range(0, len(entries), chunk_size):
+        group = entries[i : i + chunk_size]
+        chunk_text = "\n\n".join(e["text"] for e in group)
+        first_ts = group[0]["timestamp"]
+        chunks.append(
+            {
+                "text": chunk_text.strip(),
+                "timestamp": first_ts,
+                "timestamp_seconds": _parse_timestamp_seconds(first_ts),
+            }
+        )
+
+    return chunks
+
+
+def _load_concepts_for_video(concepts_path: Path) -> list[str]:
+    """Load concept_ids from a video's concepts.json."""
+    if not concepts_path.exists():
+        return []
+    data = json.loads(concepts_path.read_text(encoding="utf-8"))
+    return [c.get("concept_id", "") for c in data.get("concepts", []) if c.get("concept_id")]
+
+
+def _extract_video_metadata(prefix: str, channel_dir: Path, channel_name: str) -> dict:
+    """Extract video metadata from meta.json for index records."""
+    meta_path = channel_dir / f"{prefix}.meta.json"
+    title = prefix
+    published = ""
+    video_id = ""
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        title = meta.get("title", prefix)
+        published = meta.get("published", "")
+        video_id = meta.get("video_id", "")
+    return {"title": title, "published": published, "video_id": video_id, "channel": channel_name}
+
+
+def _embed_batch(vo_client, texts: list[str], model: str, input_type: str) -> list[list[float]]:
+    """Embed a list of texts with Voyage AI, handling batch size and rate limits."""
+    all_embeddings = []
+    total_batches = (len(texts) + VOYAGE_BATCH_SIZE - 1) // VOYAGE_BATCH_SIZE
+
+    for batch_num, i in enumerate(range(0, len(texts), VOYAGE_BATCH_SIZE)):
+        batch = texts[i : i + VOYAGE_BATCH_SIZE]
+        max_retries = 5
+        for attempt in range(max_retries + 1):
+            try:
+                result = vo_client.embed(batch, model=model, input_type=input_type)
+                all_embeddings.extend(result.embeddings)
+                log.info("[%d/%d] Embedded %d chunks", batch_num + 1, total_batches, len(batch))
+                # Pace requests to stay under rate limits (3 RPM on free tier)
+                if batch_num < total_batches - 1:
+                    time.sleep(1)
+                break
+            except Exception as e:
+                error_str = str(e).lower()
+                is_rate_limit = "rate" in error_str and "limit" in error_str
+                is_connection = "connection" in error_str or "resolve" in error_str or "timeout" in error_str
+                if (is_rate_limit or is_connection) and attempt < max_retries:
+                    wait = 25 * (2**attempt) + random.uniform(0, 5)
+                    reason = "rate limited" if is_rate_limit else "connection error"
+                    log.warning("Voyage %s, waiting %ds (attempt %d/%d)...", reason, wait, attempt + 1, max_retries)
+                    time.sleep(wait)
+                else:
+                    raise
+
+    return all_embeddings
+
+
+def build_search_index(output_dir: Path, *, channel_filter: str | None = None, force: bool = False) -> int:
+    """Build or rebuild the LanceDB vector index from transcripts + concepts.
+
+    Returns the number of chunks indexed.
+    """
+    lancedb = require_lancedb()
+    voyageai = require_voyageai()
+
+    vo_key = os.environ.get("VOYAGE_API_KEY")
+    if not vo_key:
+        log.error("VOYAGE_API_KEY not set. Sign up free at https://dash.voyageai.com/")
+        sys.exit(1)
+
+    vo = voyageai.Client()
+    db_path = str(output_dir / LANCEDB_DIR)
+    db = lancedb.connect(db_path)
+
+    # Drop existing table if force rebuild
+    if force and LANCEDB_TABLE in db.list_tables().tables:
+        db.drop_table(LANCEDB_TABLE)
+        log.info("Dropped existing table '%s' for rebuild", LANCEDB_TABLE)
+
+    # Collect all transcript chunks
+    all_records = []
+    channels = [d for d in output_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+
+    for channel_dir in sorted(channels):
+        ch_name = channel_dir.name
+        if channel_filter and ch_name != channel_filter:
+            continue
+
+        transcripts = sorted(channel_dir.glob("*.transcript.md"))
+        log.info("[%s] Found %d transcripts", ch_name, len(transcripts))
+
+        for tx_path in transcripts:
+            prefix = tx_path.name.replace(".transcript.md", "")
+            concepts_path = channel_dir / f"{prefix}.concepts.json"
+            concept_ids = _load_concepts_for_video(concepts_path)
+            meta = _extract_video_metadata(prefix, channel_dir, ch_name)
+
+            chunks = chunk_transcript(tx_path)
+            for chunk in chunks:
+                all_records.append(
+                    {
+                        "text": chunk["text"],
+                        "timestamp": chunk["timestamp"],
+                        "timestamp_seconds": chunk["timestamp_seconds"],
+                        "video_id": meta["video_id"],
+                        "channel": meta["channel"],
+                        "title": meta["title"],
+                        "published": meta["published"],
+                        "concept_ids": json.dumps(concept_ids),
+                        "source_file": str(tx_path),
+                    }
+                )
+
+    if not all_records:
+        log.warning("No transcript chunks found to index.")
+        return 0
+
+    log.info("Embedding %d chunks with %s...", len(all_records), VOYAGE_DOC_MODEL)
+    texts = [r["text"] for r in all_records]
+    embeddings = _embed_batch(vo, texts, VOYAGE_DOC_MODEL, input_type="document")
+
+    # Attach vectors to records
+    for rec, vec in zip(all_records, embeddings, strict=True):
+        rec["vector"] = vec
+
+    # Create or overwrite table
+    table = db.create_table(LANCEDB_TABLE, data=all_records, mode="overwrite")
+
+    # Create indices for efficient search
+    if len(all_records) >= 256:
+        table.create_index(metric="cosine", vector_column_name="vector")
+    table.create_fts_index("text")
+
+    log.info("Indexed %d chunks into %s", len(all_records), db_path)
+    return len(all_records)
+
+
+def vector_search(
+    output_dir: Path,
+    query: str,
+    *,
+    channel_filter: str | None = None,
+    limit: int = 10,
+) -> list[dict]:
+    """Search the LanceDB index with Voyage AI embeddings. Returns ranked chunks."""
+    lancedb = require_lancedb()
+    voyageai = require_voyageai()
+
+    vo_key = os.environ.get("VOYAGE_API_KEY")
+    if not vo_key:
+        log.error("VOYAGE_API_KEY not set. Sign up free at https://dash.voyageai.com/")
+        sys.exit(1)
+
+    db_path = str(output_dir / LANCEDB_DIR)
+    db = lancedb.connect(db_path)
+
+    if LANCEDB_TABLE not in db.list_tables().tables:
+        log.error("Search index not found. Run: video_intel.py index")
+        return []
+
+    table = db.open_table(LANCEDB_TABLE)
+
+    # Embed query with lite model (asymmetric retrieval)
+    vo = voyageai.Client()
+    query_embedding = vo.embed([query], model=VOYAGE_QUERY_MODEL, input_type="query").embeddings[0]
+
+    # Fetch extra candidates for video-level dedup headroom
+    search_builder = table.search(query_embedding).metric("cosine").limit(limit * 5)
+    if channel_filter:
+        search_builder = search_builder.where(f"channel = '{channel_filter}'")
+
+    results = search_builder.to_pandas()
+
+    # Convert rows to dicts
+    raw_hits = []
+    for _, row in results.iterrows():
+        raw_hits.append(
+            {
+                "text": row["text"],
+                "timestamp": row["timestamp"],
+                "video_id": row.get("video_id", ""),
+                "channel": row.get("channel", ""),
+                "title": row.get("title", ""),
+                "published": row.get("published", ""),
+                "source_file": row.get("source_file", ""),
+                "concept_ids": row.get("concept_ids", "[]"),
+                "distance": float(row.get("_distance", 999)),
+            }
+        )
+
+    return _dedup_by_video(raw_hits, limit)
+
+
+def _dedup_by_video(hits: list[dict], limit: int) -> list[dict]:
+    """Keep only the best-scoring chunk per video_id, return top `limit` videos."""
+    best_per_video: dict[str, dict] = {}
+    for hit in hits:
+        vid = hit.get("video_id", "")
+        if not vid:
+            vid = hit.get("source_file", "")  # fallback key
+        dist = hit["distance"]
+        if vid not in best_per_video or dist < best_per_video[vid]["distance"]:
+            best_per_video[vid] = hit
+
+    deduped = sorted(best_per_video.values(), key=lambda h: h["distance"])
+    return deduped[:limit]
+
+
+def cmd_index(args, config):
+    """Build or rebuild the vector search index."""
+    output_dir = resolve_output_dir(config)
+    t0 = time.time()
+    count = build_search_index(output_dir, channel_filter=args.channel, force=args.force)
+    elapsed = time.time() - t0
+
+    if count == 0:
+        print("No transcripts found to index.")
+    else:
+        mins, secs = divmod(int(elapsed), 60)
+        print(f"Indexed {count} chunks in {mins}m {secs:02d}s.")
+        print(f"  Index: {output_dir / LANCEDB_DIR}")
+        print("  Run 'search --vector \"query\"' to search.")
+
+
 def search_corpus(output_dir: Path, query: str, *, channel_filter: str | None = None, limit: int = 20) -> dict:
     """Search taxonomy + concepts for matching videos. Returns structured results."""
     taxonomy = load_taxonomy(output_dir)
@@ -1251,6 +1569,37 @@ def search_corpus(output_dir: Path, query: str, *, channel_filter: str | None = 
 def cmd_search(args, config):
     """Search the corpus for videos matching a query."""
     output_dir = resolve_output_dir(config)
+
+    # Vector search mode
+    if getattr(args, "vector", False):
+        hits = vector_search(output_dir, args.query, channel_filter=args.channel, limit=args.limit)
+        if not hits:
+            print(f'No results for "{args.query}". Is the index built? Run: video_intel.py index')
+            return
+
+        # Filter out weak matches below similarity threshold
+        min_sim = getattr(args, "min_similarity", 0.0)
+        strong_hits = [h for h in hits if (1 - h["distance"]) >= min_sim]
+
+        if not strong_hits:
+            print(f'No strong matches for "{args.query}" (best similarity: {1 - hits[0]["distance"]:.3f}).')
+            print("Try broader terms, lower --min-similarity, or use concept search without --vector.")
+            return
+
+        print(f'Vector results for "{args.query}" ({len(strong_hits)} videos):\n')
+        for i, hit in enumerate(strong_hits, 1):
+            similarity = 1 - hit["distance"]
+            print(f"  [{i}] [{hit['channel']}] {hit['published']}  {hit['title']}")
+            print(f"      Timestamp: [{hit['timestamp']}]  Similarity: {similarity:.3f}")
+            preview = hit["text"][:200].replace("\n", " ")
+            if len(hit["text"]) > 200:
+                preview += "..."
+            print(f"      {preview}")
+            print(f"      Source: {hit['source_file']}")
+            print()
+        return
+
+    # Concept search mode (default)
     results = search_corpus(output_dir, args.query, channel_filter=args.channel, limit=args.limit)
 
     if not results["concepts"]:
@@ -1315,6 +1664,8 @@ Examples:
   %(prog)s taxonomy-build                 # Rebuild taxonomy.json from concept files
   %(prog)s search "skills standard"       # Search corpus by concept
   %(prog)s search "context window" --channel natebjones
+  %(prog)s index                           # Build vector search index
+  %(prog)s search "permission problems" --vector  # Semantic search
         """,
     )
     parser.add_argument(
@@ -1359,10 +1710,25 @@ Examples:
     subparsers.add_parser("taxonomy-build", help="Rebuild taxonomy.json from all concept files")
 
     # search command
-    search_parser = subparsers.add_parser("search", help="Search corpus by concept")
+    search_parser = subparsers.add_parser("search", help="Search corpus by concept or vector similarity")
     search_parser.add_argument("query", help="Search terms (matched against concept labels and aliases)")
     search_parser.add_argument("--channel", help="Filter results to this channel")
     search_parser.add_argument("--limit", type=int, default=20, help="Max results (default: 20)")
+    search_parser.add_argument(
+        "--vector", action="store_true", help="Use vector search (requires index; see 'index' command)"
+    )
+    search_parser.add_argument(
+        "--min-similarity",
+        type=float,
+        default=0.0,
+        dest="min_similarity",
+        help="Minimum cosine similarity for vector results (default: 0.0)",
+    )
+
+    # index command
+    index_parser = subparsers.add_parser("index", help="Build vector search index from transcripts")
+    index_parser.add_argument("--channel", help="Index only this channel")
+    index_parser.add_argument("--force", action="store_true", help="Rebuild index from scratch")
 
     # status command
     subparsers.add_parser("status", help="Show corpus status: output dir, channels, artifact counts")
@@ -1388,6 +1754,8 @@ Examples:
         cmd_taxonomy_build(args, config)
     elif args.command == "search":
         cmd_search(args, config)
+    elif args.command == "index":
+        cmd_index(args, config)
     elif args.command == "status":
         cmd_status(args, config)
 

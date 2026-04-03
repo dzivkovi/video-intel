@@ -42,10 +42,11 @@ Three layers, designed as a narrowing funnel:
    for the same idea — the concept layer resolves synonyms so cross-video
    queries work without reading every file.
 
-**Triage workflow:** When the user asks about topics, read `taxonomy.json`
-first to find matching concepts and which videos cover them. Only read
-specific mindmaps/transcripts for the relevant videos — don't scan the
-entire corpus.
+**Triage workflow:**
+- **"Which videos cover X?"** → `search "X"` (concept match, no API calls)
+- **"What did someone say about X?"** → `search "X" --vector` (semantic match over transcripts)
+- **"What themes recur across channels?"** → `search` with broad terms, or read taxonomy.json directly
+- Read only the files returned by search — don't scan the entire corpus.
 
 ## Prerequisites
 
@@ -59,6 +60,9 @@ Python dependencies:
 
 ```bash
 pip install google-genai google-api-python-client pyyaml
+
+# Optional: for vector search
+pip install lancedb voyageai
 ```
 
 If prerequisites are missing, tell the user what's needed and where to get it.
@@ -68,20 +72,27 @@ If prerequisites are missing, tell the user what's needed and where to get it.
 ### Find videos about a topic (start here)
 
 ```bash
-# Search the corpus by concept — returns matching videos with artifact paths
+# "Which videos cover X?" — concept match, no API calls
 python "${SKILL_DIR}/scripts/video_intel.py" search "skills standard"
 
-# Filter to a specific channel
+# "What did someone say about X?" — semantic search over transcripts
+python "${SKILL_DIR}/scripts/video_intel.py" search "150-line skill limit" --vector
+
+# Filter either mode to a channel
 python "${SKILL_DIR}/scripts/video_intel.py" search "context window" --channel natebjones
 
 # Check corpus status
 python "${SKILL_DIR}/scripts/video_intel.py" status
 ```
 
-The `search` command matches query terms against concept labels and aliases
-in `taxonomy.json`, then returns the videos that contain those concepts along
-with paths to their mindmap and transcript files. Read only the returned
-files — don't scan the entire corpus.
+**When to use which:**
+- **`search "X"`** — topic lookup. Matches concept labels and aliases in
+  taxonomy.json. Fast, no API calls. Use for "which videos cover X?" or
+  "what themes recur?"
+- **`search "X" --vector`** — evidence lookup. Finds relevant transcript
+  passages by meaning. Use for "what did someone say about X?" or queries
+  where the exact words aren't in any concept label. Requires `VOYAGE_API_KEY`.
+- Read only the files returned by search — don't scan the entire corpus.
 
 ### Scan channels for new videos
 
@@ -110,6 +121,26 @@ Options:
 - `--channel natebjones` - Save output under this channel's folder
 - `--url` - YouTube URL to transcribe
 - `--force` - Regenerate even if transcript exists
+
+### Vector search (semantic / evidence queries)
+
+```bash
+# Build the vector search index from all transcripts (requires VOYAGE_API_KEY)
+python "${SKILL_DIR}/scripts/video_intel.py" index
+
+# Semantic search — finds relevant transcript passages by meaning
+python "${SKILL_DIR}/scripts/video_intel.py" search "permission problems" --vector
+
+# Filter vector search to a channel
+python "${SKILL_DIR}/scripts/video_intel.py" search "150-line skill limit" --vector --channel natebjones
+```
+
+Vector search requires: `pip install 'video-intel[vector]'` and `VOYAGE_API_KEY`
+(free at https://dash.voyageai.com/).
+
+Use `--vector` for evidence queries ("what did they say about X?") that keyword
+matching can't handle. Use plain `search` (without `--vector`) for concept
+lookups ("which videos cover agent skills?").
 
 ### Extract and normalize concepts
 
@@ -162,6 +193,8 @@ Each prompt is self-contained. Users can modify or add their own.
 ```
 ~/video-intel/
 ├── taxonomy.json                                    # Master vocabulary (derived)
+├── .lancedb/                                        # Vector search index (derived)
+│   └── transcript_chunks.lance
 ├── natebjones/
 │   ├── 2026-03-20-building-mcp-agents.mindmap.md
 │   ├── 2026-03-20-building-mcp-agents.transcript.md

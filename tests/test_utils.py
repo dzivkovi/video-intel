@@ -7,7 +7,11 @@ from unittest.mock import MagicMock
 import pytest
 
 from video_intel import (
+    _dedup_by_video,
+    _load_concepts_for_video,
+    _parse_timestamp_seconds,
     build_taxonomy,
+    chunk_transcript,
     fetch_channel_videos,
     find_mindmap_source,
     is_processed,
@@ -726,3 +730,188 @@ class TestSearchCorpus:
         self._setup_corpus(tmp_path)
         results = search_corpus(tmp_path, "multi agent", limit=1)
         assert len(results["videos"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# _parse_timestamp_seconds
+# ---------------------------------------------------------------------------
+
+
+class TestParseTimestampSeconds:
+    def test_mm_ss_returns_seconds(self):
+        assert _parse_timestamp_seconds("01:30") == 90
+
+    def test_hh_mm_ss_returns_seconds(self):
+        assert _parse_timestamp_seconds("1:15:30") == 4530
+
+    def test_zero_returns_zero(self):
+        assert _parse_timestamp_seconds("00:00") == 0
+
+    def test_invalid_returns_zero(self):
+        assert _parse_timestamp_seconds("bad") == 0
+
+
+# ---------------------------------------------------------------------------
+# chunk_transcript
+# ---------------------------------------------------------------------------
+
+
+class TestChunkTranscript:
+    SAMPLE_TRANSCRIPT = (
+        "# Transcript: Test Video\n"
+        "\n"
+        "**Source:** https://www.youtube.com/watch?v=TEST\n"
+        "**Published:** 2026-03-20\n"
+        "\n"
+        "---\n"
+        "\n"
+        '[00:00] Alice (Host): "Welcome to the show."\n'
+        "\n"
+        '[00:15] Bob (Guest): "Thanks for having me."\n'
+        "\n"
+        "  SCREEN [00:20-00:30] [slide]: Title slide with logo\n"
+        "\n"
+        '[00:35] Alice (Host): "Let\'s talk about AI agents."\n'
+        "\n"
+        '[01:00] Bob (Guest): "Agents are transforming software."\n'
+        "\n"
+        '[01:30] Alice (Host): "What about skills?"\n'
+        "\n"
+        '[02:00] Bob (Guest): "Skills are the key abstraction."\n'
+    )
+
+    def test_chunk_transcript_returns_chunks(self, tmp_path):
+        tx = tmp_path / "test.transcript.md"
+        tx.write_text(self.SAMPLE_TRANSCRIPT, encoding="utf-8")
+        chunks = chunk_transcript(tx, chunk_size=3)
+        assert len(chunks) >= 1
+
+    def test_chunk_transcript_first_chunk_starts_at_zero(self, tmp_path):
+        tx = tmp_path / "test.transcript.md"
+        tx.write_text(self.SAMPLE_TRANSCRIPT, encoding="utf-8")
+        chunks = chunk_transcript(tx, chunk_size=3)
+        assert chunks[0]["timestamp"] == "00:00"
+        assert chunks[0]["timestamp_seconds"] == 0
+
+    def test_chunk_transcript_preserves_text_content(self, tmp_path):
+        tx = tmp_path / "test.transcript.md"
+        tx.write_text(self.SAMPLE_TRANSCRIPT, encoding="utf-8")
+        chunks = chunk_transcript(tx, chunk_size=3)
+        all_text = " ".join(c["text"] for c in chunks)
+        assert "Welcome to the show" in all_text
+        assert "Skills are the key abstraction" in all_text
+
+    def test_chunk_transcript_respects_chunk_size(self, tmp_path):
+        tx = tmp_path / "test.transcript.md"
+        tx.write_text(self.SAMPLE_TRANSCRIPT, encoding="utf-8")
+        # 7 entries (6 speech + 1 SCREEN) with chunk_size=3 => 3 chunks
+        chunks = chunk_transcript(tx, chunk_size=3)
+        assert len(chunks) == 3
+
+    def test_chunk_transcript_includes_screen_entries(self, tmp_path):
+        tx = tmp_path / "test.transcript.md"
+        tx.write_text(self.SAMPLE_TRANSCRIPT, encoding="utf-8")
+        chunks = chunk_transcript(tx, chunk_size=10)  # one big chunk
+        assert "SCREEN" in chunks[0]["text"]
+
+    def test_chunk_transcript_empty_file_returns_empty(self, tmp_path):
+        tx = tmp_path / "empty.transcript.md"
+        tx.write_text("# No entries\n\nJust a header.", encoding="utf-8")
+        chunks = chunk_transcript(tx)
+        assert chunks == []
+
+    def test_chunk_transcript_later_chunks_have_correct_timestamps(self, tmp_path):
+        tx = tmp_path / "test.transcript.md"
+        tx.write_text(self.SAMPLE_TRANSCRIPT, encoding="utf-8")
+        chunks = chunk_transcript(tx, chunk_size=3)
+        if len(chunks) > 1:
+            assert chunks[1]["timestamp_seconds"] > chunks[0]["timestamp_seconds"]
+
+
+# ---------------------------------------------------------------------------
+# _load_concepts_for_video
+# ---------------------------------------------------------------------------
+
+
+class TestLoadConceptsForVideo:
+    def test_loads_concept_ids(self, tmp_path):
+        data = {
+            "video_id": "TEST",
+            "concepts": [
+                {"concept_id": "ai.agents", "preferred_label": "Agents"},
+                {"concept_id": "ai.skills", "preferred_label": "Skills"},
+            ],
+        }
+        path = tmp_path / "test.concepts.json"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        result = _load_concepts_for_video(path)
+        assert result == ["ai.agents", "ai.skills"]
+
+    def test_missing_file_returns_empty(self, tmp_path):
+        result = _load_concepts_for_video(tmp_path / "nonexistent.json")
+        assert result == []
+
+    def test_empty_concepts_returns_empty(self, tmp_path):
+        data = {"video_id": "TEST", "concepts": []}
+        path = tmp_path / "test.concepts.json"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        result = _load_concepts_for_video(path)
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
+# _dedup_by_video
+# ---------------------------------------------------------------------------
+
+
+class TestDedupByVideo:
+    def _hit(self, video_id, distance, title="Test"):
+        return {
+            "text": f"chunk from {video_id}",
+            "timestamp": "00:00",
+            "video_id": video_id,
+            "channel": "test",
+            "title": title,
+            "published": "2026-01-01",
+            "source_file": f"{video_id}.transcript.md",
+            "concept_ids": "[]",
+            "distance": distance,
+        }
+
+    def test_keeps_best_chunk_per_video(self):
+        hits = [
+            self._hit("vid1", 0.3),
+            self._hit("vid1", 0.1),  # best
+            self._hit("vid1", 0.5),
+        ]
+        result = _dedup_by_video(hits, limit=10)
+        assert len(result) == 1
+        assert result[0]["distance"] == 0.1
+
+    def test_preserves_distinct_videos(self):
+        hits = [
+            self._hit("vid1", 0.1),
+            self._hit("vid2", 0.2),
+            self._hit("vid3", 0.3),
+        ]
+        result = _dedup_by_video(hits, limit=10)
+        assert len(result) == 3
+        assert [r["video_id"] for r in result] == ["vid1", "vid2", "vid3"]
+
+    def test_respects_limit(self):
+        hits = [self._hit(f"vid{i}", i * 0.1) for i in range(5)]
+        result = _dedup_by_video(hits, limit=3)
+        assert len(result) == 3
+
+    def test_sorts_by_best_distance(self):
+        hits = [
+            self._hit("vid_far", 0.9),
+            self._hit("vid_close", 0.05),
+            self._hit("vid_mid", 0.4),
+        ]
+        result = _dedup_by_video(hits, limit=10)
+        assert result[0]["video_id"] == "vid_close"
+        assert result[-1]["video_id"] == "vid_far"
+
+    def test_empty_input_returns_empty(self):
+        assert _dedup_by_video([], limit=10) == []
