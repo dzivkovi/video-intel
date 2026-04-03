@@ -78,6 +78,8 @@ All commands support `--force` to regenerate existing output files.
 
 **Concept layer:** Per-video `concepts.json` is the source of truth. `taxonomy.json` is derived (rebuilt by `taxonomy-build`). During batch extraction, new concepts accumulate in memory so each video normalizes against concepts discovered in earlier videos. See ADR-0010.
 
+**Search internals:** Score math, pipeline mechanics, tuning levers, and empirical observations are documented in [`docs/search-internals.md`](docs/search-internals.md). Read this before modifying search behavior.
+
 ## Key Design Decisions
 
 - Gemini is a multimodal proxy, not a competing assistant. Video understanding requires vision+audio that Claude doesn't have via API.

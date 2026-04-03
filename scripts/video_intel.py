@@ -1570,6 +1570,10 @@ def cmd_search(args, config):
     """Search the corpus for videos matching a query."""
     output_dir = resolve_output_dir(config)
 
+    # Resolve per-mode default limit (None means user didn't pass --limit)
+    if args.limit is None:
+        args.limit = 10 if getattr(args, "vector", False) else 20
+
     # Vector search mode
     if getattr(args, "vector", False):
         hits = vector_search(output_dir, args.query, channel_filter=args.channel, limit=args.limit)
@@ -1587,14 +1591,23 @@ def cmd_search(args, config):
             return
 
         print(f'Vector results for "{args.query}" ({len(strong_hits)} videos):\n')
+        preview_mode = getattr(args, "preview", False)
         for i, hit in enumerate(strong_hits, 1):
             similarity = 1 - hit["distance"]
             print(f"  [{i}] [{hit['channel']}] {hit['published']}  {hit['title']}")
             print(f"      Timestamp: [{hit['timestamp']}]  Similarity: {similarity:.3f}")
-            preview = hit["text"][:200].replace("\n", " ")
-            if len(hit["text"]) > 200:
-                preview += "..."
-            print(f"      {preview}")
+            if preview_mode:
+                display = hit["text"][:200].replace("\n", " ")
+                if len(hit["text"]) > 200:
+                    display += "..."
+                print(f"      {display}")
+            else:
+                display = hit["text"][:3000]
+                if len(hit["text"]) > 3000:
+                    display += "\n      [truncated — see source]"
+                # Indent each line for visual grouping under the header
+                for line in display.split("\n"):
+                    print(f"      {line}")
             print(f"      Source: {hit['source_file']}")
             print()
         return
@@ -1713,9 +1726,14 @@ Examples:
     search_parser = subparsers.add_parser("search", help="Search corpus by concept or vector similarity")
     search_parser.add_argument("query", help="Search terms (matched against concept labels and aliases)")
     search_parser.add_argument("--channel", help="Filter results to this channel")
-    search_parser.add_argument("--limit", type=int, default=20, help="Max results (default: 20)")
+    search_parser.add_argument(
+        "--limit", type=int, default=None, help="Max results (default: 10 for --vector, 20 for concept)"
+    )
     search_parser.add_argument(
         "--vector", action="store_true", help="Use vector search (requires index; see 'index' command)"
+    )
+    search_parser.add_argument(
+        "--preview", action="store_true", help="Show compact 200-char previews instead of full chunk text"
     )
     search_parser.add_argument(
         "--min-similarity",

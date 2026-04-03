@@ -90,9 +90,14 @@ python "${SKILL_DIR}/scripts/video_intel.py" status
   taxonomy.json. Fast, no API calls. Use for "which videos cover X?" or
   "what themes recur?"
 - **`search "X" --vector`** — evidence lookup. Finds relevant transcript
-  passages by meaning. Use for "what did someone say about X?" or queries
-  where the exact words aren't in any concept label. Requires `VOYAGE_API_KEY`.
-- Read only the files returned by search — don't scan the entire corpus.
+  passages by meaning. Returns up to 3000 chars of each matched chunk with
+  preserved structure (speaker turns, SCREEN blocks). Use for "what did
+  someone say about X?" or queries where the exact words aren't in any
+  concept label. Requires `VOYAGE_API_KEY`. Add `--preview` for compact
+  200-char output.
+- Vector results include the matched evidence directly — follow-up transcript
+  reads are usually unnecessary. Only read the full source file if you need
+  broader context around the matched passage.
 
 ### Scan channels for new videos
 
@@ -139,8 +144,11 @@ Vector search requires: `pip install 'video-intel[vector]'` and `VOYAGE_API_KEY`
 (free at https://dash.voyageai.com/).
 
 Use `--vector` for evidence queries ("what did they say about X?") that keyword
-matching can't handle. Use plain `search` (without `--vector`) for concept
-lookups ("which videos cover agent skills?").
+matching can't handle. Vector results show full chunk text (up to 3000 chars)
+with preserved newlines — the evidence is in the output, no need to read the
+source file unless you need more surrounding context. Add `--preview` for
+compact 200-char single-line output. Use plain `search` (without `--vector`)
+for concept lookups ("which videos cover agent skills?").
 
 ### Extract and normalize concepts
 
