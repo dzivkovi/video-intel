@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 
 from translate_video import (
+    apply_timestamp_offset,
     build_chunk_list,
     build_output_path,
     extract_video_id,
@@ -218,6 +219,85 @@ class TestNormalizeTimestamp:
         assert normalize_timestamp("") == ""
 
 
+class TestApplyTimestampOffset:
+    """Tests for apply_timestamp_offset() — chunk-aware offset with classification."""
+
+    # --- Clean relative inputs ---
+
+    def test_hh_mm_ss_relative_with_offset(self):
+        # [00:05:30] + 3600s in a 1200s chunk → relative → [01:05:30]
+        assert apply_timestamp_offset("[00:05:30] text", 3600, 1200) == "[01:05:30] text"
+
+    def test_mm_ss_relative_with_offset(self):
+        # [05:30] + 3600s in a 1200s chunk → relative (330s ≤ 1500s) → [01:05:30]
+        assert apply_timestamp_offset("[05:30] text", 3600, 1200) == "[01:05:30] text"
+
+    def test_zero_offset_normalizes_mm_ss(self):
+        # [05:30] + 0s → still relative → [00:05:30] (MM:SS → HH:MM:SS)
+        assert apply_timestamp_offset("[05:30] text", 0, 3600) == "[00:05:30] text"
+
+    def test_zero_offset_hh_mm_ss_passthrough(self):
+        assert apply_timestamp_offset("[00:05:30] text", 0, 3600) == "[00:05:30] text"
+
+    def test_no_timestamp_passthrough(self):
+        assert apply_timestamp_offset("no timestamp here", 3600, 1200) == "no timestamp here"
+
+    def test_empty_line_passthrough(self):
+        assert apply_timestamp_offset("", 3600, 1200) == ""
+
+    def test_real_world_part_60_80(self):
+        # part-60-80: offset=3600, duration=1200. Gemini outputs [00:00:04] relative.
+        assert apply_timestamp_offset("[00:00:04] milioni", 3600, 1200) == "[01:00:04] milioni"
+
+    def test_real_world_part_120_138(self):
+        # part-120-138: offset=7200, duration=1080. Gemini outputs [17:42] relative.
+        # 17*60+42 = 1062s ≤ 1080+300 → relative → +7200 = 8262s = 2h17m42s
+        assert apply_timestamp_offset("[17:42] text", 7200, 1080) == "[02:17:42] text"
+
+    def test_large_relative_near_chunk_boundary(self):
+        # [19:58] in a 1200s (20-min) chunk → 1198s ≤ 1500s → relative
+        assert apply_timestamp_offset("[19:58] text", 3600, 1200) == "[01:19:58] text"
+
+    # --- Already-absolute inputs (should not double-offset) ---
+
+    def test_already_absolute_kept_as_is(self):
+        # [01:00:04] in part-60-80 (offset=3600, duration=1200)
+        # 3604s in [3600, 4500] → absolute → keep
+        assert apply_timestamp_offset("[01:00:04] text", 3600, 1200) == "[01:00:04] text"
+
+    def test_already_absolute_mid_chunk(self):
+        # [01:10:00] in part-60-80 → 4200s in [3600, 4500] → absolute
+        assert apply_timestamp_offset("[01:10:00] text", 3600, 1200) == "[01:10:00] text"
+
+    # --- Implausible inputs (from real failures) ---
+
+    def test_implausible_echo_pattern(self, caplog):
+        # [18:42:42] in a 20-min chunk (offset=4800, duration=1200)
+        # 67362s fits neither relative (≤1500) nor absolute ([4800, 6300])
+        with caplog.at_level(logging.WARNING, logger="translate_video"):
+            result = apply_timestamp_offset("[18:42:42] text", 4800, 1200)
+        assert result == "[18:42:42] text"  # unchanged
+        assert any("implausible" in r.message.lower() for r in caplog.records)
+
+    def test_implausible_jump(self, caplog):
+        # [09:02:48] in part-60-80 (offset=3600, duration=1200)
+        # 32568s fits neither range
+        with caplog.at_level(logging.WARNING, logger="translate_video"):
+            result = apply_timestamp_offset("[09:02:48] text", 3600, 1200)
+        assert result == "[09:02:48] text"
+        assert any("implausible" in r.message.lower() for r in caplog.records)
+
+    # --- Mixed-mode (absolute then relative in same chunk) ---
+
+    def test_mixed_mode_absolute_then_relative(self):
+        # Part-80-100: first line absolute [01:20:00], later line relative [05:30]
+        # offset=4800, duration=1200
+        abs_result = apply_timestamp_offset("[01:20:00] first", 4800, 1200)
+        rel_result = apply_timestamp_offset("[05:30] later", 4800, 1200)
+        assert abs_result == "[01:20:00] first"  # kept as-is
+        assert rel_result == "[01:25:30] later"  # 330s + 4800 = 5130s = 1h25m30s
+
+
 class TestStitchParts:
     """Tests for stitch_parts() — merges part files into a single translation."""
 
@@ -228,50 +308,49 @@ class TestStitchParts:
         return path
 
     def test_stitch_three_parts_correct_order(self, tmp_path):
-        # Arrange: 3 parts with known content, written out of order
-        self._write_part(tmp_path, "my-video", "2024-01-01", 40, 60, ["[00:40:00] part three"])
+        # Arrange: 3 parts with RELATIVE timestamps (counting from 0:00), written out of order
+        self._write_part(tmp_path, "my-video", "2024-01-01", 40, 60, ["[00:00:00] part three"])
         self._write_part(tmp_path, "my-video", "2024-01-01", 0, 20, ["[00:00:00] part one"])
-        self._write_part(tmp_path, "my-video", "2024-01-01", 20, 40, ["[00:20:00] part two"])
+        self._write_part(tmp_path, "my-video", "2024-01-01", 20, 40, ["[00:00:00] part two"])
 
         # Act
         result = stitch_parts(tmp_path, "My Video", "2024-01-01", "https://youtube.com/watch?v=TEST", "gemini-test")
 
-        # Assert
+        # Assert: offsets applied — 0*60=0, 20*60=1200, 40*60=2400
         content = result.read_text(encoding="utf-8")
         assert "# Translation (BCS): My Video" in content
         lines = [line for line in content.split("\n") if line.startswith("[")]
         assert lines == ["[00:00:00] part one", "[00:20:00] part two", "[00:40:00] part three"]
 
     def test_stitch_newline_seam_no_missing_line(self, tmp_path):
-        # Arrange: part 1 ends WITHOUT trailing newline, part 2 starts with timestamp
+        # Arrange: relative timestamps, part 1 ends WITHOUT trailing newline
         p1 = tmp_path / "2024-01-01-vid.part-0-20.translate-bcs.txt"
-        p1.write_text("[00:00:00] first\n[00:19:50] last of part one", encoding="utf-8")  # no trailing \n
+        p1.write_text("[00:00:00] first\n[19:50] last of part one", encoding="utf-8")  # no trailing \n
         p2 = tmp_path / "2024-01-01-vid.part-20-40.translate-bcs.txt"
-        p2.write_text("[00:20:00] first of part two\n[00:39:50] last", encoding="utf-8")
+        p2.write_text("[00:00:00] first of part two\n[19:50] last", encoding="utf-8")
 
         # Act
         result = stitch_parts(tmp_path, "Vid", "2024-01-01", "https://youtube.com/watch?v=TEST", "gemini-test")
 
-        # Assert: no line is lost at the seam
+        # Assert: no line is lost at the seam, offsets applied
         content = result.read_text(encoding="utf-8")
         assert "[00:19:50] last of part one" in content
         assert "[00:20:00] first of part two" in content
-        # And they're on separate lines
         ts_lines = [line for line in content.split("\n") if line.startswith("[")]
         assert ts_lines.index("[00:19:50] last of part one") < ts_lines.index("[00:20:00] first of part two")
 
-    def test_stitch_normalizes_timestamps(self, tmp_path):
-        # Arrange: part with malformed timestamp
-        self._write_part(tmp_path, "vid", "2024-01-01", 0, 60, ["[00:05:00] ok"])
-        self._write_part(tmp_path, "vid", "2024-01-01", 60, 120, ["[120:05:30] malformed"])
+    def test_stitch_applies_offset_to_mm_ss(self, tmp_path):
+        # Arrange: part-60-120 with relative MM:SS timestamps
+        self._write_part(tmp_path, "vid", "2024-01-01", 0, 60, ["[05:00] ok"])
+        self._write_part(tmp_path, "vid", "2024-01-01", 60, 120, ["[05:30] was relative"])
 
         # Act
         result = stitch_parts(tmp_path, "Vid", "2024-01-01", "https://youtube.com/watch?v=TEST", "gemini-test")
 
-        # Assert
+        # Assert: offset applied, MM:SS normalized to HH:MM:SS
         content = result.read_text(encoding="utf-8")
-        assert "[02:05:30] malformed" in content
-        assert "[120:05:30]" not in content
+        assert "[00:05:00] ok" in content  # 0 offset, MM:SS → HH:MM:SS
+        assert "[01:05:30] was relative" in content  # 3600s offset + 330s = 3930s = 1:05:30
 
     def test_stitch_no_parts_raises_error(self, tmp_path):
         # Act & Assert
@@ -281,18 +360,18 @@ class TestStitchParts:
             stitch_parts(tmp_path, "Nothing", "2024-01-01", "https://youtube.com/watch?v=TEST", "gemini-test")
 
     def test_stitch_missing_intermediate_warns(self, tmp_path, caplog):
-        # Arrange: parts 0-20 and 40-60, but no 20-40
+        # Arrange: parts 0-20 and 40-60, but no 20-40. Relative timestamps.
         self._write_part(tmp_path, "vid", "2024-01-01", 0, 20, ["[00:00:00] part one"])
-        self._write_part(tmp_path, "vid", "2024-01-01", 40, 60, ["[00:40:00] part three"])
+        self._write_part(tmp_path, "vid", "2024-01-01", 40, 60, ["[00:00:00] part three"])
 
         # Act
         with caplog.at_level(logging.WARNING, logger="translate_video"):
             result = stitch_parts(tmp_path, "Vid", "2024-01-01", "https://youtube.com/watch?v=TEST", "gemini-test")
 
-        # Assert: stitched file exists with both parts, warning logged about gap
+        # Assert: offsets applied, warning logged about gap
         content = result.read_text(encoding="utf-8")
-        assert "[00:00:00] part one" in content
-        assert "[00:40:00] part three" in content
+        assert "[00:00:00] part one" in content  # 0 offset
+        assert "[00:40:00] part three" in content  # 40*60 offset
         assert any("gap" in r.message.lower() for r in caplog.records)
 
     def test_stitch_with_original_title_in_header(self, tmp_path):

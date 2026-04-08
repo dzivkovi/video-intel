@@ -440,9 +440,9 @@ python scripts/translate_video.py "https://www.youtube.com/watch?v=Sm7568B0BC8" 
 # Print to stdout instead of file
 python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" --stdout
 
-# Use a different model
+# Use a different model (default: gemini-2.5-pro)
 python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" \
-  --model gemini-2.5-pro
+  --model gemini-2.5-flash
 ```
 
 Output follows the same `{date}-{slug}` naming convention as video-intel

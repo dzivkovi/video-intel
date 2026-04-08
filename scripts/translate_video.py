@@ -9,7 +9,7 @@ dialogue density). Streams output progressively for live monitoring.
 Usage:
     export GEMINI_API_KEY=your_key
     python translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID"
-    python translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" --model gemini-2.5-pro
+    python translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" --model gemini-2.5-flash  # default: gemini-2.5-pro
     python translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" --stdout
 """
 
@@ -104,6 +104,51 @@ def normalize_timestamp(line: str) -> str:
         extra_hours, new_minutes = divmod(new_minutes, 60)
         hours += extra_hours
     return f"[{hours:02d}:{new_minutes:02d}:{ss:02d}]{line[m.end() :]}"
+
+
+def apply_timestamp_offset(line: str, offset_seconds: int, chunk_duration_seconds: int) -> str:
+    """Add a time offset to the timestamp at the start of a line.
+
+    Classifies each timestamp as relative, already-absolute, or implausible
+    before deciding whether to apply the offset. Handles both [HH:MM:SS] and
+    [MM:SS] formats; always outputs [HH:MM:SS].
+    """
+    tolerance = 300  # 5 minutes
+
+    # First, fix legacy malformed timestamps (e.g. [120:05:30] → [02:05:30])
+    line = normalize_timestamp(line)
+
+    # Try [HH:MM:SS] first (more specific), then [MM:SS]
+    m = re.match(r"\[(\d+):(\d{2}):(\d{2})\]", line)
+    if m:
+        total = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+    else:
+        m = re.match(r"\[(\d+):(\d{2})\]", line)
+        if not m:
+            return line
+        total = int(m.group(1)) * 60 + int(m.group(2))
+
+    max_relative = chunk_duration_seconds + tolerance
+
+    if total <= max_relative:
+        # Relative timestamp — add offset
+        total += offset_seconds
+    elif offset_seconds <= total <= offset_seconds + max_relative:
+        # Already absolute — keep as-is
+        pass
+    else:
+        # Implausible — warn, pass through unchanged
+        log.warning(
+            "Implausible timestamp %s in chunk (offset=%ds, duration=%ds)",
+            line.split("]")[0] + "]",
+            offset_seconds,
+            chunk_duration_seconds,
+        )
+        return line
+
+    h, rem = divmod(total, 3600)
+    mm, ss = divmod(rem, 60)
+    return f"[{h:02d}:{mm:02d}:{ss:02d}]{line[m.end() :]}"
 
 
 def build_output_path(output_dir: Path, title: str, date: str) -> Path:
@@ -276,19 +321,28 @@ def stitch_parts(
             if start_min > end_min:
                 log.warning("Gap: no part for %d-%d min", end_min, start_min)
 
-    # Read, normalize, and merge
+    # Read, apply offsets, and merge
     all_lines: list[str] = []
     last_ts: tuple[int, int, int] | None = None
 
     for part_file in part_files:
+        # Extract offset and duration from filename: part-START-END
+        offset_match = re.search(r"\.part-(\d+)-(\d+)\.", part_file.name)
+        if offset_match:
+            offset_seconds = int(offset_match.group(1)) * 60
+            chunk_duration_seconds = (int(offset_match.group(2)) - int(offset_match.group(1))) * 60
+        else:
+            offset_seconds = 0
+            chunk_duration_seconds = 3600  # fallback: assume 1h
+
         content = part_file.read_text(encoding="utf-8")
         lines = content.splitlines()
 
         for line in lines:
-            normalized = normalize_timestamp(line)
+            adjusted = apply_timestamp_offset(line, offset_seconds, chunk_duration_seconds)
 
             # Check monotonic timestamps
-            ts_match = re.match(r"\[(\d{2}):(\d{2}):(\d{2})\]", normalized)
+            ts_match = re.match(r"\[(\d{2}):(\d{2}):(\d{2})\]", adjusted)
             if ts_match:
                 current_ts = (int(ts_match.group(1)), int(ts_match.group(2)), int(ts_match.group(3)))
                 if last_ts is not None and current_ts < last_ts:
@@ -299,7 +353,7 @@ def stitch_parts(
                     )
                 last_ts = current_ts
 
-            all_lines.append(normalized)
+            all_lines.append(adjusted)
 
     # Build output
     header = build_header(title, url, date, model, original_title=original_title)
@@ -355,9 +409,11 @@ def call_gemini_translate(
             meta_kwargs["end_offset"] = f"{end_offset}s"
         part_kwargs["video_metadata"] = types.VideoMetadata(**meta_kwargs)
 
-    # Tell Gemini the absolute start time so timestamps are correct in chunked output
-    if start_offset and start_offset > 0:
-        instruction = f"Translate the video audio to BCS. Timestamps must start at {format_elapsed(start_offset)} (absolute video time, not relative to clip start)."
+    # Clip-relative instruction for chunks; stitcher applies absolute offsets later
+    if start_offset is not None and end_offset is not None:
+        instruction = (
+            "Translate only the provided clip. Start timestamps near [00:00:00] and keep them relative to this clip."
+        )
     else:
         instruction = "Translate the entire video audio to BCS."
 
@@ -408,10 +464,9 @@ def call_gemini_translate(
     accumulated = []
     usage = None
     first_chunk = True
-    # 10 minutes max wait for first chunk.
-    # KNOWN LIMITATION: this timeout only fires if the stream yields empty chunks while waiting.
-    # If the stream iterator itself blocks (pre-yield hang), this check never executes.
-    # The heartbeat thread still provides visibility, but the user must manually kill.
+    # If the stream iterator blocks without yielding (pre-yield hang), this loop
+    # never advances and the timeout check below never fires. The heartbeat thread
+    # still logs progress so the user knows it's stuck — Ctrl+C to abort.
     first_chunk_timeout = 600
 
     try:
@@ -441,7 +496,7 @@ def call_gemini_translate(
                     "total_token_count": getattr(meta, "total_token_count", None),
                 }
 
-            # Check for first-chunk timeout (stream may yield empty chunks while waiting)
+            # Timeout check — only fires if the stream yields empty chunks while waiting
             if first_chunk and (time.time() - start_time) > first_chunk_timeout:
                 raise TimeoutError(f"No data received after {format_elapsed(first_chunk_timeout)}")
 
@@ -760,8 +815,8 @@ Examples:
     parser.add_argument(
         "--model",
         "-m",
-        default="gemini-3.1-pro-preview",
-        help="Gemini model (default: gemini-3.1-pro-preview)",
+        default="gemini-2.5-pro",
+        help="Gemini model (default: gemini-2.5-pro)",
     )
     parser.add_argument(
         "--output-dir",
