@@ -58,6 +58,23 @@ def require_youtube():
 
 
 # ---------------------------------------------------------------------------
+# Title translation
+# ---------------------------------------------------------------------------
+
+
+def translate_title(client, model: str, title: str) -> str:
+    """Translate a video title to BCS via a single text-only Gemini call."""
+    response = client.models.generate_content(
+        model=model,
+        contents=(
+            "Translate this video title to BCS (Bosnian-neutral). "
+            "Output ONLY the translated title, nothing else.\n\n" + title
+        ),
+    )
+    return response.text.strip().strip('"')
+
+
+# ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------
 
@@ -890,8 +907,14 @@ Examples:
         meta = fetch_video_metadata(video_id)
         original_title = meta["title"] if meta else video_id
         date = args.date or (meta["published"] if meta else "0000-00-00")
-        # --title is the translated/display title; original_title is for part-file discovery
-        display_title = args.title or original_title
+        # --title overrides; otherwise auto-translate the title to BCS
+        if args.title:
+            display_title = args.title
+        else:
+            genai, _ = require_gemini()
+            client = genai.Client()
+            display_title = translate_title(client, args.model, original_title)
+            log.info("Translated title: %s", display_title)
         url = f"https://www.youtube.com/watch?v={video_id}"
         result = stitch_parts(output_dir, display_title, date, url, args.model, original_title=original_title)
         log.info("Stitched → %s", result)

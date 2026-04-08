@@ -15,3 +15,5 @@ build/
 .venv/
 venv/
 .coverage
+examples/*.part-*.txt
+examples/*.txt.tmp

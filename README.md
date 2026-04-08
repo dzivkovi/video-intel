@@ -456,16 +456,26 @@ Each chunk produces a separate part file — these are the primary artifacts.
 Use `--low-res` to reduce input tokens (~100/sec vs ~300/sec), recommended
 for videos over 55 minutes to stay within Gemini's 1M context window.
 
+Long-video workflow is two steps: **translate** (produces part files), then
+**stitch** (merges them). Part files use filenames for stable slug-based naming;
+the video title is translated to BCS during stitch via a single lightweight
+Gemini call. Timestamps within chunks are relative to the clip start — the
+stitcher applies absolute offsets from the filename and normalizes to `[HH:MM:SS]`.
+
 ```bash
-# Translate a 2-hour video (auto-chunks into 20-min segments)
+# Step 1: Translate (auto-chunks into 20-min segments)
 python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" --low-res
+
+# Step 2: Stitch part files + auto-translate title to BCS
+python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" --stitch
 
 # Backfill a failed chunk
 python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" \
   --start 40 --end 60 --low-res
 
-# Stitch part files into a single translation (no Gemini call)
-python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" --stitch
+# Override the auto-translated title
+python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" \
+  --stitch --title "Moj Naslov"
 ```
 
 **Note:** The Gemini Python SDK has a

@@ -9,7 +9,7 @@ symptoms:
   - "First chunk of auto-chunked 2h18m video hangs indefinitely on gemini-3.1-pro-preview"
   - "Streaming iterator blocks at gRPC/HTTP layer, never yields first token"
   - "Heartbeat thread logs 'Waiting for Gemini...' for 43+ minutes with no progress"
-root_cause: "Default model gemini-3.1-pro-preview is a Preview release with unstable/capacity-limited long video processing; replacing with GA model gemini-2.5-pro resolved the hang"
+root_cause: "Working hypothesis: Preview model gemini-3.1-pro-preview is unstable for long video; GA model gemini-2.5-pro resolved the hang. Timestamp drift resolved by clip-relative instructions + stitcher offset math."
 ---
 
 # Preview Model Hang on Long Video Translation
@@ -46,6 +46,12 @@ parser.add_argument("--model", default="gemini-2.5-pro")
 Supporting doc updates in `README.md`, `CLAUDE.md`, and the script's module docstring to reflect the new default.
 
 **Key insight:** The problem was not missing timeout logic — it was using a Preview-tier model for a production translation workflow. Preview models can hang, change behavior without notice, and lack the instruction-following fidelity needed for complex prompts (dialect selection, timestamp formatting, full-coverage chunking). The fix is to pin to a GA model that meets quality requirements.
+
+### Follow-up: Timestamp drift in 2.5-pro (resolved)
+
+Even with `gemini-2.5-pro`, timestamps drifted when chunks were instructed to use absolute offsets ("Timestamps must start at 1h 0m 0s"). Gemini starts correct but can't sustain the math — drifts to `[MM:SS]`, echo patterns (`[18:42:42]`), or nonsensical jumps.
+
+**Solution:** Let Gemini count from `[00:00:00]` (its natural mode) with a clip-relative instruction. The stitcher applies offsets mechanically using start time from the filename (`part-60-80` → +3600s). A chunk-aware classifier distinguishes relative, already-absolute, and implausible timestamps per-line, preventing double-offsetting or garbage propagation.
 
 ## Evidence
 
@@ -92,3 +98,4 @@ Before changing the model for any command, validate along these independent dime
 - `docs/adr/ADR-0003-single-model-replaces-pipeline.md` — Prior model selection reasoning for the main pipeline
 - `docs/adr/ADR-0001-gemini-as-multimodal-proxy.md` — Architectural context: Gemini as multimodal proxy
 - `work/2026-04-02/01-gemini-api-cost-audit.md` — API cost context ($17 for 340 videos)
+- Commit `2d16784` — clip-relative timestamps, chunk-aware stitcher, model default change
