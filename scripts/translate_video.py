@@ -185,6 +185,8 @@ def call_gemini_translate(
     system_prompt: str,
     model: str,
     tmp_file=None,
+    *,
+    low_res: bool = False,
 ) -> tuple[str, dict | None]:
     """Stream video translation from Gemini with heartbeat and progressive writes."""
     contents = types.Content(
@@ -193,11 +195,17 @@ def call_gemini_translate(
             types.Part(text="Translate the entire video audio to BCS."),
         ]
     )
-    config = types.GenerateContentConfig(
-        system_instruction=system_prompt,
-        max_output_tokens=MAX_OUTPUT_TOKENS,
-        temperature=0.2,
-    )
+    config_kwargs = {
+        "system_instruction": system_prompt,
+        "max_output_tokens": MAX_OUTPUT_TOKENS,
+        "temperature": 0.2,
+    }
+    if low_res:
+        # Must use the full enum name, not "low" — the API rejects shorthand with 400 INVALID_ARGUMENT.
+        # See: https://ai.google.dev/gemini-api/docs/video-understanding#technical-details-about-videos
+        # Default ~300 tokens/sec, low ~100 tokens/sec. 1M context ÷ 100 = ~2.7 hours max.
+        config_kwargs["media_resolution"] = "MEDIA_RESOLUTION_LOW"
+    config = types.GenerateContentConfig(**config_kwargs)
 
     max_retries = 3
     for attempt in range(max_retries + 1):
@@ -286,6 +294,7 @@ def translate_video(
     date_override: str | None = None,
     use_stdout: bool = False,
     force: bool = False,
+    low_res: bool = False,
 ) -> None:
     """Translate a YouTube video's audio to BCS subtitles."""
     genai, types = require_gemini()
@@ -331,6 +340,8 @@ def translate_video(
     log.info("Model:     %s", model_name)
     log.info("Video:     %s", canonical_url)
     log.info("Title:     %s", title)
+    if low_res:
+        log.info("Resolution: low (~100 tokens/sec, fits videos up to ~2.7 hours)")
     if output_path:
         log.info("Output:    %s", output_path)
         log.info('Progress:  tail -f "%s"', tmp_path)
@@ -347,7 +358,9 @@ def translate_video(
         if tmp_path:
             tmp_file = open(tmp_path, "w", encoding="utf-8")  # noqa: SIM115
 
-        text, usage = call_gemini_translate(client, types, canonical_url, system_prompt, model_name, tmp_file)
+        text, usage = call_gemini_translate(
+            client, types, canonical_url, system_prompt, model_name, tmp_file, low_res=low_res
+        )
     except Exception:
         if tmp_file:
             tmp_file.close()
@@ -410,12 +423,38 @@ Examples:
     parser.add_argument("--stdout", action="store_true", help="Print translation to stdout instead of file")
     parser.add_argument("--force", action="store_true", help="Overwrite existing translation")
     parser.add_argument(
+        "--low-res",
+        action="store_true",
+        help="Use low media resolution (~100 tokens/sec vs ~300). Required for videos over ~55 min.",
+    )
+    parser.add_argument(
+        "--ipv4",
+        action="store_true",
+        help="Force IPv4 connections (workaround for IPv6 socket stalls, see googleapis/python-genai#1893)",
+    )
+    parser.add_argument(
         "--log-level",
         default="info",
         choices=["debug", "info", "warning", "error"],
         help="Set logging verbosity (default: info)",
     )
     args = parser.parse_args()
+
+    # IPv4 workaround — process-global monkey-patch on socket.getaddrinfo().
+    # Affects ALL network calls in this process, not just Gemini.
+    # See: https://github.com/googleapis/python-genai/issues/1893
+    # The SDK can hang indefinitely when IPv6 routing is broken — no timeout, no error.
+    # This forces IPv4-only resolution. Opt-in because IPv6 works on most networks.
+    if args.ipv4:
+        import socket
+
+        _original_getaddrinfo = socket.getaddrinfo
+
+        def _ipv4_only_getaddrinfo(*a, **kw):
+            return [r for r in _original_getaddrinfo(*a, **kw) if r[0] == socket.AF_INET]
+
+        socket.getaddrinfo = _ipv4_only_getaddrinfo
+        log.info("Forcing IPv4 connections (--ipv4)")
 
     logging.basicConfig(
         level=logging.WARNING,
@@ -434,6 +473,7 @@ Examples:
         date_override=args.date,
         use_stdout=args.stdout,
         force=args.force,
+        low_res=args.low_res,
     )
 
 

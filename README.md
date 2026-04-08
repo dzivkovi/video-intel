@@ -449,6 +449,17 @@ Output follows the same `{date}-{slug}` naming convention as video-intel
 artifacts. See [examples/2026-04-05-the-tide-has-turned-rejoice-in-this.translate-bcs.txt](examples/2026-04-05-the-tide-has-turned-rejoice-in-this.translate-bcs.txt)
 for a real translation output.
 
+**Long videos (over ~55 minutes):** Use `--low-res` to reduce input tokens
+from ~300/sec to ~100/sec, fitting videos up to ~2.7 hours within Gemini's
+1M context window. Without it, a 2-hour video exceeds the context limit.
+See [Gemini video understanding docs](https://ai.google.dev/gemini-api/docs/video-understanding)
+for token math and limits.
+
+**If the script hangs indefinitely:** The Gemini Python SDK has a
+[known bug](https://github.com/googleapis/python-genai/issues/1893) where
+requests stall at the socket level with no timeout or error. Try `--ipv4`
+to force IPv4 connections as a workaround.
+
 ## Cross-Platform Compatibility
 
 This skill uses the open Agent Skills format (SKILL.md + scripts/).
