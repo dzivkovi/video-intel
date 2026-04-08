@@ -86,6 +86,26 @@ def load_prompt(prompt_name: str) -> str:
     return prompt_path.read_text(encoding="utf-8")
 
 
+def normalize_timestamp(line: str) -> str:
+    """Fix malformed timestamps where Gemini puts total minutes in the HH field.
+
+    Rule: parse [A:MM:SS]. If A <= 23, leave unchanged. If A > 23, treat A as
+    total minutes: divmod into hours, add remainder to MM, carry if needed.
+    """
+    m = re.match(r"\[(\d+):(\d{2}):(\d{2})\]", line)
+    if not m:
+        return line
+    a, mm, ss = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if a <= 23:
+        return line
+    hours, add_minutes = divmod(a, 60)
+    new_minutes = add_minutes + mm
+    if new_minutes >= 60:
+        extra_hours, new_minutes = divmod(new_minutes, 60)
+        hours += extra_hours
+    return f"[{hours:02d}:{new_minutes:02d}:{ss:02d}]{line[m.end() :]}"
+
+
 def build_output_path(output_dir: Path, title: str, date: str) -> Path:
     """Build the output file path using the video-intel naming convention."""
     slug = slugify(title)
@@ -131,17 +151,48 @@ def fetch_video_metadata(video_id: str) -> dict[str, str | int] | None:
     return result
 
 
-def build_header(title: str, url: str, published: str, model: str) -> str:
+def build_chunk_list(duration_seconds: int, chunk_minutes: int = 20) -> list[tuple[int, int]]:
+    """Build the list of (start_sec, end_sec) chunks for a video.
+
+    Policy from experiments:
+    - Videos <= 60 min: single request, no clipping → [(0, 0)]
+    - Videos > 60 min: first hour as one chunk, then chunk_minutes for remainder
+    """
+    first_hour = 3600
+    if duration_seconds <= first_hour:
+        return [(0, 0)]  # (0, 0) = no clipping, full video
+
+    chunk_seconds = chunk_minutes * 60
+    chunks = [(0, first_hour)]
+    pos = first_hour
+    while pos < duration_seconds:
+        end = min(pos + chunk_seconds, duration_seconds)
+        chunks.append((pos, end))
+        pos = end
+    return chunks
+
+
+def build_header(
+    title: str,
+    url: str,
+    published: str,
+    model: str,
+    *,
+    original_title: str | None = None,
+) -> str:
     """Build the metadata header for the translation file."""
     now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
-    return (
-        f"# Translation (BCS): {title}\n\n"
-        f"**Source:** {url}\n"
-        f"**Published:** {published}\n"
-        f"**Translated:** {now}\n"
-        f"**Model:** {model}\n\n"
-        f"---\n\n"
-    )
+    lines = [f"# Translation (BCS): {title}", ""]
+    if original_title and original_title != title:
+        lines.append(f"**Original:** {original_title}")
+    lines.append(f"**Source:** {url}")
+    lines.append(f"**Published:** {published}")
+    lines.append(f"**Translated:** {now}")
+    lines.append(f"**Model:** {model}")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    return "\n".join(lines) + "\n"
 
 
 def format_elapsed(seconds: float) -> str:
@@ -175,6 +226,93 @@ def format_stats(elapsed: float, line_count: int, usage: dict | None) -> str:
             lines.append(f"Total tokens:   {total:,}")
     lines.append(f"Lines:          {line_count}")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Stitcher — merges part files into a single translation
+# ---------------------------------------------------------------------------
+
+
+def stitch_parts(
+    part_dir: Path,
+    title: str,
+    date: str,
+    url: str,
+    model: str,
+    *,
+    original_title: str | None = None,
+) -> Path:
+    """Merge part files into a single stitched translation.
+
+    Part files are the canonical artifacts. This produces a convenience merged file.
+    No parts found → hard error. Missing intermediate parts → warn and stitch what exists.
+
+    Part discovery uses original_title slug (how parts were named during translation).
+    The title parameter is used only for the stitched file's header display.
+    """
+    # Discover parts by original title slug (parts were named during translation with original title)
+    discovery_slug = slugify(original_title) if original_title else slugify(title)
+    pattern = f"{date}-{discovery_slug}.part-*.translate-bcs.txt"
+    part_files = sorted(part_dir.glob(pattern))
+
+    if not part_files:
+        log.error("No part files matching pattern: %s/%s", part_dir, pattern)
+        sys.exit(1)
+
+    # Sort by start-minute extracted from filename (part-START-END)
+    def sort_key(p: Path) -> int:
+        m = re.search(r"\.part-(\d+)-", p.name)
+        return int(m.group(1)) if m else 0
+
+    part_files.sort(key=sort_key)
+
+    # Detect gaps between consecutive parts
+    for i in range(len(part_files) - 1):
+        current_end = re.search(r"\.part-\d+-(\d+)\.", part_files[i].name)
+        next_start = re.search(r"\.part-(\d+)-", part_files[i + 1].name)
+        if current_end and next_start:
+            end_min = int(current_end.group(1))
+            start_min = int(next_start.group(1))
+            if start_min > end_min:
+                log.warning("Gap: no part for %d-%d min", end_min, start_min)
+
+    # Read, normalize, and merge
+    all_lines: list[str] = []
+    last_ts: tuple[int, int, int] | None = None
+
+    for part_file in part_files:
+        content = part_file.read_text(encoding="utf-8")
+        lines = content.splitlines()
+
+        for line in lines:
+            normalized = normalize_timestamp(line)
+
+            # Check monotonic timestamps
+            ts_match = re.match(r"\[(\d{2}):(\d{2}):(\d{2})\]", normalized)
+            if ts_match:
+                current_ts = (int(ts_match.group(1)), int(ts_match.group(2)), int(ts_match.group(3)))
+                if last_ts is not None and current_ts < last_ts:
+                    log.warning(
+                        "Non-monotonic timestamp: [%02d:%02d:%02d] after [%02d:%02d:%02d]",
+                        *current_ts,
+                        *last_ts,
+                    )
+                last_ts = current_ts
+
+            all_lines.append(normalized)
+
+    # Build output
+    header = build_header(title, url, date, model, original_title=original_title)
+    body = "\n".join(all_lines)
+    # Ensure single trailing newline
+    if not body.endswith("\n"):
+        body += "\n"
+
+    output_path = part_dir / f"{date}-{discovery_slug}.translate-bcs.txt"
+    output_path.write_text(header + body, encoding="utf-8")
+
+    log.info("Stitched %d parts (%d lines) → %s", len(part_files), len(all_lines), output_path)
+    return output_path
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +408,11 @@ def call_gemini_translate(
     accumulated = []
     usage = None
     first_chunk = True
-    first_chunk_timeout = 600  # 10 minutes max wait for first chunk
+    # 10 minutes max wait for first chunk.
+    # KNOWN LIMITATION: this timeout only fires if the stream yields empty chunks while waiting.
+    # If the stream iterator itself blocks (pre-yield hang), this check never executes.
+    # The heartbeat thread still provides visibility, but the user must manually kill.
+    first_chunk_timeout = 600
 
     try:
         for chunk in stream:
@@ -339,7 +481,7 @@ def translate_video(
     use_stdout: bool = False,
     force: bool = False,
     low_res: bool = False,
-    chunk_minutes: int = 30,
+    chunk_minutes: int = 20,
     start_minutes: int | None = None,
     end_minutes: int | None = None,
 ) -> None:
@@ -390,24 +532,23 @@ def translate_video(
         user_end = duration_seconds or 0
 
     # Determine if we need chunking
-    # Auto-chunk when: video is long AND user didn't specify a manual range
-    chunk_seconds = chunk_minutes * 60
     manual_range = start_minutes is not None or end_minutes is not None
 
     if manual_range:
-        # User specified explicit range — single request with clipping
         needs_chunking = False
     else:
-        # Auto-chunk if video exceeds chunk size
-        needs_chunking = duration_seconds > chunk_seconds
+        needs_chunking = duration_seconds > 3600
 
-    # Resolve output path and tmp file
-    output_path = None
-    tmp_path = None
+    # Resolve output directory
     if not use_stdout:
         output_dir.mkdir(parents=True, exist_ok=True)
+
+    # For single-request and manual-range modes, resolve output path up front.
+    # For auto-chunking, each chunk gets its own part file (resolved in the loop).
+    output_path = None
+    tmp_path = None
+    if not use_stdout and not needs_chunking:
         if manual_range:
-            # Include time range in filename for partial translations
             slug = slugify(title)
             range_tag = f"part-{start_minutes or 0}-{end_minutes or 'end'}"
             output_path = output_dir / f"{date}-{slug}.{range_tag}.translate-bcs.txt"
@@ -422,13 +563,13 @@ def translate_video(
 
     # Build chunk list
     if needs_chunking:
-        chunks = []
-        pos = 0
-        while pos < duration_seconds:
-            end = min(pos + chunk_seconds, duration_seconds)
-            chunks.append((pos, end))
-            pos = end
-        log.info("Duration:  %s (%d chunks of %dm)", format_elapsed(duration_seconds), len(chunks), chunk_minutes)
+        chunks = build_chunk_list(duration_seconds, chunk_minutes)
+        log.info(
+            "Duration:  %s (1h first chunk + %d x %dm)",
+            format_elapsed(duration_seconds),
+            len(chunks) - 1,
+            chunk_minutes,
+        )
     elif manual_range:
         chunks = [(user_start, user_end)]
         log.info("Range:     %s → %s", format_elapsed(user_start), format_elapsed(user_end))
@@ -450,27 +591,101 @@ def translate_video(
     # Load prompt and call Gemini with streaming
     system_prompt = load_prompt("translate-bcs")
     client = genai.Client(api_key=api_key)
+    slug = slugify(title)
 
     start_time = time.time()
-    all_text_parts = []
     last_usage = None
-    tmp_file = None
+    part_files_written: list[Path] = []
 
-    try:
-        # Open tmp file for progressive writes
-        if tmp_path:
-            tmp_file = open(tmp_path, "w", encoding="utf-8")  # noqa: SIM115
-
+    if needs_chunking:
+        # Auto-chunk mode: each chunk produces its own part file (canonical artifacts)
         for i, (s_off, e_off) in enumerate(chunks):
-            use_clipping = s_off > 0 or e_off > 0
-            if len(chunks) > 1:
-                log.info("Chunk %d/%d: %s → %s", i + 1, len(chunks), format_elapsed(s_off), format_elapsed(e_off))
-            elif use_clipping:
-                log.info("Sending to Gemini (%s → %s)...", format_elapsed(s_off), format_elapsed(e_off))
-            else:
-                log.info("Sending to Gemini...")
+            s_min, e_min = s_off // 60, e_off // 60
+            part_path = output_dir / f"{date}-{slug}.part-{s_min}-{e_min}.translate-bcs.txt"
+            part_tmp = part_path.with_suffix(".txt.tmp")
 
+            if part_path.exists() and not force:
+                log.info("Chunk %d/%d already exists: %s", i + 1, len(chunks), part_path.name)
+                part_files_written.append(part_path)
+                continue
+
+            log.info("Chunk %d/%d: %s → %s", i + 1, len(chunks), format_elapsed(s_off), format_elapsed(e_off))
+            tmp_file = None
             try:
+                tmp_file = open(part_tmp, "w", encoding="utf-8")  # noqa: SIM115
+                text, usage = call_gemini_translate(
+                    client,
+                    types,
+                    canonical_url,
+                    system_prompt,
+                    model_name,
+                    tmp_file,
+                    low_res=low_res,
+                    start_offset=s_off,
+                    end_offset=e_off,
+                )
+                if usage:
+                    last_usage = usage
+            except TimeoutError:
+                log.warning(
+                    "Chunk %d/%d timed out (%s → %s). Skipping — retry with: --start %d --end %d",
+                    i + 1,
+                    len(chunks),
+                    format_elapsed(s_off),
+                    format_elapsed(e_off),
+                    s_min,
+                    e_min,
+                )
+                if tmp_file:
+                    tmp_file.close()
+                continue
+            except Exception:
+                if tmp_file:
+                    tmp_file.close()
+                if part_tmp.exists() and part_tmp.stat().st_size > 0:
+                    log.error("Partial chunk saved: %s", part_tmp)
+                raise
+            finally:
+                if tmp_file and not tmp_file.closed:
+                    tmp_file.close()
+
+            if text and text.strip():
+                part_tmp.write_text(text, encoding="utf-8")
+                part_tmp.replace(part_path)
+                part_files_written.append(part_path)
+                log.info("Written part: %s", part_path.name)
+            elif part_tmp.exists():
+                part_tmp.unlink()
+
+        elapsed = time.time() - start_time
+        if not part_files_written:
+            log.error("No chunks completed after %s", format_elapsed(elapsed))
+            sys.exit(1)
+
+        log.info(
+            "Completed %d/%d chunks in %s. Stitch with: --stitch",
+            len(part_files_written),
+            len(chunks),
+            format_elapsed(elapsed),
+        )
+        if last_usage:
+            log.info(format_stats(elapsed, 0, last_usage))
+
+    else:
+        # Single-request mode (no chunking, or manual range)
+        all_text_parts = []
+        tmp_file = None
+        try:
+            if tmp_path:
+                tmp_file = open(tmp_path, "w", encoding="utf-8")  # noqa: SIM115
+
+            for s_off, e_off in chunks:
+                use_clipping = s_off > 0 or e_off > 0
+                if use_clipping:
+                    log.info("Sending to Gemini (%s → %s)...", format_elapsed(s_off), format_elapsed(e_off))
+                else:
+                    log.info("Sending to Gemini...")
+
                 text, usage = call_gemini_translate(
                     client,
                     types,
@@ -486,50 +701,38 @@ def translate_video(
                     all_text_parts.append(text)
                 if usage:
                     last_usage = usage
-            except TimeoutError:
-                log.warning(
-                    "Chunk %d/%d timed out (%s → %s). Skipping — retry with: --start %d --end %d",
-                    i + 1,
-                    len(chunks),
-                    format_elapsed(s_off),
-                    format_elapsed(e_off),
-                    s_off // 60,
-                    e_off // 60,
-                )
-                continue
 
-    except Exception:
-        if tmp_file:
-            tmp_file.close()
-        # On failure, tmp file preserves partial progress
-        if tmp_path and tmp_path.exists() and tmp_path.stat().st_size > 0:
-            log.error("Partial translation saved: %s", tmp_path)
-        raise
-    finally:
-        if tmp_file and not tmp_file.closed:
-            tmp_file.close()
+        except Exception:
+            if tmp_file:
+                tmp_file.close()
+            if tmp_path and tmp_path.exists() and tmp_path.stat().st_size > 0:
+                log.error("Partial translation saved: %s", tmp_path)
+            raise
+        finally:
+            if tmp_file and not tmp_file.closed:
+                tmp_file.close()
 
-    elapsed = time.time() - start_time
-    full_text = "\n".join(all_text_parts)
+        elapsed = time.time() - start_time
+        full_text = "\n".join(all_text_parts)
 
-    if not full_text.strip():
-        log.error("Gemini returned empty response after %s", format_elapsed(elapsed))
-        sys.exit(1)
+        if not full_text.strip():
+            log.error("Gemini returned empty response after %s", format_elapsed(elapsed))
+            sys.exit(1)
 
-    if use_stdout:
-        print(full_text)
+        if use_stdout:
+            print(full_text)
+            line_count = full_text.count("\n") + 1
+            log.info(format_stats(elapsed, line_count, last_usage))
+            return
+
+        # Atomic promotion: write header + full text, then rename
+        header = build_header(title, canonical_url, date, model_name)
+        tmp_path.write_text(header + full_text, encoding="utf-8")
+        tmp_path.replace(output_path)
+
         line_count = full_text.count("\n") + 1
+        log.info("Written to %s", output_path)
         log.info(format_stats(elapsed, line_count, last_usage))
-        return
-
-    # Atomic promotion: write header + full text, then rename
-    header = build_header(title, canonical_url, date, model_name)
-    tmp_path.write_text(header + full_text, encoding="utf-8")
-    tmp_path.replace(output_path)
-
-    line_count = full_text.count("\n") + 1
-    log.info("Written to %s", output_path)
-    log.info(format_stats(elapsed, line_count, last_usage))
 
 
 def main() -> None:
@@ -543,11 +746,14 @@ Examples:
   %(prog)s "https://www.youtube.com/watch?v=VIDEO_ID" --stdout
   %(prog)s "https://www.youtube.com/watch?v=VIDEO_ID" --output-dir ./translations
 
-  # Long video — auto-chunks into 30-min segments
+  # Long video — first hour + 20-min chunks for remainder
   %(prog)s "https://www.youtube.com/watch?v=VIDEO_ID" --low-res
 
   # Translate only the second hour (backfill after partial success)
   %(prog)s "https://www.youtube.com/watch?v=VIDEO_ID" --start 60 --end 120 --low-res
+
+  # Stitch part files into a single translation (no Gemini call)
+  %(prog)s "https://www.youtube.com/watch?v=VIDEO_ID" --stitch
         """,
     )
     parser.add_argument("url", help="YouTube video URL")
@@ -569,8 +775,11 @@ Examples:
     parser.add_argument(
         "--chunk-minutes",
         type=int,
-        default=30,
-        help="Chunk size in minutes for auto-splitting long videos (default: 30)",
+        default=20,
+        help="Chunk size in minutes for auto-splitting long videos (default: 20)",
+    )
+    parser.add_argument(
+        "--stitch", action="store_true", help="Stitch part files into a single translation (no Gemini call)"
     )
     parser.add_argument("--stdout", action="store_true", help="Print translation to stdout instead of file")
     parser.add_argument("--force", action="store_true", help="Overwrite existing translation")
@@ -616,6 +825,22 @@ Examples:
     log.setLevel(getattr(logging, args.log_level.upper()))
 
     output_dir = Path(args.output_dir).expanduser()
+
+    if args.stitch:
+        # Stitch mode: merge existing part files, no Gemini call
+        video_id = extract_video_id(args.url)
+        if not video_id:
+            log.error("Could not extract video ID from: %s", args.url)
+            sys.exit(1)
+        meta = fetch_video_metadata(video_id)
+        original_title = meta["title"] if meta else video_id
+        date = args.date or (meta["published"] if meta else "0000-00-00")
+        # --title is the translated/display title; original_title is for part-file discovery
+        display_title = args.title or original_title
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        result = stitch_parts(output_dir, display_title, date, url, args.model, original_title=original_title)
+        log.info("Stitched → %s", result)
+        return
 
     translate_video(
         args.url,

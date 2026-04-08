@@ -63,7 +63,7 @@ Optional: `VOYAGE_API_KEY` (for vector search, free at https://dash.voyageai.com
 
 All commands support `--force` to regenerate existing output files.
 
-**Standalone utility:** `scripts/translate_video.py` — BCS subtitle translation. **This is NOT part of the video-intel pipeline.** It shares the same Gemini API patterns (lazy imports, retry logic, FileData for YouTube URLs) and lives in this repo for convenience, but has no dependency on `video_intel.py`, `config.yaml`, or the scan/transcript/concepts workflow. It has its own CLI args, its own output directory, and its own tests. Do not integrate it into the main script or add pipeline features (meta.json, concept extraction, etc.) to it.
+**Standalone utility:** `scripts/translate_video.py` — BCS subtitle translation. **This is NOT part of the video-intel pipeline.** It shares the same Gemini API patterns (lazy imports, retry logic, FileData for YouTube URLs) and lives in this repo for convenience, but has no dependency on `video_intel.py`, `config.yaml`, or the scan/transcript/concepts workflow. It has its own CLI args, its own output directory, and its own tests. Do not integrate it into the main script or add pipeline features (meta.json, concept extraction, etc.) to it. Videos up to 60 min translate as single requests. Longer videos auto-chunk: first hour as one piece, then 20-min segments for the remainder (`--chunk-minutes`). Part files are the canonical artifacts; `--stitch` merges them into a single file with timestamp normalization.
 
 **Prompt templates:** `prompts/*.md` — self-contained, referenced by name (without extension) in `config.yaml`:
 - `mindmap-knowledge` — thematic mind map with domain terminology + timestamps (default)

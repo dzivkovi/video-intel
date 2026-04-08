@@ -449,16 +449,30 @@ Output follows the same `{date}-{slug}` naming convention as video-intel
 artifacts. See [examples/2026-04-05-the-tide-has-turned-rejoice-in-this.translate-bcs.txt](examples/2026-04-05-the-tide-has-turned-rejoice-in-this.translate-bcs.txt)
 for a real translation output.
 
-**Long videos (over ~55 minutes):** Use `--low-res` to reduce input tokens
-from ~300/sec to ~100/sec, fitting videos up to ~2.7 hours within Gemini's
-1M context window. Without it, a 2-hour video exceeds the context limit.
-See [Gemini video understanding docs](https://ai.google.dev/gemini-api/docs/video-understanding)
-for token math and limits.
+**Long videos (over 60 minutes):** Videos up to 60 minutes translate as a
+single request. Longer videos auto-chunk: the first hour as one piece, then
+20-minute segments for the remainder (configurable with `--chunk-minutes`).
+Each chunk produces a separate part file — these are the primary artifacts.
+Use `--low-res` to reduce input tokens (~100/sec vs ~300/sec), recommended
+for videos over 55 minutes to stay within Gemini's 1M context window.
 
-**If the script hangs indefinitely:** The Gemini Python SDK has a
+```bash
+# Translate a 2-hour video (auto-chunks into 20-min segments)
+python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" --low-res
+
+# Backfill a failed chunk
+python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" \
+  --start 40 --end 60 --low-res
+
+# Stitch part files into a single translation (no Gemini call)
+python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" --stitch
+```
+
+**Note:** The Gemini Python SDK has a
 [known bug](https://github.com/googleapis/python-genai/issues/1893) where
-requests stall at the socket level with no timeout or error. Try `--ipv4`
-to force IPv4 connections as a workaround.
+requests can stall at the socket level. If this happens, try `--ipv4` to
+force IPv4 connections as a workaround (usually unrelated to the YouTube
+long-video chunking issue).
 
 ## Cross-Platform Compatibility
 
