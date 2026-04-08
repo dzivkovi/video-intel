@@ -4,7 +4,7 @@ Translate YouTube video audio to BCS (Bosnian/Croatian/Serbian) subtitles.
 
 Uses Gemini's multimodal video understanding with maxOutputTokens=65536
 to translate entire videos in a single pass (up to ~2.5 hours of typical
-dialogue density).
+dialogue density). Streams output progressively for live monitoring.
 
 Usage:
     export GEMINI_API_KEY=your_key
@@ -19,6 +19,7 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,6 +28,7 @@ log = logging.getLogger("translate_video")
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT_DIR = "~/Dropbox/My Life/Transcripts"
+MAX_OUTPUT_TOKENS = 65536
 
 
 # ---------------------------------------------------------------------------
@@ -126,13 +128,65 @@ def build_header(title: str, url: str, published: str, model: str) -> str:
     )
 
 
+def format_elapsed(seconds: float) -> str:
+    """Format seconds into human-readable duration."""
+    m, s = divmod(int(seconds), 60)
+    if m >= 60:
+        h, m = divmod(m, 60)
+        return f"{h}h {m}m {s}s"
+    if m > 0:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+def format_stats(elapsed: float, line_count: int, usage: dict | None) -> str:
+    """Format translation statistics for display."""
+    lines = [
+        "",
+        "--- Statistics ---",
+        f"Duration:       {format_elapsed(elapsed)}",
+    ]
+    if usage:
+        out_tokens = usage.get("candidates_token_count", 0)
+        in_tokens = usage.get("prompt_token_count", 0)
+        if out_tokens:
+            pct = (out_tokens / MAX_OUTPUT_TOKENS) * 100
+            lines.append(f"Output tokens:  {out_tokens:,} / {MAX_OUTPUT_TOKENS:,} ({pct:.1f}% of max)")
+        if in_tokens:
+            lines.append(f"Input tokens:   {in_tokens:,}")
+        total = usage.get("total_token_count", 0)
+        if total:
+            lines.append(f"Total tokens:   {total:,}")
+    lines.append(f"Lines:          {line_count}")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
-# Gemini translation
+# Heartbeat thread
 # ---------------------------------------------------------------------------
 
 
-def call_gemini_translate(client, types, video_url: str, system_prompt: str, model: str) -> str:
-    """Send video to Gemini for BCS translation with retry on rate limits."""
+def _heartbeat_loop(stop_event: threading.Event, start_time: float) -> None:
+    """Print elapsed time every 30s until stopped. Runs as daemon thread."""
+    while not stop_event.wait(timeout=30):
+        elapsed = time.time() - start_time
+        log.info("Waiting for Gemini... (%s)", format_elapsed(elapsed))
+
+
+# ---------------------------------------------------------------------------
+# Gemini streaming translation
+# ---------------------------------------------------------------------------
+
+
+def call_gemini_translate(
+    client,
+    types,
+    video_url: str,
+    system_prompt: str,
+    model: str,
+    tmp_file=None,
+) -> tuple[str, dict | None]:
+    """Stream video translation from Gemini with heartbeat and progressive writes."""
     contents = types.Content(
         parts=[
             types.Part(file_data=types.FileData(file_uri=video_url)),
@@ -141,19 +195,19 @@ def call_gemini_translate(client, types, video_url: str, system_prompt: str, mod
     )
     config = types.GenerateContentConfig(
         system_instruction=system_prompt,
-        max_output_tokens=65536,
+        max_output_tokens=MAX_OUTPUT_TOKENS,
         temperature=0.2,
     )
 
     max_retries = 3
     for attempt in range(max_retries + 1):
         try:
-            response = client.models.generate_content(
+            stream = client.models.generate_content_stream(
                 model=model,
                 contents=contents,
                 config=config,
             )
-            return response.text
+            break
         except Exception as e:
             error_str = str(e).lower()
             is_rate_limit = "429" in error_str or "resource exhausted" in error_str
@@ -164,6 +218,58 @@ def call_gemini_translate(client, types, video_url: str, system_prompt: str, mod
                 time.sleep(wait)
             else:
                 raise
+
+    # Start heartbeat thread
+    start_time = time.time()
+    stop_heartbeat = threading.Event()
+    heartbeat = threading.Thread(target=_heartbeat_loop, args=(stop_heartbeat, start_time), daemon=True)
+    heartbeat.start()
+
+    accumulated = []
+    usage = None
+    first_chunk = True
+
+    try:
+        for chunk in stream:
+            if first_chunk:
+                stop_heartbeat.set()
+                ttfc = time.time() - start_time
+                log.info("First chunk received (%s). Streaming translation...", format_elapsed(ttfc))
+                first_chunk = False
+
+            text = chunk.text
+            if text:
+                accumulated.append(text)
+                # Progressive write to tmp file
+                if tmp_file:
+                    tmp_file.write(text)
+                    tmp_file.flush()
+                # Live progress to stderr
+                print(text, end="", file=sys.stderr, flush=True)
+
+            # Capture usage metadata from final chunk
+            if hasattr(chunk, "usage_metadata") and chunk.usage_metadata:
+                meta = chunk.usage_metadata
+                usage = {
+                    "prompt_token_count": getattr(meta, "prompt_token_count", None),
+                    "candidates_token_count": getattr(meta, "candidates_token_count", None),
+                    "total_token_count": getattr(meta, "total_token_count", None),
+                }
+    except Exception as e:
+        stop_heartbeat.set()
+        partial = "".join(accumulated)
+        if partial:
+            log.error("Stream interrupted after %d chars: %s", len(partial), e)
+            log.error("Partial output preserved in .txt.tmp file")
+        else:
+            log.error("Stream failed before any output: %s", e)
+        raise
+    finally:
+        stop_heartbeat.set()
+        # Newline after streaming output
+        print("", file=sys.stderr)
+
+    return "".join(accumulated), usage
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +315,9 @@ def translate_video(
     title = title or video_id
     date = date or "0000-00-00"
 
-    # Resolve output path
+    # Resolve output path and tmp file
+    output_path = None
+    tmp_path = None
     if not use_stdout:
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = build_output_path(output_dir, title, date)
@@ -218,38 +326,59 @@ def translate_video(
             log.info("Already translated: %s (use --force to redo)", output_path)
             return
 
+        tmp_path = output_path.with_suffix(".txt.tmp")
+
     log.info("Model:     %s", model_name)
     log.info("Video:     %s", canonical_url)
     log.info("Title:     %s", title)
-    if not use_stdout:
+    if output_path:
         log.info("Output:    %s", output_path)
-    log.info("Sending to Gemini (this may take a few minutes)...")
+        log.info('Progress:  tail -f "%s"', tmp_path)
+    log.info("Sending to Gemini...")
 
-    # Load prompt and call Gemini
+    # Load prompt and call Gemini with streaming
     system_prompt = load_prompt("translate-bcs")
     client = genai.Client(api_key=api_key)
 
     start = time.time()
-    text = call_gemini_translate(client, types, canonical_url, system_prompt, model_name)
+    tmp_file = None
+    try:
+        # Open tmp file for progressive writes
+        if tmp_path:
+            tmp_file = open(tmp_path, "w", encoding="utf-8")  # noqa: SIM115
+
+        text, usage = call_gemini_translate(client, types, canonical_url, system_prompt, model_name, tmp_file)
+    except Exception:
+        if tmp_file:
+            tmp_file.close()
+        # On failure, tmp file preserves partial progress
+        if tmp_path and tmp_path.exists() and tmp_path.stat().st_size > 0:
+            log.error("Partial translation saved: %s", tmp_path)
+        raise
+    finally:
+        if tmp_file and not tmp_file.closed:
+            tmp_file.close()
+
     elapsed = time.time() - start
 
     if not text or not text.strip():
-        log.error("Gemini returned empty response after %.0fs", elapsed)
+        log.error("Gemini returned empty response after %s", format_elapsed(elapsed))
         sys.exit(1)
 
     if use_stdout:
         print(text)
-        log.info("Done in %.0fs", elapsed)
+        line_count = text.count("\n") + 1
+        log.info(format_stats(elapsed, line_count, usage))
         return
 
-    # Atomic write: tmp → replace (crash-safe for long translations)
+    # Atomic promotion: write header + full text, then rename
     header = build_header(title, canonical_url, date, model_name)
-    tmp_path = output_path.with_suffix(".txt.tmp")
     tmp_path.write_text(header + text, encoding="utf-8")
     tmp_path.replace(output_path)
 
     line_count = text.count("\n") + 1
-    log.info("Done in %.0fs — %d lines written to %s", elapsed, line_count, output_path)
+    log.info("Written to %s", output_path)
+    log.info(format_stats(elapsed, line_count, usage))
 
 
 def main() -> None:

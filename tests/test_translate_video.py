@@ -1,6 +1,6 @@
 """Tests for translate_video.py — pure functions only, no API calls."""
 
-from translate_video import build_output_path, extract_video_id, slugify
+from translate_video import build_output_path, extract_video_id, format_elapsed, format_stats, slugify
 
 
 class TestExtractVideoId:
@@ -73,6 +73,48 @@ class TestSkipIfExists:
         rebuilt = _bop(tmp_path, "Existing Video", "2024-01-01")
         assert rebuilt.exists()
         assert rebuilt.read_text(encoding="utf-8") == original_content
+
+
+class TestFormatElapsed:
+    def test_format_elapsed_seconds_only(self):
+        assert format_elapsed(45) == "45s"
+
+    def test_format_elapsed_minutes_and_seconds(self):
+        assert format_elapsed(125) == "2m 5s"
+
+    def test_format_elapsed_hours_minutes_seconds(self):
+        assert format_elapsed(3725) == "1h 2m 5s"
+
+    def test_format_elapsed_zero(self):
+        assert format_elapsed(0) == "0s"
+
+
+class TestFormatStats:
+    def test_format_stats_with_usage_metadata(self):
+        usage = {
+            "prompt_token_count": 500_000,
+            "candidates_token_count": 12_847,
+            "total_token_count": 512_847,
+        }
+        result = format_stats(342.0, 487, usage)
+        assert "5m 42s" in result
+        assert "12,847" in result
+        assert "65,536" in result
+        assert "19.6%" in result
+        assert "500,000" in result
+        assert "487" in result
+
+    def test_format_stats_without_usage_metadata(self):
+        result = format_stats(91.0, 132, None)
+        assert "1m 31s" in result
+        assert "132" in result
+        assert "Output tokens" not in result
+
+    def test_format_stats_partial_usage(self):
+        usage = {"candidates_token_count": 5000, "prompt_token_count": None, "total_token_count": None}
+        result = format_stats(60.0, 50, usage)
+        assert "5,000" in result
+        assert "Input tokens" not in result
 
 
 class TestLoadPrompt:
