@@ -1,6 +1,13 @@
 """Tests for translate_video.py — pure functions only, no API calls."""
 
-from translate_video import build_output_path, extract_video_id, format_elapsed, format_stats, slugify
+from translate_video import (
+    build_output_path,
+    extract_video_id,
+    format_elapsed,
+    format_stats,
+    parse_iso8601_duration,
+    slugify,
+)
 
 
 class TestExtractVideoId:
@@ -35,6 +42,20 @@ class TestSlugify:
         # If truncation lands mid-word leaving a trailing dash
         result = slugify("hello-world-this-is-long", max_len=12)
         assert not result.endswith("-")
+
+
+class TestParseIso8601Duration:
+    def test_parse_full_duration(self):
+        assert parse_iso8601_duration("PT2H18M42S") == 2 * 3600 + 18 * 60 + 42
+
+    def test_parse_minutes_only(self):
+        assert parse_iso8601_duration("PT11M30S") == 11 * 60 + 30
+
+    def test_parse_hours_only(self):
+        assert parse_iso8601_duration("PT1H") == 3600
+
+    def test_parse_invalid_returns_zero(self):
+        assert parse_iso8601_duration("invalid") == 0
 
 
 class TestBuildOutputPath:
