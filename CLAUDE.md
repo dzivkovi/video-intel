@@ -63,12 +63,15 @@ Optional: `VOYAGE_API_KEY` (for vector search, free at https://dash.voyageai.com
 
 All commands support `--force` to regenerate existing output files.
 
+**Standalone utility:** `scripts/translate_video.py` — BCS subtitle translation. **This is NOT part of the video-intel pipeline.** It shares the same Gemini API patterns (lazy imports, retry logic, FileData for YouTube URLs) and lives in this repo for convenience, but has no dependency on `video_intel.py`, `config.yaml`, or the scan/transcript/concepts workflow. It has its own CLI args, its own output directory, and its own tests. Do not integrate it into the main script or add pipeline features (meta.json, concept extraction, etc.) to it.
+
 **Prompt templates:** `prompts/*.md` — self-contained, referenced by name (without extension) in `config.yaml`:
 - `mindmap-knowledge` — thematic mind map with domain terminology + timestamps (default)
 - `mindmap-light` — fast scan, 4-6 branches
 - `mindmap-heavy` — comprehensive, 6-10 branches with resources/perspectives
 - `transcript` — three-task decoupled prompt returning structured JSON
 - `concepts` — concept extraction + normalization against taxonomy, with `{{taxonomy}}` template slot
+- `translate-bcs` — BCS subtitle translation system prompt (used by `translate_video.py`, not the main pipeline)
 
 **Config:** `config.yaml` — channels, output directory, model, parallelism, per-channel prompt/since overrides.
 

@@ -249,6 +249,7 @@ Prompts live in `prompts/`. Each file is self-contained.
 | mindmap-heavy.md | Comprehensive extraction (6-10 branches, resources, perspectives) |
 | transcript.md | Three-task diarized transcript with screen content |
 | concepts.md | Concept extraction + normalization against taxonomy |
+| translate-bcs.md | BCS subtitle translation (used by `translate_video.py`) |
 
 Add a `.md` file to `prompts/` and reference it in config.yaml by filename
 (without extension).
@@ -410,6 +411,43 @@ python scripts/video_intel.py taxonomy-build
 
 Transcripts are independent of mindmaps and concepts — they only need
 regeneration if you change the transcript prompt.
+
+## Bosnian/Croatian/Serbian (BCS) Translation Utility
+
+A separate utility script for translating YouTube video audio into
+BCS subtitles. Not part of the video-intel
+pipeline, but shares the same Gemini API patterns and lives in this repo.
+
+**Why this exists.** Millions of people in the Balkans and the diaspora
+speak BCS languages that YouTube's auto-translate does not support.
+Gemini can translate video audio into BCS with high quality, but the web
+interface caps output at 8K tokens (~30 minutes of video). The API allows
+65K tokens, enough for 2-3 hours of content in a single pass. This script
+is a bridge: it gives non-English speakers access to long-form content
+that YouTube's own tools cannot reach yet.
+
+Built for family, elders, and friends who live in North America but
+cannot benefit from English-language YouTube.
+
+```bash
+# Translate a video to BCS (auto-detects title, saves to file)
+python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID"
+
+# Save to a specific directory (e.g., the examples folder in this repo)
+python scripts/translate_video.py "https://www.youtube.com/watch?v=Sm7568B0BC8" \
+  --output-dir ./examples
+
+# Print to stdout instead of file
+python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" --stdout
+
+# Use a different model
+python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" \
+  --model gemini-2.5-pro
+```
+
+Output follows the same `{date}-{slug}` naming convention as video-intel
+artifacts. See [examples/2026-04-05-the-tide-has-turned-rejoice-in-this.translate-bcs.txt](examples/2026-04-05-the-tide-has-turned-rejoice-in-this.translate-bcs.txt)
+for a real translation output.
 
 ## Cross-Platform Compatibility
 
