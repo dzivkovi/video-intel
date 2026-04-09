@@ -449,12 +449,15 @@ Output follows the same `{date}-{slug}` naming convention as video-intel
 artifacts. See [examples/2026-04-05-the-tide-has-turned-rejoice-in-this.translate-bcs.txt](examples/2026-04-05-the-tide-has-turned-rejoice-in-this.translate-bcs.txt)
 for a real translation output.
 
+**Token budget:** Gemini's input limit is 1M tokens. At full resolution,
+video costs ~300 tokens/sec (~55 min max). With `--low-res` it drops to
+~100 tokens/sec (~170 min max). **Always use `--low-res` for videos over
+45 minutes.**
+
 **Long videos (over 60 minutes):** Videos up to 60 minutes translate as a
 single request. Longer videos auto-chunk: the first hour as one piece, then
 20-minute segments for the remainder (configurable with `--chunk-minutes`).
 Each chunk produces a separate part file — these are the primary artifacts.
-Use `--low-res` to reduce input tokens (~100/sec vs ~300/sec), recommended
-for videos over 55 minutes to stay within Gemini's 1M context window.
 
 Long-video workflow is two steps: **translate** (produces part files), then
 **stitch** (merges them). Part files use filenames for stable slug-based naming;
@@ -463,10 +466,17 @@ Gemini call. Timestamps within chunks are relative to the clip start — the
 stitcher applies absolute offsets from the filename and normalizes to `[HH:MM:SS]`.
 
 ```bash
-# Step 1: Translate (auto-chunks into 20-min segments)
+# Short video (under 45 min) — full resolution, single pass
+python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID"
+
+# Long video (over 45 min) — auto-chunks into first hour + 20-min parts
 python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" --low-res
 
-# Step 2: Stitch part files + auto-translate title to BCS
+# Partial translation — e.g. first hour only, skip the interview segment
+python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" \
+  --end 63 --low-res
+
+# Stitch parts into single file (auto-translates title, adds coverage metadata)
 python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" --stitch
 
 # Backfill a failed chunk
@@ -478,11 +488,23 @@ python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" \
   --stitch --title "Moj Naslov"
 ```
 
+**Partial translations:** When stitching a subset of a video (e.g., only
+the first hour of a 2h18m video), the output includes a `**Coverage:**`
+line in the header and a BCS reader note indicating what portion was
+translated. Full translations omit these — no clutter in the normal case.
+
+**Error handling:** The script retries automatically on Gemini server
+errors (408, 500, 502, 503, 504) with exponential backoff — up to 8
+retries over ~30 minutes. Rate limits (429) retry 3 times with shorter
+waits. A 20-minute read timeout prevents infinite hangs when Gemini
+accepts a request but never responds — the connection is aborted and
+your terminal is returned. All retries log progress with
+`(Ctrl+C to abort)`.
+
 **Note:** The Gemini Python SDK has a
 [known bug](https://github.com/googleapis/python-genai/issues/1893) where
 requests can stall at the socket level. If this happens, try `--ipv4` to
-force IPv4 connections as a workaround (usually unrelated to the YouTube
-long-video chunking issue).
+force IPv4 connections as a workaround.
 
 ## Cross-Platform Compatibility
 

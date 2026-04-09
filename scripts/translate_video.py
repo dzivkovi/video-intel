@@ -27,8 +27,10 @@ from pathlib import Path
 log = logging.getLogger("translate_video")
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
-DEFAULT_OUTPUT_DIR = "~/Dropbox/My Life/Transcripts"
+DEFAULT_OUTPUT_DIR = "./examples"
 MAX_OUTPUT_TOKENS = 65536
+RETRYABLE_SERVER_CODES = {408, 500, 502, 503, 504}
+RETRYABLE_RATE_CODES = {429}
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +236,11 @@ def build_chunk_list(duration_seconds: int, chunk_minutes: int = 20) -> list[tup
     return chunks
 
 
+def _format_hhmm(seconds: int) -> str:
+    """Format seconds as HH:MM for coverage display."""
+    return f"{seconds // 3600:02d}:{(seconds % 3600) // 60:02d}"
+
+
 def build_header(
     title: str,
     url: str,
@@ -241,8 +248,15 @@ def build_header(
     model: str,
     *,
     original_title: str | None = None,
+    coverage: tuple[int, int] | None = None,
+    duration_seconds: int | None = None,
 ) -> str:
-    """Build the metadata header for the translation file."""
+    """Build the metadata header for the translation file.
+
+    coverage: (start_min, end_min) of translated range.
+    duration_seconds: total video duration from YouTube API.
+    When both are provided, a Coverage line is added to the header.
+    """
     now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
     lines = [f"# Translation (BCS): {title}", ""]
     if original_title and original_title != title:
@@ -251,6 +265,11 @@ def build_header(
     lines.append(f"**Published:** {published}")
     lines.append(f"**Translated:** {now}")
     lines.append(f"**Model:** {model}")
+    if coverage is not None and duration_seconds is not None:
+        cov_start, cov_end = coverage
+        total_hhmm = _format_hhmm(duration_seconds)
+        cov_label = f"{_format_hhmm(cov_start * 60)} \u2013 {_format_hhmm(cov_end * 60)} / {total_hhmm} total"
+        lines.append(f"**Coverage:** {cov_label}")
     lines.append("")
     lines.append("---")
     lines.append("")
@@ -290,6 +309,34 @@ def format_stats(elapsed: float, line_count: int, usage: dict | None) -> str:
     return "\n".join(lines)
 
 
+def _get_retry_delay(
+    exc: Exception,
+    attempt: int,
+    *,
+    max_retries_rate: int,
+    max_retries_server: int,
+) -> tuple[str, float, int] | None:
+    """Return retry metadata for retryable Gemini API errors."""
+    from google.genai import errors
+
+    if not isinstance(exc, errors.APIError):
+        return None
+
+    if exc.code in RETRYABLE_SERVER_CODES:
+        if attempt >= max_retries_server:
+            return None
+        base_wait = 60 * (2 ** min(attempt, 3))  # 60s, 120s, 240s, 480s cap
+        return "Server error", base_wait + random.uniform(0, 10), max_retries_server
+
+    if exc.code in RETRYABLE_RATE_CODES:
+        if attempt >= max_retries_rate:
+            return None
+        base_wait = 15 * (2**attempt)  # 15s, 30s, 60s
+        return "Rate limited (429)", base_wait + random.uniform(0, 10), max_retries_rate
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Stitcher — merges part files into a single translation
 # ---------------------------------------------------------------------------
@@ -303,6 +350,7 @@ def stitch_parts(
     model: str,
     *,
     original_title: str | None = None,
+    duration_seconds: int | None = None,
 ) -> Path:
     """Merge part files into a single stitched translation.
 
@@ -311,6 +359,7 @@ def stitch_parts(
 
     Part discovery uses original_title slug (how parts were named during translation).
     The title parameter is used only for the stitched file's header display.
+    duration_seconds: total video duration (from YouTube API) for coverage metadata.
     """
     # Discover parts by original title slug (parts were named during translation with original title)
     discovery_slug = slugify(original_title) if original_title else slugify(title)
@@ -372,15 +421,39 @@ def stitch_parts(
 
             all_lines.append(adjusted)
 
+    # Calculate coverage range from part filenames (first start, last end in minutes)
+    first_match = re.search(r"\.part-(\d+)-\d+\.", part_files[0].name)
+    last_match = re.search(r"\.part-\d+-(\d+)\.", part_files[-1].name)
+    coverage_start = int(first_match.group(1)) if first_match else 0
+    coverage_end = int(last_match.group(1)) if last_match else 0
+    coverage = (coverage_start, coverage_end) if coverage_end > 0 else None
+
+    is_partial = (
+        coverage is not None
+        and duration_seconds is not None
+        and coverage_end * 60 < duration_seconds - 60  # >1 min gap = partial
+    )
+
     # Build output
-    header = build_header(title, url, date, model, original_title=original_title)
+    header = build_header(
+        title, url, date, model,
+        original_title=original_title,
+        coverage=coverage,
+        duration_seconds=duration_seconds,
+    )
+    bcs_note = ""
+    if is_partial:
+        cov_hhmm = _format_hhmm(coverage_end * 60)
+        total_hhmm = _format_hhmm(duration_seconds)
+        bcs_note = f"> Ovaj prevod pokriva prvih {cov_hhmm} od ukupno {total_hhmm} videa.\n\n"
+
     body = "\n".join(all_lines)
     # Ensure single trailing newline
     if not body.endswith("\n"):
         body += "\n"
 
     output_path = part_dir / f"{date}-{discovery_slug}.translate-bcs.txt"
-    output_path.write_text(header + body, encoding="utf-8")
+    output_path.write_text(header + bcs_note + body, encoding="utf-8")
 
     log.info("Stitched %d parts (%d lines) → %s", len(part_files), len(all_lines), output_path)
     return output_path
@@ -452,8 +525,9 @@ def call_gemini_translate(
         config_kwargs["media_resolution"] = "MEDIA_RESOLUTION_LOW"
     config = types.GenerateContentConfig(**config_kwargs)
 
-    max_retries = 3
-    for attempt in range(max_retries + 1):
+    max_retries_rate = 3   # 429 rate-limit: short bursts, resolve quickly
+    max_retries_server = 8  # 503 overload: capacity issues, may last minutes
+    for attempt in range(max(max_retries_rate, max_retries_server) + 1):
         try:
             stream = client.models.generate_content_stream(
                 model=model,
@@ -462,15 +536,20 @@ def call_gemini_translate(
             )
             break
         except Exception as e:
-            error_str = str(e).lower()
-            is_rate_limit = "429" in error_str or "resource exhausted" in error_str
-            is_server_error = "503" in error_str or "overloaded" in error_str
-            if (is_rate_limit or is_server_error) and attempt < max_retries:
-                wait = (15 * (2**attempt)) + random.uniform(0, 5)
-                log.warning("Rate limited, retrying in %ds...", wait)
-                time.sleep(wait)
-            else:
+            retry = _get_retry_delay(
+                e,
+                attempt,
+                max_retries_rate=max_retries_rate,
+                max_retries_server=max_retries_server,
+            )
+            if retry is None:
                 raise
+            kind, wait, max_for_type = retry
+            log.warning(
+                "%s — retry %d/%d in %.0fs (Ctrl+C to abort)",
+                kind, attempt + 1, max_for_type, wait,
+            )
+            time.sleep(wait)
 
     # Start heartbeat thread
     start_time = time.time()
@@ -481,9 +560,8 @@ def call_gemini_translate(
     accumulated = []
     usage = None
     first_chunk = True
-    # If the stream iterator blocks without yielding (pre-yield hang), this loop
-    # never advances and the timeout check below never fires. The heartbeat thread
-    # still logs progress so the user knows it's stuck — Ctrl+C to abort.
+    # httpx read timeout (300s) aborts if the server goes silent during streaming.
+    # The timeout check below catches empty-chunk stalls within the iterator.
     first_chunk_timeout = 600
 
     try:
@@ -662,7 +740,17 @@ def translate_video(
 
     # Load prompt and call Gemini with streaming
     system_prompt = load_prompt("translate-bcs")
-    client = genai.Client(api_key=api_key)
+    import httpx
+
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(
+            # read=1200: abort if server is silent for 20 min during streaming.
+            # Does NOT limit total request time — only the gap between data.
+            # Pro can take 10-15 min before first chunk on long videos.
+            client_args={"timeout": httpx.Timeout(connect=30, read=1200, write=30, pool=30)},
+        ),
+    )
     slug = slugify(title)
 
     start_time = time.time()
@@ -812,20 +900,29 @@ def main() -> None:
         description="Translate YouTube video audio to BCS subtitles via Gemini",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  %(prog)s "https://www.youtube.com/watch?v=VIDEO_ID"
-  %(prog)s "https://www.youtube.com/watch?v=VIDEO_ID" --model gemini-2.5-pro
-  %(prog)s "https://www.youtube.com/watch?v=VIDEO_ID" --stdout
-  %(prog)s "https://www.youtube.com/watch?v=VIDEO_ID" --output-dir ./translations
+Token budget:
+  Gemini's input limit is 1M tokens. At full resolution, video costs ~300
+  tokens/sec (~55 min max). With --low-res it drops to ~100 tokens/sec
+  (~170 min max). Rule of thumb: always use --low-res for videos over 45 min.
 
-  # Long video — first hour + 20-min chunks for remainder
+Examples:
+  # Short video (under 45 min) — full resolution, single pass
+  %(prog)s "https://www.youtube.com/watch?v=VIDEO_ID"
+
+  # Long video (over 45 min) — auto-chunks into first hour + 20-min parts
   %(prog)s "https://www.youtube.com/watch?v=VIDEO_ID" --low-res
 
-  # Translate only the second hour (backfill after partial success)
-  %(prog)s "https://www.youtube.com/watch?v=VIDEO_ID" --start 60 --end 120 --low-res
+  # Partial translation — e.g. first hour only, skip the interview segment
+  %(prog)s "https://www.youtube.com/watch?v=VIDEO_ID" --end 63 --low-res
 
-  # Stitch part files into a single translation (no Gemini call)
+  # Stitch parts into single file (auto-translates title, adds coverage metadata)
   %(prog)s "https://www.youtube.com/watch?v=VIDEO_ID" --stitch
+
+  # Backfill a failed or missing chunk
+  %(prog)s "https://www.youtube.com/watch?v=VIDEO_ID" --start 60 --end 80 --low-res
+
+  # Custom output directory
+  %(prog)s "https://www.youtube.com/watch?v=VIDEO_ID" --output-dir ./translations
         """,
     )
     parser.add_argument("url", help="YouTube video URL")
@@ -916,7 +1013,12 @@ Examples:
             display_title = translate_title(client, args.model, original_title)
             log.info("Translated title: %s", display_title)
         url = f"https://www.youtube.com/watch?v={video_id}"
-        result = stitch_parts(output_dir, display_title, date, url, args.model, original_title=original_title)
+        total_duration = meta.get("duration_seconds") if meta else None
+        result = stitch_parts(
+            output_dir, display_title, date, url, args.model,
+            original_title=original_title,
+            duration_seconds=total_duration,
+        )
         log.info("Stitched → %s", result)
         return
 

@@ -4,8 +4,11 @@ import logging
 from pathlib import Path
 
 from translate_video import (
+    _format_hhmm,
+    _get_retry_delay,
     apply_timestamp_offset,
     build_chunk_list,
+    build_header,
     build_output_path,
     extract_video_id,
     format_elapsed,
@@ -143,6 +146,45 @@ class TestFormatStats:
         result = format_stats(60.0, 50, usage)
         assert "5,000" in result
         assert "Input tokens" not in result
+
+
+class TestGetRetryDelay:
+    def test_server_error_503_gets_long_retry_budget(self, monkeypatch):
+        from google.genai import errors
+
+        monkeypatch.setattr("translate_video.random.uniform", lambda _a, _b: 0)
+        exc = errors.APIError(503, {"error": {"message": "overloaded", "status": "UNAVAILABLE"}})
+
+        result = _get_retry_delay(exc, 0, max_retries_rate=3, max_retries_server=8)
+
+        assert result == ("Server error", 60, 8)
+
+    def test_rate_limit_429_gets_short_retry_budget(self, monkeypatch):
+        from google.genai import errors
+
+        monkeypatch.setattr("translate_video.random.uniform", lambda _a, _b: 0)
+        exc = errors.APIError(429, {"error": {"message": "quota hit", "status": "RESOURCE_EXHAUSTED"}})
+
+        result = _get_retry_delay(exc, 1, max_retries_rate=3, max_retries_server=8)
+
+        assert result == ("Rate limited (429)", 30, 3)
+
+    def test_non_retryable_api_error_returns_none(self):
+        from google.genai import errors
+
+        exc = errors.APIError(400, {"error": {"message": "bad request", "status": "INVALID_ARGUMENT"}})
+
+        assert _get_retry_delay(exc, 0, max_retries_rate=3, max_retries_server=8) is None
+
+    def test_non_api_error_returns_none(self):
+        assert _get_retry_delay(RuntimeError("503 overloaded"), 0, max_retries_rate=3, max_retries_server=8) is None
+
+    def test_server_error_stops_retrying_after_budget(self):
+        from google.genai import errors
+
+        exc = errors.APIError(503, {"error": {"message": "overloaded", "status": "UNAVAILABLE"}})
+
+        assert _get_retry_delay(exc, 8, max_retries_rate=3, max_retries_server=8) is None
 
 
 class TestBuildChunkList:
@@ -416,6 +458,103 @@ class TestStitchParts:
 
         # Assert: warning about non-monotonic, but still succeeds
         assert any("monotonic" in r.message.lower() for r in caplog.records)
+
+
+class TestFormatHhmm:
+    def test_zero(self):
+        assert _format_hhmm(0) == "00:00"
+
+    def test_one_hour(self):
+        assert _format_hhmm(3600) == "01:00"
+
+    def test_63_minutes(self):
+        assert _format_hhmm(63 * 60) == "01:03"
+
+    def test_2h18m(self):
+        assert _format_hhmm(2 * 3600 + 18 * 60) == "02:18"
+
+
+class TestBuildHeaderCoverage:
+    """Tests for coverage metadata in build_header()."""
+
+    def test_no_coverage_no_duration_omits_line(self):
+        header = build_header("Title", "https://example.com", "2024-01-01", "gemini-test")
+        assert "Coverage" not in header
+
+    def test_coverage_without_duration_omits_line(self):
+        header = build_header(
+            "Title", "https://example.com", "2024-01-01", "gemini-test",
+            coverage=(0, 63),
+        )
+        assert "Coverage" not in header
+
+    def test_duration_without_coverage_omits_line(self):
+        header = build_header(
+            "Title", "https://example.com", "2024-01-01", "gemini-test",
+            duration_seconds=8280,
+        )
+        assert "Coverage" not in header
+
+    def test_partial_coverage_shown(self):
+        header = build_header(
+            "Title", "https://example.com", "2024-01-01", "gemini-test",
+            coverage=(0, 63), duration_seconds=2 * 3600 + 18 * 60,
+        )
+        assert "**Coverage:** 00:00" in header
+        assert "01:03" in header
+        assert "02:18 total" in header
+
+    def test_full_coverage_shown(self):
+        header = build_header(
+            "Title", "https://example.com", "2024-01-01", "gemini-test",
+            coverage=(0, 138), duration_seconds=138 * 60,
+        )
+        assert "**Coverage:** 00:00" in header
+        assert "02:18" in header
+
+
+class TestStitchPartsCoverage:
+    """Tests for coverage metadata and BCS partial note in stitch_parts()."""
+
+    def _write_part(self, tmp_path: Path, slug: str, date: str, start: int, end: int, lines: list[str]) -> Path:
+        path = tmp_path / f"{date}-{slug}.part-{start}-{end}.translate-bcs.txt"
+        path.write_text("\n".join(lines), encoding="utf-8")
+        return path
+
+    def test_partial_stitch_adds_coverage_and_bcs_note(self, tmp_path):
+        self._write_part(tmp_path, "vid", "2024-01-01", 0, 63, ["[00:00:00] text"])
+
+        result = stitch_parts(
+            tmp_path, "Vid", "2024-01-01", "https://youtube.com/watch?v=TEST", "gemini-test",
+            duration_seconds=2 * 3600 + 18 * 60,
+        )
+        content = result.read_text(encoding="utf-8")
+        assert "**Coverage:** 00:00" in content
+        assert "01:03" in content
+        assert "02:18 total" in content
+        assert "Ovaj prevod pokriva" in content
+
+    def test_full_coverage_no_bcs_note(self, tmp_path):
+        self._write_part(tmp_path, "vid", "2024-01-01", 0, 60, ["[00:00:00] first"])
+        self._write_part(tmp_path, "vid", "2024-01-01", 60, 120, ["[00:00:00] second"])
+
+        result = stitch_parts(
+            tmp_path, "Vid", "2024-01-01", "https://youtube.com/watch?v=TEST", "gemini-test",
+            duration_seconds=120 * 60,
+        )
+        content = result.read_text(encoding="utf-8")
+        assert "**Coverage:**" in content
+        assert "Ovaj prevod pokriva" not in content
+
+    def test_no_duration_omits_coverage(self, tmp_path):
+        self._write_part(tmp_path, "vid", "2024-01-01", 0, 63, ["[00:00:00] text"])
+
+        result = stitch_parts(
+            tmp_path, "Vid", "2024-01-01", "https://youtube.com/watch?v=TEST", "gemini-test",
+        )
+        content = result.read_text(encoding="utf-8")
+        assert "Coverage" not in content
+        assert "Ovaj prevod pokriva" not in content
 
 
 class TestLoadPrompt:
