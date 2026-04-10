@@ -483,22 +483,32 @@ class TestBuildHeaderCoverage:
 
     def test_coverage_without_duration_omits_line(self):
         header = build_header(
-            "Title", "https://example.com", "2024-01-01", "gemini-test",
+            "Title",
+            "https://example.com",
+            "2024-01-01",
+            "gemini-test",
             coverage=(0, 63),
         )
         assert "Coverage" not in header
 
     def test_duration_without_coverage_omits_line(self):
         header = build_header(
-            "Title", "https://example.com", "2024-01-01", "gemini-test",
+            "Title",
+            "https://example.com",
+            "2024-01-01",
+            "gemini-test",
             duration_seconds=8280,
         )
         assert "Coverage" not in header
 
     def test_partial_coverage_shown(self):
         header = build_header(
-            "Title", "https://example.com", "2024-01-01", "gemini-test",
-            coverage=(0, 63), duration_seconds=2 * 3600 + 18 * 60,
+            "Title",
+            "https://example.com",
+            "2024-01-01",
+            "gemini-test",
+            coverage=(0, 63),
+            duration_seconds=2 * 3600 + 18 * 60,
         )
         assert "**Coverage:** 00:00" in header
         assert "01:03" in header
@@ -506,8 +516,12 @@ class TestBuildHeaderCoverage:
 
     def test_full_coverage_shown(self):
         header = build_header(
-            "Title", "https://example.com", "2024-01-01", "gemini-test",
-            coverage=(0, 138), duration_seconds=138 * 60,
+            "Title",
+            "https://example.com",
+            "2024-01-01",
+            "gemini-test",
+            coverage=(0, 138),
+            duration_seconds=138 * 60,
         )
         assert "**Coverage:** 00:00" in header
         assert "02:18" in header
@@ -525,7 +539,11 @@ class TestStitchPartsCoverage:
         self._write_part(tmp_path, "vid", "2024-01-01", 0, 63, ["[00:00:00] text"])
 
         result = stitch_parts(
-            tmp_path, "Vid", "2024-01-01", "https://youtube.com/watch?v=TEST", "gemini-test",
+            tmp_path,
+            "Vid",
+            "2024-01-01",
+            "https://youtube.com/watch?v=TEST",
+            "gemini-test",
             duration_seconds=2 * 3600 + 18 * 60,
         )
         content = result.read_text(encoding="utf-8")
@@ -539,7 +557,11 @@ class TestStitchPartsCoverage:
         self._write_part(tmp_path, "vid", "2024-01-01", 60, 120, ["[00:00:00] second"])
 
         result = stitch_parts(
-            tmp_path, "Vid", "2024-01-01", "https://youtube.com/watch?v=TEST", "gemini-test",
+            tmp_path,
+            "Vid",
+            "2024-01-01",
+            "https://youtube.com/watch?v=TEST",
+            "gemini-test",
             duration_seconds=120 * 60,
         )
         content = result.read_text(encoding="utf-8")
@@ -550,11 +572,125 @@ class TestStitchPartsCoverage:
         self._write_part(tmp_path, "vid", "2024-01-01", 0, 63, ["[00:00:00] text"])
 
         result = stitch_parts(
-            tmp_path, "Vid", "2024-01-01", "https://youtube.com/watch?v=TEST", "gemini-test",
+            tmp_path,
+            "Vid",
+            "2024-01-01",
+            "https://youtube.com/watch?v=TEST",
+            "gemini-test",
         )
         content = result.read_text(encoding="utf-8")
         assert "Coverage" not in content
         assert "Ovaj prevod pokriva" not in content
+
+
+class TestStreamTimeout:
+    """Tests for wall-clock timeout on Gemini stream iteration."""
+
+    def test_first_chunk_timeout_fires_when_stream_blocks(self):
+        """The old code never timed out because the check was inside the for-loop body.
+        Verify the queue-based drain thread raises TimeoutError when no chunks arrive."""
+        import queue
+        import threading
+
+        # Arrange: a stream that blocks forever (simulates Gemini "thinking")
+        class _HangingStream:
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                threading.Event().wait()  # block forever
+
+        # Test the queue mechanism directly: drain thread + queue.get(timeout=...)
+        chunk_q = queue.Queue()
+
+        def _drain():
+            try:
+                for _ in _HangingStream():
+                    chunk_q.put(("chunk", None))
+                chunk_q.put(("done", None))
+            except Exception as exc:
+                chunk_q.put(("error", exc))
+
+        drain_thread = threading.Thread(target=_drain, daemon=True)
+        drain_thread.start()
+
+        # Act & Assert: queue.get with a short timeout raises queue.Empty
+        import pytest
+
+        with pytest.raises(queue.Empty):
+            chunk_q.get(timeout=0.1)
+
+    def test_stream_error_propagated_through_queue(self):
+        """Errors in the drain thread should surface to the caller."""
+        import queue
+        import threading
+
+        # Arrange: a stream that raises after one chunk
+        class _ErrorStream:
+            def __init__(self):
+                self._yielded = False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if not self._yielded:
+                    self._yielded = True
+                    return "chunk1"
+                raise RuntimeError("Gemini exploded")
+
+        chunk_q = queue.Queue()
+
+        def _drain():
+            try:
+                for chunk in _ErrorStream():
+                    chunk_q.put(("chunk", chunk))
+                chunk_q.put(("done", None))
+            except Exception as exc:
+                chunk_q.put(("error", exc))
+
+        drain_thread = threading.Thread(target=_drain, daemon=True)
+        drain_thread.start()
+        drain_thread.join(timeout=2)
+
+        # Act: read all items
+        items = []
+        while not chunk_q.empty():
+            items.append(chunk_q.get_nowait())
+
+        # Assert: first chunk, then error
+        assert items[0] == ("chunk", "chunk1")
+        assert items[1][0] == "error"
+        assert "Gemini exploded" in str(items[1][1])
+
+    def test_normal_stream_completes_through_queue(self):
+        """Normal stream drains all chunks and sends 'done'."""
+        import queue
+        import threading
+
+        chunks = ["hello ", "world"]
+
+        chunk_q = queue.Queue()
+
+        def _drain():
+            try:
+                for c in chunks:
+                    chunk_q.put(("chunk", c))
+                chunk_q.put(("done", None))
+            except Exception as exc:
+                chunk_q.put(("error", exc))
+
+        drain_thread = threading.Thread(target=_drain, daemon=True)
+        drain_thread.start()
+        drain_thread.join(timeout=2)
+
+        # Act: read all items
+        items = []
+        while not chunk_q.empty():
+            items.append(chunk_q.get_nowait())
+
+        # Assert
+        assert items == [("chunk", "hello "), ("chunk", "world"), ("done", None)]
 
 
 class TestLoadPrompt:

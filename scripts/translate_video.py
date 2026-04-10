@@ -16,6 +16,7 @@ Usage:
 import argparse
 import logging
 import os
+import queue
 import random
 import re
 import sys
@@ -436,7 +437,10 @@ def stitch_parts(
 
     # Build output
     header = build_header(
-        title, url, date, model,
+        title,
+        url,
+        date,
+        model,
         original_title=original_title,
         coverage=coverage,
         duration_seconds=duration_seconds,
@@ -502,7 +506,7 @@ def call_gemini_translate(
     # Clip-relative instruction for chunks; stitcher applies absolute offsets later
     if start_offset is not None and end_offset is not None:
         instruction = (
-            "Translate only the provided clip. Start timestamps near [00:00:00] and keep them relative to this clip."
+            "Translate only the provided clip. Start timestamps at [00:00:00] relative to this clip, in [HH:MM:SS] format."
         )
     else:
         instruction = "Translate the entire video audio to BCS."
@@ -525,7 +529,7 @@ def call_gemini_translate(
         config_kwargs["media_resolution"] = "MEDIA_RESOLUTION_LOW"
     config = types.GenerateContentConfig(**config_kwargs)
 
-    max_retries_rate = 3   # 429 rate-limit: short bursts, resolve quickly
+    max_retries_rate = 3  # 429 rate-limit: short bursts, resolve quickly
     max_retries_server = 8  # 503 overload: capacity issues, may last minutes
     for attempt in range(max(max_retries_rate, max_retries_server) + 1):
         try:
@@ -547,7 +551,10 @@ def call_gemini_translate(
             kind, wait, max_for_type = retry
             log.warning(
                 "%s — retry %d/%d in %.0fs (Ctrl+C to abort)",
-                kind, attempt + 1, max_for_type, wait,
+                kind,
+                attempt + 1,
+                max_for_type,
+                wait,
             )
             time.sleep(wait)
 
@@ -560,12 +567,44 @@ def call_gemini_translate(
     accumulated = []
     usage = None
     first_chunk = True
-    # httpx read timeout (300s) aborts if the server goes silent during streaming.
-    # The timeout check below catches empty-chunk stalls within the iterator.
-    first_chunk_timeout = 600
+    # Wall-clock timeout for first chunk. Gemini Pro can take 10-15 min to start
+    # on long videos, so 20 min is generous but bounded.  The httpx read=1200
+    # timeout is unreliable here because HTTP-level keepalives reset it.
+    first_chunk_timeout = 1200  # 20 min
+    stall_timeout = 300  # 5 min gap after streaming starts
+
+    # Drain stream in a background thread so we can enforce wall-clock timeouts
+    # via queue.get().  The iterator blocks inside __next__() when Gemini is
+    # "thinking", and in-loop timeout checks never fire if __next__ never returns.
+    chunk_q: queue.Queue = queue.Queue()
+
+    def _drain():
+        try:
+            for chunk in stream:
+                chunk_q.put(("chunk", chunk))
+            chunk_q.put(("done", None))
+        except Exception as exc:
+            chunk_q.put(("error", exc))
+
+    drain_thread = threading.Thread(target=_drain, daemon=True)
+    drain_thread.start()
 
     try:
-        for chunk in stream:
+        while True:
+            timeout = first_chunk_timeout if first_chunk else stall_timeout
+            try:
+                kind, value = chunk_q.get(timeout=timeout)
+            except queue.Empty:
+                if first_chunk:
+                    raise TimeoutError(f"No data received after {format_elapsed(first_chunk_timeout)}") from None
+                raise TimeoutError(f"Stream stalled for {format_elapsed(stall_timeout)}") from None
+
+            if kind == "done":
+                break
+            if kind == "error":
+                raise value
+
+            chunk = value
             if first_chunk:
                 stop_heartbeat.set()
                 ttfc = time.time() - start_time
@@ -591,13 +630,9 @@ def call_gemini_translate(
                     "total_token_count": getattr(meta, "total_token_count", None),
                 }
 
-            # Timeout check — only fires if the stream yields empty chunks while waiting
-            if first_chunk and (time.time() - start_time) > first_chunk_timeout:
-                raise TimeoutError(f"No data received after {format_elapsed(first_chunk_timeout)}")
-
     except TimeoutError as e:
         stop_heartbeat.set()
-        log.error("Chunk timed out: %s", e)
+        log.error("Timed out: %s", e)
         raise
     except Exception as e:
         stop_heartbeat.set()
@@ -1015,7 +1050,11 @@ Examples:
         url = f"https://www.youtube.com/watch?v={video_id}"
         total_duration = meta.get("duration_seconds") if meta else None
         result = stitch_parts(
-            output_dir, display_title, date, url, args.model,
+            output_dir,
+            display_title,
+            date,
+            url,
+            args.model,
             original_title=original_title,
             duration_seconds=total_duration,
         )
