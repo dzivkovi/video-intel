@@ -459,7 +459,7 @@ def call_gemini_translate(
     model: str,
     tmp_file=None,
     *,
-    low_res: bool = False,
+    high_res: bool = False,
     start_offset: int | None = None,
     end_offset: int | None = None,
 ) -> tuple[str, dict | None]:
@@ -491,10 +491,14 @@ def call_gemini_translate(
         "max_output_tokens": MAX_OUTPUT_TOKENS,
         "temperature": 0.2,
     }
-    if low_res:
-        # Must use the full enum name, not "low" — the API rejects shorthand with 400 INVALID_ARGUMENT.
+    if not high_res:
+        # Default to low media resolution: translation reads audio only, and audio tokens
+        # (32/sec) are unaffected by media_resolution — only video frame tokens change
+        # (66/frame low vs 258/frame default). Low-res is 3x cheaper and extends single-
+        # request capacity from ~55 min to ~170 min. Opt in to --high-res only when the
+        # prompt needs to read on-screen text (slides, burned-in captions). Must use the
+        # full enum name; the API rejects shorthand with 400 INVALID_ARGUMENT.
         # See: https://ai.google.dev/gemini-api/docs/video-understanding#technical-details-about-videos
-        # Default ~300 tokens/sec, low ~100 tokens/sec. 1M context ÷ 100 = ~2.7 hours max.
         config_kwargs["media_resolution"] = "MEDIA_RESOLUTION_LOW"
     config = types.GenerateContentConfig(**config_kwargs)
 
@@ -634,7 +638,7 @@ def translate_video(
     date_override: str | None = None,
     use_stdout: bool = False,
     force: bool = False,
-    low_res: bool = False,
+    high_res: bool = False,
     chunk_minutes: int = 20,
     start_minutes: int | None = None,
     end_minutes: int | None = None,
@@ -736,8 +740,8 @@ def translate_video(
     log.info("Model:     %s", model_name)
     log.info("Video:     %s", canonical_url)
     log.info("Title:     %s", title)
-    if low_res:
-        log.info("Resolution: low (~100 tokens/sec, fits videos up to ~2.7 hours)")
+    if high_res:
+        log.info("Resolution: high (~300 tokens/sec, ~55 min per request)")
     if output_path:
         log.info("Output:    %s", output_path)
         log.info('Progress:  tail -f "%s"', tmp_path)
@@ -774,7 +778,7 @@ def translate_video(
                     system_prompt,
                     model_name,
                     tmp_file,
-                    low_res=low_res,
+                    high_res=high_res,
                     start_offset=s_off,
                     end_offset=e_off,
                 )
@@ -847,7 +851,7 @@ def translate_video(
                     system_prompt,
                     model_name,
                     tmp_file,
-                    low_res=low_res,
+                    high_res=high_res,
                     start_offset=s_off if use_clipping else None,
                     end_offset=e_off if use_clipping else None,
                 )
@@ -895,25 +899,30 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Token budget:
-  Gemini's input limit is 1M tokens. At full resolution, video costs ~300
-  tokens/sec (~55 min max). With --low-res it drops to ~100 tokens/sec
-  (~170 min max). Rule of thumb: always use --low-res for videos over 45 min.
+  Gemini's input limit is 1M tokens. Translation reads audio only, so this
+  script defaults to low media resolution (~100 tokens/sec, fits videos up
+  to ~170 min in a single request). Audio quality is unaffected — the
+  media_resolution setting only controls video frame tokens, and audio is
+  tokenized at a fixed 32 tokens/sec regardless. Use --high-res (~300
+  tokens/sec, ~55 min per request) only when the prompt needs to read
+  on-screen text such as slides or burned-in captions. The default prompt
+  (translate-bcs) does not.
 
 Examples:
-  # Short video (under 45 min) — full resolution, single pass
+  # Any talking-head video up to ~2.5 hours — single pass, low-res default
   %(prog)s "https://www.youtube.com/watch?v=VIDEO_ID"
 
-  # Long video (over 45 min) — auto-chunks into first hour + 20-min parts
-  %(prog)s "https://www.youtube.com/watch?v=VIDEO_ID" --low-res
-
   # Partial translation — e.g. first hour only, skip the interview segment
-  %(prog)s "https://www.youtube.com/watch?v=VIDEO_ID" --end 63 --low-res
+  %(prog)s "https://www.youtube.com/watch?v=VIDEO_ID" --end 63
 
-  # Stitch parts into single file (auto-translates title, adds coverage metadata)
+  # Stitch auto-chunked parts for videos over ~2.5 hours
   %(prog)s "https://www.youtube.com/watch?v=VIDEO_ID" --stitch
 
   # Backfill a failed or missing chunk
-  %(prog)s "https://www.youtube.com/watch?v=VIDEO_ID" --start 60 --end 80 --low-res
+  %(prog)s "https://www.youtube.com/watch?v=VIDEO_ID" --start 60 --end 80
+
+  # Slide-driven talk where on-screen terminology matters (rare)
+  %(prog)s "https://www.youtube.com/watch?v=VIDEO_ID" --high-res
 
   # Custom output directory
   %(prog)s "https://www.youtube.com/watch?v=VIDEO_ID" --output-dir ./translations
@@ -947,9 +956,13 @@ Examples:
     parser.add_argument("--stdout", action="store_true", help="Print translation to stdout instead of file")
     parser.add_argument("--force", action="store_true", help="Overwrite existing translation")
     parser.add_argument(
-        "--low-res",
+        "--high-res",
         action="store_true",
-        help="Use low media resolution (~100 tokens/sec vs ~300). Required for videos over ~55 min.",
+        help=(
+            "Use high media resolution (~300 tokens/sec vs the ~100 default). "
+            "Only needed when the prompt reads on-screen text such as slides or burned-in captions — "
+            "the default translate-bcs prompt does not. Caps single-request capacity at ~55 min."
+        ),
     )
     parser.add_argument(
         "--ipv4",
@@ -1028,7 +1041,7 @@ Examples:
         date_override=args.date,
         use_stdout=args.stdout,
         force=args.force,
-        low_res=args.low_res,
+        high_res=args.high_res,
         chunk_minutes=args.chunk_minutes,
         start_minutes=args.start,
         end_minutes=args.end,

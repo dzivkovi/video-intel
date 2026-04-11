@@ -449,15 +449,20 @@ Output follows the same `{date}-{slug}` naming convention as video-intel
 artifacts. See [examples/2026-04-05-the-tide-has-turned-rejoice-in-this.translate-bcs.txt](examples/2026-04-05-the-tide-has-turned-rejoice-in-this.translate-bcs.txt)
 for a real translation output.
 
-**Token budget:** Gemini's input limit is 1M tokens. At full resolution,
-video costs ~300 tokens/sec (~55 min max). With `--low-res` it drops to
-~100 tokens/sec (~170 min max). **Always use `--low-res` for videos over
-45 minutes.**
+**Token budget:** Gemini's input limit is 1M tokens. Translation reads
+audio only — the `translate-bcs` prompt never references on-screen text —
+so the script **defaults to low media resolution** (~100 tokens/sec, fits
+videos up to ~170 min in a single request). Audio quality is unaffected:
+`media_resolution` only controls video frame tokens, and audio is tokenized
+at a fixed 32 tokens/sec regardless of the resolution setting. Pass
+`--high-res` (~300 tokens/sec, ~55 min per request) only when the prompt
+needs to read on-screen text such as slides or burned-in captions.
 
-**Long videos (over 60 minutes):** Videos up to 60 minutes translate as a
-single request. Longer videos auto-chunk: the first hour as one piece, then
-20-minute segments for the remainder (configurable with `--chunk-minutes`).
-Each chunk produces a separate part file — these are the primary artifacts.
+**Long videos (over ~2.5 hours):** Most videos translate as a single request
+at the default low resolution. Longer videos auto-chunk: the first hour as
+one piece, then 20-minute segments for the remainder (configurable with
+`--chunk-minutes`). Each chunk produces a separate part file — these are the
+primary artifacts.
 
 Long-video workflow is two steps: **translate** (produces part files), then
 **stitch** (merges them). Part files use filenames for stable slug-based naming;
@@ -466,22 +471,22 @@ Gemini call. Timestamps within chunks are relative to the clip start — the
 stitcher applies absolute offsets from the filename and normalizes to `[HH:MM:SS]`.
 
 ```bash
-# Short video (under 45 min) — full resolution, single pass
+# Any talking-head video up to ~2.5 hours — single pass, low-res default
 python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID"
-
-# Long video (over 45 min) — auto-chunks into first hour + 20-min parts
-python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" --low-res
 
 # Partial translation — e.g. first hour only, skip the interview segment
 python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" \
-  --end 63 --low-res
+  --end 63
 
-# Stitch parts into single file (auto-translates title, adds coverage metadata)
+# Stitch auto-chunked parts for videos over ~2.5 hours
 python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" --stitch
 
 # Backfill a failed chunk
 python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" \
-  --start 40 --end 60 --low-res
+  --start 40 --end 60
+
+# Slide-driven talk where on-screen terminology matters (rare)
+python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" --high-res
 
 # Override the auto-translated title
 python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" \
