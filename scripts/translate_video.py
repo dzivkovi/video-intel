@@ -73,7 +73,6 @@ def translate_title(client, model: str, title: str) -> str:
             kind, wait, max_for_type = retry
             log.warning("%s — retry %d/%d in %.0fs...", kind, attempt + 1, max_for_type, wait)
             time.sleep(wait)
-    log.warning("Title translation exhausted retries; falling back to original title")
     return title
 
 

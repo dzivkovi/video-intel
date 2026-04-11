@@ -714,11 +714,15 @@ class TestTranslateTitle:
     # Note: translate_title uses a reduced best-effort retry budget (2/2) rather
     # than the aggressive 3/8 used by the main streaming path. Stitch must not
     # block for ~47 min on an optional title translation during a Gemini outage.
+    # Tests assert exact call count AND sleep sequence — without this, a budget
+    # bug would still pass because StopIteration from a depleted side_effect list
+    # gets swallowed by `except Exception` and falls back to the original title.
     def test_falls_back_after_exhausting_server_retries(self, monkeypatch, caplog):
         from google.genai import errors
 
         monkeypatch.setattr("gemini_common.random.uniform", lambda _a, _b: 0)
-        monkeypatch.setattr("translate_video.time.sleep", lambda _: None)
+        sleeps: list[float] = []
+        monkeypatch.setattr("translate_video.time.sleep", sleeps.append)
 
         exc = errors.APIError(503, {"error": {"message": "overloaded", "status": "UNAVAILABLE"}})
         # 2 server retries + 1 initial = 3 calls, all fail
@@ -728,12 +732,15 @@ class TestTranslateTitle:
             result = translate_title(client, "gemini-test", "Original Title")
 
         assert result == "Original Title"
+        assert client.models.generate_content.call_count == 3
+        assert sleeps == [60, 120]
 
     def test_falls_back_after_exhausting_rate_retries(self, monkeypatch, caplog):
         from google.genai import errors
 
         monkeypatch.setattr("gemini_common.random.uniform", lambda _a, _b: 0)
-        monkeypatch.setattr("translate_video.time.sleep", lambda _: None)
+        sleeps: list[float] = []
+        monkeypatch.setattr("translate_video.time.sleep", sleeps.append)
 
         exc = errors.APIError(429, {"error": {"message": "quota hit", "status": "RESOURCE_EXHAUSTED"}})
         # 2 rate retries + 1 initial = 3 calls, all fail
@@ -743,3 +750,5 @@ class TestTranslateTitle:
             result = translate_title(client, "gemini-test", "Original Title")
 
         assert result == "Original Title"
+        assert client.models.generate_content.call_count == 3
+        assert sleeps == [15, 30]
