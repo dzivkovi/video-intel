@@ -6,6 +6,7 @@ dependencies = [
     "google-genai",
     "google-api-python-client",
     "pyyaml",
+    "youtube-transcript-api",
 ]
 
 [project.optional-dependencies]

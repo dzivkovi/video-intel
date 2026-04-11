@@ -21,6 +21,7 @@ import re
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -305,6 +306,112 @@ def fetch_video_metadata(video_id: str) -> dict[str, str | int] | None:
     return result
 
 
+# ---------------------------------------------------------------------------
+# YouTube captions: SRT-first translation path
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CaptionsResult:
+    """English caption track fetched from YouTube.
+
+    snippets: list of (start_seconds, text) tuples in source order.
+    is_generated: True for auto-generated ASR captions, False for
+        manually authored tracks. Affects the prompt sent to Gemini.
+    language: BCP-47 language tag reported by YouTube (typically "en").
+    """
+
+    snippets: list[tuple[float, str]]
+    is_generated: bool
+    language: str
+
+
+def fetch_english_captions(video_id: str) -> CaptionsResult | None:
+    """Fetch the English caption track from YouTube, preferring manual over auto-generated.
+
+    Returns a CaptionsResult on success, or None when no captions are
+    available for any reason the caller should treat as "fall back to
+    the video-understanding path." Any unexpected exception propagates
+    so we do not silently swallow real problems.
+
+    The library's default behavior for `find_transcript(['en'])` is to
+    return a manually authored track when one exists, falling back to
+    the auto-generated track only if no manual track is present. We
+    rely on that default instead of re-implementing preference logic.
+    """
+    try:
+        from youtube_transcript_api import (
+            CouldNotRetrieveTranscript,
+            NoTranscriptFound,
+            TranscriptsDisabled,
+            VideoUnavailable,
+            YouTubeTranscriptApi,
+        )
+    except ImportError:
+        log.debug("youtube-transcript-api not installed, skipping captions fetch")
+        return None
+
+    try:
+        ytt_api = YouTubeTranscriptApi()
+        transcript_list = ytt_api.list(video_id)
+        transcript = transcript_list.find_transcript(["en"])
+        fetched = transcript.fetch()
+    except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable, CouldNotRetrieveTranscript) as e:
+        log.info("No English captions available (%s) - falling back to video path", type(e).__name__)
+        return None
+
+    snippets = [(float(s.start), s.text) for s in fetched]
+    if not snippets:
+        log.info("Captions list returned empty - falling back to video path")
+        return None
+
+    return CaptionsResult(
+        snippets=snippets,
+        is_generated=bool(transcript.is_generated),
+        language=str(transcript.language_code or "en"),
+    )
+
+
+def format_captions_for_translation(snippets: list[tuple[float, str]]) -> str:
+    """Render caption snippets as a [HH:MM:SS]-prefixed text block.
+
+    The output is the exact format we want Gemini to echo back in the
+    translation, so preservation is trivial: "translate each line, keep
+    the timestamp prefix unchanged." Pure function for easy testing.
+    Line-internal newlines in snippet text are flattened to spaces so
+    the one-line-per-snippet invariant holds.
+    """
+    lines = []
+    for start_seconds, text in snippets:
+        # Round to the nearest whole second. The library returns start times
+        # as floats with millisecond precision (e.g. 4.59, 2121.11); rounding
+        # minimizes absolute error versus truncating.
+        start = round(start_seconds)
+        h, remainder = divmod(start, 3600)
+        m, s = divmod(remainder, 60)
+        clean = " ".join(text.split())  # collapse any whitespace, incl. newlines
+        lines.append(f"[{h:02d}:{m:02d}:{s:02d}] {clean}")
+    return "\n".join(lines)
+
+
+def filter_snippets_by_range(
+    snippets: list[tuple[float, str]],
+    start_minutes: int | None,
+    end_minutes: int | None,
+) -> list[tuple[float, str]]:
+    """Return snippets whose start time falls within [start_min, end_min).
+
+    Mirrors the --start/--end semantics used by the video path. A None
+    boundary means "no limit" on that side. start_minutes is inclusive,
+    end_minutes is exclusive.
+    """
+    if start_minutes is None and end_minutes is None:
+        return snippets
+    lo = (start_minutes or 0) * 60
+    hi = end_minutes * 60 if end_minutes is not None else None
+    return [(start, text) for start, text in snippets if start >= lo and (hi is None or start < hi)]
+
+
 SINGLE_REQUEST_CAP_LOW_RES_SECONDS = 9000  # 150 min, below ~170 min theoretical
 SINGLE_REQUEST_CAP_HIGH_RES_SECONDS = 3000  # 50 min, below ~55 min theoretical
 
@@ -408,6 +515,101 @@ def build_incomplete_notice(
     )
 
 
+def detect_overshoot(
+    body_text: str,
+    last_input_seconds: int,
+    *,
+    tolerance_seconds: int = 30,
+) -> tuple[int, int] | None:
+    """Find the first output line whose timestamp exceeds the input's last
+    timestamp by more than `tolerance_seconds`.
+
+    Returns (overshoot_line_number, observed_last_seconds) when hallucinated
+    overshoot is detected, or None when the output stays within tolerance.
+    Line number is 1-indexed and counts only lines that carry a parseable
+    timestamp — it is a best-effort pointer for a human reader, not a
+    precise file-position index.
+
+    Tolerant of the same `[HH:MM:SS]` and `[MM:SS]` formats that
+    `extract_last_timestamp_seconds` accepts. Lines without a parseable
+    timestamp are ignored entirely.
+    """
+    cutoff = last_input_seconds + tolerance_seconds
+    hhmmss = re.compile(r"^\[(\d\d):(\d\d):(\d\d)\]")
+    mmss = re.compile(r"^\[(\d\d):(\d\d)\]")
+    first_over_line: int | None = None
+    last_seconds = 0
+    ts_line_number = 0
+    for line in body_text.splitlines():
+        stripped = line.lstrip("\ufeff").strip()
+        m = hhmmss.match(stripped)
+        if m:
+            h, mn, s = map(int, m.groups())
+            total = h * 3600 + mn * 60 + s
+        else:
+            m = mmss.match(stripped)
+            if not m:
+                continue
+            mn, s = map(int, m.groups())
+            total = mn * 60 + s
+        ts_line_number += 1
+        last_seconds = max(last_seconds, total)
+        if first_over_line is None and total > cutoff:
+            first_over_line = ts_line_number
+
+    if first_over_line is None:
+        return None
+    return (first_over_line, last_seconds)
+
+
+def build_overshoot_notice(
+    last_input_seconds: int,
+    last_observed_seconds: int,
+    first_overshoot_line: int,
+    *,
+    tolerance_seconds: int = 30,
+) -> str:
+    """Build a markdown warning block to append at the END of the output file
+    when Gemini produced timestamps past the real end of the input.
+
+    Placed at the end of the file, not the header, because that is where the
+    hallucinated content physically lives — a reader scrolling down to review
+    the translation will see the warning right next to the questionable lines.
+    Nothing is trimmed: the full translation is preserved and the user
+    decides what to keep.
+    """
+    last_input = _format_hhmmss(last_input_seconds)
+    last_observed = _format_hhmmss(last_observed_seconds)
+    cutoff = _format_hhmmss(last_input_seconds + tolerance_seconds)
+    overshoot_seconds = max(0, last_observed_seconds - last_input_seconds)
+    overshoot = _format_hhmmss(overshoot_seconds)
+
+    return "\n".join(
+        [
+            "---",
+            "",
+            "## \u26a0\ufe0f Possible hallucinated overshoot",
+            "",
+            f"The last English caption in the YouTube source ended at **{last_input}**.",
+            f"The translation above extends to **{last_observed}** \u2014 about **{overshoot}** "
+            f"past the end of the real video.",
+            "",
+            f"Content from approximately **line {first_overshoot_line}** onward (the first line "
+            f"with a timestamp after **{cutoff}**) could not be verified against the source "
+            f"and may have been invented by the translation model.",
+            "",
+            "The full translation is preserved as-is. Review manually and trim if needed.",
+        ]
+    )
+
+
+SOURCE_MODE_LABELS = {
+    "captions-manual": "YouTube captions (manually authored)",
+    "captions-autogen": "YouTube captions (auto-generated, cleaned up via Gemini)",
+    "video": "Direct video audio (no captions available)",
+}
+
+
 def build_header(
     title: str,
     url: str,
@@ -420,6 +622,7 @@ def build_header(
     observed_end_seconds: int | None = None,
     segments_block: str | None = None,
     finish_reason: str | None = None,
+    source_mode: str | None = None,
 ) -> str:
     """Build the metadata header for the translation file.
 
@@ -434,6 +637,10 @@ def build_header(
         table) inserted between the metadata lines and the trailing `---`.
     finish_reason: Gemini's finish_reason from the final chunk. Used to tailor
         the incomplete-translation notice with a root-cause description.
+    source_mode: one of "captions-manual", "captions-autogen", "video", or None.
+        Emitted as a `**Source mode:**` line so the reader knows whether the
+        BCS came from a YouTube caption track or from direct video audio.
+        None omits the line entirely (backward-compatible).
     """
     now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
     lines = [f"# Translation (BCS): {title}", ""]
@@ -443,6 +650,9 @@ def build_header(
     lines.append(f"**Published:** {published}")
     lines.append(f"**Translated:** {now}")
     lines.append(f"**Model:** {model}")
+    if source_mode is not None:
+        label = SOURCE_MODE_LABELS.get(source_mode, source_mode)
+        lines.append(f"**Source mode:** {label}")
 
     cov_end_s: int | None = None
     truncated = False
@@ -783,6 +993,151 @@ def _heartbeat_loop(stop_event: threading.Event, start_time: float) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _stream_with_timeouts(
+    client,
+    model: str,
+    contents,
+    config,
+    tmp_file=None,
+) -> tuple[str, dict | None, str | None]:
+    """Stream a Gemini generation with heartbeat, wall-clock timeouts, and progressive writes.
+
+    Used by both the video-translation path (translate_video) and the
+    captions-translation path (translate_captions_text). Pre-built
+    `contents` and `config` are passed in by the caller — this helper
+    only owns the streaming/retry/draining/diagnostic machinery so the
+    two callers stay consistent.
+
+    Returns: (text, usage_metadata, finish_reason). finish_reason is
+    captured from `chunk.candidates[0].finish_reason` and normalized
+    to its `.name` ("STOP", "SAFETY", "MAX_TOKENS", ...).
+    """
+    max_retries_rate = 3  # 429 rate-limit: short bursts, resolve quickly
+    max_retries_server = 8  # 503 overload: capacity issues, may last minutes
+    for attempt in range(max(max_retries_rate, max_retries_server) + 1):
+        try:
+            stream = client.models.generate_content_stream(
+                model=model,
+                contents=contents,
+                config=config,
+            )
+            break
+        except Exception as e:
+            retry = get_retry_delay(
+                e,
+                attempt,
+                max_retries_rate=max_retries_rate,
+                max_retries_server=max_retries_server,
+            )
+            if retry is None:
+                raise
+            kind, wait, max_for_type = retry
+            log.warning(
+                "%s — retry %d/%d in %.0fs (Ctrl+C to abort)",
+                kind,
+                attempt + 1,
+                max_for_type,
+                wait,
+            )
+            time.sleep(wait)
+
+    start_time = time.time()
+    stop_heartbeat = threading.Event()
+    heartbeat = threading.Thread(target=_heartbeat_loop, args=(stop_heartbeat, start_time), daemon=True)
+    heartbeat.start()
+
+    accumulated = []
+    usage = None
+    finish_reason = None
+    first_chunk = True
+    # Wall-clock timeout for first chunk. Gemini Pro can take 10-15 min to start
+    # on long videos, so 20 min is generous but bounded.  The httpx read=1200
+    # timeout is unreliable here because HTTP-level keepalives reset it.
+    first_chunk_timeout = 1200  # 20 min
+    stall_timeout = 300  # 5 min gap after streaming starts
+
+    # Drain stream in a background thread so we can enforce wall-clock timeouts
+    # via queue.get().  The iterator blocks inside __next__() when Gemini is
+    # "thinking", and in-loop timeout checks never fire if __next__ never returns.
+    chunk_q: queue.Queue = queue.Queue()
+
+    def _drain():
+        try:
+            for chunk in stream:
+                chunk_q.put(("chunk", chunk))
+            chunk_q.put(("done", None))
+        except Exception as exc:
+            chunk_q.put(("error", exc))
+
+    drain_thread = threading.Thread(target=_drain, daemon=True)
+    drain_thread.start()
+
+    try:
+        while True:
+            timeout = first_chunk_timeout if first_chunk else stall_timeout
+            try:
+                kind, value = chunk_q.get(timeout=timeout)
+            except queue.Empty:
+                if first_chunk:
+                    raise TimeoutError(f"No data received after {format_elapsed(first_chunk_timeout)}") from None
+                raise TimeoutError(f"Stream stalled for {format_elapsed(stall_timeout)}") from None
+
+            if kind == "done":
+                break
+            if kind == "error":
+                raise value
+
+            chunk = value
+            if first_chunk:
+                stop_heartbeat.set()
+                ttfc = time.time() - start_time
+                log.info("First chunk received (%s). Streaming translation...", format_elapsed(ttfc))
+                first_chunk = False
+
+            text = chunk.text
+            if text:
+                accumulated.append(text)
+                if tmp_file:
+                    tmp_file.write(text)
+                    tmp_file.flush()
+                print(text, end="", file=sys.stderr, flush=True)
+
+            # finish_reason lives on chunk.candidates[0].finish_reason per the
+            # google-genai SDK — NOT on content.parts. Getting this path wrong
+            # silently produces `finish_reason = None` and masks exactly the
+            # diagnostic this capture is meant to surface.
+            if hasattr(chunk, "usage_metadata") and chunk.usage_metadata:
+                meta = chunk.usage_metadata
+                usage = {
+                    "prompt_token_count": getattr(meta, "prompt_token_count", None),
+                    "candidates_token_count": getattr(meta, "candidates_token_count", None),
+                    "total_token_count": getattr(meta, "total_token_count", None),
+                }
+            if hasattr(chunk, "candidates") and chunk.candidates:
+                candidate_reason = getattr(chunk.candidates[0], "finish_reason", None)
+                if candidate_reason is not None:
+                    finish_reason = getattr(candidate_reason, "name", str(candidate_reason))
+
+    except TimeoutError as e:
+        stop_heartbeat.set()
+        log.error("Timed out: %s", e)
+        raise
+    except Exception as e:
+        stop_heartbeat.set()
+        partial = "".join(accumulated)
+        if partial:
+            log.error("Stream interrupted after %d chars: %s", len(partial), e)
+            log.error("Partial output preserved in .txt.tmp file")
+        else:
+            log.error("Stream failed before any output: %s", e)
+        raise
+    finally:
+        stop_heartbeat.set()
+        print("", file=sys.stderr)
+
+    return "".join(accumulated), usage, finish_reason
+
+
 def call_gemini_translate(
     client,
     types,
@@ -976,8 +1331,260 @@ def call_gemini_translate(
 
 
 # ---------------------------------------------------------------------------
+# Captions-path translation (text-only, no video)
+# ---------------------------------------------------------------------------
+
+
+AUTO_GEN_CLEANUP_NOTE = (
+    "The English input is auto-generated from YouTube's ASR and may lack "
+    "punctuation or contain minor misrecognitions. Apply natural punctuation "
+    "and capitalization during translation."
+)
+
+
+def build_srt_prompt(is_auto_generated: bool, video_duration_hms: str) -> str:
+    """Load the SRT-translation prompt with the template slots filled.
+
+    Substitutes two template variables:
+    - `{{VIDEO_DURATION}}`: a human-readable duration string like `"1h 4m 5s"`
+      so Gemini is grounded in the actual length of the source video.
+    - `{{AUTO_GEN_NOTE}}`: an empty string for manual caption tracks, or a
+      short instruction for auto-generated tracks to silently apply
+      punctuation and capitalization repairs during translation.
+    """
+    base = load_prompt("translate-bcs-from-srt")
+    note = AUTO_GEN_CLEANUP_NOTE if is_auto_generated else ""
+    return (
+        base.replace("{{VIDEO_DURATION}}", video_duration_hms)
+        .replace("{{AUTO_GEN_NOTE}}", note)
+        .strip()
+        + "\n"
+    )
+
+
+def translate_captions_text(
+    client,
+    types,
+    model: str,
+    captions_block: str,
+    is_auto_generated: bool,
+    video_duration_hms: str,
+) -> tuple[str, dict | None, str | None]:
+    """Translate a [HH:MM:SS]-prefixed English caption block to BCS via Gemini.
+
+    Streaming text-only request. Routes through `_stream_with_timeouts` for
+    the same heartbeat / wall-clock first-chunk timeout / stall timeout /
+    finish_reason capture as the video path. Non-streaming was tried first
+    and hung for 12+ minutes on a 2098-line input with no progress signal,
+    which is why this path now insists on streaming end-to-end.
+
+    `video_duration_hms` is a human-readable duration string (e.g. "1h 4m 5s")
+    that is substituted into the prompt to ground Gemini in the actual length
+    of the source video. Passing a fallback like "an unknown length" is fine
+    when YouTube metadata is unavailable.
+
+    Returns: (text, usage_metadata, finish_reason). finish_reason is
+    normalized to a bare name ("STOP", "SAFETY", ...) when available.
+    """
+    system_prompt = build_srt_prompt(is_auto_generated, video_duration_hms)
+    config = types.GenerateContentConfig(
+        system_instruction=system_prompt,
+        max_output_tokens=MAX_OUTPUT_TOKENS,
+        temperature=0.2,
+        safety_settings=build_permissive_safety_settings(types),
+    )
+    # google-genai accepts a bare string as the contents argument and
+    # treats it as a single user-role text part. No need to wrap.
+    return _stream_with_timeouts(client, model, captions_block, config)
+
+
+# ---------------------------------------------------------------------------
 # Main workflow
 # ---------------------------------------------------------------------------
+
+
+def _translate_via_captions(
+    *,
+    video_id: str,
+    canonical_url: str,
+    title: str,
+    date: str,
+    model_name: str,
+    duration_seconds: int,
+    captions: CaptionsResult,
+    output_dir: Path,
+    use_stdout: bool,
+    force: bool,
+    start_minutes: int | None,
+    end_minutes: int | None,
+) -> None:
+    """Captions-first translation path.
+
+    Runs when YouTube has an English caption track for the video. One
+    non-streaming Gemini call per video, text-only input, no chunking,
+    no stitch step. Writes the same output file format as the video path
+    (header + `[HH:MM:SS]` body) with a `**Source mode:**` field added
+    so the reader knows the text came from captions, not video audio.
+    """
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        log.error("GEMINI_API_KEY not set.")
+        sys.exit(1)
+
+    _, types = require_gemini()
+    client = create_client(api_key)
+
+    manual_range = start_minutes is not None or end_minutes is not None
+    filtered = filter_snippets_by_range(captions.snippets, start_minutes, end_minutes)
+    if not filtered:
+        log.error("Captions filtered to empty range (start=%s, end=%s)", start_minutes, end_minutes)
+        sys.exit(1)
+
+    # Resolve output path
+    output_path = None
+    tmp_path = None
+    if not use_stdout:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if manual_range:
+            slug = slugify(title)
+            range_tag = f"part-{start_minutes or 0}-{end_minutes or 'end'}"
+            output_path = output_dir / f"{date}-{slug}.{range_tag}.translate-bcs.txt"
+        else:
+            output_path = build_output_path(output_dir, title, date)
+
+        if output_path.exists() and not force:
+            log.info("Already translated: %s (use --force to redo)", output_path)
+            return
+
+        tmp_path = output_path.with_suffix(".txt.tmp")
+        log.info("Output:    %s", output_path)
+
+    log.info("Model:     %s", model_name)
+    log.info("Video:     %s", canonical_url)
+    log.info("Title:     %s", title)
+    if duration_seconds:
+        log.info("Duration:  %s", format_elapsed(duration_seconds))
+
+    # Build the [HH:MM:SS]-prefixed input block
+    captions_block = format_captions_for_translation(filtered)
+    input_line_count = captions_block.count("\n") + 1
+    last_input_seconds = int(filtered[-1][0]) if filtered else 0
+    log.info(
+        "Input:     %d caption snippets, last timestamp %s",
+        input_line_count,
+        _format_hhmmss(last_input_seconds),
+    )
+
+    # Human-readable duration string for the prompt. Falls back gracefully
+    # when YouTube metadata is unavailable (no duration_seconds) so Gemini
+    # still gets a coherent sentence instead of a raw {{VIDEO_DURATION}} token.
+    video_duration_hms = format_elapsed(duration_seconds) if duration_seconds else "an unknown length"
+
+    start_time = time.time()
+    log.info("Sending to Gemini...")
+    text, usage, finish_reason = translate_captions_text(
+        client,
+        types,
+        model_name,
+        captions_block,
+        is_auto_generated=captions.is_generated,
+        video_duration_hms=video_duration_hms,
+    )
+    elapsed = time.time() - start_time
+
+    if finish_reason and finish_reason != "STOP":
+        log.warning("finish_reason: %s (not STOP)", finish_reason)
+
+    if not text or not text.strip():
+        log.error("Gemini returned empty response after %s", format_elapsed(elapsed))
+        sys.exit(1)
+
+    if use_stdout:
+        print(text)
+        line_count = text.count("\n") + 1
+        log.info(format_stats(elapsed, line_count, usage))
+        return
+
+    # Coverage sanity check on the captions path. Reference point is the
+    # LAST INPUT TIMESTAMP, not the video duration, because caption tracks
+    # legitimately end before the video runs out (music-only tails, rolling
+    # credits, silence). The question we want answered is "did Gemini
+    # translate every caption line we gave it?", not "did the captions
+    # cover the whole video?".
+    observed_end = extract_last_timestamp_seconds(text)
+
+    # Coverage tuple for the header. For a full-captions run we synthesize
+    # one based on the actual caption span (not the video duration) so the
+    # header's Coverage line and the truncation check use the same anchor.
+    cov_for_header: tuple[int, int] | None = None
+    if manual_range:
+        cov_start_min = start_minutes or 0
+        cov_end_min = (
+            end_minutes if end_minutes is not None else (duration_seconds // 60 if duration_seconds else cov_start_min)
+        )
+        cov_for_header = (cov_start_min, cov_end_min)
+    elif duration_seconds:
+        # Coverage window is [0, ceil(last_input / 60)] so the header
+        # matches the span Gemini was actually asked to translate.
+        captions_end_min = (last_input_seconds + 59) // 60
+        cov_for_header = (0, captions_end_min)
+
+    observed_end_for_header: int | None = None
+    if observed_end is not None and last_input_seconds > 0:
+        ratio = observed_end / last_input_seconds
+        if ratio < 0.95:
+            observed_end_for_header = observed_end
+            log.warning(
+                "Captions translation ended at %s but input goes to %s (%.0f%% covered) - Gemini may have truncated.",
+                _format_hhmmss(observed_end),
+                _format_hhmmss(last_input_seconds),
+                ratio * 100,
+            )
+
+    # Overshoot detection (Phase 5): Gemini sometimes produces timestamps
+    # past the real end of the input, either by drifting or by inventing
+    # hallucinated content. We do NOT truncate — the user pays for the
+    # translation and keeps full control of what to trim. We surface the
+    # overshoot as a stderr WARNING and append a visible markdown warning
+    # block to the END of the output file so a reader scrolling to the
+    # tail sees it right next to the questionable content.
+    overshoot_notice = ""
+    if last_input_seconds > 0:
+        overshoot = detect_overshoot(text, last_input_seconds)
+        if overshoot is not None:
+            first_over_line, last_obs = overshoot
+            log.warning(
+                "Possible hallucinated overshoot: output extends to %s but input ended at %s "
+                "(first overshoot line ~%d). Content preserved; review manually.",
+                _format_hhmmss(last_obs),
+                _format_hhmmss(last_input_seconds),
+                first_over_line,
+            )
+            overshoot_notice = "\n\n" + build_overshoot_notice(
+                last_input_seconds=last_input_seconds,
+                last_observed_seconds=last_obs,
+                first_overshoot_line=first_over_line,
+            ) + "\n"
+
+    source_mode = "captions-autogen" if captions.is_generated else "captions-manual"
+    header = build_header(
+        title,
+        canonical_url,
+        date,
+        model_name,
+        coverage=cov_for_header,
+        duration_seconds=duration_seconds or None,
+        observed_end_seconds=observed_end_for_header,
+        finish_reason=finish_reason,
+        source_mode=source_mode,
+    )
+
+    tmp_path.write_text(header + text + overshoot_notice, encoding="utf-8")
+    tmp_path.replace(output_path)
+
+    line_count = text.count("\n") + 1
+    log.info("Written to %s", output_path)
+    log.info(format_stats(elapsed, line_count, usage))
 
 
 def translate_video(
@@ -993,8 +1600,20 @@ def translate_video(
     chunk_minutes: int = 20,
     start_minutes: int | None = None,
     end_minutes: int | None = None,
+    force_video: bool = False,
 ) -> None:
-    """Translate a YouTube video's audio to BCS subtitles."""
+    """Translate a YouTube video's audio to BCS subtitles.
+
+    Default behavior is SRT-first: if the video has an English caption
+    track on YouTube, fetch it and translate the text through Gemini in
+    a single non-streaming call. This avoids the silent-truncation
+    failure mode of long-video understanding. Falls back to the
+    video-understanding path when no captions are available.
+
+    Set `force_video=True` to skip the captions check and go straight
+    to the video-understanding path (for testing the fallback, or when
+    caption quality is known to be bad).
+    """
     _, types = require_gemini()
 
     api_key = os.environ.get("GEMINI_API_KEY")
@@ -1023,6 +1642,34 @@ def translate_video(
     # Stable fallback when no metadata available
     title = title or video_id
     date = date or "0000-00-00"
+
+    # SRT-first: try to use YouTube's English captions before spending any
+    # tokens on video understanding. This avoids the silent-truncation
+    # failure mode documented in ADR-0015 and its companion solution doc.
+    # Any caption-path failure falls through to the existing video path.
+    if not force_video:
+        captions = fetch_english_captions(video_id)
+        if captions is not None:
+            log.info(
+                "Captions:  YouTube %s (%s) - skipping video translation",
+                captions.language,
+                "auto-generated" if captions.is_generated else "manual",
+            )
+            _translate_via_captions(
+                video_id=video_id,
+                canonical_url=canonical_url,
+                title=title,
+                date=date,
+                model_name=model_name,
+                duration_seconds=duration_seconds,
+                captions=captions,
+                output_dir=output_dir,
+                use_stdout=use_stdout,
+                force=force,
+                start_minutes=start_minutes,
+                end_minutes=end_minutes,
+            )
+            return
 
     # Validate chunk size
     if chunk_minutes < 1:
@@ -1378,6 +2025,16 @@ Examples:
         ),
     )
     parser.add_argument(
+        "--force-video",
+        action="store_true",
+        help=(
+            "Skip the YouTube captions check and go straight to video-understanding translation. "
+            "Default is captions-first (fetch YouTube English captions if available, fall back to "
+            "video only when no captions exist). Use this flag when caption quality is known to be "
+            "bad or to force a full video-based rerun."
+        ),
+    )
+    parser.add_argument(
         "--ipv4",
         action="store_true",
         help="Force IPv4 connections (workaround for IPv6 socket stalls, see googleapis/python-genai#1893)",
@@ -1458,6 +2115,7 @@ Examples:
         chunk_minutes=args.chunk_minutes,
         start_minutes=args.start,
         end_minutes=args.end,
+        force_video=args.force_video,
     )
 
 

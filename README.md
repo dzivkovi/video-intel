@@ -249,7 +249,8 @@ Prompts live in `prompts/`. Each file is self-contained.
 | mindmap-heavy.md | Comprehensive extraction (6-10 branches, resources, perspectives) |
 | transcript.md | Three-task diarized transcript with screen content |
 | concepts.md | Concept extraction + normalization against taxonomy |
-| translate-bcs.md | BCS subtitle translation (used by `translate_video.py`) |
+| translate-bcs.md | BCS subtitle translation, video-understanding fallback path (`translate_video.py`) |
+| translate-bcs-from-srt.md | BCS subtitle translation, captions-first path (`translate_video.py`) |
 
 Add a `.md` file to `prompts/` and reference it in config.yaml by filename
 (without extension).
@@ -431,6 +432,7 @@ cannot benefit from English-language YouTube.
 
 ```bash
 # Translate a video to BCS (auto-detects title, saves to file)
+# Default behavior: tries YouTube English captions first, falls back to video
 python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID"
 
 # Save to a specific directory (e.g., the examples folder in this repo)
@@ -443,18 +445,36 @@ python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" --s
 # Use a different model (default: gemini-2.5-pro)
 python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" \
   --model gemini-2.5-flash
+
+# Force the video-understanding path even when captions are available
+# (useful for testing the fallback or when caption quality is known to be bad)
+python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" \
+  --force-video
 ```
 
 Output follows the same `{date}-{slug}` naming convention as video-intel
 artifacts. See [examples/2026-04-05-the-tide-has-turned-rejoice-in-this.translate-bcs.txt](examples/2026-04-05-the-tide-has-turned-rejoice-in-this.translate-bcs.txt)
 for a real translation output.
 
-**Token budget:** Gemini's input limit is 1M tokens. Translation reads
-audio only — the `translate-bcs` prompt never references on-screen text —
-so the script **defaults to low media resolution** (~100 tokens/sec, fits
-videos up to ~170 min in a single request). Audio quality is unaffected:
-`media_resolution` only controls video frame tokens, and audio is tokenized
-at a fixed 32 tokens/sec regardless of the resolution setting. Pass
+**Translation strategy: SRT-first.** The script first checks YouTube for an
+English caption track via `youtube-transcript-api`, preferring manually
+authored captions over auto-generated. When a caption track exists, the
+text goes to Gemini as a single non-streaming request — completes in
+seconds, costs ~10-20K input tokens, and avoids the long-video safety-filter
+soft-stops we documented in
+[ADR-0015](docs/adr/ADR-0015-permissive-safety-filters-for-faithful-reporting.md).
+The output file's `**Source mode:**` field tells you exactly where the
+BCS came from: manual captions, auto-generated captions (with silent ASR
+cleanup), or direct video audio. When the captions track is auto-generated,
+the SRT prompt instructs Gemini to repair punctuation and capitalization
+as part of the translation pass.
+
+**Video fallback (used when no captions exist):** Gemini's input limit is
+1M tokens. Translation reads audio only — the `translate-bcs` prompt never
+references on-screen text — so the script **defaults to low media resolution**
+(~100 tokens/sec, fits videos up to ~170 min in a single request). Audio
+quality is unaffected: `media_resolution` only controls video frame tokens,
+and audio is tokenized at a fixed 32 tokens/sec regardless. Pass
 `--high-res` (~300 tokens/sec, ~55 min per request) only when the prompt
 needs to read on-screen text such as slides or burned-in captions.
 

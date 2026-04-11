@@ -2,18 +2,26 @@
 
 import logging
 from pathlib import Path
+from typing import ClassVar
 
 from translate_video import (
+    CaptionsResult,
     _format_hhmm,
     _format_hhmmss,
     apply_timestamp_offset,
     build_chunk_list,
     build_header,
     build_output_path,
+    build_overshoot_notice,
     build_segments_block,
+    build_srt_prompt,
     classify_segment_status,
+    detect_overshoot,
     extract_last_timestamp_seconds,
     extract_video_id,
+    fetch_english_captions,
+    filter_snippets_by_range,
+    format_captions_for_translation,
     format_elapsed,
     format_stats,
     normalize_timestamp,
@@ -1414,3 +1422,790 @@ class TestTranslateVideoSingleRequestCoverage:
         # comparable to full video duration in the manual-range path)
         assert "TRUNCATED" not in content
         assert not any("translation ended" in r.message.lower() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# SRT-first / captions path tests
+# ---------------------------------------------------------------------------
+
+
+class TestFormatCaptionsForTranslation:
+    def test_basic_snippets_produce_hhmmss_lines(self):
+        # 4.5 uses banker's rounding -> 4 (rounds to even). Verified in the
+        # banker's rounding test below; here we use 4.0 and 3721.0 for clarity.
+        snippets = [
+            (0.0, "First line."),
+            (4.0, "Second line."),
+            (3600.0, "One hour in."),
+            (3721.0, "One hour two minutes one second."),
+        ]
+        out = format_captions_for_translation(snippets)
+        assert out == (
+            "[00:00:00] First line.\n"
+            "[00:00:04] Second line.\n"
+            "[01:00:00] One hour in.\n"
+            "[01:02:01] One hour two minutes one second."
+        )
+
+    def test_multiline_text_flattened_to_single_line(self):
+        # YouTube sometimes returns snippets with internal newlines.
+        snippets = [(10.0, "line one\nline two\nline three")]
+        out = format_captions_for_translation(snippets)
+        assert out == "[00:00:10] line one line two line three"
+        assert "\n" not in out
+
+    def test_empty_snippets_returns_empty_string(self):
+        assert format_captions_for_translation([]) == ""
+
+    def test_fractional_seconds_round_to_nearest(self):
+        # 4.59 rounds up to 5; 2121.11 rounds down to 2121; 2122.93 rounds up to 2123.
+        # Rounding minimizes absolute error versus truncating.
+        snippets = [
+            (4.59, "rounds up"),
+            (2121.11, "rounds down"),
+            (2122.93, "rounds up big"),
+        ]
+        out = format_captions_for_translation(snippets)
+        assert out == (
+            "[00:00:05] rounds up\n"
+            "[00:35:21] rounds down\n"
+            "[00:35:23] rounds up big"
+        )
+
+    def test_bankers_rounding_on_exact_half(self):
+        # Python's round() uses banker's rounding (round-half-to-even) on
+        # exact .5 cases. 4.5 -> 4, 5.5 -> 6. This is a documented Python
+        # behavior; we lock it in so a future refactor that switches to
+        # math.floor() or int() cannot silently change the output.
+        snippets = [(4.5, "four point five"), (5.5, "five point five")]
+        out = format_captions_for_translation(snippets)
+        assert out == "[00:00:04] four point five\n[00:00:06] five point five"
+
+
+class TestFilterSnippetsByRange:
+    SNIPPETS: ClassVar[list[tuple[float, str]]] = [
+        (0.0, "zero"),
+        (30.0, "thirty seconds"),
+        (60.0, "one minute"),
+        (120.0, "two minutes"),
+        (300.0, "five minutes"),
+    ]
+
+    def test_none_none_returns_all(self):
+        assert filter_snippets_by_range(self.SNIPPETS, None, None) == self.SNIPPETS
+
+    def test_start_only_filters_below(self):
+        # start=1 (minute) = 60s; include snippets where start >= 60
+        result = filter_snippets_by_range(self.SNIPPETS, 1, None)
+        assert [s[0] for s in result] == [60.0, 120.0, 300.0]
+
+    def test_end_only_filters_above(self):
+        # end=2 (minute) = 120s; include snippets where start < 120
+        result = filter_snippets_by_range(self.SNIPPETS, None, 2)
+        assert [s[0] for s in result] == [0.0, 30.0, 60.0]
+
+    def test_start_and_end_windows_correctly(self):
+        # start=1, end=5 -> [60, 300); 60s and 120s qualify
+        result = filter_snippets_by_range(self.SNIPPETS, 1, 5)
+        assert [s[0] for s in result] == [60.0, 120.0]
+
+    def test_empty_range_returns_empty(self):
+        assert filter_snippets_by_range(self.SNIPPETS, 10, 20) == []
+
+
+class TestBuildSrtPrompt:
+    def test_manual_track_omits_auto_gen_note(self):
+        prompt = build_srt_prompt(is_auto_generated=False, video_duration_hms="1h 4m 5s")
+        assert "{{AUTO_GEN_NOTE}}" not in prompt
+        assert "auto-generated" not in prompt.lower()
+        # Core instructions must still be present
+        assert "BCS" in prompt
+        assert "timestamp" in prompt.lower()
+        # The single positive example line anchors the format implicitly
+        assert "[00:00:04]" in prompt
+
+    def test_prompt_is_format_agnostic(self):
+        # Phase 5 change: the prompt does NOT hardcode the literal
+        # "[HH:MM:SS]" format specifier. It says "leave the timestamps
+        # as they are" instead. The single positive example in the
+        # prompt is the only format anchor. This lets us change the
+        # input format (e.g. to [MM:SS] or something else) without
+        # touching the prompt file.
+        prompt = build_srt_prompt(is_auto_generated=False, video_duration_hms="1h 4m 5s")
+        assert "[HH:MM:SS]" not in prompt
+
+    def test_auto_gen_track_includes_cleanup_instructions(self):
+        prompt = build_srt_prompt(is_auto_generated=True, video_duration_hms="1h 4m 5s")
+        assert "{{AUTO_GEN_NOTE}}" not in prompt
+        assert "auto-generated" in prompt.lower()
+        assert "punctuation" in prompt.lower()
+
+    def test_video_duration_substituted(self):
+        # The prompt must be grounded with the actual video length so
+        # Gemini does not invent content past the real end.
+        prompt = build_srt_prompt(is_auto_generated=False, video_duration_hms="1h 4m 5s")
+        assert "{{VIDEO_DURATION}}" not in prompt
+        assert "1h 4m 5s" in prompt
+
+    def test_video_duration_unknown_fallback(self):
+        # Fallback string is fine; what matters is that the slot is filled.
+        prompt = build_srt_prompt(is_auto_generated=False, video_duration_hms="an unknown length")
+        assert "{{VIDEO_DURATION}}" not in prompt
+        assert "an unknown length" in prompt
+
+    def test_prompt_is_under_fifteen_lines(self):
+        # Regression guard against re-bloating the prompt. Phase 4 simplification
+        # went from ~50 lines of defensive instructions down to ~10 lines. If
+        # a future edit pushes this back over 15, that's a design regression.
+        prompt = build_srt_prompt(is_auto_generated=True, video_duration_hms="1h 4m 5s")
+        line_count = prompt.count("\n") + 1
+        assert line_count <= 15, f"Prompt grew to {line_count} lines; target is <=15"
+
+    def test_prompt_has_no_hard_stopping_rule(self):
+        # Phase 4 removed the "HARD STOPPING RULE" section because empirical
+        # evidence showed it INCREASED hallucination, not reduced it. If a
+        # future revision re-adds it, the test forces a conscious decision.
+        prompt = build_srt_prompt(is_auto_generated=True, video_duration_hms="1h 4m 5s")
+        lowered = prompt.lower()
+        assert "hard stopping rule" not in lowered
+        assert "do not invent" not in lowered
+        assert "do not extrapolate" not in lowered
+        assert "do not continue" not in lowered
+
+    def test_prompt_has_no_negative_format_examples(self):
+        # Negative examples like "INCORRECT: [00:00:04s]" were removed
+        # because listing bad formats prompts Gemini to produce them.
+        prompt = build_srt_prompt(is_auto_generated=True, video_duration_hms="1h 4m 5s")
+        assert "INCORRECT" not in prompt
+        assert "[00:00:04s]" not in prompt
+
+
+class TestDetectOvershoot:
+    def test_clean_output_within_input_range_returns_none(self):
+        # Output ends exactly at the last input timestamp — no overshoot.
+        body = "\n".join(
+            [
+                "[00:00:00] zero",
+                "[00:00:30] thirty",
+                "[00:01:00] one minute",
+                "[00:01:30] one thirty",
+            ]
+        )
+        assert detect_overshoot(body, last_input_seconds=90) is None
+
+    def test_small_overshoot_within_tolerance_returns_none(self):
+        # 90s input, output ends at 100s, tolerance 30s -> within tolerance.
+        body = "[00:00:00] zero\n[00:01:40] one forty"
+        assert detect_overshoot(body, last_input_seconds=90, tolerance_seconds=30) is None
+
+    def test_large_overshoot_returns_first_line_and_observed_end(self):
+        # Input ends at 60s. Output goes to 3600s. First overshoot line
+        # is whichever line first exceeds 60 + 30 = 90s.
+        body = "\n".join(
+            [
+                "[00:00:00] zero",  # line 1, 0s
+                "[00:00:30] thirty",  # line 2, 30s
+                "[00:01:00] sixty",  # line 3, 60s (at boundary, not over)
+                "[00:01:30] ninety",  # line 4, 90s (at tolerance edge, not over)
+                "[00:02:00] one twenty",  # line 5, 120s -- first overshoot
+                "[01:00:00] one hour",  # line 6, 3600s
+            ]
+        )
+        result = detect_overshoot(body, last_input_seconds=60, tolerance_seconds=30)
+        assert result is not None
+        first_line, observed = result
+        assert first_line == 5
+        assert observed == 3600
+
+    def test_mm_ss_format_also_parsed(self):
+        # Overshoot detector must handle [MM:SS] legacy format too.
+        body = "[00:00] zero\n[01:00] one minute\n[05:00] five minutes"
+        result = detect_overshoot(body, last_input_seconds=60, tolerance_seconds=30)
+        assert result is not None
+        first_line, observed = result
+        assert first_line == 3  # 5 minutes is the overshoot
+        assert observed == 300
+
+    def test_lines_without_timestamps_ignored(self):
+        # Body containing non-timestamped lines (e.g. prose, header leftovers)
+        # should not break the detector; only parseable timestamps count.
+        body = "\n".join(
+            [
+                "Some heading",
+                "[00:00:00] first",  # TS #1: 0s (<= 90)
+                "",
+                "more prose",
+                "[00:02:00] two min",  # TS #2: 120s (> 90, first overshoot)
+                "[05:00:00] way past",  # TS #3: 18000s (max)
+            ]
+        )
+        result = detect_overshoot(body, last_input_seconds=60, tolerance_seconds=30)
+        assert result is not None
+        first_line, observed = result
+        assert first_line == 2  # second TS line is first overshoot
+        assert observed == 18000
+
+    def test_empty_body_returns_none(self):
+        assert detect_overshoot("", last_input_seconds=60) is None
+
+    def test_regression_journalist_scenario(self):
+        # Flash 3-preview empirical case: real input ends at 3838s
+        # (01:03:58), Gemini output extends to 7427s (02:03:47), first
+        # overshoot around line 144 in the real run. This synthesizes
+        # a small version of the pattern.
+        body_lines = []
+        for sec in range(0, 3840, 2):  # legitimate range 0 to 3838 every 2s
+            h, rem = divmod(sec, 3600)
+            mn, s = divmod(rem, 60)
+            body_lines.append(f"[{h:02d}:{mn:02d}:{s:02d}] legitimate")
+        for sec in range(3840, 7430, 2):  # hallucinated tail
+            h, rem = divmod(sec, 3600)
+            mn, s = divmod(rem, 60)
+            body_lines.append(f"[{h:02d}:{mn:02d}:{s:02d}] hallucinated")
+        body = "\n".join(body_lines)
+        result = detect_overshoot(body, last_input_seconds=3838, tolerance_seconds=30)
+        assert result is not None
+        first_line, observed = result
+        # Tolerance is 30s → cutoff = 3868s. First hallucinated line with
+        # ts > 3868 is sec=3870. The hallucinated range starts at 3840
+        # stepping by 2: 3840, 3842, 3844, ..., 3868, 3870. That's the
+        # 16th hallucinated line. Legitimate range had 3840/2 = 1920 lines.
+        # So first_line = 1920 + 16 = 1936.
+        assert first_line == 1936
+        assert observed == 7428
+
+
+class TestBuildOvershootNotice:
+    def test_notice_contains_key_timestamps_and_line_number(self):
+        notice = build_overshoot_notice(
+            last_input_seconds=3838,  # 01:03:58
+            last_observed_seconds=7427,  # 02:03:47
+            first_overshoot_line=144,
+            tolerance_seconds=30,
+        )
+        # Must call out both the real end and the hallucinated end
+        assert "01:03:58" in notice
+        assert "02:03:47" in notice
+        # Must name the line number so users can trim manually
+        assert "line 144" in notice
+        # Must call out the tolerance cutoff
+        assert "01:04:28" in notice  # 3838 + 30 = 3868 = 01:04:28
+        # Must be a clearly flagged H2 so a reader notices it
+        assert "## \u26a0\ufe0f" in notice
+        # Must NOT tell the user it was truncated — the full text is preserved
+        assert "truncat" not in notice.lower()
+
+    def test_notice_starts_with_horizontal_rule_separator(self):
+        # The notice is appended to the end of the file, after the body.
+        # A leading `---` gives visual separation from the last subtitle line.
+        notice = build_overshoot_notice(
+            last_input_seconds=100,
+            last_observed_seconds=1000,
+            first_overshoot_line=50,
+        )
+        assert notice.startswith("---")
+
+
+class TestTranslateVideoCaptionsOvershoot:
+    """End-to-end tests: overshoot appears as WARNING log + file-tail notice."""
+
+    def _common_setup(self, monkeypatch, tmp_path, *, duration_seconds=3845):
+        import translate_video as tv
+
+        monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+        monkeypatch.setattr(
+            tv,
+            "fetch_video_metadata",
+            lambda _vid: {
+                "title": "Test Video",
+                "published": "2024-01-01",
+                "duration_seconds": duration_seconds,
+            },
+        )
+        monkeypatch.setattr(tv, "create_client", lambda _key: object())
+
+        class _Types:
+            class SafetySetting:
+                def __init__(self, **_kw):
+                    pass
+
+            class GenerateContentConfig:
+                def __init__(self, **_kw):
+                    pass
+
+        monkeypatch.setattr(tv, "require_gemini", lambda: (None, _Types))
+        return tv
+
+    def _install_video_abort(self, monkeypatch, tv):
+        def _explode(*_a, **_kw):
+            raise AssertionError("Video path should not run when captions are available")
+
+        monkeypatch.setattr(tv, "call_gemini_translate", _explode)
+
+    def test_overshoot_appends_notice_and_logs_warning(self, monkeypatch, tmp_path, caplog):
+        import logging
+
+        tv = self._common_setup(monkeypatch, tmp_path)
+        # Input: captions to 01:00:00.
+        captions = CaptionsResult(
+            snippets=[(0.0, "first"), (3600.0, "one hour")],
+            is_generated=False,
+            language="en",
+        )
+        monkeypatch.setattr(tv, "fetch_english_captions", lambda _vid: captions)
+        self._install_video_abort(monkeypatch, tv)
+
+        # Gemini returns output that extends to 02:00:00 — 1 hour overshoot.
+        hallucinated = (
+            "[00:00:00] prvi\n"
+            "[01:00:00] jedan sat\n"
+            "[01:30:00] hallucinated line\n"
+            "[02:00:00] another hallucinated line"
+        )
+
+        def _fake_translate(*_a, **_kw):
+            return (hallucinated, None, "STOP")
+
+        monkeypatch.setattr(tv, "translate_captions_text", _fake_translate)
+
+        with caplog.at_level(logging.WARNING, logger="translate_video"):
+            tv.translate_video(
+                "https://www.youtube.com/watch?v=OVERSHOOT001",
+                "gemini-test",
+                tmp_path,
+                force=True,
+            )
+
+        output_path = tmp_path / "2024-01-01-test-video.translate-bcs.txt"
+        assert output_path.exists()
+        content = output_path.read_text(encoding="utf-8")
+
+        # File-tail warning block is present
+        assert "## \u26a0\ufe0f Possible hallucinated overshoot" in content
+        assert "01:00:00" in content  # last input timestamp
+        assert "02:00:00" in content  # observed overshoot end
+        # Stderr WARNING was logged
+        assert any("hallucinated overshoot" in r.message.lower() for r in caplog.records)
+        # The translation body itself is preserved, not trimmed
+        assert "hallucinated line" in content
+
+    def test_clean_output_appends_no_overshoot_notice(self, monkeypatch, tmp_path):
+        tv = self._common_setup(monkeypatch, tmp_path)
+        captions = CaptionsResult(
+            snippets=[(0.0, "first"), (3600.0, "one hour")],
+            is_generated=False,
+            language="en",
+        )
+        monkeypatch.setattr(tv, "fetch_english_captions", lambda _vid: captions)
+        self._install_video_abort(monkeypatch, tv)
+
+        # Clean output — ends right at the last input timestamp, no overshoot.
+        clean = "[00:00:00] prvi\n[01:00:00] jedan sat"
+
+        def _fake_translate(*_a, **_kw):
+            return (clean, None, "STOP")
+
+        monkeypatch.setattr(tv, "translate_captions_text", _fake_translate)
+
+        tv.translate_video(
+            "https://www.youtube.com/watch?v=CLEAN0000001",
+            "gemini-test",
+            tmp_path,
+            force=True,
+        )
+
+        output_path = tmp_path / "2024-01-01-test-video.translate-bcs.txt"
+        content = output_path.read_text(encoding="utf-8")
+        assert "Possible hallucinated overshoot" not in content
+
+
+class TestFetchEnglishCaptions:
+    """Tests for the YouTube captions fetch helper.
+
+    All tests mock `YouTubeTranscriptApi` so no network is touched.
+    """
+
+    def _install_mock(self, monkeypatch, list_side_effect=None, transcript_list=None):
+        """Replace the library classes `fetch_english_captions` imports lazily."""
+        import sys
+        import types as python_types
+
+        fake_module = python_types.ModuleType("youtube_transcript_api")
+
+        class _FakeApi:
+            def list(self, _video_id):
+                if list_side_effect is not None:
+                    raise list_side_effect
+                return transcript_list
+
+        class _Base(Exception):
+            pass
+
+        class _TranscriptsDisabled(_Base):
+            pass
+
+        class _NoTranscriptFound(_Base):
+            pass
+
+        class _VideoUnavailable(_Base):
+            pass
+
+        class _CouldNotRetrieveTranscript(_Base):
+            pass
+
+        fake_module.YouTubeTranscriptApi = _FakeApi
+        fake_module.TranscriptsDisabled = _TranscriptsDisabled
+        fake_module.NoTranscriptFound = _NoTranscriptFound
+        fake_module.VideoUnavailable = _VideoUnavailable
+        fake_module.CouldNotRetrieveTranscript = _CouldNotRetrieveTranscript
+
+        monkeypatch.setitem(sys.modules, "youtube_transcript_api", fake_module)
+        return fake_module
+
+    def _fake_snippet(self, start: float, text: str):
+        class _S:
+            pass
+
+        s = _S()
+        s.start = start
+        s.text = text
+        return s
+
+    def _fake_transcript(self, *, snippets, is_generated, language_code="en"):
+        class _T:
+            pass
+
+        t = _T()
+        t.is_generated = is_generated
+        t.language_code = language_code
+        t.language = "English"
+        fetched = list(snippets)
+        t.fetch = lambda: fetched
+        return t
+
+    def _fake_transcript_list(self, transcript):
+        class _TL:
+            def find_transcript(self_inner, _langs):
+                return transcript
+
+        return _TL()
+
+    def test_prefers_manual_transcript(self, monkeypatch):
+        # find_transcript() on the library already prefers manual over
+        # auto-generated by default, so our mock just returns whichever the
+        # library would have returned — we assert we trust its decision.
+        manual = self._fake_transcript(
+            snippets=[self._fake_snippet(0.0, "hello"), self._fake_snippet(5.0, "world")],
+            is_generated=False,
+        )
+        self._install_mock(monkeypatch, transcript_list=self._fake_transcript_list(manual))
+
+        result = fetch_english_captions("fake_video_id")
+        assert result is not None
+        assert result.is_generated is False
+        assert result.language == "en"
+        assert result.snippets == [(0.0, "hello"), (5.0, "world")]
+
+    def test_returns_auto_gen_when_library_picked_it(self, monkeypatch):
+        auto = self._fake_transcript(
+            snippets=[self._fake_snippet(0.0, "auto line")],
+            is_generated=True,
+        )
+        self._install_mock(monkeypatch, transcript_list=self._fake_transcript_list(auto))
+
+        result = fetch_english_captions("fake_video_id")
+        assert result is not None
+        assert result.is_generated is True
+
+    def test_returns_none_when_transcripts_disabled(self, monkeypatch):
+        fake = self._install_mock(monkeypatch, transcript_list=None)
+        # Raise TranscriptsDisabled from list()
+        fake.YouTubeTranscriptApi = type(
+            "_F",
+            (),
+            {"list": lambda self, _vid: (_ for _ in ()).throw(fake.TranscriptsDisabled("disabled"))},
+        )
+        assert fetch_english_captions("fake_video_id") is None
+
+    def test_returns_none_when_no_transcript_found(self, monkeypatch):
+        fake = self._install_mock(monkeypatch, transcript_list=None)
+        fake.YouTubeTranscriptApi = type(
+            "_F",
+            (),
+            {"list": lambda self, _vid: (_ for _ in ()).throw(fake.NoTranscriptFound("not found"))},
+        )
+        assert fetch_english_captions("fake_video_id") is None
+
+    def test_returns_none_when_video_unavailable(self, monkeypatch):
+        fake = self._install_mock(monkeypatch, transcript_list=None)
+        fake.YouTubeTranscriptApi = type(
+            "_F",
+            (),
+            {"list": lambda self, _vid: (_ for _ in ()).throw(fake.VideoUnavailable("gone"))},
+        )
+        assert fetch_english_captions("fake_video_id") is None
+
+    def test_returns_none_on_empty_snippet_list(self, monkeypatch):
+        empty = self._fake_transcript(snippets=[], is_generated=False)
+        self._install_mock(monkeypatch, transcript_list=self._fake_transcript_list(empty))
+        assert fetch_english_captions("fake_video_id") is None
+
+    def test_unexpected_exception_propagates(self, monkeypatch):
+        fake = self._install_mock(monkeypatch, transcript_list=None)
+        fake.YouTubeTranscriptApi = type(
+            "_F",
+            (),
+            {"list": lambda self, _vid: (_ for _ in ()).throw(RuntimeError("something else"))},
+        )
+        # Unexpected errors must NOT be silently swallowed — they would hide
+        # real bugs (e.g. import errors, network failures in unexpected places).
+        import pytest
+
+        with pytest.raises(RuntimeError, match="something else"):
+            fetch_english_captions("fake_video_id")
+
+
+class TestBuildHeaderSourceMode:
+    def test_source_mode_captions_manual_label(self):
+        header = build_header(
+            "Title",
+            "https://youtube.com/watch?v=x",
+            "2024-01-01",
+            "gemini-test",
+            source_mode="captions-manual",
+        )
+        assert "**Source mode:** YouTube captions (manually authored)" in header
+
+    def test_source_mode_captions_autogen_label(self):
+        header = build_header(
+            "Title",
+            "https://youtube.com/watch?v=x",
+            "2024-01-01",
+            "gemini-test",
+            source_mode="captions-autogen",
+        )
+        assert "**Source mode:** YouTube captions (auto-generated" in header
+
+    def test_source_mode_video_label(self):
+        header = build_header(
+            "Title",
+            "https://youtube.com/watch?v=x",
+            "2024-01-01",
+            "gemini-test",
+            source_mode="video",
+        )
+        assert "**Source mode:** Direct video audio" in header
+
+    def test_source_mode_none_omits_line(self):
+        header = build_header(
+            "Title",
+            "https://youtube.com/watch?v=x",
+            "2024-01-01",
+            "gemini-test",
+        )
+        assert "Source mode" not in header
+
+
+class TestTranslateVideoCaptionsPath:
+    """End-to-end tests for the captions-first flow in translate_video()."""
+
+    def _install_captions_mock(self, monkeypatch, tv, *, captions_result):
+        """Make `fetch_english_captions` return a canned result."""
+        monkeypatch.setattr(tv, "fetch_english_captions", lambda _vid: captions_result)
+
+    def _install_video_abort(self, monkeypatch, tv):
+        """Fail loudly if the video-understanding path is entered.
+
+        Used to assert that a captions run never touches call_gemini_translate.
+        """
+
+        def _explode(*_a, **_kw):
+            raise AssertionError("Video path should not run when captions are available")
+
+        monkeypatch.setattr(tv, "call_gemini_translate", _explode)
+
+    def _common_setup(self, monkeypatch, tmp_path, *, duration_seconds=3845):
+        import translate_video as tv
+
+        monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+        monkeypatch.setattr(
+            tv,
+            "fetch_video_metadata",
+            lambda _vid: {
+                "title": "Test Video",
+                "published": "2024-01-01",
+                "duration_seconds": duration_seconds,
+            },
+        )
+        monkeypatch.setattr(tv, "create_client", lambda _key: object())
+
+        # Stub require_gemini with a minimal types shim that build_header /
+        # helpers can inspect without hitting google-genai.
+        class _Types:
+            class SafetySetting:
+                def __init__(self, **_kw):
+                    pass
+
+            class GenerateContentConfig:
+                def __init__(self, **_kw):
+                    pass
+
+        monkeypatch.setattr(tv, "require_gemini", lambda: (None, _Types))
+        return tv
+
+    def test_captions_path_skips_video_translation_and_writes_expected_output(self, monkeypatch, tmp_path):
+        tv = self._common_setup(monkeypatch, tmp_path)
+        captions = CaptionsResult(
+            snippets=[(0.0, "hello"), (10.0, "world"), (3600.0, "one hour in")],
+            is_generated=False,
+            language="en",
+        )
+        self._install_captions_mock(monkeypatch, tv, captions_result=captions)
+        self._install_video_abort(monkeypatch, tv)
+
+        # Stub the Gemini text call to return canned BCS body
+        returned_body = "[00:00:00] zdravo\n[00:00:10] svijete\n[01:00:00] sat vremena kasnije"
+
+        def _fake_translate(*_a, **_kw):
+            return (returned_body, {"candidates_token_count": 10}, "STOP")
+
+        monkeypatch.setattr(tv, "translate_captions_text", _fake_translate)
+
+        tv.translate_video(
+            "https://www.youtube.com/watch?v=FAKE0000001",
+            "gemini-test",
+            tmp_path,
+            force=True,
+        )
+
+        output_path = tmp_path / "2024-01-01-test-video.translate-bcs.txt"
+        assert output_path.exists()
+        content = output_path.read_text(encoding="utf-8")
+        assert "**Source mode:** YouTube captions (manually authored)" in content
+        assert "zdravo" in content
+        assert "svijete" in content
+        assert "sat vremena kasnije" in content
+        assert "TRUNCATED" not in content  # full coverage
+        assert "Incomplete translation" not in content
+
+    def test_captions_autogen_path_uses_autogen_source_mode(self, monkeypatch, tmp_path):
+        tv = self._common_setup(monkeypatch, tmp_path)
+        captions = CaptionsResult(
+            snippets=[(0.0, "a"), (3800.0, "end near")],
+            is_generated=True,
+            language="en",
+        )
+        self._install_captions_mock(monkeypatch, tv, captions_result=captions)
+        self._install_video_abort(monkeypatch, tv)
+
+        def _fake_translate(*_a, **_kw):
+            return ("[00:00:00] a\n[01:03:20] pred kraj", None, "STOP")
+
+        monkeypatch.setattr(tv, "translate_captions_text", _fake_translate)
+
+        tv.translate_video(
+            "https://www.youtube.com/watch?v=FAKE0000002",
+            "gemini-test",
+            tmp_path,
+            force=True,
+        )
+
+        output_path = tmp_path / "2024-01-01-test-video.translate-bcs.txt"
+        content = output_path.read_text(encoding="utf-8")
+        assert "**Source mode:** YouTube captions (auto-generated" in content
+
+    def test_captions_path_detects_truncation_and_emits_notice(self, monkeypatch, tmp_path):
+        tv = self._common_setup(monkeypatch, tmp_path)
+        # Input goes to one hour, but the translation output only reaches 10 min.
+        captions = CaptionsResult(
+            snippets=[(0.0, "a"), (600.0, "ten minutes"), (3600.0, "one hour")],
+            is_generated=False,
+            language="en",
+        )
+        self._install_captions_mock(monkeypatch, tv, captions_result=captions)
+        self._install_video_abort(monkeypatch, tv)
+
+        # Translation stops at 10 min even though input asked for an hour.
+        def _fake_translate(*_a, **_kw):
+            return ("[00:00:00] a\n[00:10:00] deset minuta", None, "STOP")
+
+        monkeypatch.setattr(tv, "translate_captions_text", _fake_translate)
+
+        tv.translate_video(
+            "https://www.youtube.com/watch?v=FAKE0000003",
+            "gemini-test",
+            tmp_path,
+            force=True,
+        )
+
+        output_path = tmp_path / "2024-01-01-test-video.translate-bcs.txt"
+        content = output_path.read_text(encoding="utf-8")
+        assert "TRUNCATED" in content
+        assert "Incomplete translation" in content
+
+    def test_force_video_skips_captions_check_entirely(self, monkeypatch, tmp_path):
+        tv = self._common_setup(monkeypatch, tmp_path)
+
+        # If --force-video is respected, fetch_english_captions must NOT be called.
+        def _explode(*_a, **_kw):
+            raise AssertionError("fetch_english_captions must not run with --force-video")
+
+        monkeypatch.setattr(tv, "fetch_english_captions", _explode)
+
+        # And translate_captions_text must also not run.
+        def _explode_text(*_a, **_kw):
+            raise AssertionError("translate_captions_text must not run with --force-video")
+
+        monkeypatch.setattr(tv, "translate_captions_text", _explode_text)
+
+        # The video path should run instead. Stub call_gemini_translate to
+        # return a canned video-path response so translate_video() completes.
+        def _fake_video_call(*_a, **_kw):
+            return ("[00:00:00] video path ran", {"candidates_token_count": 5}, "STOP")
+
+        monkeypatch.setattr(tv, "call_gemini_translate", _fake_video_call)
+
+        tv.translate_video(
+            "https://www.youtube.com/watch?v=FAKE0000004",
+            "gemini-test",
+            tmp_path,
+            force=True,
+            force_video=True,
+        )
+
+        output_path = tmp_path / "2024-01-01-test-video.translate-bcs.txt"
+        assert output_path.exists()
+        content = output_path.read_text(encoding="utf-8")
+        assert "video path ran" in content
+        # Should NOT show captions source mode
+        assert "YouTube captions" not in content
+
+    def test_no_captions_falls_back_to_video_path(self, monkeypatch, tmp_path):
+        tv = self._common_setup(monkeypatch, tmp_path)
+
+        # Captions fetch returns None (no captions available)
+        monkeypatch.setattr(tv, "fetch_english_captions", lambda _vid: None)
+
+        # translate_captions_text must NOT run
+        def _explode_text(*_a, **_kw):
+            raise AssertionError("translate_captions_text must not run when no captions")
+
+        monkeypatch.setattr(tv, "translate_captions_text", _explode_text)
+
+        # Video path should run
+        def _fake_video_call(*_a, **_kw):
+            return ("[00:00:00] from video", None, "STOP")
+
+        monkeypatch.setattr(tv, "call_gemini_translate", _fake_video_call)
+
+        tv.translate_video(
+            "https://www.youtube.com/watch?v=FAKE0000005",
+            "gemini-test",
+            tmp_path,
+            force=True,
+        )
+
+        output_path = tmp_path / "2024-01-01-test-video.translate-bcs.txt"
+        content = output_path.read_text(encoding="utf-8")
+        assert "from video" in content
+        assert "YouTube captions" not in content
