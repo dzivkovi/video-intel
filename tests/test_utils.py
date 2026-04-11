@@ -11,6 +11,7 @@ from video_intel import (
     _load_concepts_for_video,
     _parse_timestamp_seconds,
     build_taxonomy,
+    call_gemini,
     chunk_transcript,
     fetch_channel_videos,
     find_mindmap_source,
@@ -915,3 +916,63 @@ class TestDedupByVideo:
 
     def test_empty_input_returns_empty(self):
         assert _dedup_by_video([], limit=10) == []
+
+
+# ---------------------------------------------------------------------------
+# call_gemini retry behavior
+# ---------------------------------------------------------------------------
+
+
+class TestCallGeminiRetry:
+    """Verify call_gemini delegates retry decisions to get_retry_delay."""
+
+    def _make_client_and_types(self, side_effects):
+        """Build a stub client whose generate_content has the given side effects."""
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.models.generate_content.side_effect = side_effects
+
+        from google.genai import types
+
+        return client, types
+
+    def test_retries_on_503_then_succeeds(self, monkeypatch):
+        from google.genai import errors
+
+        monkeypatch.setattr("gemini_common.random.uniform", lambda _a, _b: 0)
+        monkeypatch.setattr("video_intel.time.sleep", lambda _: None)
+
+        exc = errors.APIError(503, {"error": {"message": "overloaded", "status": "UNAVAILABLE"}})
+        ok_response = MagicMock()
+        ok_response.text = "mind map output"
+
+        client, types = self._make_client_and_types([exc, ok_response])
+
+        result = call_gemini(client, types, "https://youtube.com/watch?v=X", "prompt", "gemini-test")
+        assert result == "mind map output"
+        assert client.models.generate_content.call_count == 2
+
+    def test_raises_immediately_on_400(self, monkeypatch):
+        from google.genai import errors
+
+        monkeypatch.setattr("video_intel.time.sleep", lambda _: None)
+
+        exc = errors.APIError(400, {"error": {"message": "bad request", "status": "INVALID_ARGUMENT"}})
+        client, types = self._make_client_and_types([exc])
+
+        with pytest.raises(errors.APIError):
+            call_gemini(client, types, "https://youtube.com/watch?v=X", "prompt", "gemini-test")
+
+    def test_exhausts_rate_limit_budget_then_raises(self, monkeypatch):
+        from google.genai import errors
+
+        monkeypatch.setattr("gemini_common.random.uniform", lambda _a, _b: 0)
+        monkeypatch.setattr("video_intel.time.sleep", lambda _: None)
+
+        exc = errors.APIError(429, {"error": {"message": "quota hit", "status": "RESOURCE_EXHAUSTED"}})
+        # 3 retries for rate limit + 1 initial = 4 calls, all fail
+        client, types = self._make_client_and_types([exc] * 4)
+
+        with pytest.raises(errors.APIError):
+            call_gemini(client, types, "https://youtube.com/watch?v=X", "prompt", "gemini-test")

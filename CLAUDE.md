@@ -52,6 +52,8 @@ Optional: `VOYAGE_API_KEY` (for vector search, free at https://dash.voyageai.com
 
 **Skill entry point:** `SKILL.md` — the YAML frontmatter `description` field controls when Claude Code triggers this skill. The body tells Claude how to invoke the scripts and manage config.
 
+**Shared utilities:** `scripts/gemini_common.py` — Gemini retry logic (`get_retry_delay`), client factory with httpx timeouts (`create_client`), lazy imports (`require_gemini`, `require_youtube`). Used by both scripts; kept minimal.
+
 **Single script:** `scripts/video_intel.py` — all logic in one file, subcommands:
 - `scan` — uses YouTube Data API to discover new videos per channel, then calls Gemini in parallel (`ThreadPoolExecutor`) to generate mind maps. Optionally chains transcript and concept generation.
 - `transcript` — calls Gemini with `response_json=True`, parses the three-task JSON response (speech + screen_content + speakers), and merges them into a fused markdown document via `merge_transcript_json()`.
@@ -88,7 +90,7 @@ All commands support `--force` to regenerate existing output files.
 - Gemini is a multimodal proxy, not a competing assistant. Video understanding requires vision+audio that Claude doesn't have via API.
 - The transcript prompt requests structured JSON with three parallel tasks (diarization, screen content, speaker ID). `merge_transcript_json()` fuses them by timestamp sort.
 - `SKILL_DIR` is resolved from the script's own path (`Path(__file__).resolve().parent.parent`), making the skill relocatable across `~/.claude/skills/`, `~/.gemini/skills/`, or `~/.agents/skills/`.
-- Lazy imports (`require_gemini()`, `require_youtube()`) give clear error messages when dependencies are missing instead of cryptic ImportErrors.
+- Lazy imports (`require_gemini()`, `require_youtube()`) in `gemini_common.py` give clear error messages when dependencies are missing instead of cryptic ImportErrors.
 
 ## Packaging
 

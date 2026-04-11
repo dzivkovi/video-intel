@@ -5,7 +5,6 @@ from pathlib import Path
 
 from translate_video import (
     _format_hhmm,
-    _get_retry_delay,
     apply_timestamp_offset,
     build_chunk_list,
     build_header,
@@ -17,6 +16,7 @@ from translate_video import (
     parse_iso8601_duration,
     slugify,
     stitch_parts,
+    translate_title,
 )
 
 
@@ -146,45 +146,6 @@ class TestFormatStats:
         result = format_stats(60.0, 50, usage)
         assert "5,000" in result
         assert "Input tokens" not in result
-
-
-class TestGetRetryDelay:
-    def test_server_error_503_gets_long_retry_budget(self, monkeypatch):
-        from google.genai import errors
-
-        monkeypatch.setattr("translate_video.random.uniform", lambda _a, _b: 0)
-        exc = errors.APIError(503, {"error": {"message": "overloaded", "status": "UNAVAILABLE"}})
-
-        result = _get_retry_delay(exc, 0, max_retries_rate=3, max_retries_server=8)
-
-        assert result == ("Server error", 60, 8)
-
-    def test_rate_limit_429_gets_short_retry_budget(self, monkeypatch):
-        from google.genai import errors
-
-        monkeypatch.setattr("translate_video.random.uniform", lambda _a, _b: 0)
-        exc = errors.APIError(429, {"error": {"message": "quota hit", "status": "RESOURCE_EXHAUSTED"}})
-
-        result = _get_retry_delay(exc, 1, max_retries_rate=3, max_retries_server=8)
-
-        assert result == ("Rate limited (429)", 30, 3)
-
-    def test_non_retryable_api_error_returns_none(self):
-        from google.genai import errors
-
-        exc = errors.APIError(400, {"error": {"message": "bad request", "status": "INVALID_ARGUMENT"}})
-
-        assert _get_retry_delay(exc, 0, max_retries_rate=3, max_retries_server=8) is None
-
-    def test_non_api_error_returns_none(self):
-        assert _get_retry_delay(RuntimeError("503 overloaded"), 0, max_retries_rate=3, max_retries_server=8) is None
-
-    def test_server_error_stops_retrying_after_budget(self):
-        from google.genai import errors
-
-        exc = errors.APIError(503, {"error": {"message": "overloaded", "status": "UNAVAILABLE"}})
-
-        assert _get_retry_delay(exc, 8, max_retries_rate=3, max_retries_server=8) is None
 
 
 class TestBuildChunkList:
@@ -700,3 +661,85 @@ class TestLoadPrompt:
         text = load_prompt("translate-bcs")
         assert "BCS" in text
         assert "[HH:MM:SS]" in text
+
+
+class TestTranslateTitle:
+    """Verify translate_title retries on transient errors and falls back gracefully."""
+
+    def _client_with_side_effects(self, side_effects):
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.models.generate_content.side_effect = side_effects
+        return client
+
+    def test_returns_translated_title_on_success(self):
+        from unittest.mock import MagicMock
+
+        ok = MagicMock()
+        ok.text = '"Prevod naslova"'
+        client = self._client_with_side_effects([ok])
+
+        result = translate_title(client, "gemini-test", "Original Title")
+        assert result == "Prevod naslova"
+
+    def test_falls_back_to_original_on_non_retryable_error(self, caplog):
+        from google.genai import errors
+
+        exc = errors.APIError(400, {"error": {"message": "bad", "status": "INVALID_ARGUMENT"}})
+        client = self._client_with_side_effects([exc])
+
+        with caplog.at_level(logging.WARNING, logger="translate_video"):
+            result = translate_title(client, "gemini-test", "Original Title")
+
+        assert result == "Original Title"
+        assert any("falling back" in r.message.lower() for r in caplog.records)
+
+    def test_retries_on_503_then_succeeds(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        from google.genai import errors
+
+        monkeypatch.setattr("gemini_common.random.uniform", lambda _a, _b: 0)
+        monkeypatch.setattr("translate_video.time.sleep", lambda _: None)
+
+        exc = errors.APIError(503, {"error": {"message": "overloaded", "status": "UNAVAILABLE"}})
+        ok = MagicMock()
+        ok.text = "Prevod"
+        client = self._client_with_side_effects([exc, ok])
+
+        result = translate_title(client, "gemini-test", "Original Title")
+        assert result == "Prevod"
+
+    # Note: translate_title uses a reduced best-effort retry budget (2/2) rather
+    # than the aggressive 3/8 used by the main streaming path. Stitch must not
+    # block for ~47 min on an optional title translation during a Gemini outage.
+    def test_falls_back_after_exhausting_server_retries(self, monkeypatch, caplog):
+        from google.genai import errors
+
+        monkeypatch.setattr("gemini_common.random.uniform", lambda _a, _b: 0)
+        monkeypatch.setattr("translate_video.time.sleep", lambda _: None)
+
+        exc = errors.APIError(503, {"error": {"message": "overloaded", "status": "UNAVAILABLE"}})
+        # 2 server retries + 1 initial = 3 calls, all fail
+        client = self._client_with_side_effects([exc] * 3)
+
+        with caplog.at_level(logging.WARNING, logger="translate_video"):
+            result = translate_title(client, "gemini-test", "Original Title")
+
+        assert result == "Original Title"
+
+    def test_falls_back_after_exhausting_rate_retries(self, monkeypatch, caplog):
+        from google.genai import errors
+
+        monkeypatch.setattr("gemini_common.random.uniform", lambda _a, _b: 0)
+        monkeypatch.setattr("translate_video.time.sleep", lambda _: None)
+
+        exc = errors.APIError(429, {"error": {"message": "quota hit", "status": "RESOURCE_EXHAUSTED"}})
+        # 2 rate retries + 1 initial = 3 calls, all fail
+        client = self._client_with_side_effects([exc] * 3)
+
+        with caplog.at_level(logging.WARNING, logger="translate_video"):
+            result = translate_title(client, "gemini-test", "Original Title")
+
+        assert result == "Original Title"

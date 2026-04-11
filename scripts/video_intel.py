@@ -26,33 +26,9 @@ from pathlib import Path
 
 import yaml
 
+from gemini_common import create_client, get_retry_delay, require_gemini, require_youtube
+
 log = logging.getLogger("video_intel")
-
-# ---------------------------------------------------------------------------
-# Lazy imports with clear error messages
-# ---------------------------------------------------------------------------
-
-
-def require_gemini():
-    try:
-        from google import genai
-        from google.genai import types
-
-        return genai, types
-    except ImportError:
-        log.error("google-genai not installed. Run: pip install google-genai")
-        sys.exit(1)
-
-
-def require_youtube():
-    try:
-        from googleapiclient.discovery import build
-
-        return build
-    except ImportError:
-        log.error("google-api-python-client not installed. Run: pip install google-api-python-client")
-        sys.exit(1)
-
 
 # ---------------------------------------------------------------------------
 # Config
@@ -300,8 +276,9 @@ def call_gemini(client, types, video_url, prompt_text, model, response_json=Fals
         ]
     )
 
-    max_retries = 3
-    for attempt in range(max_retries + 1):
+    max_retries_rate = 3
+    max_retries_server = 8
+    for attempt in range(max(max_retries_rate, max_retries_server) + 1):
         try:
             response = client.models.generate_content(
                 model=model,
@@ -310,15 +287,17 @@ def call_gemini(client, types, video_url, prompt_text, model, response_json=Fals
             )
             return response.text
         except Exception as e:
-            error_str = str(e).lower()
-            is_rate_limit = "429" in error_str or "resource exhausted" in error_str
-            is_server_error = "503" in error_str or "overloaded" in error_str
-            if (is_rate_limit or is_server_error) and attempt < max_retries:
-                wait = (15 * (2**attempt)) + random.uniform(0, 5)
-                log.warning("Rate limited, retrying in %ds...", wait)
-                time.sleep(wait)
-            else:
+            retry = get_retry_delay(
+                e,
+                attempt,
+                max_retries_rate=max_retries_rate,
+                max_retries_server=max_retries_server,
+            )
+            if retry is None:
                 raise
+            kind, wait, max_for_type = retry
+            log.warning("%s — retry %d/%d in %.0fs...", kind, attempt + 1, max_for_type, wait)
+            time.sleep(wait)
 
 
 # ---------------------------------------------------------------------------
@@ -543,8 +522,9 @@ def call_gemini_text(client, types, text_content, model):
     config_kwargs = {"temperature": 0.3, "response_mime_type": "application/json"}
     contents = types.Content(parts=[types.Part(text=text_content)])
 
-    max_retries = 3
-    for attempt in range(max_retries + 1):
+    max_retries_rate = 3
+    max_retries_server = 8
+    for attempt in range(max(max_retries_rate, max_retries_server) + 1):
         try:
             response = client.models.generate_content(
                 model=model,
@@ -553,15 +533,17 @@ def call_gemini_text(client, types, text_content, model):
             )
             return response.text
         except Exception as e:
-            error_str = str(e).lower()
-            is_rate_limit = "429" in error_str or "resource exhausted" in error_str
-            is_server_error = "503" in error_str or "overloaded" in error_str
-            if (is_rate_limit or is_server_error) and attempt < max_retries:
-                wait = (15 * (2**attempt)) + random.uniform(0, 5)
-                log.warning("Rate limited, retrying in %ds...", wait)
-                time.sleep(wait)
-            else:
+            retry = get_retry_delay(
+                e,
+                attempt,
+                max_retries_rate=max_retries_rate,
+                max_retries_server=max_retries_server,
+            )
+            if retry is None:
                 raise
+            kind, wait, max_for_type = retry
+            log.warning("%s — retry %d/%d in %.0fs...", kind, attempt + 1, max_for_type, wait)
+            time.sleep(wait)
 
 
 def process_concepts(
@@ -709,7 +691,7 @@ def build_taxonomy(output_dir: Path) -> dict:
 def cmd_scan(args, config):
     """Scan channels for new videos and generate mind maps."""
     errors = []
-    genai, types = require_gemini()
+    _, types = require_gemini()
     yt_build = require_youtube()
 
     # Check API keys
@@ -724,7 +706,7 @@ def cmd_scan(args, config):
         )
         sys.exit(1)
 
-    client = genai.Client(api_key=gemini_key)
+    client = create_client(gemini_key)
     youtube = yt_build("youtube", "v3", developerKey=yt_key)
     output_dir = resolve_output_dir(config)
     model = config.get("model", "gemini-3-flash-preview")
@@ -889,14 +871,14 @@ def cmd_scan(args, config):
 
 def cmd_mindmap(args, config):
     """Generate a mind map for a single video with a specific prompt."""
-    genai, types = require_gemini()
+    _, types = require_gemini()
 
     gemini_key = os.environ.get("GEMINI_API_KEY")
     if not gemini_key:
         log.error("GEMINI_API_KEY not set.")
         sys.exit(1)
 
-    client = genai.Client(api_key=gemini_key)
+    client = create_client(gemini_key)
     output_dir = resolve_output_dir(config)
     model = config.get("model", "gemini-3-flash-preview")
 
@@ -958,14 +940,14 @@ def cmd_mindmap(args, config):
 
 def cmd_transcript(args, config):
     """Generate a transcript for a single video."""
-    genai, types = require_gemini()
+    _, types = require_gemini()
 
     gemini_key = os.environ.get("GEMINI_API_KEY")
     if not gemini_key:
         log.error("GEMINI_API_KEY not set.")
         sys.exit(1)
 
-    client = genai.Client(api_key=gemini_key)
+    client = create_client(gemini_key)
     output_dir = resolve_output_dir(config)
     model = config.get("model", "gemini-3-flash-preview")
     prompt_text = load_prompt("transcript")
@@ -1025,14 +1007,14 @@ def cmd_transcript(args, config):
 
 def cmd_concepts(args, config):
     """Extract and normalize concepts from existing mindmaps."""
-    genai, types = require_gemini()
+    _, types = require_gemini()
 
     gemini_key = os.environ.get("GEMINI_API_KEY")
     if not gemini_key:
         log.error("GEMINI_API_KEY not set.")
         sys.exit(1)
 
-    client = genai.Client(api_key=gemini_key)
+    client = create_client(gemini_key)
     output_dir = resolve_output_dir(config)
     model = config.get("model", "gemini-3-flash-preview")
     taxonomy = load_taxonomy(output_dir)

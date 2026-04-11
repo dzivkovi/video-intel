@@ -17,7 +17,6 @@ import argparse
 import logging
 import os
 import queue
-import random
 import re
 import sys
 import threading
@@ -25,39 +24,13 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+from gemini_common import create_client, get_retry_delay, require_gemini, require_youtube
+
 log = logging.getLogger("translate_video")
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT_DIR = "./examples"
 MAX_OUTPUT_TOKENS = 65536
-RETRYABLE_SERVER_CODES = {408, 500, 502, 503, 504}
-RETRYABLE_RATE_CODES = {429}
-
-
-# ---------------------------------------------------------------------------
-# Lazy imports
-# ---------------------------------------------------------------------------
-
-
-def require_gemini():
-    try:
-        from google import genai
-        from google.genai import types
-
-        return genai, types
-    except ImportError:
-        log.error("google-genai not installed. Run: pip install google-genai")
-        sys.exit(1)
-
-
-def require_youtube():
-    try:
-        from googleapiclient.discovery import build
-
-        return build
-    except ImportError:
-        log.error("google-api-python-client not installed. Run: pip install google-api-python-client")
-        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -66,15 +39,42 @@ def require_youtube():
 
 
 def translate_title(client, model: str, title: str) -> str:
-    """Translate a video title to BCS via a single text-only Gemini call."""
-    response = client.models.generate_content(
-        model=model,
-        contents=(
-            "Translate this video title to BCS (Bosnian-neutral). "
-            "Output ONLY the translated title, nothing else.\n\n" + title
-        ),
+    """Translate a video title to BCS via a single text-only Gemini call.
+
+    Uses a reduced best-effort retry budget and falls back to the original
+    title on failure. Stitch is a local file merge — it should never block
+    for long on an optional title translation during a Gemini outage.
+
+    Budget math (worst case before fallback):
+      rate (2):   15s + 30s        ≈ 45s
+      server (2): 60s + 120s       ≈ 3 min
+    Contrast with the streaming path's 3/8 budget which can wait ~47 min.
+    """
+    contents = (
+        "Translate this video title to BCS (Bosnian-neutral). "
+        "Output ONLY the translated title, nothing else.\n\n" + title
     )
-    return response.text.strip().strip('"')
+    max_retries_rate = 2
+    max_retries_server = 2
+    for attempt in range(max(max_retries_rate, max_retries_server) + 1):
+        try:
+            response = client.models.generate_content(model=model, contents=contents)
+            return response.text.strip().strip('"')
+        except Exception as e:
+            retry = get_retry_delay(
+                e,
+                attempt,
+                max_retries_rate=max_retries_rate,
+                max_retries_server=max_retries_server,
+            )
+            if retry is None:
+                log.warning("Title translation failed (%s); falling back to original title", e)
+                return title
+            kind, wait, max_for_type = retry
+            log.warning("%s — retry %d/%d in %.0fs...", kind, attempt + 1, max_for_type, wait)
+            time.sleep(wait)
+    log.warning("Title translation exhausted retries; falling back to original title")
+    return title
 
 
 # ---------------------------------------------------------------------------
@@ -310,34 +310,6 @@ def format_stats(elapsed: float, line_count: int, usage: dict | None) -> str:
     return "\n".join(lines)
 
 
-def _get_retry_delay(
-    exc: Exception,
-    attempt: int,
-    *,
-    max_retries_rate: int,
-    max_retries_server: int,
-) -> tuple[str, float, int] | None:
-    """Return retry metadata for retryable Gemini API errors."""
-    from google.genai import errors
-
-    if not isinstance(exc, errors.APIError):
-        return None
-
-    if exc.code in RETRYABLE_SERVER_CODES:
-        if attempt >= max_retries_server:
-            return None
-        base_wait = 60 * (2 ** min(attempt, 3))  # 60s, 120s, 240s, 480s cap
-        return "Server error", base_wait + random.uniform(0, 10), max_retries_server
-
-    if exc.code in RETRYABLE_RATE_CODES:
-        if attempt >= max_retries_rate:
-            return None
-        base_wait = 15 * (2**attempt)  # 15s, 30s, 60s
-        return "Rate limited (429)", base_wait + random.uniform(0, 10), max_retries_rate
-
-    return None
-
-
 # ---------------------------------------------------------------------------
 # Stitcher — merges part files into a single translation
 # ---------------------------------------------------------------------------
@@ -505,9 +477,7 @@ def call_gemini_translate(
 
     # Clip-relative instruction for chunks; stitcher applies absolute offsets later
     if start_offset is not None and end_offset is not None:
-        instruction = (
-            "Translate only the provided clip. Start timestamps at [00:00:00] relative to this clip, in [HH:MM:SS] format."
-        )
+        instruction = "Translate only the provided clip. Start timestamps at [00:00:00] relative to this clip, in [HH:MM:SS] format."
     else:
         instruction = "Translate the entire video audio to BCS."
 
@@ -540,7 +510,7 @@ def call_gemini_translate(
             )
             break
         except Exception as e:
-            retry = _get_retry_delay(
+            retry = get_retry_delay(
                 e,
                 attempt,
                 max_retries_rate=max_retries_rate,
@@ -671,7 +641,7 @@ def translate_video(
     end_minutes: int | None = None,
 ) -> None:
     """Translate a YouTube video's audio to BCS subtitles."""
-    genai, types = require_gemini()
+    _, types = require_gemini()
 
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
@@ -775,17 +745,7 @@ def translate_video(
 
     # Load prompt and call Gemini with streaming
     system_prompt = load_prompt("translate-bcs")
-    import httpx
-
-    client = genai.Client(
-        api_key=api_key,
-        http_options=types.HttpOptions(
-            # read=1200: abort if server is silent for 20 min during streaming.
-            # Does NOT limit total request time — only the gap between data.
-            # Pro can take 10-15 min before first chunk on long videos.
-            client_args={"timeout": httpx.Timeout(connect=30, read=1200, write=30, pool=30)},
-        ),
-    )
+    client = create_client(api_key)
     slug = slugify(title)
 
     start_time = time.time()
@@ -1043,8 +1003,8 @@ Examples:
         if args.title:
             display_title = args.title
         else:
-            genai, _ = require_gemini()
-            client = genai.Client()
+            api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY", "")
+            client = create_client(api_key)
             display_title = translate_title(client, args.model, original_title)
             log.info("Translated title: %s", display_title)
         url = f"https://www.youtube.com/watch?v={video_id}"
