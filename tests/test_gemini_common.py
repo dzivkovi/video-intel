@@ -69,3 +69,33 @@ class TestCreateClient:
         # Verify it doesn't crash with a custom timeout
         client = create_client("test-api-key", read_timeout=60)
         assert client is not None
+
+
+class TestBuildPermissiveSafetySettings:
+    def test_returns_four_categories_all_block_none(self):
+        from google.genai import types
+
+        from gemini_common import build_permissive_safety_settings
+
+        settings = build_permissive_safety_settings(types)
+        assert len(settings) == 4
+        categories = {str(s.category) for s in settings}
+        # All four standard harm categories present
+        assert any("HARASSMENT" in c for c in categories)
+        assert any("HATE_SPEECH" in c for c in categories)
+        assert any("SEXUALLY_EXPLICIT" in c for c in categories)
+        assert any("DANGEROUS_CONTENT" in c for c in categories)
+        # All thresholds are BLOCK_NONE
+        for s in settings:
+            assert "BLOCK_NONE" in str(s.threshold)
+
+    def test_omits_civic_integrity(self):
+        # CIVIC_INTEGRITY is intentionally excluded — not universally supported
+        # on Gemini 2.x and unrelated to violence/war coverage.
+        from google.genai import types
+
+        from gemini_common import build_permissive_safety_settings
+
+        settings = build_permissive_safety_settings(types)
+        categories = {str(s.category) for s in settings}
+        assert not any("CIVIC_INTEGRITY" in c for c in categories)

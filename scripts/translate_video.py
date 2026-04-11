@@ -24,7 +24,13 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from gemini_common import create_client, get_retry_delay, require_gemini, require_youtube
+from gemini_common import (
+    build_permissive_safety_settings,
+    create_client,
+    get_retry_delay,
+    require_gemini,
+    require_youtube,
+)
 
 log = logging.getLogger("translate_video")
 
@@ -111,6 +117,7 @@ def normalize_timestamp(line: str) -> str:
     Rule: parse [A:MM:SS]. If A <= 23, leave unchanged. If A > 23, treat A as
     total minutes: divmod into hours, add remainder to MM, carry if needed.
     """
+    line = line.lstrip("\ufeff")
     m = re.match(r"\[(\d+):(\d{2}):(\d{2})\]", line)
     if not m:
         return line
@@ -125,6 +132,62 @@ def normalize_timestamp(line: str) -> str:
     return f"[{hours:02d}:{new_minutes:02d}:{ss:02d}]{line[m.end() :]}"
 
 
+def timestamp_tolerance(chunk_duration_seconds: int) -> int:
+    """Return slack for timestamp classification.
+
+    Long clips can drift by minutes; short clips should stay much tighter or we
+    start mistaking malformed [MM:SS:00] output for real [HH:MM:SS].
+    """
+    return min(300, max(30, chunk_duration_seconds // 10))
+
+
+def normalize_mm_ss_zero_timestamp(line: str) -> str:
+    """Fix Gemini's malformed [MM:SS:00] output by converting it to [MM:SS]."""
+    line = line.lstrip("\ufeff")
+    m = re.match(r"\[(\d+):(\d{2}):00\]", line)
+    if not m:
+        return line
+    mm, ss = int(m.group(1)), int(m.group(2))
+    return f"[{mm:02d}:{ss:02d}]{line[m.end() :]}"
+
+
+def should_reinterpret_part_as_mm_ss_zero(
+    lines: list[str],
+    offset_seconds: int,
+    chunk_duration_seconds: int,
+) -> bool:
+    """Detect parts where Gemini emitted [MM:SS:00] instead of [HH:MM:SS].
+
+    We only switch modes when the malformed interpretation clearly explains far
+    more lines than the standard interpretation.
+    """
+    max_relative = chunk_duration_seconds + timestamp_tolerance(chunk_duration_seconds)
+    candidates = 0
+    standard_fit = 0
+    alt_fit = 0
+
+    for raw_line in lines:
+        line = normalize_timestamp(raw_line)
+        m = re.match(r"\[(\d+):(\d{2}):(\d{2})\]", line)
+        if not m:
+            continue
+
+        hh, mm, ss = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if ss != 0:
+            continue
+
+        candidates += 1
+        standard_total = hh * 3600 + mm * 60 + ss
+        if standard_total <= max_relative or offset_seconds <= standard_total <= offset_seconds + max_relative:
+            standard_fit += 1
+
+        alt_total = hh * 60 + mm
+        if alt_total <= max_relative:
+            alt_fit += 1
+
+    return candidates >= 3 and alt_fit >= 3 and alt_fit > standard_fit
+
+
 def apply_timestamp_offset(line: str, offset_seconds: int, chunk_duration_seconds: int) -> str:
     """Add a time offset to the timestamp at the start of a line.
 
@@ -132,7 +195,7 @@ def apply_timestamp_offset(line: str, offset_seconds: int, chunk_duration_second
     before deciding whether to apply the offset. Handles both [HH:MM:SS] and
     [MM:SS] formats; always outputs [HH:MM:SS].
     """
-    tolerance = 300  # 5 minutes
+    tolerance = timestamp_tolerance(chunk_duration_seconds)
 
     # First, fix legacy malformed timestamps (e.g. [120:05:30] → [02:05:30])
     line = normalize_timestamp(line)
@@ -168,6 +231,33 @@ def apply_timestamp_offset(line: str, offset_seconds: int, chunk_duration_second
     h, rem = divmod(total, 3600)
     mm, ss = divmod(rem, 60)
     return f"[{h:02d}:{mm:02d}:{ss:02d}]{line[m.end() :]}"
+
+
+def extract_last_timestamp_seconds(text: str) -> int | None:
+    """Return the last parseable timestamp in `text`, in seconds.
+
+    Handles [HH:MM:SS] and [MM:SS]. Callers must run
+    `normalize_mm_ss_zero_timestamp` first on any [MM:SS:00]-drift parts —
+    this helper operates on already-repaired text.
+    """
+    last: int | None = None
+    for raw in text.splitlines():
+        line = raw.lstrip("\ufeff").lstrip()
+        m = re.match(r"\[(\d{1,2}):(\d{2}):(\d{2})\]", line)
+        if m:
+            last = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+            continue
+        m = re.match(r"\[(\d{1,2}):(\d{2})\]", line)
+        if m:
+            last = int(m.group(1)) * 60 + int(m.group(2))
+    return last
+
+
+def _format_hhmmss(seconds: int) -> str:
+    """Format seconds as HH:MM:SS for coverage annotations."""
+    h, rem = divmod(max(0, seconds), 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 def build_output_path(output_dir: Path, title: str, date: str) -> Path:
@@ -215,20 +305,37 @@ def fetch_video_metadata(video_id: str) -> dict[str, str | int] | None:
     return result
 
 
-def build_chunk_list(duration_seconds: int, chunk_minutes: int = 20) -> list[tuple[int, int]]:
+SINGLE_REQUEST_CAP_LOW_RES_SECONDS = 9000  # 150 min, below ~170 min theoretical
+SINGLE_REQUEST_CAP_HIGH_RES_SECONDS = 3000  # 50 min, below ~55 min theoretical
+
+
+def single_request_cap_seconds(high_res: bool) -> int:
+    """Return the duration ceiling below which a video fits one Gemini request."""
+    return SINGLE_REQUEST_CAP_HIGH_RES_SECONDS if high_res else SINGLE_REQUEST_CAP_LOW_RES_SECONDS
+
+
+def build_chunk_list(
+    duration_seconds: int,
+    chunk_minutes: int = 20,
+    *,
+    high_res: bool = False,
+) -> list[tuple[int, int]]:
     """Build the list of (start_sec, end_sec) chunks for a video.
 
-    Policy from experiments:
-    - Videos <= 60 min: single request, no clipping → [(0, 0)]
-    - Videos > 60 min: first hour as one chunk, then chunk_minutes for remainder
+    Resolution-aware: low-res single-request capacity is ~170 min and high-res
+    is ~55 min, so the threshold below which we skip chunking depends on which
+    mode we're calling Gemini in.
+
+    - duration <= cap: single request, no clipping → [(0, 0)]
+    - duration >  cap: uniform chunk_minutes segments from the start
     """
-    first_hour = 3600
-    if duration_seconds <= first_hour:
+    cap = single_request_cap_seconds(high_res)
+    if duration_seconds <= cap:
         return [(0, 0)]  # (0, 0) = no clipping, full video
 
     chunk_seconds = chunk_minutes * 60
-    chunks = [(0, first_hour)]
-    pos = first_hour
+    chunks = []
+    pos = 0
     while pos < duration_seconds:
         end = min(pos + chunk_seconds, duration_seconds)
         chunks.append((pos, end))
@@ -241,6 +348,66 @@ def _format_hhmm(seconds: int) -> str:
     return f"{seconds // 3600:02d}:{(seconds % 3600) // 60:02d}"
 
 
+def build_incomplete_notice(
+    observed_end_seconds: int,
+    requested_end_seconds: int,
+    *,
+    finish_reason: str | None = None,
+) -> str:
+    """Build a visible markdown warning when translation ends early.
+
+    Emitted as a bordered H2 block before the transcript body so a reader
+    opening the file cannot miss it. Never phrased in a way that could be
+    mistaken for a transcript line. Lists finish_reason when available so
+    the reader can distinguish safety blocks, length limits, and voluntary
+    soft-stops without reading the logs.
+    """
+    observed = _format_hhmmss(observed_end_seconds)
+    requested = _format_hhmmss(requested_end_seconds)
+    missing_seconds = max(0, requested_end_seconds - observed_end_seconds)
+    missing = _format_hhmmss(missing_seconds)
+    ratio_pct = int((observed_end_seconds / requested_end_seconds) * 100) if requested_end_seconds > 0 else 0
+
+    if finish_reason == "SAFETY":
+        reason_line = "**Reason:** Gemini blocked output on safety filters (`finish_reason: SAFETY`)."
+        advice = (
+            "Safety filters are already relaxed in this pipeline. If this message "
+            "appears, a filter still fired — try a different model or reduce the "
+            "portion of the video containing triggering content."
+        )
+    elif finish_reason == "MAX_TOKENS":
+        reason_line = "**Reason:** Output token budget exhausted (`finish_reason: MAX_TOKENS`)."
+        advice = "Split the video with `--start` / `--end` into shorter segments and rerun."
+    elif finish_reason and finish_reason != "STOP":
+        reason_line = f"**Reason:** Gemini reported `finish_reason: {finish_reason}`."
+        advice = "Check the Gemini docs for this finish_reason, or rerun with `--force`."
+    else:
+        reason_line = (
+            "**Reason:** Gemini stopped voluntarily (`finish_reason: STOP`) before reaching "
+            "the end of the video. This is model-level soft-stop behavior, often triggered "
+            "on politically or emotionally heavy content. It is not a code bug."
+        )
+        advice = (
+            "Try rerunning with `--force`, using a different model, or splitting the video "
+            "with `--start` / `--end` into shorter segments."
+        )
+
+    return "\n".join(
+        [
+            "## \u26a0\ufe0f Incomplete translation",
+            "",
+            f"Gemini stopped at **{observed}** but the requested window ends at "
+            f"**{requested}** ({ratio_pct}% covered, **{missing}** missing).",
+            "",
+            reason_line,
+            "",
+            f"**What to try:** {advice}",
+            "",
+            "The text below is partial. Do not treat it as a complete translation.",
+        ]
+    )
+
+
 def build_header(
     title: str,
     url: str,
@@ -250,12 +417,23 @@ def build_header(
     original_title: str | None = None,
     coverage: tuple[int, int] | None = None,
     duration_seconds: int | None = None,
+    observed_end_seconds: int | None = None,
+    segments_block: str | None = None,
+    finish_reason: str | None = None,
 ) -> str:
     """Build the metadata header for the translation file.
 
-    coverage: (start_min, end_min) of translated range.
+    coverage: (start_min, end_min) of translated range. If None but
+        `duration_seconds` is set, defaults to full-video coverage.
     duration_seconds: total video duration from YouTube API.
-    When both are provided, a Coverage line is added to the header.
+    observed_end_seconds: last observed translation timestamp, in seconds.
+        When materially below the requested end (< 95%), appended to the
+        Coverage line as a TRUNCATED annotation AND a visible `## Incomplete
+        translation` notice block is emitted before the transcript body.
+    segments_block: optional pre-rendered markdown block (e.g. F2 coverage
+        table) inserted between the metadata lines and the trailing `---`.
+    finish_reason: Gemini's finish_reason from the final chunk. Used to tailor
+        the incomplete-translation notice with a root-cause description.
     """
     now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
     lines = [f"# Translation (BCS): {title}", ""]
@@ -265,14 +443,47 @@ def build_header(
     lines.append(f"**Published:** {published}")
     lines.append(f"**Translated:** {now}")
     lines.append(f"**Model:** {model}")
-    if coverage is not None and duration_seconds is not None:
-        cov_start, cov_end = coverage
+
+    cov_end_s: int | None = None
+    truncated = False
+    if duration_seconds is not None:
+        if coverage is not None:
+            cov_start_s = coverage[0] * 60
+            cov_end_s = coverage[1] * 60
+        else:
+            cov_start_s = 0
+            cov_end_s = duration_seconds
         total_hhmm = _format_hhmm(duration_seconds)
-        cov_label = f"{_format_hhmm(cov_start * 60)} \u2013 {_format_hhmm(cov_end * 60)} / {total_hhmm} total"
+        cov_label = f"{_format_hhmm(cov_start_s)} \u2013 {_format_hhmm(cov_end_s)} / {total_hhmm} total"
+        if observed_end_seconds is not None and cov_end_s > 0:
+            ratio = observed_end_seconds / cov_end_s
+            if ratio < 0.95:
+                cov_label += f" \u2014 observed end {_format_hhmmss(observed_end_seconds)} (TRUNCATED)"
+                truncated = True
         lines.append(f"**Coverage:** {cov_label}")
+
+    if segments_block:
+        lines.append("")
+        lines.append(segments_block.rstrip())
     lines.append("")
     lines.append("---")
     lines.append("")
+
+    # Visible incomplete-translation notice: a reader scanning the file must
+    # not confuse the partial body for a complete translation. Append after
+    # the `---` separator and before the transcript body.
+    if truncated and observed_end_seconds is not None and cov_end_s is not None:
+        lines.append(
+            build_incomplete_notice(
+                observed_end_seconds,
+                cov_end_s,
+                finish_reason=finish_reason,
+            )
+        )
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
     return "\n".join(lines) + "\n"
 
 
@@ -312,6 +523,46 @@ def format_stats(elapsed: float, line_count: int, usage: dict | None) -> str:
 # ---------------------------------------------------------------------------
 # Stitcher — merges part files into a single translation
 # ---------------------------------------------------------------------------
+
+
+def classify_segment_status(
+    observed_last_relative: int | None,
+    chunk_duration_seconds: int,
+) -> str:
+    """Return `ok` / `suspicious` / `truncated` for a single part file.
+
+    Deterministic ratio thresholds, no heuristics:
+    - ok          observed_last >= 95% of expected duration
+    - suspicious  observed_last in [80%, 95%)
+    - truncated   observed_last < 80% (or no parseable timestamps)
+    """
+    if observed_last_relative is None or chunk_duration_seconds <= 0:
+        return "truncated"
+    ratio = observed_last_relative / chunk_duration_seconds
+    if ratio >= 0.95:
+        return "ok"
+    if ratio >= 0.80:
+        return "suspicious"
+    return "truncated"
+
+
+def build_segments_block(rows: list[dict]) -> str:
+    """Render per-part coverage rows as a compact markdown table.
+
+    Columns: Range, Expected end, Observed last, Status. One row per part
+    file. Omits the block entirely when there are no rows.
+    """
+    if not rows:
+        return ""
+    lines = [
+        "**Segments:**",
+        "",
+        "| Range | Expected end | Observed last | Status |",
+        "| --- | --- | --- | --- |",
+    ]
+    for row in rows:
+        lines.append(f"| {row['range']} | {row['expected_end']} | {row['observed_last']} | {row['status']} |")
+    return "\n".join(lines) + "\n"
 
 
 def stitch_parts(
@@ -362,27 +613,64 @@ def stitch_parts(
     # Read, apply offsets, and merge
     all_lines: list[str] = []
     last_ts: tuple[int, int, int] | None = None
+    segment_rows: list[dict] = []
+    pending_divider: str | None = None  # queued for next segment's first line
 
     for part_file in part_files:
         # Extract offset and duration from filename: part-START-END
         offset_match = re.search(r"\.part-(\d+)-(\d+)\.", part_file.name)
         if offset_match:
-            offset_seconds = int(offset_match.group(1)) * 60
-            chunk_duration_seconds = (int(offset_match.group(2)) - int(offset_match.group(1))) * 60
+            start_min_raw = int(offset_match.group(1))
+            end_min_raw = int(offset_match.group(2))
+            offset_seconds = start_min_raw * 60
+            chunk_duration_seconds = (end_min_raw - start_min_raw) * 60
         else:
+            start_min_raw = 0
+            end_min_raw = 60
             offset_seconds = 0
             chunk_duration_seconds = 3600  # fallback: assume 1h
 
         content = part_file.read_text(encoding="utf-8")
-        lines = content.splitlines()
+        raw_lines = content.splitlines()
+        reinterpret_mm_ss_zero = should_reinterpret_part_as_mm_ss_zero(
+            raw_lines, offset_seconds, chunk_duration_seconds
+        )
+        if reinterpret_mm_ss_zero:
+            log.warning(
+                "Detected malformed [MM:SS:00] timestamps in %s; reinterpreting as clip-relative [MM:SS]",
+                part_file.name,
+            )
+            repaired_lines = [normalize_mm_ss_zero_timestamp(line) for line in raw_lines]
+        else:
+            repaired_lines = raw_lines
 
-        for line in lines:
+        # Emit any divider queued by the previous non-ok segment before
+        # this segment's first line, so the body position matches the row.
+        if pending_divider is not None:
+            all_lines.append(pending_divider)
+            pending_divider = None
+
+        # F2 observed-last: walk the ADJUSTED lines and track the last
+        # timestamp that falls inside the expected absolute window for this
+        # chunk. Using the adjusted output means already-absolute timestamps
+        # (part files that arrive as [01:11:00] rather than [00:11:00]) are
+        # handled correctly, and implausible pass-throughs are excluded by
+        # the window check. Values beyond the window are skipped rather
+        # than trusted; classify_segment_status then reads the clip-
+        # relative observation (= absolute minus offset).
+        chunk_tolerance = timestamp_tolerance(chunk_duration_seconds)
+        abs_window_min = offset_seconds - chunk_tolerance
+        abs_window_max = offset_seconds + chunk_duration_seconds + chunk_tolerance
+        part_last_absolute: int | None = None
+
+        for line in repaired_lines:
             adjusted = apply_timestamp_offset(line, offset_seconds, chunk_duration_seconds)
 
             # Check monotonic timestamps
             ts_match = re.match(r"\[(\d{2}):(\d{2}):(\d{2})\]", adjusted)
             if ts_match:
-                current_ts = (int(ts_match.group(1)), int(ts_match.group(2)), int(ts_match.group(3)))
+                hh, mm, ss = int(ts_match.group(1)), int(ts_match.group(2)), int(ts_match.group(3))
+                current_ts = (hh, mm, ss)
                 if last_ts is not None and current_ts < last_ts:
                     log.warning(
                         "Non-monotonic timestamp: [%02d:%02d:%02d] after [%02d:%02d:%02d]",
@@ -391,7 +679,49 @@ def stitch_parts(
                     )
                 last_ts = current_ts
 
+                total_adjusted = hh * 3600 + mm * 60 + ss
+                if abs_window_min <= total_adjusted <= abs_window_max:
+                    part_last_absolute = total_adjusted
+
             all_lines.append(adjusted)
+
+        # Derive clip-relative observation for status classification and
+        # absolute display. None → no valid in-window timestamps → truncated.
+        if part_last_absolute is not None:
+            observed_last_relative = max(0, part_last_absolute - offset_seconds)
+            observed_last_label = _format_hhmmss(part_last_absolute)
+        else:
+            observed_last_relative = None
+            observed_last_label = "—"
+        status = classify_segment_status(observed_last_relative, chunk_duration_seconds)
+
+        range_label = f"{_format_hhmm(start_min_raw * 60)}\u2013{_format_hhmm(end_min_raw * 60)}"
+        expected_end_label = _format_hhmmss(end_min_raw * 60)
+        segment_rows.append(
+            {
+                "range": range_label,
+                "expected_end": expected_end_label,
+                "observed_last": observed_last_label,
+                "status": status,
+            }
+        )
+        if status != "ok":
+            log.warning(
+                "Segment %s %s: observed end %s, expected %s",
+                range_label,
+                status.upper(),
+                observed_last_label,
+                expected_end_label,
+            )
+            # Queue a divider so the NEXT segment (or end of body) carries
+            # the annotation inline with the coverage-table entry.
+            pending_divider = (
+                f"<!-- segment {range_label} {status} at {observed_last_label} (expected {expected_end_label}) -->"
+            )
+
+    # If the last segment was non-ok, flush its divider at the end of body
+    if pending_divider is not None:
+        all_lines.append(pending_divider)
 
     # Calculate coverage range from part filenames (first start, last end in minutes)
     first_match = re.search(r"\.part-(\d+)-\d+\.", part_files[0].name)
@@ -407,6 +737,7 @@ def stitch_parts(
     )
 
     # Build output
+    segments_block = build_segments_block(segment_rows)
     header = build_header(
         title,
         url,
@@ -415,6 +746,7 @@ def stitch_parts(
         original_title=original_title,
         coverage=coverage,
         duration_seconds=duration_seconds,
+        segments_block=segments_block or None,
     )
     bcs_note = ""
     if is_partial:
@@ -462,8 +794,12 @@ def call_gemini_translate(
     high_res: bool = False,
     start_offset: int | None = None,
     end_offset: int | None = None,
-) -> tuple[str, dict | None]:
-    """Stream video translation from Gemini with heartbeat and progressive writes."""
+) -> tuple[str, dict | None, str | None]:
+    """Stream video translation from Gemini with heartbeat and progressive writes.
+
+    Returns: (text, usage_metadata, finish_reason)
+    finish_reason: "STOP", "MAX_TOKENS", etc. from final chunk, or None if unavailable.
+    """
     # Build video part with optional clipping via video_metadata
     part_kwargs = {"file_data": types.FileData(file_uri=video_url)}
     if start_offset is not None or end_offset is not None:
@@ -476,7 +812,11 @@ def call_gemini_translate(
 
     # Clip-relative instruction for chunks; stitcher applies absolute offsets later
     if start_offset is not None and end_offset is not None:
-        instruction = "Translate only the provided clip. Start timestamps at [00:00:00] relative to this clip, in [HH:MM:SS] format."
+        instruction = (
+            "Translate only the provided clip. Start timestamps at [00:00:00] relative to this clip, "
+            "in [HH:MM:SS] format. For seconds, use the LAST field: 5 seconds must be [00:00:05], "
+            "not [00:05:00]."
+        )
     else:
         instruction = "Translate the entire video audio to BCS."
 
@@ -490,6 +830,7 @@ def call_gemini_translate(
         "system_instruction": system_prompt,
         "max_output_tokens": MAX_OUTPUT_TOKENS,
         "temperature": 0.2,
+        "safety_settings": build_permissive_safety_settings(types),
     }
     if not high_res:
         # Default to low media resolution: translation reads audio only, and audio tokens
@@ -539,6 +880,7 @@ def call_gemini_translate(
 
     accumulated = []
     usage = None
+    finish_reason = None
     first_chunk = True
     # Wall-clock timeout for first chunk. Gemini Pro can take 10-15 min to start
     # on long videos, so 20 min is generous but bounded.  The httpx read=1200
@@ -594,7 +936,11 @@ def call_gemini_translate(
                 # Live progress to stderr
                 print(text, end="", file=sys.stderr, flush=True)
 
-            # Capture usage metadata from final chunk
+            # Capture usage metadata and finish reason from final chunk.
+            # finish_reason lives on chunk.candidates[0].finish_reason per the
+            # google-genai SDK — NOT on content.parts. Getting this path
+            # wrong silently produces `finish_reason = None` and masks
+            # exactly the diagnostic this capture is meant to surface.
             if hasattr(chunk, "usage_metadata") and chunk.usage_metadata:
                 meta = chunk.usage_metadata
                 usage = {
@@ -602,6 +948,11 @@ def call_gemini_translate(
                     "candidates_token_count": getattr(meta, "candidates_token_count", None),
                     "total_token_count": getattr(meta, "total_token_count", None),
                 }
+            if hasattr(chunk, "candidates") and chunk.candidates:
+                candidate_reason = getattr(chunk.candidates[0], "finish_reason", None)
+                if candidate_reason is not None:
+                    # Normalize enum or string to a bare name ("STOP", "SAFETY", ...)
+                    finish_reason = getattr(candidate_reason, "name", str(candidate_reason))
 
     except TimeoutError as e:
         stop_heartbeat.set()
@@ -621,7 +972,7 @@ def call_gemini_translate(
         # Newline after streaming output
         print("", file=sys.stderr)
 
-    return "".join(accumulated), usage
+    return "".join(accumulated), usage, finish_reason
 
 
 # ---------------------------------------------------------------------------
@@ -695,7 +1046,7 @@ def translate_video(
     if manual_range:
         needs_chunking = False
     else:
-        needs_chunking = duration_seconds > 3600
+        needs_chunking = duration_seconds > single_request_cap_seconds(high_res)
 
     # Resolve output directory
     if not use_stdout:
@@ -721,11 +1072,11 @@ def translate_video(
 
     # Build chunk list
     if needs_chunking:
-        chunks = build_chunk_list(duration_seconds, chunk_minutes)
+        chunks = build_chunk_list(duration_seconds, chunk_minutes, high_res=high_res)
         log.info(
-            "Duration:  %s (1h first chunk + %d x %dm)",
+            "Duration:  %s (auto-chunked into %d x ~%dm segments)",
             format_elapsed(duration_seconds),
-            len(chunks) - 1,
+            len(chunks),
             chunk_minutes,
         )
     elif manual_range:
@@ -755,6 +1106,20 @@ def translate_video(
     last_usage = None
     part_files_written: list[Path] = []
 
+    # Clear stale part files before either branch runs. Without this, a video
+    # that previously went through the chunked path and is now running in
+    # single-request mode (e.g. after F1 lowered the chunking threshold) would
+    # leave old part-N-N files on disk alongside the new single-request output.
+    # The stitcher would then see them as canonical artifacts and produce a
+    # garbage merge.
+    if force:
+        stale_parts = sorted(output_dir.glob(f"{date}-{slug}.part-*.translate-bcs.txt"))
+        stale_tmps = sorted(output_dir.glob(f"{date}-{slug}.part-*.translate-bcs.txt.tmp"))
+        for stale_path in stale_parts + stale_tmps:
+            stale_path.unlink(missing_ok=True)
+        if stale_parts or stale_tmps:
+            log.info("Cleared %d existing part file(s) for forced re-run", len(stale_parts) + len(stale_tmps))
+
     if needs_chunking:
         # Auto-chunk mode: each chunk produces its own part file (canonical artifacts)
         for i, (s_off, e_off) in enumerate(chunks):
@@ -771,7 +1136,7 @@ def translate_video(
             tmp_file = None
             try:
                 tmp_file = open(part_tmp, "w", encoding="utf-8")  # noqa: SIM115
-                text, usage = call_gemini_translate(
+                text, usage, finish_reason_chunk = call_gemini_translate(
                     client,
                     types,
                     canonical_url,
@@ -782,6 +1147,8 @@ def translate_video(
                     start_offset=s_off,
                     end_offset=e_off,
                 )
+                if finish_reason_chunk and finish_reason_chunk != "STOP":
+                    log.warning("Chunk %d/%d finish_reason: %s (not STOP)", i + 1, len(chunks), finish_reason_chunk)
                 if usage:
                     last_usage = usage
             except TimeoutError:
@@ -832,6 +1199,7 @@ def translate_video(
     else:
         # Single-request mode (no chunking, or manual range)
         all_text_parts = []
+        last_finish_reason: str | None = None
         tmp_file = None
         try:
             if tmp_path:
@@ -844,7 +1212,7 @@ def translate_video(
                 else:
                     log.info("Sending to Gemini...")
 
-                text, usage = call_gemini_translate(
+                text, usage, finish_reason_req = call_gemini_translate(
                     client,
                     types,
                     canonical_url,
@@ -855,6 +1223,10 @@ def translate_video(
                     start_offset=s_off if use_clipping else None,
                     end_offset=e_off if use_clipping else None,
                 )
+                if finish_reason_req:
+                    last_finish_reason = finish_reason_req
+                    if finish_reason_req != "STOP":
+                        log.warning("finish_reason: %s (not STOP)", finish_reason_req)
                 if text and text.strip():
                     all_text_parts.append(text)
                 if usage:
@@ -883,8 +1255,49 @@ def translate_video(
             log.info(format_stats(elapsed, line_count, last_usage))
             return
 
+        # F1b: single-request coverage sanity check.
+        # Taking the video out of chunking does not take it out of the
+        # truncation blast radius — if Gemini silently stops early,
+        # there's no stitch step to surface the problem. Compare the last
+        # observed timestamp against the known video duration and warn
+        # loudly if the run under-covers.
+        observed_end = None
+        if duration_seconds and not manual_range:
+            observed_end = extract_last_timestamp_seconds(full_text)
+            if observed_end is not None:
+                ratio = observed_end / duration_seconds
+                if ratio < 0.95:
+                    log.warning(
+                        "Translation ended at %s but video duration is %s "
+                        "(%.0f%% covered) — Gemini may have truncated. "
+                        "Verify output or rerun with --force.",
+                        _format_hhmmss(observed_end),
+                        _format_hhmmss(duration_seconds),
+                        ratio * 100,
+                    )
+
+        # For manual --start/--end, pass a coverage tuple matching the
+        # requested range so the header does not falsely claim full-video
+        # coverage. F1b annotation is skipped (observed_end stays None) for
+        # the same reason — observed clip time is not comparable to total
+        # duration for partial translations.
+        cov_for_header: tuple[int, int] | None = None
+        if manual_range and duration_seconds:
+            cov_start_min = start_minutes or 0
+            cov_end_min = end_minutes if end_minutes is not None else (duration_seconds // 60)
+            cov_for_header = (cov_start_min, cov_end_min)
+
         # Atomic promotion: write header + full text, then rename
-        header = build_header(title, canonical_url, date, model_name)
+        header = build_header(
+            title,
+            canonical_url,
+            date,
+            model_name,
+            coverage=cov_for_header,
+            duration_seconds=duration_seconds or None,
+            observed_end_seconds=observed_end,
+            finish_reason=last_finish_reason,
+        )
         tmp_path.write_text(header + full_text, encoding="utf-8")
         tmp_path.replace(output_path)
 
@@ -909,13 +1322,13 @@ Token budget:
   (translate-bcs) does not.
 
 Examples:
-  # Any talking-head video up to ~2.5 hours — single pass, low-res default
+  # Any talking-head video up to ~150 min — single pass, low-res default
   %(prog)s "https://www.youtube.com/watch?v=VIDEO_ID"
 
   # Partial translation — e.g. first hour only, skip the interview segment
   %(prog)s "https://www.youtube.com/watch?v=VIDEO_ID" --end 63
 
-  # Stitch auto-chunked parts for videos over ~2.5 hours
+  # Stitch auto-chunked parts (triggered past 150 min low-res / 50 min high-res)
   %(prog)s "https://www.youtube.com/watch?v=VIDEO_ID" --stitch
 
   # Backfill a failed or missing chunk

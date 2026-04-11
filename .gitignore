@@ -15,5 +15,9 @@ build/
 .venv/
 venv/
 .coverage
+
 examples/*.part-*.txt
 examples/*.txt.tmp
+
+.codex-review-smoke2/
+.codex-review-smoke2-out/

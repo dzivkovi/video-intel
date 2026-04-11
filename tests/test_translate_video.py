@@ -5,15 +5,20 @@ from pathlib import Path
 
 from translate_video import (
     _format_hhmm,
+    _format_hhmmss,
     apply_timestamp_offset,
     build_chunk_list,
     build_header,
     build_output_path,
+    build_segments_block,
+    classify_segment_status,
+    extract_last_timestamp_seconds,
     extract_video_id,
     format_elapsed,
     format_stats,
     normalize_timestamp,
     parse_iso8601_duration,
+    single_request_cap_seconds,
     slugify,
     stitch_parts,
     translate_title,
@@ -148,51 +153,98 @@ class TestFormatStats:
         assert "Input tokens" not in result
 
 
-class TestBuildChunkList:
-    """Tests for the chunking policy: <= 60 min single, > 60 min first-hour + 20m."""
+class TestSingleRequestCap:
+    """Tests for the resolution-aware single-request capacity."""
 
-    def test_short_video_no_chunking(self):
-        # 30-min video → single request, no clipping
+    def test_low_res_cap_is_150_min(self):
+        assert single_request_cap_seconds(high_res=False) == 9000
+
+    def test_high_res_cap_is_50_min(self):
+        assert single_request_cap_seconds(high_res=True) == 3000
+
+
+class TestBuildChunkList:
+    """Tests for the resolution-aware chunking policy.
+
+    Low-res default: single request up to 150 min, then uniform 20-min chunks.
+    High-res:        single request up to 50 min,  then uniform 20-min chunks.
+    """
+
+    # --- Low-res (default) single-request cases ---
+
+    def test_short_video_no_chunking_low_res(self):
+        # 30-min video → single request
         assert build_chunk_list(30 * 60) == [(0, 0)]
 
-    def test_45_min_video_no_chunking(self):
-        # 45-min video → single request, no clipping
-        assert build_chunk_list(45 * 60) == [(0, 0)]
+    def test_64_min_video_no_chunking_low_res(self):
+        # Regression guard: user's failing video is 1h 4m 5s and must
+        # NOT trigger chunking in default (low-res) mode.
+        assert build_chunk_list(3845) == [(0, 0)]
 
-    def test_exactly_60_min_no_chunking(self):
-        # 60-min video → single request (boundary: <= 60)
-        assert build_chunk_list(60 * 60) == [(0, 0)]
+    def test_90_min_video_no_chunking_low_res(self):
+        # 90-min video fits under the 150-min low-res cap → single request
+        assert build_chunk_list(90 * 60) == [(0, 0)]
 
-    def test_61_min_video_chunks_first_hour_then_remainder(self):
-        # 61-min video → first hour + 1-min remainder
-        chunks = build_chunk_list(61 * 60)
-        assert chunks[0] == (0, 3600)
-        assert chunks[1] == (3600, 61 * 60)
-        assert len(chunks) == 2
+    def test_149_min_video_no_chunking_low_res(self):
+        # Just under the 150-min threshold → single request
+        assert build_chunk_list(149 * 60) == [(0, 0)]
 
-    def test_90_min_video_first_hour_then_20m_chunks(self):
-        # 90-min video → first hour + 20-min chunk + 10-min remainder
-        chunks = build_chunk_list(90 * 60, chunk_minutes=20)
-        assert chunks[0] == (0, 3600)
-        assert chunks[1] == (3600, 3600 + 1200)  # 60-80 min
-        assert chunks[2] == (3600 + 1200, 90 * 60)  # 80-90 min
-        assert len(chunks) == 3
+    def test_exactly_150_min_no_chunking_low_res(self):
+        # Boundary case: threshold is `<=` 150 min → single request
+        assert build_chunk_list(150 * 60) == [(0, 0)]
 
-    def test_140_min_video_first_hour_then_four_20m_chunks(self):
-        # 140 min = 2h20m → first hour + 4 x 20-min chunks
-        chunks = build_chunk_list(140 * 60, chunk_minutes=20)
-        assert chunks[0] == (0, 3600)
-        assert chunks[1] == (3600, 4800)  # 60-80
-        assert chunks[2] == (4800, 6000)  # 80-100
-        assert chunks[3] == (6000, 7200)  # 100-120
-        assert chunks[4] == (7200, 8400)  # 120-140
+    # --- Low-res chunked cases ---
+
+    def test_151_min_video_chunks_low_res(self):
+        # Just over the 150-min threshold → uniform 20-min chunks from 0.
+        # 151 min = 9060 sec → 7 full 20-min chunks then an 11-min remainder
+        chunks = build_chunk_list(151 * 60)
+        assert chunks[0] == (0, 1200)
+        assert chunks[-1] == (8400, 151 * 60)
+        assert len(chunks) == 8
+
+    def test_200_min_video_chunks_low_res(self):
+        chunks = build_chunk_list(200 * 60)
+        # 200 min = 10 uniform 20-min chunks
+        assert chunks[0] == (0, 1200)
+        assert chunks[-1] == (10800, 12000)
+        assert len(chunks) == 10
+
+    # --- High-res single-request cases ---
+
+    def test_short_video_no_chunking_high_res(self):
+        assert build_chunk_list(30 * 60, high_res=True) == [(0, 0)]
+
+    def test_50_min_video_no_chunking_high_res(self):
+        # Boundary: <= 50 min → single request
+        assert build_chunk_list(50 * 60, high_res=True) == [(0, 0)]
+
+    # --- High-res chunked cases ---
+
+    def test_64_min_video_chunks_high_res(self):
+        # High-res gets chunked at ~50 min, so the user's 64-min video
+        # would split if (and only if) they pass --high-res.
+        chunks = build_chunk_list(3845, high_res=True)
+        assert chunks[0] == (0, 1200)
+        assert chunks[-1] == (3600, 3845)
+        assert len(chunks) == 4  # 20+20+20+4:05
+
+    def test_90_min_video_20m_chunks_high_res(self):
+        # 90-min video → 4 x 20m + 10m remainder
+        chunks = build_chunk_list(90 * 60, chunk_minutes=20, high_res=True)
+        assert chunks[0] == (0, 1200)
+        assert chunks[1] == (1200, 2400)
+        assert chunks[2] == (2400, 3600)
+        assert chunks[3] == (3600, 4800)
+        assert chunks[4] == (4800, 90 * 60)
         assert len(chunks) == 5
 
-    def test_custom_chunk_minutes(self):
-        # 90-min video with 10-min chunks → first hour + 3 x 10-min
-        chunks = build_chunk_list(90 * 60, chunk_minutes=10)
-        assert chunks[0] == (0, 3600)
-        assert len(chunks) == 4  # 1 first-hour + 3 remainder chunks
+    def test_custom_chunk_minutes_high_res(self):
+        # Force chunking via high_res and verify chunk_minutes override
+        chunks = build_chunk_list(90 * 60, chunk_minutes=10, high_res=True)
+        assert chunks[0] == (0, 600)
+        assert chunks[-1] == (4800, 5400)
+        assert len(chunks) == 9
 
 
 class TestNormalizeTimestamp:
@@ -260,6 +312,12 @@ class TestApplyTimestampOffset:
     def test_large_relative_near_chunk_boundary(self):
         # [19:58] in a 1200s (20-min) chunk → 1198s ≤ 1500s → relative
         assert apply_timestamp_offset("[19:58] text", 3600, 1200) == "[01:19:58] text"
+
+    def test_mm_ss_zero_pattern_in_short_chunk_becomes_implausible(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="translate_video"):
+            result = apply_timestamp_offset("[00:05:00] text", 3600, 240)
+        assert result == "[00:05:00] text"
+        assert any("implausible" in r.message.lower() for r in caplog.records)
 
     # --- Already-absolute inputs (should not double-offset) ---
 
@@ -420,6 +478,31 @@ class TestStitchParts:
         # Assert: warning about non-monotonic, but still succeeds
         assert any("monotonic" in r.message.lower() for r in caplog.records)
 
+    def test_stitch_repairs_mm_ss_zero_tail_chunk(self, tmp_path):
+        self._write_part(
+            tmp_path,
+            "vid",
+            "2024-01-01",
+            60,
+            64,
+            [
+                "[00:00:00] nastavak",
+                "[00:05:00] druga rečenica",
+                "[00:09:00] treća rečenica",
+                "[01:01:00] još malo",
+                "[03:58:00] kraj",
+            ],
+        )
+
+        result = stitch_parts(tmp_path, "Vid", "2024-01-01", "https://youtube.com/watch?v=TEST", "gemini-test")
+
+        content = result.read_text(encoding="utf-8")
+        assert "[01:00:00] nastavak" in content
+        assert "[01:00:05] druga rečenica" in content
+        assert "[01:00:09] treća rečenica" in content
+        assert "[01:01:01] još malo" in content
+        assert "[01:03:58] kraj" in content
+
 
 class TestFormatHhmm:
     def test_zero(self):
@@ -452,7 +535,9 @@ class TestBuildHeaderCoverage:
         )
         assert "Coverage" not in header
 
-    def test_duration_without_coverage_omits_line(self):
+    def test_duration_without_coverage_derives_full_range(self):
+        # F1b: single-request path passes duration alone — header derives a
+        # full-video coverage range rather than omitting the line.
         header = build_header(
             "Title",
             "https://example.com",
@@ -460,7 +545,8 @@ class TestBuildHeaderCoverage:
             "gemini-test",
             duration_seconds=8280,
         )
-        assert "Coverage" not in header
+        assert "**Coverage:** 00:00" in header
+        assert "02:18 total" in header
 
     def test_partial_coverage_shown(self):
         header = build_header(
@@ -752,3 +838,579 @@ class TestTranslateTitle:
         assert result == "Original Title"
         assert client.models.generate_content.call_count == 3
         assert sleeps == [15, 30]
+
+
+class TestFormatHhmmss:
+    """Tests for _format_hhmmss() — HH:MM:SS formatter used in coverage output."""
+
+    def test_zero(self):
+        assert _format_hhmmss(0) == "00:00:00"
+
+    def test_under_one_minute(self):
+        assert _format_hhmmss(42) == "00:00:42"
+
+    def test_under_one_hour(self):
+        assert _format_hhmmss(32 * 60 + 58) == "00:32:58"
+
+    def test_over_one_hour(self):
+        assert _format_hhmmss(3600 + 58) == "01:00:58"
+
+    def test_user_video_duration(self):
+        # 1h 4m 5s — the user's failing video duration
+        assert _format_hhmmss(3845) == "01:04:05"
+
+    def test_negative_clamps_to_zero(self):
+        assert _format_hhmmss(-5) == "00:00:00"
+
+
+class TestExtractLastTimestampSeconds:
+    """Tests for extract_last_timestamp_seconds() — last parseable ts in text."""
+
+    def test_empty_text_returns_none(self):
+        assert extract_last_timestamp_seconds("") is None
+
+    def test_no_timestamps_returns_none(self):
+        assert extract_last_timestamp_seconds("hello\nworld") is None
+
+    def test_single_hh_mm_ss(self):
+        assert extract_last_timestamp_seconds("[00:32:58] last line") == 32 * 60 + 58
+
+    def test_single_mm_ss(self):
+        assert extract_last_timestamp_seconds("[03:58] last") == 3 * 60 + 58
+
+    def test_returns_last_of_many(self):
+        text = "[00:00:00] one\n[00:15:30] two\n[00:32:58] three"
+        assert extract_last_timestamp_seconds(text) == 32 * 60 + 58
+
+    def test_mixed_formats(self):
+        # MM:SS earlier, HH:MM:SS later — returns the last one
+        text = "[05:00] first\n[00:32:58] last"
+        assert extract_last_timestamp_seconds(text) == 32 * 60 + 58
+
+    def test_ignores_leading_whitespace_and_bom(self):
+        text = "\ufeff[00:32:58] text"
+        assert extract_last_timestamp_seconds(text) == 32 * 60 + 58
+
+    def test_mm_ss_zero_drift_not_handled(self):
+        # Helper operates on already-repaired text — raw [MM:SS:cc] drift is
+        # parsed as HH:MM:SS (a known contract of the helper).
+        # Callers must run normalize_mm_ss_zero_timestamp first.
+        assert extract_last_timestamp_seconds("[03:58:00] raw drift") == 3 * 3600 + 58 * 60
+
+    def test_user_video_full_coverage(self):
+        # 1h 4m 5s video, observed end at 01:03:58 → near-complete
+        text = "[00:00:00] start\n[01:03:58] end"
+        assert extract_last_timestamp_seconds(text) == 3600 + 3 * 60 + 58
+
+
+class TestClassifySegmentStatus:
+    """Tests for classify_segment_status() — ok/suspicious/truncated thresholds."""
+
+    def test_full_coverage_ok(self):
+        # 20-min chunk, observed to 19:58 (>= 95%)
+        assert classify_segment_status(19 * 60 + 58, 20 * 60) == "ok"
+
+    def test_exactly_95_percent_ok(self):
+        # 60-min chunk at 95% = 3420s
+        assert classify_segment_status(3420, 3600) == "ok"
+
+    def test_just_below_95_percent_suspicious(self):
+        assert classify_segment_status(3419, 3600) == "suspicious"
+
+    def test_exactly_80_percent_suspicious(self):
+        assert classify_segment_status(2880, 3600) == "suspicious"
+
+    def test_just_below_80_percent_truncated(self):
+        assert classify_segment_status(2879, 3600) == "truncated"
+
+    def test_user_chunk_1_truncated(self):
+        # User's chunk 1 ended at [32:58] of a 60-min expected window
+        # → 1978s / 3600s ≈ 55% → truncated
+        assert classify_segment_status(32 * 60 + 58, 60 * 60) == "truncated"
+
+    def test_none_observed_is_truncated(self):
+        assert classify_segment_status(None, 60 * 60) == "truncated"
+
+    def test_zero_duration_returns_truncated(self):
+        assert classify_segment_status(100, 0) == "truncated"
+
+
+class TestBuildSegmentsBlock:
+    """Tests for build_segments_block() — F2 coverage table rendering."""
+
+    def test_empty_rows_returns_empty_string(self):
+        assert build_segments_block([]) == ""
+
+    def test_single_row(self):
+        block = build_segments_block(
+            [
+                {
+                    "range": "00:00\u201300:20",
+                    "expected_end": "00:20:00",
+                    "observed_last": "00:19:47",
+                    "status": "ok",
+                }
+            ]
+        )
+        assert "**Segments:**" in block
+        assert "| Range | Expected end | Observed last | Status |" in block
+        assert "| 00:00\u201300:20 | 00:20:00 | 00:19:47 | ok |" in block
+
+    def test_multi_row_contains_each_status(self):
+        rows = [
+            {
+                "range": "00:00\u201300:20",
+                "expected_end": "00:20:00",
+                "observed_last": "00:19:47",
+                "status": "ok",
+            },
+            {
+                "range": "00:20\u201300:40",
+                "expected_end": "00:40:00",
+                "observed_last": "00:32:58",
+                "status": "truncated",
+            },
+            {
+                "range": "00:40\u201301:00",
+                "expected_end": "01:00:00",
+                "observed_last": "00:58:30",
+                "status": "suspicious",
+            },
+        ]
+        block = build_segments_block(rows)
+        assert "truncated" in block
+        assert "suspicious" in block
+        # 3 data rows (+2 header rows) in the rendered table
+        data_rows = [line for line in block.splitlines() if line.startswith("| 00:")]
+        assert len(data_rows) == 3
+
+
+class TestBuildHeaderF1bAnnotation:
+    """Tests for the F1b TRUNCATED annotation on build_header's Coverage line."""
+
+    def test_clean_run_no_annotation(self):
+        # observed_end within 5% of requested end → no annotation
+        header = build_header(
+            "Title",
+            "https://example.com",
+            "2024-01-01",
+            "gemini-test",
+            duration_seconds=3845,
+            observed_end_seconds=3838,
+        )
+        assert "**Coverage:** 00:00" in header
+        assert "TRUNCATED" not in header
+        assert "observed end" not in header
+
+    def test_truncated_run_annotated(self):
+        # user's failure case: 1h4m5s video, Gemini stopped at 32:58
+        header = build_header(
+            "Title",
+            "https://example.com",
+            "2024-01-01",
+            "gemini-test",
+            duration_seconds=3845,
+            observed_end_seconds=32 * 60 + 58,
+        )
+        assert "**Coverage:** 00:00" in header
+        assert "01:04 total" in header
+        assert "observed end 00:32:58" in header
+        assert "TRUNCATED" in header
+
+    def test_observed_none_no_annotation(self):
+        header = build_header(
+            "Title",
+            "https://example.com",
+            "2024-01-01",
+            "gemini-test",
+            duration_seconds=3845,
+            observed_end_seconds=None,
+        )
+        assert "**Coverage:** 00:00" in header
+        assert "TRUNCATED" not in header
+
+    def test_segments_block_included(self):
+        block = (
+            "**Segments:**\n\n"
+            "| Range | Expected end | Observed last | Status |\n"
+            "| --- | --- | --- | --- |\n"
+            "| 00:00\u201300:20 | 00:20:00 | 00:19:47 | ok |\n"
+        )
+        header = build_header(
+            "Title",
+            "https://example.com",
+            "2024-01-01",
+            "gemini-test",
+            duration_seconds=3600,
+            segments_block=block,
+        )
+        assert "**Segments:**" in header
+        assert "| 00:00\u201300:20 | 00:20:00 | 00:19:47 | ok |" in header
+        # Structurally: segments block sits before the trailing --- separator
+        assert header.index("**Segments:**") < header.index("\n---\n")
+
+
+class TestStitchPartsF2Diagnostics:
+    """Tests for F2: stitcher coverage table, status, and dividers."""
+
+    def _write_part(self, tmp_path: Path, slug: str, date: str, start: int, end: int, lines: list[str]) -> Path:
+        path = tmp_path / f"{date}-{slug}.part-{start}-{end}.translate-bcs.txt"
+        path.write_text("\n".join(lines), encoding="utf-8")
+        return path
+
+    def test_all_clean_parts_produce_ok_rows_no_dividers(self, tmp_path, caplog):
+        # Three 20-min chunks, each ending near full coverage
+        self._write_part(tmp_path, "vid", "2024-01-01", 0, 20, ["[00:00:00] a", "[00:19:47] b"])
+        self._write_part(tmp_path, "vid", "2024-01-01", 20, 40, ["[00:00:00] c", "[00:19:50] d"])
+        self._write_part(tmp_path, "vid", "2024-01-01", 40, 60, ["[00:00:00] e", "[00:19:30] f"])
+
+        with caplog.at_level(logging.WARNING, logger="translate_video"):
+            result = stitch_parts(tmp_path, "Vid", "2024-01-01", "https://youtube.com/watch?v=TEST", "gemini-test")
+
+        content = result.read_text(encoding="utf-8")
+        assert "**Segments:**" in content
+        assert content.count("| ok |") == 3
+        assert "truncated" not in content
+        assert "suspicious" not in content
+        assert "<!-- segment" not in content
+        assert not any("TRUNCATED" in r.message or "SUSPICIOUS" in r.message for r in caplog.records)
+
+    def test_truncated_middle_part_flagged_and_divided(self, tmp_path, caplog):
+        # Three 60-min chunks. Part 2 ends at 32:58 → truncated (55%)
+        self._write_part(tmp_path, "vid", "2024-01-01", 0, 60, ["[00:00:00] a", "[00:59:30] b"])
+        self._write_part(tmp_path, "vid", "2024-01-01", 60, 120, ["[00:00:00] c", "[00:32:58] mid"])
+        self._write_part(tmp_path, "vid", "2024-01-01", 120, 180, ["[00:00:00] d", "[00:58:10] e"])
+
+        with caplog.at_level(logging.WARNING, logger="translate_video"):
+            result = stitch_parts(tmp_path, "Vid", "2024-01-01", "https://youtube.com/watch?v=TEST", "gemini-test")
+
+        content = result.read_text(encoding="utf-8")
+        # Coverage table has one truncated row
+        assert content.count("| truncated |") == 1
+        assert content.count("| ok |") == 2
+        # Divider comment precedes the following segment's first line
+        assert "<!-- segment 01:00\u201302:00 truncated" in content
+        # Divider appears in the body BEFORE part 3's first line
+        divider_idx = content.index("<!-- segment 01:00\u201302:00 truncated")
+        part3_idx = content.index("[02:00:00] d")
+        assert divider_idx < part3_idx
+        # And AFTER part 2's last line
+        part2_last_idx = content.index("[01:32:58] mid")
+        assert part2_last_idx < divider_idx
+        # Warning was logged
+        assert any("TRUNCATED" in r.message for r in caplog.records)
+
+    def test_last_part_truncated_divider_at_end(self, tmp_path, caplog):
+        # Two 20-min chunks; the LAST one is truncated. Divider should land
+        # at the end of the body since there's no following segment.
+        self._write_part(tmp_path, "vid", "2024-01-01", 0, 20, ["[00:00:00] a", "[00:19:47] b"])
+        self._write_part(tmp_path, "vid", "2024-01-01", 20, 40, ["[00:00:00] c", "[00:05:00] early"])
+
+        with caplog.at_level(logging.WARNING, logger="translate_video"):
+            result = stitch_parts(tmp_path, "Vid", "2024-01-01", "https://youtube.com/watch?v=TEST", "gemini-test")
+
+        content = result.read_text(encoding="utf-8")
+        assert "<!-- segment 00:20\u201300:40 truncated" in content
+        # Divider is the last thing in the body (after the last part's content)
+        assert content.index("[00:25:00] early") < content.index("<!-- segment 00:20\u201300:40 truncated")
+
+    def test_single_part_produces_one_row(self, tmp_path):
+        # Single-part stitch still renders a one-row segments table
+        self._write_part(tmp_path, "vid", "2024-01-01", 0, 20, ["[00:00:00] a", "[00:19:30] b"])
+
+        result = stitch_parts(tmp_path, "Vid", "2024-01-01", "https://youtube.com/watch?v=TEST", "gemini-test")
+
+        content = result.read_text(encoding="utf-8")
+        assert "**Segments:**" in content
+        assert content.count("| 00:00") == 1
+        assert "| ok |" in content
+
+    def test_mm_ss_zero_drift_repair_feeds_coverage_table(self, tmp_path):
+        # Regression: the user's chunk 2 with MM:SS:00 drift + full coverage
+        # must report `ok` in the F2 table, not `truncated`. This tests that
+        # the coverage helper runs AFTER the MM:SS:00 repair.
+        self._write_part(
+            tmp_path,
+            "vid",
+            "2024-01-01",
+            60,
+            64,
+            [
+                "[00:00:00] nastavak",
+                "[00:05:00] druga",
+                "[00:09:00] treća",
+                "[01:01:00] još",
+                "[03:58:00] kraj",
+            ],
+        )
+
+        result = stitch_parts(tmp_path, "Vid", "2024-01-01", "https://youtube.com/watch?v=TEST", "gemini-test")
+
+        content = result.read_text(encoding="utf-8")
+        # The part covers 03:58 of 04:00 expected → 99% → ok
+        assert "| ok |" in content
+        assert "| truncated |" not in content
+        # And timestamp repair still works end-to-end (Codex's existing fix)
+        assert "[01:03:58] kraj" in content
+
+    def test_absolute_timestamps_in_part_observed_correctly(self, tmp_path):
+        # Regression for Codex finding #1: a part-60-80 file whose timestamps
+        # are ALREADY absolute ([01:00:00] .. [01:19:50]) must report the
+        # correct observed-end (01:19:50) and `ok` status — not 02:19:50 and
+        # not an accidental `ok` from a ratio >1.
+        self._write_part(
+            tmp_path,
+            "vid",
+            "2024-01-01",
+            60,
+            80,
+            [
+                "[01:00:00] start",
+                "[01:11:00] middle",
+                "[01:19:50] end",
+            ],
+        )
+
+        result = stitch_parts(tmp_path, "Vid", "2024-01-01", "https://youtube.com/watch?v=TEST", "gemini-test")
+
+        content = result.read_text(encoding="utf-8")
+        # Observed end displayed in absolute form must be 01:19:50, NOT 02:19:50
+        assert "01:19:50" in content
+        assert "02:19:50" not in content
+        # And the row is still `ok` (99% of 1200s)
+        assert "| ok |" in content
+
+    def test_absolute_timestamps_truncated_part_flagged(self, tmp_path, caplog):
+        # Regression for Codex finding #1: a part-60-80 file where Gemini
+        # emitted absolute timestamps AND stopped early (last at [01:05:30])
+        # must be classified as truncated. Before the fix, the helper read
+        # 3930s against a 1200s chunk → 327% → false `ok`.
+        self._write_part(
+            tmp_path,
+            "vid",
+            "2024-01-01",
+            60,
+            80,
+            [
+                "[01:00:00] start",
+                "[01:05:30] stopped early",
+            ],
+        )
+
+        with caplog.at_level(logging.WARNING, logger="translate_video"):
+            result = stitch_parts(tmp_path, "Vid", "2024-01-01", "https://youtube.com/watch?v=TEST", "gemini-test")
+
+        content = result.read_text(encoding="utf-8")
+        # 330s of 1200s = 27.5% → truncated
+        assert "| truncated |" in content
+        assert "01:05:30" in content
+        assert "02:05:30" not in content  # no offset-doubling
+        assert any("TRUNCATED" in r.message for r in caplog.records)
+
+    def test_implausible_timestamps_not_accepted_as_observed(self, tmp_path):
+        # An implausible pass-through (e.g. [18:42:42] in a 20-min chunk at
+        # offset 60-80) must NOT be trusted as the observed-end. We should
+        # fall back to the previous valid in-window timestamp, or None.
+        self._write_part(
+            tmp_path,
+            "vid",
+            "2024-01-01",
+            60,
+            80,
+            [
+                "[01:00:00] start",
+                "[01:10:00] middle",
+                "[18:42:42] nonsense",  # apply_timestamp_offset passes through
+            ],
+        )
+
+        result = stitch_parts(tmp_path, "Vid", "2024-01-01", "https://youtube.com/watch?v=TEST", "gemini-test")
+
+        content = result.read_text(encoding="utf-8")
+        # Observed-last should be [01:10:00], not [18:42:42]
+        assert "01:10:00" in content
+        assert "18:42:42" in content  # still present in body as pass-through
+        # But the coverage table observed cell should NOT show 18:42:42
+        segments_section = content.split("**Segments:**")[1].split("\n---")[0]
+        assert "18:42:42" not in segments_section
+
+
+class TestTranslateVideoSingleRequestCoverage:
+    """F1b: single-request coverage warning and header annotation.
+
+    These tests exercise the F1b path by mocking Gemini's streaming call and
+    YouTube metadata, since translate_video() is the only entry point where
+    the single-request coverage check runs.
+    """
+
+    def _run_translate(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+        duration_seconds: int,
+        returned_text: str,
+        *,
+        start_minutes: int | None = None,
+        end_minutes: int | None = None,
+        finish_reason: str = "STOP",
+    ) -> Path:
+        import translate_video as tv
+
+        monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+
+        monkeypatch.setattr(
+            tv,
+            "fetch_video_metadata",
+            lambda _vid: {
+                "title": "Test Video",
+                "published": "2024-01-01",
+                "duration_seconds": duration_seconds,
+            },
+        )
+        monkeypatch.setattr(tv, "create_client", lambda _key: object())
+        monkeypatch.setattr(
+            tv,
+            "load_prompt",
+            lambda _name: "system prompt",
+        )
+
+        # Avoid importing google.genai — require_gemini returns (_, types)
+        class _Types:
+            class Content:
+                def __init__(self, **_kw):
+                    pass
+
+            class Part:
+                def __init__(self, **_kw):
+                    pass
+
+            class FileData:
+                def __init__(self, **_kw):
+                    pass
+
+            class VideoMetadata:
+                def __init__(self, **_kw):
+                    pass
+
+            class GenerateContentConfig:
+                def __init__(self, **_kw):
+                    pass
+
+        monkeypatch.setattr(tv, "require_gemini", lambda: (None, _Types))
+
+        # Stub the streaming call to return our canned text + a usage dict + finish reason
+        def _fake_call_gemini(*_a, tmp_file=None, **_kw):
+            if tmp_file is not None:
+                tmp_file.write(returned_text)
+                tmp_file.flush()
+            return (
+                returned_text,
+                {"candidates_token_count": 100, "prompt_token_count": 1000, "total_token_count": 1100},
+                finish_reason,
+            )
+
+        monkeypatch.setattr(tv, "call_gemini_translate", _fake_call_gemini)
+
+        tv.translate_video(
+            "https://www.youtube.com/watch?v=TEST0000001",
+            "gemini-test",
+            tmp_path,
+            force=True,
+            start_minutes=start_minutes,
+            end_minutes=end_minutes,
+        )
+        # Manual range → build_output_path uses a range-tagged slug
+        if start_minutes is not None or end_minutes is not None:
+            range_tag = f"part-{start_minutes or 0}-{end_minutes or 'end'}"
+            return tmp_path / f"2024-01-01-test-video.{range_tag}.translate-bcs.txt"
+        return tmp_path / "2024-01-01-test-video.translate-bcs.txt"
+
+    def test_clean_run_no_warning_no_annotation(self, monkeypatch, tmp_path, caplog):
+        full_text = "[00:00:00] first\n[01:03:58] near end"  # 1h3m58s
+        with caplog.at_level(logging.WARNING, logger="translate_video"):
+            output_path = self._run_translate(monkeypatch, tmp_path, 3845, full_text)
+
+        content = output_path.read_text(encoding="utf-8")
+        assert "**Coverage:** 00:00" in content
+        assert "01:04 total" in content
+        assert "TRUNCATED" not in content
+        assert not any("truncated" in r.message.lower() for r in caplog.records)
+
+    def test_truncated_run_warns_and_annotates(self, monkeypatch, tmp_path, caplog):
+        # Simulates the user's chunk 1 failure: video is 1h 4m 5s but
+        # Gemini's last timestamp is 00:32:58 — a 55% coverage.
+        truncated_text = "[00:00:00] first\n[00:32:58] stopped mid-sentence..."
+        with caplog.at_level(logging.WARNING, logger="translate_video"):
+            output_path = self._run_translate(monkeypatch, tmp_path, 3845, truncated_text)
+
+        content = output_path.read_text(encoding="utf-8")
+        assert "observed end 00:32:58" in content
+        assert "TRUNCATED" in content
+        assert any("translation ended" in r.message.lower() and "00:32:58" in r.message for r in caplog.records)
+        # Visible notice block must be present so readers cannot miss it.
+        assert "## \u26a0\ufe0f Incomplete translation" in content
+        assert "00:32:58" in content
+        assert "partial" in content.lower()
+
+    def test_truncated_run_safety_reason_tailors_notice(self, monkeypatch, tmp_path):
+        # When Gemini returns finish_reason=SAFETY, the notice must say so
+        # explicitly so the reader can distinguish safety blocks from soft-stops.
+        truncated_text = "[00:00:00] first\n[00:32:58] stopped"
+        output_path = self._run_translate(
+            monkeypatch,
+            tmp_path,
+            3845,
+            truncated_text,
+            finish_reason="SAFETY",
+        )
+        content = output_path.read_text(encoding="utf-8")
+        assert "## \u26a0\ufe0f Incomplete translation" in content
+        assert "SAFETY" in content
+        assert "safety filters" in content.lower()
+
+    def test_truncated_run_max_tokens_reason_tailors_notice(self, monkeypatch, tmp_path):
+        # MAX_TOKENS should advise splitting with --start/--end.
+        truncated_text = "[00:00:00] first\n[00:32:58] stopped"
+        output_path = self._run_translate(
+            monkeypatch,
+            tmp_path,
+            3845,
+            truncated_text,
+            finish_reason="MAX_TOKENS",
+        )
+        content = output_path.read_text(encoding="utf-8")
+        assert "## \u26a0\ufe0f Incomplete translation" in content
+        assert "MAX_TOKENS" in content
+        assert "--start" in content
+
+    def test_clean_run_has_no_notice_block(self, monkeypatch, tmp_path):
+        # Full coverage must NOT emit the notice block.
+        full_text = "[00:00:00] first\n[01:03:58] near end"
+        output_path = self._run_translate(monkeypatch, tmp_path, 3845, full_text)
+        content = output_path.read_text(encoding="utf-8")
+        assert "Incomplete translation" not in content
+
+    def test_manual_range_coverage_reflects_requested_window(self, monkeypatch, tmp_path, caplog):
+        # Regression for Codex finding #2: a --start 60 --end 80 run on a
+        # 1h4m5s video must NOT claim full-video coverage. The header
+        # Coverage line should reflect the requested 01:00 to 01:20 slice.
+        partial_text = "[00:00:00] backfill\n[00:19:45] end of slice"
+        with caplog.at_level(logging.WARNING, logger="translate_video"):
+            output_path = self._run_translate(
+                monkeypatch,
+                tmp_path,
+                3845,
+                partial_text,
+                start_minutes=60,
+                end_minutes=80,
+            )
+
+        content = output_path.read_text(encoding="utf-8")
+        assert "**Coverage:** 01:00" in content
+        assert "01:20" in content
+        # Must NOT claim 00:00 to 01:04 (the old buggy behavior)
+        assert "**Coverage:** 00:00 \u2013 01:04" not in content
+        # And F1b annotation must not trigger (observed clip time is not
+        # comparable to full video duration in the manual-range path)
+        assert "TRUNCATED" not in content
+        assert not any("translation ended" in r.message.lower() for r in caplog.records)

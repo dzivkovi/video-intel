@@ -61,6 +61,34 @@ def create_client(api_key: str, *, read_timeout: int = 1200):
 
 
 # ---------------------------------------------------------------------------
+# Safety settings
+# ---------------------------------------------------------------------------
+
+
+def build_permissive_safety_settings(types):
+    """Return safety_settings list that disables all filters we can safely disable.
+
+    Used by transcription, translation, and mind-map generation across this
+    skill. The pipeline is a faithful-reporting tool: it transcribes what was
+    said on-screen, not content it generated itself. Filter-induced silent
+    truncation produces broken subtitles mid-sentence for ordinary news
+    coverage (war, politics, violence). Users rely on file-level coverage
+    diagnostics and finish_reason annotations to see when a model refused
+    to continue — blocking content here only hides the problem.
+
+    CIVIC_INTEGRITY is intentionally omitted: it is not universally supported
+    on Gemini 2.x models and is unrelated to the violence/politics cases
+    that trigger silent truncations in practice.
+    """
+    return [
+        types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
+        types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"),
+        types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"),
+        types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Retry logic
 # ---------------------------------------------------------------------------
 

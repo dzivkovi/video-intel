@@ -458,11 +458,17 @@ at a fixed 32 tokens/sec regardless of the resolution setting. Pass
 `--high-res` (~300 tokens/sec, ~55 min per request) only when the prompt
 needs to read on-screen text such as slides or burned-in captions.
 
-**Long videos (over ~2.5 hours):** Most videos translate as a single request
-at the default low resolution. Longer videos auto-chunk: the first hour as
-one piece, then 20-minute segments for the remainder (configurable with
-`--chunk-minutes`). Each chunk produces a separate part file — these are the
-primary artifacts.
+**Long videos (resolution-aware threshold):** The chunking cutoff depends on
+which media resolution you're using. At the default low resolution, videos
+up to **150 minutes** run as a single request. With `--high-res`, the
+threshold drops to **50 minutes**. Above the threshold, the script
+auto-chunks into uniform `--chunk-minutes` (default 20) segments from the
+start, and each chunk produces a separate part file — these are the
+primary artifacts. Both single-request and chunked paths carry coverage
+diagnostics in the output header: single-request gets a TRUNCATED
+annotation if Gemini stops early, and stitched files include a
+per-segment coverage table plus `<!-- segment ... -->` dividers around
+non-ok chunks.
 
 Long-video workflow is two steps: **translate** (produces part files), then
 **stitch** (merges them). Part files use filenames for stable slug-based naming;
@@ -478,7 +484,7 @@ python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID"
 python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" \
   --end 63
 
-# Stitch auto-chunked parts for videos over ~2.5 hours
+# Stitch auto-chunked parts (for videos past the resolution-aware threshold)
 python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" --stitch
 
 # Backfill a failed chunk

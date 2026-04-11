@@ -26,7 +26,13 @@ from pathlib import Path
 
 import yaml
 
-from gemini_common import create_client, get_retry_delay, require_gemini, require_youtube
+from gemini_common import (
+    build_permissive_safety_settings,
+    create_client,
+    get_retry_delay,
+    require_gemini,
+    require_youtube,
+)
 
 log = logging.getLogger("video_intel")
 
@@ -265,7 +271,11 @@ def is_skipped(output_dir, channel_name, video):
 
 def call_gemini(client, types, video_url, prompt_text, model, response_json=False):
     """Send a video to Gemini for multimodal analysis with retry on rate limits."""
-    config_kwargs = {"temperature": 0.3, "max_output_tokens": 16384}
+    config_kwargs = {
+        "temperature": 0.3,
+        "max_output_tokens": 16384,
+        "safety_settings": build_permissive_safety_settings(types),
+    }
     if response_json:
         config_kwargs["response_mime_type"] = "application/json"
 
@@ -519,7 +529,11 @@ def process_transcript(client, types, video, prompt_text, model, output_dir, cha
 
 def call_gemini_text(client, types, text_content, model):
     """Send text-only content to Gemini and get a JSON response."""
-    config_kwargs = {"temperature": 0.3, "response_mime_type": "application/json"}
+    config_kwargs = {
+        "temperature": 0.3,
+        "response_mime_type": "application/json",
+        "safety_settings": build_permissive_safety_settings(types),
+    }
     contents = types.Content(parts=[types.Part(text=text_content)])
 
     max_retries_rate = 3
