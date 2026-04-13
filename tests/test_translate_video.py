@@ -4,10 +4,13 @@ import logging
 from pathlib import Path
 from typing import ClassVar
 
+import pytest
 from translate_video import (
+    SRT_DEFAULT_THINKING_BUDGET,
     CaptionsResult,
     _format_hhmm,
     _format_hhmmss,
+    _write_srt_only,
     apply_timestamp_offset,
     build_chunk_list,
     build_header,
@@ -21,6 +24,7 @@ from translate_video import (
     extract_video_id,
     fetch_english_captions,
     filter_snippets_by_range,
+    format_captions_as_srt,
     format_captions_for_translation,
     format_elapsed,
     format_stats,
@@ -30,6 +34,7 @@ from translate_video import (
     slugify,
     stitch_parts,
     translate_title,
+    validate_thinking_budget,
 )
 
 
@@ -1466,11 +1471,7 @@ class TestFormatCaptionsForTranslation:
             (2122.93, "rounds up big"),
         ]
         out = format_captions_for_translation(snippets)
-        assert out == (
-            "[00:00:05] rounds up\n"
-            "[00:35:21] rounds down\n"
-            "[00:35:23] rounds up big"
-        )
+        assert out == ("[00:00:05] rounds up\n[00:35:21] rounds down\n[00:35:23] rounds up big")
 
     def test_bankers_rounding_on_exact_half(self):
         # Python's round() uses banker's rounding (round-half-to-even) on
@@ -1480,6 +1481,76 @@ class TestFormatCaptionsForTranslation:
         snippets = [(4.5, "four point five"), (5.5, "five point five")]
         out = format_captions_for_translation(snippets)
         assert out == "[00:00:04] four point five\n[00:00:06] five point five"
+
+
+class TestFormatCaptionsAsSrt:
+    def test_basic_entry_structure(self):
+        # One snippet at 0.0s, 4s duration. SRT = seq + timestamp line + text + blank.
+        snippets = [(0.0, "Hello world.")]
+        durations = (4.0,)
+        out = format_captions_as_srt(snippets, durations)
+        # Trailing \n on the entry followed by \n separator = "\n\n" split,
+        # but for a single entry the output is "1\n00:00:00,000 --> 00:00:04,000\nHello world.\n"
+        assert out == "1\n00:00:00,000 --> 00:00:04,000\nHello world.\n"
+
+    def test_multiple_entries_separated_by_blank_line(self):
+        snippets = [(0.0, "first"), (4.0, "second")]
+        durations = (4.0, 3.5)
+        out = format_captions_as_srt(snippets, durations)
+        assert out == ("1\n00:00:00,000 --> 00:00:04,000\nfirst\n\n2\n00:00:04,000 --> 00:00:07,500\nsecond\n")
+
+    def test_millisecond_precision_uses_comma_separator(self):
+        # SRT uses comma (not period) as decimal separator — this is the
+        # difference between valid SRT and broken SRT in strict players.
+        snippets = [(1.234, "quick")]
+        durations = (0.5,)
+        out = format_captions_as_srt(snippets, durations)
+        assert "00:00:01,234 --> 00:00:01,734" in out
+        assert "." not in out.split("\n")[1]  # no period in timestamp line
+
+    def test_hour_boundary(self):
+        snippets = [(3661.5, "one hour mark")]
+        durations = (2.0,)
+        out = format_captions_as_srt(snippets, durations)
+        assert "01:01:01,500 --> 01:01:03,500" in out
+
+    def test_multiline_text_flattened(self):
+        # Mirror the behavior of format_captions_for_translation — YouTube
+        # sometimes emits internal newlines as word-wrap hints, not
+        # meaningful breaks. Flattening gives cleaner player rendering.
+        snippets = [(0.0, "line one\nline two")]
+        durations = (3.0,)
+        out = format_captions_as_srt(snippets, durations)
+        assert "line one line two" in out
+        # The text portion of an entry is the third line; confirm no
+        # embedded newline splits it into a fourth line.
+        lines = out.rstrip("\n").split("\n")
+        assert lines[2] == "line one line two"
+
+    def test_empty_snippets_returns_empty(self):
+        assert format_captions_as_srt([], ()) == ""
+
+    def test_missing_duration_falls_back_to_two_seconds(self):
+        # Belt-and-suspenders: if durations list is empty, we still
+        # produce a valid SRT rather than crashing. Fallback = 2s.
+        snippets = [(10.0, "orphan")]
+        out = format_captions_as_srt(snippets, ())
+        assert "00:00:10,000 --> 00:00:12,000" in out
+
+    def test_zero_duration_also_uses_fallback(self):
+        # Defensive: some tracks report 0.0 duration on trailing snippets.
+        snippets = [(5.0, "zero dur")]
+        durations = (0.0,)
+        out = format_captions_as_srt(snippets, durations)
+        assert "00:00:05,000 --> 00:00:07,000" in out
+
+    def test_sequence_numbers_one_indexed_and_contiguous(self):
+        snippets = [(0.0, "a"), (1.0, "b"), (2.0, "c")]
+        durations = (1.0, 1.0, 1.0)
+        out = format_captions_as_srt(snippets, durations)
+        # Split into entries on blank line, first line of each entry = seq num.
+        entries = out.rstrip("\n").split("\n\n")
+        assert [e.split("\n")[0] for e in entries] == ["1", "2", "3"]
 
 
 class TestFilterSnippetsByRange:
@@ -1515,7 +1586,7 @@ class TestFilterSnippetsByRange:
 
 class TestBuildSrtPrompt:
     def test_manual_track_omits_auto_gen_note(self):
-        prompt = build_srt_prompt(is_auto_generated=False, video_duration_hms="1h 4m 5s")
+        prompt = build_srt_prompt(is_auto_generated=False, video_duration_hms="1h 4m 5s", input_line_count=2098)
         assert "{{AUTO_GEN_NOTE}}" not in prompt
         assert "auto-generated" not in prompt.lower()
         # Core instructions must still be present
@@ -1531,11 +1602,11 @@ class TestBuildSrtPrompt:
         # prompt is the only format anchor. This lets us change the
         # input format (e.g. to [MM:SS] or something else) without
         # touching the prompt file.
-        prompt = build_srt_prompt(is_auto_generated=False, video_duration_hms="1h 4m 5s")
+        prompt = build_srt_prompt(is_auto_generated=False, video_duration_hms="1h 4m 5s", input_line_count=2098)
         assert "[HH:MM:SS]" not in prompt
 
     def test_auto_gen_track_includes_cleanup_instructions(self):
-        prompt = build_srt_prompt(is_auto_generated=True, video_duration_hms="1h 4m 5s")
+        prompt = build_srt_prompt(is_auto_generated=True, video_duration_hms="1h 4m 5s", input_line_count=2098)
         assert "{{AUTO_GEN_NOTE}}" not in prompt
         assert "auto-generated" in prompt.lower()
         assert "punctuation" in prompt.lower()
@@ -1543,13 +1614,15 @@ class TestBuildSrtPrompt:
     def test_video_duration_substituted(self):
         # The prompt must be grounded with the actual video length so
         # Gemini does not invent content past the real end.
-        prompt = build_srt_prompt(is_auto_generated=False, video_duration_hms="1h 4m 5s")
+        prompt = build_srt_prompt(is_auto_generated=False, video_duration_hms="1h 4m 5s", input_line_count=2098)
         assert "{{VIDEO_DURATION}}" not in prompt
         assert "1h 4m 5s" in prompt
 
     def test_video_duration_unknown_fallback(self):
         # Fallback string is fine; what matters is that the slot is filled.
-        prompt = build_srt_prompt(is_auto_generated=False, video_duration_hms="an unknown length")
+        prompt = build_srt_prompt(
+            is_auto_generated=False, video_duration_hms="an unknown length", input_line_count=2098
+        )
         assert "{{VIDEO_DURATION}}" not in prompt
         assert "an unknown length" in prompt
 
@@ -1557,7 +1630,7 @@ class TestBuildSrtPrompt:
         # Regression guard against re-bloating the prompt. Phase 4 simplification
         # went from ~50 lines of defensive instructions down to ~10 lines. If
         # a future edit pushes this back over 15, that's a design regression.
-        prompt = build_srt_prompt(is_auto_generated=True, video_duration_hms="1h 4m 5s")
+        prompt = build_srt_prompt(is_auto_generated=True, video_duration_hms="1h 4m 5s", input_line_count=2098)
         line_count = prompt.count("\n") + 1
         assert line_count <= 15, f"Prompt grew to {line_count} lines; target is <=15"
 
@@ -1565,7 +1638,7 @@ class TestBuildSrtPrompt:
         # Phase 4 removed the "HARD STOPPING RULE" section because empirical
         # evidence showed it INCREASED hallucination, not reduced it. If a
         # future revision re-adds it, the test forces a conscious decision.
-        prompt = build_srt_prompt(is_auto_generated=True, video_duration_hms="1h 4m 5s")
+        prompt = build_srt_prompt(is_auto_generated=True, video_duration_hms="1h 4m 5s", input_line_count=2098)
         lowered = prompt.lower()
         assert "hard stopping rule" not in lowered
         assert "do not invent" not in lowered
@@ -1575,9 +1648,77 @@ class TestBuildSrtPrompt:
     def test_prompt_has_no_negative_format_examples(self):
         # Negative examples like "INCORRECT: [00:00:04s]" were removed
         # because listing bad formats prompts Gemini to produce them.
-        prompt = build_srt_prompt(is_auto_generated=True, video_duration_hms="1h 4m 5s")
+        prompt = build_srt_prompt(is_auto_generated=True, video_duration_hms="1h 4m 5s", input_line_count=2098)
         assert "INCORRECT" not in prompt
         assert "[00:00:04s]" not in prompt
+
+    def test_input_line_count_substituted(self):
+        # The new {{INPUT_LINE_COUNT}} slot must be replaced with the
+        # actual count. Anchors the 1-to-1 invariant on a concrete number
+        # so the model has a measurable target.
+        prompt = build_srt_prompt(is_auto_generated=False, video_duration_hms="1h 4m 5s", input_line_count=2098)
+        assert "{{INPUT_LINE_COUNT}}" not in prompt
+        assert "2098" in prompt
+
+    def test_count_invariant_present_in_positive_voice(self):
+        # The 1:1 count invariant must use positive framing. Negative
+        # framing ("do not invent") empirically worsens hallucination
+        # and is forbidden by the sibling test_prompt_has_no_hard_stopping_rule.
+        prompt = build_srt_prompt(is_auto_generated=False, video_duration_hms="1h 4m 5s", input_line_count=2098)
+        lowered = prompt.lower()
+        assert "1-to-1" in lowered
+        assert "one output line per input line" in lowered
+
+    def test_completion_anchor_phrasing_present(self):
+        # "Your translation is complete when every input line has been
+        # translated" anchors termination without a hard stopping rule.
+        prompt = build_srt_prompt(is_auto_generated=False, video_duration_hms="1h 4m 5s", input_line_count=2098)
+        assert "complete when every input line has been translated" in prompt.lower()
+
+
+class TestValidateThinkingBudget:
+    def test_none_accepts_any_model(self):
+        # No budget specified = SDK default. Must be a no-op regardless of model.
+        validate_thinking_budget("gemini-2.5-pro", None)
+        validate_thinking_budget("gemini-2.5-flash", None)
+        validate_thinking_budget("gemini-3-pro-preview", None)
+        validate_thinking_budget("some-future-model", None)
+
+    def test_pro_rejects_below_128(self):
+        # Gemini 2.5 Pro cannot disable thinking; minimum is 128.
+        with pytest.raises(SystemExit):
+            validate_thinking_budget("gemini-2.5-pro", 0)
+        with pytest.raises(SystemExit):
+            validate_thinking_budget("gemini-2.5-pro", 127)
+
+    def test_pro_rejects_above_32768(self):
+        with pytest.raises(SystemExit):
+            validate_thinking_budget("gemini-2.5-pro", 32769)
+
+    def test_pro_accepts_boundaries(self):
+        # Both boundaries must be valid. Belt-and-suspenders check.
+        validate_thinking_budget("gemini-2.5-pro", 128)
+        validate_thinking_budget("gemini-2.5-pro", 32768)
+        validate_thinking_budget("gemini-2.5-pro", 8192)
+
+    def test_flash_accepts_zero_to_disable(self):
+        # Unlike Pro, Flash can disable thinking entirely.
+        validate_thinking_budget("gemini-2.5-flash", 0)
+
+    def test_flash_accepts_upper_boundary(self):
+        validate_thinking_budget("gemini-2.5-flash", 24576)
+
+    def test_flash_rejects_above_24576(self):
+        with pytest.raises(SystemExit):
+            validate_thinking_budget("gemini-2.5-flash", 24577)
+
+    def test_gemini_3_rejects_any_budget(self):
+        # Gemini 3.x uses thinking_level (low/medium/high), not thinking_budget.
+        # Passing a budget to a 3.x model returns a 400 from the API.
+        with pytest.raises(SystemExit):
+            validate_thinking_budget("gemini-3-pro-preview", 128)
+        with pytest.raises(SystemExit):
+            validate_thinking_budget("gemini-3.1-pro", 1024)
 
 
 class TestDetectOvershoot:
@@ -1757,10 +1898,7 @@ class TestTranslateVideoCaptionsOvershoot:
 
         # Gemini returns output that extends to 02:00:00 — 1 hour overshoot.
         hallucinated = (
-            "[00:00:00] prvi\n"
-            "[01:00:00] jedan sat\n"
-            "[01:30:00] hallucinated line\n"
-            "[02:00:00] another hallucinated line"
+            "[00:00:00] prvi\n[01:00:00] jedan sat\n[01:30:00] hallucinated line\n[02:00:00] another hallucinated line"
         )
 
         def _fake_translate(*_a, **_kw):
@@ -2209,3 +2347,425 @@ class TestTranslateVideoCaptionsPath:
         content = output_path.read_text(encoding="utf-8")
         assert "from video" in content
         assert "YouTube captions" not in content
+
+
+class TestWriteSrtOnly:
+    """Unit tests for `_write_srt_only` — the --srt-only helper.
+
+    Exercises the helper directly rather than going through the whole
+    `translate_video` entry-point so each behavior is isolated and
+    fast. Full end-to-end flag-plumbing is covered by
+    TestTranslateVideoSrtOnlyFlag below.
+    """
+
+    def _captions(self) -> CaptionsResult:
+        return CaptionsResult(
+            snippets=[(0.0, "hello"), (4.0, "world")],
+            is_generated=False,
+            language="en",
+            durations=(4.0, 3.0),
+        )
+
+    def test_writes_srt_file_with_expected_name(self, tmp_path):
+        _write_srt_only(
+            captions=self._captions(),
+            output_dir=tmp_path,
+            title="Test Video",
+            date="2024-01-01",
+            use_stdout=False,
+            force=False,
+        )
+        srt_path = tmp_path / "2024-01-01-test-video.en.srt"
+        assert srt_path.exists()
+        content = srt_path.read_text(encoding="utf-8")
+        # Validate real SRT structure: seq num + timestamp + text + blank.
+        assert content.startswith("1\n00:00:00,000 --> 00:00:04,000\nhello\n")
+        assert "2\n00:00:04,000 --> 00:00:07,000\nworld\n" in content
+
+    def test_stdout_prints_and_writes_no_file(self, tmp_path, capsys):
+        _write_srt_only(
+            captions=self._captions(),
+            output_dir=tmp_path,
+            title="Test Video",
+            date="2024-01-01",
+            use_stdout=True,
+            force=False,
+        )
+        captured = capsys.readouterr()
+        assert "00:00:00,000 --> 00:00:04,000" in captured.out
+        assert not (tmp_path / "2024-01-01-test-video.en.srt").exists()
+
+    def test_existing_file_without_force_is_preserved(self, tmp_path, caplog):
+        srt_path = tmp_path / "2024-01-01-test-video.en.srt"
+        srt_path.write_text("SENTINEL", encoding="utf-8")
+        with caplog.at_level(logging.INFO):
+            _write_srt_only(
+                captions=self._captions(),
+                output_dir=tmp_path,
+                title="Test Video",
+                date="2024-01-01",
+                use_stdout=False,
+                force=False,
+            )
+        assert srt_path.read_text(encoding="utf-8") == "SENTINEL"
+        assert any("SRT already exists" in m for m in caplog.messages)
+
+    def test_force_overwrites_existing_file(self, tmp_path):
+        srt_path = tmp_path / "2024-01-01-test-video.en.srt"
+        srt_path.write_text("SENTINEL", encoding="utf-8")
+        _write_srt_only(
+            captions=self._captions(),
+            output_dir=tmp_path,
+            title="Test Video",
+            date="2024-01-01",
+            use_stdout=False,
+            force=True,
+        )
+        content = srt_path.read_text(encoding="utf-8")
+        assert content != "SENTINEL"
+        assert content.startswith("1\n00:00:00,000")
+
+    def test_creates_output_dir_if_missing(self, tmp_path):
+        nested = tmp_path / "does" / "not" / "exist"
+        _write_srt_only(
+            captions=self._captions(),
+            output_dir=nested,
+            title="Test Video",
+            date="2024-01-01",
+            use_stdout=False,
+            force=False,
+        )
+        assert (nested / "2024-01-01-test-video.en.srt").exists()
+
+
+class TestTranslateVideoSrtOnlyFlag:
+    """End-to-end flag plumbing for `--srt-only` through `translate_video`.
+
+    Mocks `fetch_video_metadata`, `fetch_english_captions`, and
+    `translate_captions_text`/`call_gemini_translate` to verify:
+    - The --srt-only path writes the .en.srt file.
+    - It never reaches the Gemini translation call.
+    - It exits nonzero when no captions are available.
+    """
+
+    def _common_setup(self, monkeypatch, tmp_path):
+        import translate_video as tv
+
+        monkeypatch.setattr(
+            tv,
+            "fetch_video_metadata",
+            lambda _vid: {"title": "Test Video", "published": "2024-01-01", "duration_seconds": 60},
+        )
+
+        def _boom_translate(*_a, **_kw):
+            raise AssertionError("translate_captions_text must not be called in --srt-only mode")
+
+        monkeypatch.setattr(tv, "translate_captions_text", _boom_translate)
+
+        def _boom_video(*_a, **_kw):
+            raise AssertionError("call_gemini_translate must not be called in --srt-only mode")
+
+        monkeypatch.setattr(tv, "call_gemini_translate", _boom_video)
+        return tv
+
+    def test_srt_only_writes_file_and_skips_gemini(self, monkeypatch, tmp_path):
+        tv = self._common_setup(monkeypatch, tmp_path)
+        captions = CaptionsResult(
+            snippets=[(0.0, "hello"), (4.0, "world")],
+            is_generated=False,
+            language="en",
+            durations=(4.0, 3.0),
+        )
+        monkeypatch.setattr(tv, "fetch_english_captions", lambda _vid: captions)
+
+        tv.translate_video(
+            "https://www.youtube.com/watch?v=FAKE_SRT_001",
+            "gemini-2.5-pro",
+            tmp_path,
+            srt_only=True,
+            force=True,
+        )
+
+        srt_path = tmp_path / "2024-01-01-test-video.en.srt"
+        assert srt_path.exists()
+        # And no BCS translation file should have been produced.
+        assert not (tmp_path / "2024-01-01-test-video.translate-bcs.txt").exists()
+
+    def test_srt_only_exits_nonzero_when_no_captions(self, monkeypatch, tmp_path):
+        tv = self._common_setup(monkeypatch, tmp_path)
+        monkeypatch.setattr(tv, "fetch_english_captions", lambda _vid: None)
+
+        with pytest.raises(SystemExit):
+            tv.translate_video(
+                "https://www.youtube.com/watch?v=FAKE_SRT_002",
+                "gemini-2.5-pro",
+                tmp_path,
+                srt_only=True,
+                force=True,
+            )
+        # Nothing was written either.
+        assert not any(tmp_path.glob("*.en.srt"))
+
+
+class TestTranslateCaptionsTextThinkingBudget:
+    """Verify `--thinking-budget` plumbs into ThinkingConfig on the SRT path.
+
+    Uses a fake `types` module and a fake client to capture the config
+    object passed to `_stream_with_timeouts`, then asserts on its
+    `thinking_config` attribute (or absence thereof).
+    """
+
+    def _fake_types_module(self):
+        # Minimal stand-ins — ThinkingConfig and GenerateContentConfig
+        # just need to round-trip their kwargs for inspection.
+        class _ThinkingConfig:
+            def __init__(self, thinking_budget):
+                self.thinking_budget = thinking_budget
+
+        class _GenerateContentConfig:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class _FakeTypes:
+            ThinkingConfig = _ThinkingConfig
+            GenerateContentConfig = _GenerateContentConfig
+            HarmCategory = type("HC", (), {})
+            HarmBlockThreshold = type("HBT", (), {})
+            SafetySetting = type("SS", (), dict(__init__=lambda self, **kw: self.__dict__.update(kw)))
+
+        return _FakeTypes()
+
+    def _install_stream_capture(self, monkeypatch, captured: dict):
+        import translate_video as tv
+
+        def _fake_stream(_client, _model, _contents, config):
+            captured["config"] = config
+            return ("[00:00:00] zdravo", None, "STOP")
+
+        monkeypatch.setattr(tv, "_stream_with_timeouts", _fake_stream)
+        # Avoid the real safety-settings builder which needs real types.
+        monkeypatch.setattr(tv, "build_permissive_safety_settings", lambda _types: [])
+        return tv
+
+    def test_thinking_budget_set_produces_thinking_config(self, monkeypatch):
+        captured: dict = {}
+        tv = self._install_stream_capture(monkeypatch, captured)
+        fake_types = self._fake_types_module()
+
+        tv.translate_captions_text(
+            client=None,
+            types=fake_types,
+            model="gemini-2.5-pro",
+            captions_block="[00:00:00] hello",
+            is_auto_generated=False,
+            video_duration_hms="1m",
+            input_line_count=1,
+            thinking_budget=128,
+        )
+
+        config = captured["config"]
+        assert hasattr(config, "thinking_config")
+        assert config.thinking_config.thinking_budget == 128
+
+    def test_thinking_budget_none_omits_thinking_config(self, monkeypatch):
+        captured: dict = {}
+        tv = self._install_stream_capture(monkeypatch, captured)
+        fake_types = self._fake_types_module()
+
+        tv.translate_captions_text(
+            client=None,
+            types=fake_types,
+            model="gemini-2.5-pro",
+            captions_block="[00:00:00] hello",
+            is_auto_generated=False,
+            video_duration_hms="1m",
+            input_line_count=1,
+            thinking_budget=None,
+        )
+
+        config = captured["config"]
+        # Must not be present at all — a None thinking_config would be a
+        # different behavior than "use SDK default".
+        assert not hasattr(config, "thinking_config")
+
+
+class TestSrtDefaultThinkingBudget:
+    """Verify that the SRT path defaults to thinking_budget=128 for 2.5 Pro."""
+
+    def test_constant_value(self):
+        assert SRT_DEFAULT_THINKING_BUDGET == 128
+
+    def test_srt_path_applies_default_for_pro(self, monkeypatch, tmp_path):
+        """When no --thinking-budget is given, _translate_via_captions applies
+        SRT_DEFAULT_THINKING_BUDGET for 2.5 Pro models."""
+        import translate_video as tv
+
+        captured: dict = {}
+
+        def spy(*args, **kwargs):
+            captured["thinking_budget"] = kwargs.get("thinking_budget")
+            return ("[00:00:00] zdravo", None, "STOP")
+
+        monkeypatch.setattr(tv, "translate_captions_text", spy)
+        monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+        monkeypatch.setattr(tv, "create_client", lambda _key: None)
+        monkeypatch.setattr(
+            tv,
+            "require_gemini",
+            lambda: (
+                None,
+                type(
+                    "T",
+                    (),
+                    {
+                        "ThinkingConfig": type("TC", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)}),
+                        "GenerateContentConfig": type(
+                            "GCC", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)}
+                        ),
+                        "HarmCategory": type("HC", (), {}),
+                        "HarmBlockThreshold": type("HBT", (), {}),
+                        "SafetySetting": type("SS", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)}),
+                    },
+                )(),
+            ),
+        )
+
+        captions = CaptionsResult(
+            snippets=[(0.0, "hello")],
+            is_generated=False,
+            language="en",
+            durations=(2.0,),
+        )
+        tv._translate_via_captions(
+            video_id="test123",
+            canonical_url="https://www.youtube.com/watch?v=test123",
+            title="Test",
+            date="2026-01-01",
+            model_name="gemini-2.5-pro",
+            duration_seconds=60,
+            captions=captions,
+            output_dir=tmp_path,
+            use_stdout=True,
+            force=False,
+            start_minutes=None,
+            end_minutes=None,
+            thinking_budget=None,
+        )
+
+        assert captured["thinking_budget"] == SRT_DEFAULT_THINKING_BUDGET
+
+    def test_srt_path_no_default_for_flash(self, monkeypatch, tmp_path):
+        """Flash models should NOT get the automatic default — only explicit values."""
+        import translate_video as tv
+
+        captured: dict = {}
+
+        def spy(*args, **kwargs):
+            captured["thinking_budget"] = kwargs.get("thinking_budget")
+            return ("[00:00:00] zdravo", None, "STOP")
+
+        monkeypatch.setattr(tv, "translate_captions_text", spy)
+        monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+        monkeypatch.setattr(tv, "create_client", lambda _key: None)
+        monkeypatch.setattr(
+            tv,
+            "require_gemini",
+            lambda: (
+                None,
+                type(
+                    "T",
+                    (),
+                    {
+                        "ThinkingConfig": type("TC", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)}),
+                        "GenerateContentConfig": type(
+                            "GCC", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)}
+                        ),
+                        "HarmCategory": type("HC", (), {}),
+                        "HarmBlockThreshold": type("HBT", (), {}),
+                        "SafetySetting": type("SS", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)}),
+                    },
+                )(),
+            ),
+        )
+
+        captions = CaptionsResult(
+            snippets=[(0.0, "hello")],
+            is_generated=False,
+            language="en",
+            durations=(2.0,),
+        )
+        tv._translate_via_captions(
+            video_id="test123",
+            canonical_url="https://www.youtube.com/watch?v=test123",
+            title="Test",
+            date="2026-01-01",
+            model_name="gemini-2.5-flash",
+            duration_seconds=60,
+            captions=captions,
+            output_dir=tmp_path,
+            use_stdout=True,
+            force=False,
+            start_minutes=None,
+            end_minutes=None,
+            thinking_budget=None,
+        )
+
+        assert captured["thinking_budget"] is None
+
+    def test_explicit_budget_overrides_default(self, monkeypatch, tmp_path):
+        """An explicit --thinking-budget should pass through as-is, not be overridden."""
+        import translate_video as tv
+
+        captured: dict = {}
+
+        def spy(*args, **kwargs):
+            captured["thinking_budget"] = kwargs.get("thinking_budget")
+            return ("[00:00:00] zdravo", None, "STOP")
+
+        monkeypatch.setattr(tv, "translate_captions_text", spy)
+        monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+        monkeypatch.setattr(tv, "create_client", lambda _key: None)
+        monkeypatch.setattr(
+            tv,
+            "require_gemini",
+            lambda: (
+                None,
+                type(
+                    "T",
+                    (),
+                    {
+                        "ThinkingConfig": type("TC", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)}),
+                        "GenerateContentConfig": type(
+                            "GCC", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)}
+                        ),
+                        "HarmCategory": type("HC", (), {}),
+                        "HarmBlockThreshold": type("HBT", (), {}),
+                        "SafetySetting": type("SS", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)}),
+                    },
+                )(),
+            ),
+        )
+
+        captions = CaptionsResult(
+            snippets=[(0.0, "hello")],
+            is_generated=False,
+            language="en",
+            durations=(2.0,),
+        )
+        tv._translate_via_captions(
+            video_id="test123",
+            canonical_url="https://www.youtube.com/watch?v=test123",
+            title="Test",
+            date="2026-01-01",
+            model_name="gemini-2.5-pro",
+            duration_seconds=60,
+            captions=captions,
+            output_dir=tmp_path,
+            use_stdout=True,
+            force=False,
+            start_minutes=None,
+            end_minutes=None,
+            thinking_budget=512,
+        )
+
+        assert captured["thinking_budget"] == 512

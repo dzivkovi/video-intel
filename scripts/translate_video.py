@@ -38,6 +38,7 @@ log = logging.getLogger("translate_video")
 SKILL_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT_DIR = "./examples"
 MAX_OUTPUT_TOKENS = 65536
+SRT_DEFAULT_THINKING_BUDGET = 128
 
 
 # ---------------------------------------------------------------------------
@@ -319,11 +320,18 @@ class CaptionsResult:
     is_generated: True for auto-generated ASR captions, False for
         manually authored tracks. Affects the prompt sent to Gemini.
     language: BCP-47 language tag reported by YouTube (typically "en").
+    durations: parallel list of per-snippet durations in seconds.
+        Kept as a separate list (rather than extending the snippet
+        tuple) so existing consumers that unpack `(start, text)` keep
+        working. Empty by default — test fixtures that construct
+        CaptionsResult directly without duration data trigger no SRT
+        sibling generation, which is the desired behavior.
     """
 
     snippets: list[tuple[float, str]]
     is_generated: bool
     language: str
+    durations: tuple[float, ...] = ()
 
 
 def fetch_english_captions(video_id: str) -> CaptionsResult | None:
@@ -361,6 +369,7 @@ def fetch_english_captions(video_id: str) -> CaptionsResult | None:
         return None
 
     snippets = [(float(s.start), s.text) for s in fetched]
+    durations = tuple(float(getattr(s, "duration", 0.0) or 0.0) for s in fetched)
     if not snippets:
         log.info("Captions list returned empty - falling back to video path")
         return None
@@ -369,6 +378,7 @@ def fetch_english_captions(video_id: str) -> CaptionsResult | None:
         snippets=snippets,
         is_generated=bool(transcript.is_generated),
         language=str(transcript.language_code or "en"),
+        durations=durations,
     )
 
 
@@ -392,6 +402,43 @@ def format_captions_for_translation(snippets: list[tuple[float, str]]) -> str:
         clean = " ".join(text.split())  # collapse any whitespace, incl. newlines
         lines.append(f"[{h:02d}:{m:02d}:{s:02d}] {clean}")
     return "\n".join(lines)
+
+
+def format_captions_as_srt(
+    snippets: list[tuple[float, str]],
+    durations: tuple[float, ...] | list[float],
+) -> str:
+    """Render (start, text) snippets + durations as standard SRT text.
+
+    Produces real SRT format loadable by VLC, MPV, mkvtoolnix, Aegisub,
+    etc. — 1-indexed sequence numbers, `HH:MM:SS,mmm --> HH:MM:SS,mmm`
+    timestamp lines (comma decimal, not period), flattened text, blank
+    line separators. Pure function for easy testing.
+
+    If `durations` is shorter than `snippets` (or empty), missing entries
+    fall back to a 2-second default so the output is still a valid SRT
+    file rather than a crash. YouTube normally provides duration for
+    every snippet; the fallback is belt-and-suspenders for exotic tracks.
+    """
+    if not snippets:
+        return ""
+
+    def _hms_ms(total_seconds: float) -> str:
+        total_ms = max(0, round(total_seconds * 1000))
+        h, remainder_ms = divmod(total_ms, 3600 * 1000)
+        m, remainder_ms = divmod(remainder_ms, 60 * 1000)
+        s, ms = divmod(remainder_ms, 1000)
+        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+    entries = []
+    for idx, (start, text) in enumerate(snippets, start=1):
+        duration = durations[idx - 1] if idx - 1 < len(durations) else 0.0
+        if duration <= 0:
+            duration = 2.0  # sane fallback for rare missing-duration case
+        end = start + duration
+        clean_text = " ".join(text.split())  # flatten internal newlines
+        entries.append(f"{idx}\n{_hms_ms(start)} --> {_hms_ms(end)}\n{clean_text}\n")
+    return "\n".join(entries)
 
 
 def filter_snippets_by_range(
@@ -1342,12 +1389,20 @@ AUTO_GEN_CLEANUP_NOTE = (
 )
 
 
-def build_srt_prompt(is_auto_generated: bool, video_duration_hms: str) -> str:
+def build_srt_prompt(
+    is_auto_generated: bool,
+    video_duration_hms: str,
+    input_line_count: int,
+) -> str:
     """Load the SRT-translation prompt with the template slots filled.
 
-    Substitutes two template variables:
+    Substitutes three template variables:
     - `{{VIDEO_DURATION}}`: a human-readable duration string like `"1h 4m 5s"`
       so Gemini is grounded in the actual length of the source video.
+    - `{{INPUT_LINE_COUNT}}`: the exact number of timestamped input lines,
+      used by the prompt's positive 1-to-1 count invariant to anchor the
+      model on "produce exactly this many output lines". Empirically
+      observed to reduce hallucinated continuation on long SRT inputs.
     - `{{AUTO_GEN_NOTE}}`: an empty string for manual caption tracks, or a
       short instruction for auto-generated tracks to silently apply
       punctuation and capitalization repairs during translation.
@@ -1356,10 +1411,44 @@ def build_srt_prompt(is_auto_generated: bool, video_duration_hms: str) -> str:
     note = AUTO_GEN_CLEANUP_NOTE if is_auto_generated else ""
     return (
         base.replace("{{VIDEO_DURATION}}", video_duration_hms)
+        .replace("{{INPUT_LINE_COUNT}}", str(input_line_count))
         .replace("{{AUTO_GEN_NOTE}}", note)
         .strip()
         + "\n"
     )
+
+
+def validate_thinking_budget(model: str, budget: int | None) -> None:
+    """Validate `--thinking-budget N` against the target model's allowed range.
+
+    Ranges sourced from https://ai.google.dev/gemini-api/docs/thinking as of
+    Apr 2026. 2.5 Pro cannot disable thinking (minimum 128); 2.5 Flash can
+    (minimum 0); Gemini 3.x uses `thinking_level` (low/medium/high) instead
+    and rejects `thinking_budget` with a 400. None is a no-op — leave the
+    SDK's dynamic-thinking default in place.
+    """
+    if budget is None:
+        return
+    if "gemini-3" in model:
+        raise SystemExit(
+            f"--thinking-budget is not valid for {model}. "
+            "Gemini 3.x uses thinking_level (low/medium/high), not thinking_budget."
+        )
+    if "2.5-pro" in model:
+        if not (128 <= budget <= 32768):
+            raise SystemExit(
+                f"Gemini 2.5 Pro requires --thinking-budget in [128, 32768] (got {budget}). "
+                "Pro cannot disable thinking; pass 128 for the absolute minimum."
+            )
+        return
+    if "2.5-flash" in model:
+        if not (0 <= budget <= 24576):
+            raise SystemExit(
+                f"Gemini 2.5 Flash requires --thinking-budget in [0, 24576] (got {budget}). "
+                "Pass 0 to disable thinking entirely on Flash."
+            )
+        return
+    # Unknown 2.5 variant or future model: let the API decide.
 
 
 def translate_captions_text(
@@ -1369,6 +1458,8 @@ def translate_captions_text(
     captions_block: str,
     is_auto_generated: bool,
     video_duration_hms: str,
+    input_line_count: int,
+    thinking_budget: int | None = None,
 ) -> tuple[str, dict | None, str | None]:
     """Translate a [HH:MM:SS]-prefixed English caption block to BCS via Gemini.
 
@@ -1383,16 +1474,27 @@ def translate_captions_text(
     of the source video. Passing a fallback like "an unknown length" is fine
     when YouTube metadata is unavailable.
 
+    `input_line_count` is the exact number of timestamped lines in
+    `captions_block`; it is substituted into the prompt's 1-to-1 count
+    invariant so Gemini has an explicit output-count target.
+
+    `thinking_budget`, if set, caps Gemini 2.5 internal reasoning tokens via
+    ThinkingConfig. None leaves the SDK's dynamic-thinking default in place.
+    See `validate_thinking_budget` for model-specific ranges.
+
     Returns: (text, usage_metadata, finish_reason). finish_reason is
     normalized to a bare name ("STOP", "SAFETY", ...) when available.
     """
-    system_prompt = build_srt_prompt(is_auto_generated, video_duration_hms)
-    config = types.GenerateContentConfig(
-        system_instruction=system_prompt,
-        max_output_tokens=MAX_OUTPUT_TOKENS,
-        temperature=0.2,
-        safety_settings=build_permissive_safety_settings(types),
-    )
+    system_prompt = build_srt_prompt(is_auto_generated, video_duration_hms, input_line_count)
+    config_kwargs: dict = {
+        "system_instruction": system_prompt,
+        "max_output_tokens": MAX_OUTPUT_TOKENS,
+        "temperature": 0.2,
+        "safety_settings": build_permissive_safety_settings(types),
+    }
+    if thinking_budget is not None:
+        config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=thinking_budget)
+    config = types.GenerateContentConfig(**config_kwargs)
     # google-genai accepts a bare string as the contents argument and
     # treats it as a single user-role text part. No need to wrap.
     return _stream_with_timeouts(client, model, captions_block, config)
@@ -1401,6 +1503,42 @@ def translate_captions_text(
 # ---------------------------------------------------------------------------
 # Main workflow
 # ---------------------------------------------------------------------------
+
+
+def _write_srt_only(
+    *,
+    captions: CaptionsResult,
+    output_dir: Path,
+    title: str,
+    date: str,
+    use_stdout: bool,
+    force: bool,
+) -> None:
+    """Write the fetched English captions to `.en.srt` and exit.
+
+    Mirrors the filename convention of `_translate_via_captions` so the
+    resulting SRT can sit alongside a future BCS translation of the same
+    video. Respects `--stdout` (prints SRT text to stdout, writes no
+    file) and `--force` (overwrites an existing SRT). Assumes captions
+    came back with durations populated; falls back silently to the
+    two-second default inside `format_captions_as_srt` if not.
+    """
+    srt_text = format_captions_as_srt(captions.snippets, captions.durations)
+
+    if use_stdout:
+        print(srt_text)
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    slug = slugify(title)
+    srt_path = output_dir / f"{date}-{slug}.en.srt"
+
+    if srt_path.exists() and not force:
+        log.info("SRT already exists: %s (use --force to regenerate)", srt_path)
+        return
+
+    srt_path.write_text(srt_text, encoding="utf-8")
+    log.info("SRT:       %s", srt_path)
 
 
 def _translate_via_captions(
@@ -1417,6 +1555,7 @@ def _translate_via_captions(
     force: bool,
     start_minutes: int | None,
     end_minutes: int | None,
+    thinking_budget: int | None = None,
 ) -> None:
     """Captions-first translation path.
 
@@ -1459,6 +1598,28 @@ def _translate_via_captions(
         tmp_path = output_path.with_suffix(".txt.tmp")
         log.info("Output:    %s", output_path)
 
+        # Write the raw English SRT sibling BEFORE the Gemini call so the
+        # artifact survives even when translation fails, times out, or gets
+        # soft-stopped. The SRT is the *full* caption track (unfiltered),
+        # not the Gemini-input range — it's a reviewable reference for the
+        # user and a free replacement for third-party YouTube SRT downloaders.
+        # Not written in manual-range runs because those produce a partial
+        # translation output, and the full SRT would be confusingly broader
+        # than its BCS sibling. Silent on failure: a write error here is
+        # never worth aborting the translation.
+        if captions.durations and not manual_range:
+            # Strip the full ".translate-bcs.txt" double-extension rather
+            # than using Path.with_suffix (which only peels one level)
+            # to produce "<date>-<slug>.en.srt" cleanly.
+            base_name = output_path.name.removesuffix(".translate-bcs.txt")
+            srt_path = output_path.parent / f"{base_name}.en.srt"
+            try:
+                srt_text = format_captions_as_srt(captions.snippets, captions.durations)
+                srt_path.write_text(srt_text, encoding="utf-8")
+                log.info("SRT:       %s", srt_path)
+            except OSError as e:
+                log.warning("Failed to write SRT sibling %s: %s", srt_path, e)
+
     log.info("Model:     %s", model_name)
     log.info("Video:     %s", canonical_url)
     log.info("Title:     %s", title)
@@ -1480,6 +1641,11 @@ def _translate_via_captions(
     # still gets a coherent sentence instead of a raw {{VIDEO_DURATION}} token.
     video_duration_hms = format_elapsed(duration_seconds) if duration_seconds else "an unknown length"
 
+    effective_budget = thinking_budget
+    if effective_budget is None and "2.5-pro" in model_name:
+        effective_budget = SRT_DEFAULT_THINKING_BUDGET
+        log.info("Thinking:  budget=%d (SRT default for 2.5 Pro)", effective_budget)
+
     start_time = time.time()
     log.info("Sending to Gemini...")
     text, usage, finish_reason = translate_captions_text(
@@ -1489,6 +1655,8 @@ def _translate_via_captions(
         captions_block,
         is_auto_generated=captions.is_generated,
         video_duration_hms=video_duration_hms,
+        input_line_count=input_line_count,
+        thinking_budget=effective_budget,
     )
     elapsed = time.time() - start_time
 
@@ -1560,11 +1728,15 @@ def _translate_via_captions(
                 _format_hhmmss(last_input_seconds),
                 first_over_line,
             )
-            overshoot_notice = "\n\n" + build_overshoot_notice(
-                last_input_seconds=last_input_seconds,
-                last_observed_seconds=last_obs,
-                first_overshoot_line=first_over_line,
-            ) + "\n"
+            overshoot_notice = (
+                "\n\n"
+                + build_overshoot_notice(
+                    last_input_seconds=last_input_seconds,
+                    last_observed_seconds=last_obs,
+                    first_overshoot_line=first_over_line,
+                )
+                + "\n"
+            )
 
     source_mode = "captions-autogen" if captions.is_generated else "captions-manual"
     header = build_header(
@@ -1601,6 +1773,8 @@ def translate_video(
     start_minutes: int | None = None,
     end_minutes: int | None = None,
     force_video: bool = False,
+    srt_only: bool = False,
+    thinking_budget: int | None = None,
 ) -> None:
     """Translate a YouTube video's audio to BCS subtitles.
 
@@ -1643,6 +1817,36 @@ def translate_video(
     title = title or video_id
     date = date or "0000-00-00"
 
+    # --srt-only: fetch captions and write the .en.srt sibling, then exit.
+    # No Gemini call. Useful as a free replacement for downsubs.com-style
+    # third-party sites, and as a fast shortcut when you only need the
+    # English source (monolingual summarization, review, quoting). Strict
+    # on missing captions — falling through to video translation here
+    # would violate the "just give me the SRT" contract.
+    if srt_only:
+        captions = fetch_english_captions(video_id)
+        if captions is None:
+            log.error(
+                "No English captions available for %s — cannot produce SRT. "
+                "Remove --srt-only to fall back to video translation.",
+                canonical_url,
+            )
+            sys.exit(1)
+        log.info(
+            "Captions:  YouTube %s (%s)",
+            captions.language,
+            "auto-generated" if captions.is_generated else "manual",
+        )
+        _write_srt_only(
+            captions=captions,
+            output_dir=output_dir,
+            title=title,
+            date=date,
+            use_stdout=use_stdout,
+            force=force,
+        )
+        return
+
     # SRT-first: try to use YouTube's English captions before spending any
     # tokens on video understanding. This avoids the silent-truncation
     # failure mode documented in ADR-0015 and its companion solution doc.
@@ -1668,6 +1872,7 @@ def translate_video(
                 force=force,
                 start_minutes=start_minutes,
                 end_minutes=end_minutes,
+                thinking_budget=thinking_budget,
             )
             return
 
@@ -2035,6 +2240,28 @@ Examples:
         ),
     )
     parser.add_argument(
+        "--srt-only",
+        action="store_true",
+        help=(
+            "Fetch YouTube English captions and write the .en.srt sibling file only. "
+            "No Gemini call, no BCS translation. Exits nonzero if no captions are available. "
+            "Useful as a free replacement for downsubs.com-style sites or as input for "
+            "monolingual English summarization workflows."
+        ),
+    )
+    parser.add_argument(
+        "--thinking-budget",
+        type=int,
+        default=None,
+        help=(
+            "Cap Gemini 2.5 thinking tokens via ThinkingConfig. "
+            "Ranges: 2.5 Pro 128-32768 (cannot disable), 2.5 Flash 0-24576 (0 disables). "
+            "SRT path defaults to 128 for 2.5 Pro (frees output capacity); "
+            "override with an explicit value. Video path uses SDK dynamic. "
+            "Not valid for Gemini 3.x."
+        ),
+    )
+    parser.add_argument(
         "--ipv4",
         action="store_true",
         help="Force IPv4 connections (workaround for IPv6 socket stalls, see googleapis/python-genai#1893)",
@@ -2046,6 +2273,19 @@ Examples:
         help="Set logging verbosity (default: info)",
     )
     args = parser.parse_args()
+
+    # Mutual exclusions that argparse's builtin mutex groups can't express
+    # cleanly (we want friendly error messages, not "unrecognized combo").
+    if args.srt_only and args.force_video:
+        parser.error("--srt-only and --force-video are mutually exclusive")
+    if args.srt_only and args.thinking_budget is not None:
+        parser.error("--srt-only and --thinking-budget are mutually exclusive (no Gemini call to configure)")
+    if args.srt_only and args.stitch:
+        parser.error("--srt-only and --stitch are mutually exclusive")
+
+    # Validate --thinking-budget against the target model's allowed range.
+    # Raises SystemExit with a clear message when misconfigured.
+    validate_thinking_budget(args.model, args.thinking_budget)
 
     # IPv4 workaround — process-global monkey-patch on socket.getaddrinfo().
     # Affects ALL network calls in this process, not just Gemini.
@@ -2116,6 +2356,8 @@ Examples:
         start_minutes=args.start,
         end_minutes=args.end,
         force_video=args.force_video,
+        srt_only=args.srt_only,
+        thinking_budget=args.thinking_budget,
     )
 
 
