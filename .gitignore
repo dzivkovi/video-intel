@@ -5,7 +5,7 @@ work/
 plans/*.md
 !plans/.gitkeep
 .claude/settings.local.json
-video-intel/
+/video-intel/
 __pycache__/
 *.pyc
 *.pyo

@@ -38,9 +38,11 @@ reason about.
                     └───────────────────────────────────────┘
 ```
 
-**Current state:** Everything runs locally. One Python script, two external
-APIs (YouTube Data + Gemini), flat-file output. The skill entry point
-(SKILL.md) triggers Claude Code to invoke the script.
+**Current state:** Everything runs locally. Two Python scripts (video intelligence
+and BCS translation), two external APIs (YouTube Data + Gemini), flat-file output.
+The plugin ships two skills — `skills/video-intel/SKILL.md` and
+`skills/translate-bcs/SKILL.md` — each with its own trigger description so Claude
+Code routes requests to the right one.
 
 ## Project Vision
 

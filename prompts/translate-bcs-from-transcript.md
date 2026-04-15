@@ -18,6 +18,6 @@ Preserve verbatim:
 - Markdown headers (`#`, `##`, `---`), bullet markers (`-`, `*`), indentation, horizontal rules.
 - URLs, file paths, product names, trademarks, code identifiers.
 - Triple-backtick code blocks — leave all code inside them in English.
-- The top metadata block (`**Source:**`, `**Published:**`, `**Processed:**`) — leave verbatim.
+Omit the top metadata block entirely — the `# Transcript:` title line, `**Source:**`, `**Published:**`, `**Processed:**` lines, and the `---` separator that follows them. The caller adds its own header. Start your translation from the first `[MM:SS]` timestamp line.
 
 Your translation is complete when every speech line, SCREEN description, On-screen text line, and evidence bullet has been translated into BCS with the structure intact.

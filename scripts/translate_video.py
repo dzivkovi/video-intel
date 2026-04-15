@@ -1842,6 +1842,7 @@ def _translate_from_transcript(
     *,
     transcript_path: Path,
     model_name: str,
+    output_dir: Path,
     use_stdout: bool,
     force: bool,
     thinking_budget: int | None = None,
@@ -1855,9 +1856,9 @@ def _translate_from_transcript(
     the model is 2.5 Pro, applies `SRT_DEFAULT_THINKING_BUDGET` (same
     mitigation used on the captions path).
 
-    Output: sibling file with `.translate-bcs.txt` extension next to the
-    input transcript. Respects `--stdout` (print, write nothing) and
-    `--force` (overwrite existing sibling).
+    Output: `.translate-bcs.txt` in `output_dir` (default `./examples`,
+    same as every other translate_video.py output). Respects `--stdout`
+    (print, write nothing) and `--force` (overwrite existing).
     """
     if not transcript_path.exists():
         log.error("Transcript file not found: %s", transcript_path)
@@ -1897,14 +1898,14 @@ def _translate_from_transcript(
     source_url = header_fields.get("source") or f"file://{transcript_path.resolve()}"
     published = header_fields.get("published") or "unknown"
 
-    # Output: sibling to input, `.translate-bcs.txt` replacing `.transcript.md`.
-    # Fall back to simple `<stem>.translate-bcs.txt` when suffix pattern differs.
+    # Output: `.translate-bcs.txt` in output_dir (same convention as URL-based translation).
     name = transcript_path.name
     if name.endswith(".transcript.md"):
         output_name = name.removesuffix(".transcript.md") + ".translate-bcs.txt"
     else:
         output_name = transcript_path.stem + ".translate-bcs.txt"
-    output_path = transcript_path.parent / output_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / output_name
 
     if not use_stdout and output_path.exists() and not force:
         log.info("Already translated: %s (use --force to redo)", output_path)
@@ -1918,6 +1919,10 @@ def _translate_from_transcript(
     _, types = require_gemini()
     client = create_client(api_key)
 
+    # Translate the title to BCS for the output header (same helper the stitch path uses).
+    bcs_title = translate_title(client, model_name, title)
+    log.info("Title:     %s → %s", title, bcs_title)
+
     effective_budget = thinking_budget
     if effective_budget is None and "2.5-pro" in model_name:
         effective_budget = SRT_DEFAULT_THINKING_BUDGET
@@ -1925,7 +1930,6 @@ def _translate_from_transcript(
 
     log.info("Model:     %s", model_name)
     log.info("Input:     %s (%d bytes)", transcript_path, size)
-    log.info("Title:     %s", title)
     if not use_stdout:
         log.info("Output:    %s", output_path)
 
@@ -1964,10 +1968,11 @@ def _translate_from_transcript(
         return
 
     header_block = build_header(
-        title,
+        bcs_title,
         source_url,
         published,
         model_name,
+        original_title=title,
         finish_reason=finish_reason,
         source_mode="transcript",
     )
@@ -2609,6 +2614,7 @@ Examples:
         _translate_from_transcript(
             transcript_path=Path(args.from_transcript).expanduser(),
             model_name=args.model,
+            output_dir=output_dir,
             use_stdout=args.stdout,
             force=args.force,
             thinking_budget=args.thinking_budget,

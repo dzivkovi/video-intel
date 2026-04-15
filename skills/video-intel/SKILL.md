@@ -1,23 +1,20 @@
 ---
 name: video-intel
 description: >
-  Multimodal video intelligence via Gemini API. Use this skill whenever the
-  user wants to: find videos about a topic across multiple channels; browse
-  what concepts are covered in the video library; scan a YouTube channel for
-  new videos and get mind maps of each; triage which videos are worth
-  watching; get a full diarized transcript with on-screen content (slides,
-  diagrams, code) captured; add or remove channels to monitor; change scan
-  settings. Trigger phrases include "what videos cover [topic]", "find videos
-  about [concept]", "which creators talk about [subject]", "scan channel",
-  "what's new from [creator]", "watch this for me", "transcribe this video",
-  "add [channel] to my watchlist", "what should I watch", "summarize this
-  video", "is this worth watching", any YouTube URL followed by a question,
-  "show my channels", "what concepts are in my library", or "what topics
-  recur across channels". This skill calls the Gemini API as a multimodal
-  proxy - it sees video frames, reads on-screen text, and hears audio
-  simultaneously. It also uses the YouTube Data API to discover new videos
-  from configured channels. A concept layer (taxonomy.json) enables
-  cross-video topic lookup without reading every file.
+  Multimodal video intelligence via Gemini API. Use whenever the user wants
+  to: find videos about a topic across channels; browse concepts in the
+  library; scan a YouTube channel for new videos and get mind maps; triage
+  which videos are worth watching; get a diarized transcript with on-screen
+  content (slides, diagrams, code) captured; add/remove monitored channels;
+  change scan settings. Trigger phrases: "what videos cover [topic]", "find
+  videos about [concept]", "which creators talk about [subject]", "scan
+  channel", "what's new from [creator]", "watch this for me", "transcribe
+  this video", "add [channel] to my watchlist", "what should I watch",
+  "summarize this video", "is this worth watching", any YouTube URL +
+  question, "show my channels", "what concepts are in my library", "what
+  topics recur across channels". Calls Gemini as multimodal proxy (frames +
+  on-screen text + audio). A taxonomy layer enables cross-video topic lookup
+  without reading every file.
 ---
 
 # Video Intel
@@ -73,22 +70,32 @@ pip install lancedb voyageai
 
 If prerequisites are missing, tell the user what's needed and where to get it.
 
+## Important: These Commands Are Slow
+
+Gemini API calls read video frames and audio — they take **1-5 minutes per video**. A scan of 10 videos can take 10-30 minutes. This is normal.
+
+- **Always use `--log-level info`** so progress is visible between API calls.
+- **Use a long bash timeout** (at least 600000ms / 10 minutes) for scan and transcript commands. The default 2-minute timeout WILL kill multi-video scans prematurely.
+- **Silence between log lines is normal.** Gemini is processing video — don't diagnose or interrupt.
+- **For large scans (10+ videos):** run in the background so the user isn't blocked. Check the output directory afterward for results.
+- **For single transcripts:** 1-3 minutes is typical. Wait for the "Saved:" line before proceeding.
+
 ## How to Use
 
 ### Find videos about a topic (start here)
 
 ```bash
 # "Which videos cover X?" — concept match, no API calls
-python "${SKILL_DIR}/scripts/video_intel.py" search "skills standard"
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" search "skills standard"
 
 # "What did someone say about X?" — semantic search over transcripts
-python "${SKILL_DIR}/scripts/video_intel.py" search "150-line skill limit" --vector
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" search "150-line skill limit" --vector
 
 # Filter either mode to a channel
-python "${SKILL_DIR}/scripts/video_intel.py" search "context window" --channel natebjones
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" search "context window" --channel natebjones
 
 # Check corpus status
-python "${SKILL_DIR}/scripts/video_intel.py" status
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" status
 ```
 
 **Mode reference:**
@@ -104,12 +111,14 @@ python "${SKILL_DIR}/scripts/video_intel.py" status
 ### Scan channels for new videos
 
 ```bash
-python "${SKILL_DIR}/scripts/video_intel.py" scan
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" --log-level info scan
 ```
 
 Scans all channels in config.yaml, processes new videos since each channel's
 `since` window, saves mind maps and (optionally) transcripts to the output
-directory.
+directory. **This command is slow** — multiple Gemini API calls, 1-5 min each.
+Use a 600000ms bash timeout. `--log-level info` is mandatory so progress is
+visible; without it the command appears to produce no output.
 
 Options:
 - `--since 14d` - Override the time window for this run
@@ -120,7 +129,7 @@ Options:
 ### Transcribe a specific video
 
 ```bash
-python "${SKILL_DIR}/scripts/video_intel.py" transcript \
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" --log-level info transcript \
   --url "https://www.youtube.com/watch?v=XXXXX"
 ```
 
@@ -133,13 +142,13 @@ Options:
 
 ```bash
 # Build the search index from all transcripts (requires VOYAGE_API_KEY)
-python "${SKILL_DIR}/scripts/video_intel.py" index
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" index
 
 # Hybrid search — BM25 keyword + vector semantic, merged by RRF
-python "${SKILL_DIR}/scripts/video_intel.py" search "permission problems" --vector
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" search "permission problems" --vector
 
 # Filter to a channel
-python "${SKILL_DIR}/scripts/video_intel.py" search "150-line skill limit" --vector --channel natebjones
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" search "150-line skill limit" --vector --channel natebjones
 ```
 
 Hybrid search requires: `pip install 'video-intel[vector]'` and `VOYAGE_API_KEY`
@@ -150,13 +159,13 @@ when to use `--vector` vs plain concept search.
 
 ```bash
 # Extract concepts from all mindmaps that don't have concepts yet
-python "${SKILL_DIR}/scripts/video_intel.py" concepts
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" --log-level info concepts
 
 # Re-extract for a specific channel
-python "${SKILL_DIR}/scripts/video_intel.py" concepts --channel natebjones --force
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" --log-level info concepts --channel natebjones --force
 
-# Rebuild master taxonomy from all concept files
-python "${SKILL_DIR}/scripts/video_intel.py" taxonomy-build
+# Rebuild master taxonomy from all concept files (fast, no Gemini call)
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" taxonomy-build
 ```
 
 ### Manage channels
@@ -166,7 +175,7 @@ Claude Code has write access to the config file.
 
 ### Configuration
 
-Configuration lives in `${SKILL_DIR}/config.yaml`. Key settings:
+Configuration lives at the plugin root, `${CLAUDE_SKILL_DIR}/../../config.yaml`. Key settings:
 
 ```yaml
 output_dir: ~/video-intel          # Where output files are saved
@@ -183,7 +192,7 @@ channels:
 
 ### Prompt files
 
-Prompt templates live in `${SKILL_DIR}/prompts/`:
+Prompt templates live at the plugin root, `${CLAUDE_SKILL_DIR}/../../prompts/`:
 - `mindmap-knowledge.md` - Thematic mind map with domain terminology + timestamps (default)
 - `mindmap-light.md` - Fast thematic scan (4-6 branches)
 - `mindmap-heavy.md` - Comprehensive conceptual extraction

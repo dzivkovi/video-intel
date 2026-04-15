@@ -4,5 +4,16 @@
       "mcp__exa__crawling_exa"
     ]
   },
+  "enabledPlugins": {
+    "video-intel@video-intel-local": true
+  },
+  "extraKnownMarketplaces": {
+    "video-intel-local": {
+      "source": {
+        "source": "directory",
+        "path": "."
+      }
+    }
+  },
   "plansDirectory": "./plans/"
 }

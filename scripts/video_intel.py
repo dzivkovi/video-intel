@@ -1012,11 +1012,13 @@ def cmd_transcript(args, config):
     prefix, status = process_transcript(
         client, types, video, prompt_text, model, output_dir, channel_name, force=args.force
     )
+    out_path = output_dir / channel_name / f"{prefix}.transcript.md"
     log.info("  %s: %s", prefix, status)
 
     if status == "done":
-        out_path = output_dir / channel_name / f"{prefix}.transcript.md"
         log.info("  Saved: %s", out_path)
+    elif "skipped" in status:
+        log.info("  Exists: %s", out_path)
 
 
 def cmd_concepts(args, config):

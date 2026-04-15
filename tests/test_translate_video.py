@@ -2895,6 +2895,7 @@ class TestTranslateFromTranscriptValidation:
             _translate_from_transcript(
                 transcript_path=missing,
                 model_name="gemini-2.5-pro",
+                output_dir=tmp_path,
                 use_stdout=False,
                 force=False,
             )
@@ -2906,6 +2907,7 @@ class TestTranslateFromTranscriptValidation:
             _translate_from_transcript(
                 transcript_path=big,
                 model_name="gemini-2.5-pro",
+                output_dir=tmp_path,
                 use_stdout=False,
                 force=False,
             )
@@ -2917,6 +2919,7 @@ class TestTranslateFromTranscriptValidation:
             _translate_from_transcript(
                 transcript_path=no_ts,
                 model_name="gemini-2.5-pro",
+                output_dir=tmp_path,
                 use_stdout=False,
                 force=False,
             )
@@ -2933,6 +2936,7 @@ class TestTranslateFromTranscriptHappyPath:
             return (return_text, {"total_tokens": 10}, "STOP")
 
         monkeypatch.setattr(tv, "translate_transcript_text", spy)
+        monkeypatch.setattr(tv, "translate_title", lambda _c, _m, t: f"BCS: {t}")
         monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
         monkeypatch.setattr(tv, "create_client", lambda _key: None)
         monkeypatch.setattr(
@@ -2962,23 +2966,32 @@ class TestTranslateFromTranscriptHappyPath:
         p.write_text(SAMPLE_TRANSCRIPT, encoding="utf-8")
         return p
 
-    def test_writes_sibling_translate_bcs_txt(self, monkeypatch, tmp_path):
+    def _output_dir(self, tmp_path: Path) -> Path:
+        d = tmp_path / "output"
+        d.mkdir(exist_ok=True)
+        return d
+
+    def test_writes_to_output_dir(self, monkeypatch, tmp_path):
         self._install_gemini_stubs(monkeypatch)
         src = self._write_sample(tmp_path)
+        out = self._output_dir(tmp_path)
 
         _translate_from_transcript(
             transcript_path=src,
             model_name="gemini-2.5-pro",
+            output_dir=out,
             use_stdout=False,
             force=False,
         )
 
-        expected = tmp_path / "2026-04-13-sample.translate-bcs.txt"
-        assert expected.exists(), f"Expected sibling at {expected}"
+        expected = out / "2026-04-13-sample.translate-bcs.txt"
+        assert expected.exists(), f"Expected output at {expected}"
         content = expected.read_text(encoding="utf-8")
         assert "# Translation (BCS):" in content
-        assert "Sample Video Title" in content
+        assert "BCS: Sample Video Title" in content
         assert "[00:00] zdravo" in content
+        # Must NOT be in the transcript's directory (old sibling behavior)
+        assert not (tmp_path / "2026-04-13-sample.translate-bcs.txt").exists()
 
     def test_source_mode_transcript_in_header(self, monkeypatch, tmp_path):
         self._install_gemini_stubs(monkeypatch)
@@ -2987,6 +3000,7 @@ class TestTranslateFromTranscriptHappyPath:
         _translate_from_transcript(
             transcript_path=src,
             model_name="gemini-2.5-pro",
+            output_dir=tmp_path,
             use_stdout=False,
             force=False,
         )
@@ -3001,6 +3015,7 @@ class TestTranslateFromTranscriptHappyPath:
         _translate_from_transcript(
             transcript_path=src,
             model_name="gemini-2.5-pro",
+            output_dir=tmp_path,
             use_stdout=True,
             force=False,
         )
@@ -3018,6 +3033,7 @@ class TestTranslateFromTranscriptHappyPath:
         _translate_from_transcript(
             transcript_path=src,
             model_name="gemini-2.5-pro",
+            output_dir=tmp_path,
             use_stdout=False,
             force=False,
         )
@@ -3034,6 +3050,7 @@ class TestTranslateFromTranscriptHappyPath:
         _translate_from_transcript(
             transcript_path=src,
             model_name="gemini-2.5-pro",
+            output_dir=tmp_path,
             use_stdout=False,
             force=True,
         )
@@ -3049,6 +3066,7 @@ class TestTranslateFromTranscriptHappyPath:
         _translate_from_transcript(
             transcript_path=src,
             model_name="gemini-2.5-pro",
+            output_dir=tmp_path,
             use_stdout=True,
             force=False,
         )
@@ -3062,6 +3080,7 @@ class TestTranslateFromTranscriptHappyPath:
         _translate_from_transcript(
             transcript_path=src,
             model_name="gemini-2.5-pro",
+            output_dir=tmp_path,
             use_stdout=True,
             force=False,
             thinking_budget=512,
@@ -3076,6 +3095,7 @@ class TestTranslateFromTranscriptHappyPath:
         _translate_from_transcript(
             transcript_path=src,
             model_name="gemini-2.5-flash",
+            output_dir=tmp_path,
             use_stdout=True,
             force=False,
         )
@@ -3089,6 +3109,7 @@ class TestTranslateFromTranscriptHappyPath:
         _translate_from_transcript(
             transcript_path=src,
             model_name="gemini-2.5-pro",
+            output_dir=tmp_path,
             use_stdout=True,
             force=False,
         )

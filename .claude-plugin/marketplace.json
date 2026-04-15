@@ -1,0 +1,12 @@
+{
+  "name": "video-intel",
+  "owner": {
+    "name": "Daniel Zivkovic"
+  },
+  "plugins": [
+    {
+      "name": "video-intel",
+      "source": "./"
+    }
+  ]
+}
