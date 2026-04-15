@@ -251,6 +251,7 @@ Prompts live in `prompts/`. Each file is self-contained.
 | concepts.md | Concept extraction + normalization against taxonomy |
 | translate-bcs.md | BCS subtitle translation, video-understanding fallback path (`translate_video.py`) |
 | translate-bcs-from-srt.md | BCS subtitle translation, captions-first path (`translate_video.py`) |
+| translate-bcs-from-transcript.md | BCS subtitle translation from a rich transcript (`translate_video.py --from-transcript`) |
 
 Add a `.md` file to `prompts/` and reference it in config.yaml by filename
 (without extension).
@@ -523,6 +524,75 @@ python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" \
 the first hour of a 2h18m video), the output includes a `**Coverage:**`
 line in the header and a BCS reader note indicating what portion was
 translated. Full translations omit these — no clutter in the normal case.
+
+### Translating from a rich transcript (`--from-transcript`)
+
+Some videos carry meaning that YouTube's English captions cannot preserve:
+a journalist cutting between their own commentary and clips of other
+speakers, on-screen overlays labeling who is speaking, quoted text from
+documents or news tickers, footage with burned-in captions from another
+news outlet. The captions-first path sees none of that. The
+video-understanding fallback reads audio only. Both paths will translate
+what is said but lose *why it was shown*.
+
+The fix is to generate our own rich transcript first (speech + on-screen
+content + speaker identification), then translate that file. Two
+commands, run manually in sequence:
+
+```bash
+# Step 1 — rich transcript. One Gemini call, reads the video with vision
+# enabled, produces speakers, SCREEN sections, and On-screen text: lines
+# in English. Typical 10-minute video: 60-90 seconds, a few cents.
+python scripts/video_intel.py --log-level info transcript \
+  --url "https://www.youtube.com/watch?v=VIDEO_ID"
+# Output: ~/video-intel/{channel-or-_standalone}/{date}-{slug}.transcript.md
+
+# Step 2 — translate the transcript into BCS. Text-in / text-out. Preserves
+# timestamps, SCREEN markers, On-screen text labels, speaker names; translates
+# speech content, speaker role parentheticals, SCREEN descriptions, OCR text,
+# and the Speaker Identification Evidence footer.
+python scripts/translate_video.py --log-level info \
+  --from-transcript "path/to/{date}-{slug}.transcript.md"
+# Output: sibling file — same directory as the transcript, same base name,
+# `.translate-bcs.txt` extension.
+```
+
+**When to use this instead of the default path:**
+
+| Symptom | Use |
+| ------- | --- |
+| Plain talking head, long interview, single speaker, no overlays matter | **Default** (`translate_video.py URL`) — captions-first, fastest |
+| No English captions available but audio is enough | **Default** falls through to video understanding automatically |
+| Journalist cutting to clips of other speakers; overlays label who is speaking; OCR text matters; news tickers; multi-source edits | **`--from-transcript`** (run the two-step pipeline above) |
+
+**Real example.** Abby Martin / Double Down News, 10 minutes, heavy
+editorial cutting with labeled clips:
+
+```bash
+python scripts/video_intel.py --log-level info transcript \
+  --url "https://www.youtube.com/watch?v=hLQbPCvV8W8"
+# → video-intel/double-down-news/2026-04-07-abby-martin-went-to-israel-its-worse-than-you-think.transcript.md
+# (67s, 288 lines with SCREEN / On-screen text / speaker labels)
+
+python scripts/translate_video.py --log-level info \
+  --from-transcript "video-intel/double-down-news/2026-04-07-abby-martin-went-to-israel-its-worse-than-you-think.transcript.md"
+# → video-intel/double-down-news/2026-04-07-abby-martin-went-to-israel-its-worse-than-you-think.translate-bcs.txt
+# (1m 54s, 289 lines, 12K tokens, thinking_budget=128 auto-applied,
+#  timestamps / SCREEN / On-screen text counts preserved 1:1)
+```
+
+See [video-intel/double-down-news/...translate-bcs.txt](video-intel/double-down-news/2026-04-07-abby-martin-went-to-israel-its-worse-than-you-think.translate-bcs.txt)
+for the full output.
+
+**Design notes.** This is a *manual* two-step handoff, not an auto-chained
+pipeline — the intermediate transcript is a reviewable artifact, and the
+two scripts stay operationally independent per [CLAUDE.md](CLAUDE.md).
+The `--from-transcript` flag accepts any transcript-shaped markdown file;
+validation is permissive (file must exist, be under 500KB, and contain at
+least one `[MM:SS]` timestamp line — no required footer, no strict header
+format). The path inherits `SRT_DEFAULT_THINKING_BUDGET=128` on 2.5 Pro,
+the same hallucination mitigation used on the captions path. `--stdout`
+and `--force` work the same way as elsewhere.
 
 **Error handling:** The script retries automatically on Gemini server
 errors (408, 500, 502, 503, 504) with exponential backoff — up to 8

@@ -7,9 +7,11 @@ from typing import ClassVar
 import pytest
 from translate_video import (
     SRT_DEFAULT_THINKING_BUDGET,
+    TRANSCRIPT_MAX_BYTES,
     CaptionsResult,
     _format_hhmm,
     _format_hhmmss,
+    _translate_from_transcript,
     _write_srt_only,
     apply_timestamp_offset,
     build_chunk_list,
@@ -18,6 +20,7 @@ from translate_video import (
     build_overshoot_notice,
     build_segments_block,
     build_srt_prompt,
+    build_transcript_prompt,
     classify_segment_status,
     detect_overshoot,
     extract_last_timestamp_seconds,
@@ -30,6 +33,7 @@ from translate_video import (
     format_stats,
     normalize_timestamp,
     parse_iso8601_duration,
+    parse_transcript_header,
     single_request_cap_seconds,
     slugify,
     stitch_parts,
@@ -2769,3 +2773,325 @@ class TestSrtDefaultThinkingBudget:
         )
 
         assert captured["thinking_budget"] == 512
+
+
+# ---------------------------------------------------------------------------
+# --from-transcript path
+# ---------------------------------------------------------------------------
+
+
+SAMPLE_TRANSCRIPT = """# Transcript: Sample Video Title
+
+**Source:** https://www.youtube.com/watch?v=hLQbPCvV8W8
+**Published:** 2026-04-13
+**Processed:** 2026-04-13 10:00 UTC
+
+---
+
+[00:00] Alice (Host): "Welcome to the show."
+
+  SCREEN [00:00-00:05] [text_overlay]: Title card reading "Weekly Briefing".
+
+[00:05] Bob (Guest): "Glad to be here."
+
+  On-screen text: "Breaking news ticker"
+
+---
+## Speaker Identification Evidence
+
+- Alice identified by on-screen lower third at 00:00
+- Bob identified by introduction at 00:05
+"""
+
+
+class TestParseTranscriptHeader:
+    def test_extracts_title_source_published(self):
+        result = parse_transcript_header(SAMPLE_TRANSCRIPT)
+        assert result["title"] == "Sample Video Title"
+        assert result["source"] == "https://www.youtube.com/watch?v=hLQbPCvV8W8"
+        assert result["published"] == "2026-04-13"
+
+    def test_returns_empty_when_no_recognizable_header(self):
+        result = parse_transcript_header("just some text\nno header here")
+        assert result == {}
+
+    def test_partial_header_returns_partial_dict(self):
+        text = "# Transcript: Only A Title\n\n[00:00] speaker: hi"
+        result = parse_transcript_header(text)
+        assert result == {"title": "Only A Title"}
+
+
+class TestBuildTranscriptPrompt:
+    def test_substitutes_video_title_slot(self):
+        prompt = build_transcript_prompt(video_title="Foo Bar", source_url="https://x/y")
+        assert "Foo Bar" in prompt
+        assert "{{VIDEO_TITLE}}" not in prompt
+
+    def test_substitutes_source_url_slot(self):
+        prompt = build_transcript_prompt(video_title="t", source_url="https://example.com/v")
+        assert "https://example.com/v" in prompt
+        assert "{{SOURCE_URL}}" not in prompt
+
+    def test_prompt_covers_on_screen_text_line_type(self):
+        prompt = build_transcript_prompt(video_title="t", source_url="u")
+        assert "On-screen text:" in prompt
+
+    def test_prompt_covers_screen_sections(self):
+        prompt = build_transcript_prompt(video_title="t", source_url="u")
+        assert "SCREEN" in prompt
+
+    def test_prompt_covers_speaker_role_parentheticals(self):
+        prompt = build_transcript_prompt(video_title="t", source_url="u")
+        assert "role parentheticals" in prompt.lower() or "parentheticals" in prompt.lower()
+
+    def test_prompt_preserves_timestamps_instruction(self):
+        prompt = build_transcript_prompt(video_title="t", source_url="u")
+        assert "timestamp" in prompt.lower()
+
+    def test_prompt_preserves_code_blocks_instruction(self):
+        prompt = build_transcript_prompt(video_title="t", source_url="u")
+        assert "code block" in prompt.lower() or "triple-backtick" in prompt.lower()
+
+
+class TestTranslateFromTranscriptValidation:
+    def _install_gemini_stubs(self, monkeypatch, return_text="[00:00] zdravo\n"):
+        import translate_video as tv
+
+        captured: dict = {}
+
+        def spy(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return (return_text, {"total_tokens": 10}, "STOP")
+
+        monkeypatch.setattr(tv, "translate_transcript_text", spy)
+        monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+        monkeypatch.setattr(tv, "create_client", lambda _key: None)
+        monkeypatch.setattr(
+            tv,
+            "require_gemini",
+            lambda: (
+                None,
+                type(
+                    "T",
+                    (),
+                    {
+                        "ThinkingConfig": type("TC", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)}),
+                        "GenerateContentConfig": type(
+                            "GCC", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)}
+                        ),
+                        "HarmCategory": type("HC", (), {}),
+                        "HarmBlockThreshold": type("HBT", (), {}),
+                        "SafetySetting": type("SS", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)}),
+                    },
+                )(),
+            ),
+        )
+        return captured
+
+    def test_missing_file_exits_nonzero(self, tmp_path):
+        missing = tmp_path / "does_not_exist.transcript.md"
+        with pytest.raises(SystemExit):
+            _translate_from_transcript(
+                transcript_path=missing,
+                model_name="gemini-2.5-pro",
+                use_stdout=False,
+                force=False,
+            )
+
+    def test_oversize_file_exits_nonzero(self, tmp_path):
+        big = tmp_path / "big.transcript.md"
+        big.write_text("x" * (TRANSCRIPT_MAX_BYTES + 1), encoding="utf-8")
+        with pytest.raises(SystemExit):
+            _translate_from_transcript(
+                transcript_path=big,
+                model_name="gemini-2.5-pro",
+                use_stdout=False,
+                force=False,
+            )
+
+    def test_no_timestamp_lines_exits_nonzero(self, tmp_path):
+        no_ts = tmp_path / "no_ts.transcript.md"
+        no_ts.write_text("# Transcript: Foo\n\njust prose, no timestamps\n", encoding="utf-8")
+        with pytest.raises(SystemExit):
+            _translate_from_transcript(
+                transcript_path=no_ts,
+                model_name="gemini-2.5-pro",
+                use_stdout=False,
+                force=False,
+            )
+
+
+class TestTranslateFromTranscriptHappyPath:
+    def _install_gemini_stubs(self, monkeypatch, return_text="[00:00] zdravo\n"):
+        import translate_video as tv
+
+        captured: dict = {}
+
+        def spy(*args, **kwargs):
+            captured["kwargs"] = kwargs
+            return (return_text, {"total_tokens": 10}, "STOP")
+
+        monkeypatch.setattr(tv, "translate_transcript_text", spy)
+        monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+        monkeypatch.setattr(tv, "create_client", lambda _key: None)
+        monkeypatch.setattr(
+            tv,
+            "require_gemini",
+            lambda: (
+                None,
+                type(
+                    "T",
+                    (),
+                    {
+                        "ThinkingConfig": type("TC", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)}),
+                        "GenerateContentConfig": type(
+                            "GCC", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)}
+                        ),
+                        "HarmCategory": type("HC", (), {}),
+                        "HarmBlockThreshold": type("HBT", (), {}),
+                        "SafetySetting": type("SS", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)}),
+                    },
+                )(),
+            ),
+        )
+        return captured
+
+    def _write_sample(self, tmp_path: Path) -> Path:
+        p = tmp_path / "2026-04-13-sample.transcript.md"
+        p.write_text(SAMPLE_TRANSCRIPT, encoding="utf-8")
+        return p
+
+    def test_writes_sibling_translate_bcs_txt(self, monkeypatch, tmp_path):
+        self._install_gemini_stubs(monkeypatch)
+        src = self._write_sample(tmp_path)
+
+        _translate_from_transcript(
+            transcript_path=src,
+            model_name="gemini-2.5-pro",
+            use_stdout=False,
+            force=False,
+        )
+
+        expected = tmp_path / "2026-04-13-sample.translate-bcs.txt"
+        assert expected.exists(), f"Expected sibling at {expected}"
+        content = expected.read_text(encoding="utf-8")
+        assert "# Translation (BCS):" in content
+        assert "Sample Video Title" in content
+        assert "[00:00] zdravo" in content
+
+    def test_source_mode_transcript_in_header(self, monkeypatch, tmp_path):
+        self._install_gemini_stubs(monkeypatch)
+        src = self._write_sample(tmp_path)
+
+        _translate_from_transcript(
+            transcript_path=src,
+            model_name="gemini-2.5-pro",
+            use_stdout=False,
+            force=False,
+        )
+
+        out = (tmp_path / "2026-04-13-sample.translate-bcs.txt").read_text(encoding="utf-8")
+        assert "**Source mode:** Local transcript file" in out
+
+    def test_stdout_mode_skips_file_write(self, monkeypatch, tmp_path, capsys):
+        self._install_gemini_stubs(monkeypatch)
+        src = self._write_sample(tmp_path)
+
+        _translate_from_transcript(
+            transcript_path=src,
+            model_name="gemini-2.5-pro",
+            use_stdout=True,
+            force=False,
+        )
+
+        captured = capsys.readouterr()
+        assert "[00:00] zdravo" in captured.out
+        assert not (tmp_path / "2026-04-13-sample.translate-bcs.txt").exists()
+
+    def test_existing_output_without_force_is_skipped(self, monkeypatch, tmp_path):
+        captured = self._install_gemini_stubs(monkeypatch)
+        src = self._write_sample(tmp_path)
+        existing = tmp_path / "2026-04-13-sample.translate-bcs.txt"
+        existing.write_text("preexisting", encoding="utf-8")
+
+        _translate_from_transcript(
+            transcript_path=src,
+            model_name="gemini-2.5-pro",
+            use_stdout=False,
+            force=False,
+        )
+
+        assert existing.read_text(encoding="utf-8") == "preexisting"
+        assert "kwargs" not in captured, "Gemini should not have been called"
+
+    def test_force_overwrites_existing(self, monkeypatch, tmp_path):
+        self._install_gemini_stubs(monkeypatch)
+        src = self._write_sample(tmp_path)
+        existing = tmp_path / "2026-04-13-sample.translate-bcs.txt"
+        existing.write_text("preexisting", encoding="utf-8")
+
+        _translate_from_transcript(
+            transcript_path=src,
+            model_name="gemini-2.5-pro",
+            use_stdout=False,
+            force=True,
+        )
+
+        content = existing.read_text(encoding="utf-8")
+        assert content != "preexisting"
+        assert "[00:00] zdravo" in content
+
+    def test_applies_pro_thinking_budget_default(self, monkeypatch, tmp_path):
+        captured = self._install_gemini_stubs(monkeypatch)
+        src = self._write_sample(tmp_path)
+
+        _translate_from_transcript(
+            transcript_path=src,
+            model_name="gemini-2.5-pro",
+            use_stdout=True,
+            force=False,
+        )
+
+        assert captured["kwargs"]["thinking_budget"] == SRT_DEFAULT_THINKING_BUDGET
+
+    def test_explicit_thinking_budget_overrides_default(self, monkeypatch, tmp_path):
+        captured = self._install_gemini_stubs(monkeypatch)
+        src = self._write_sample(tmp_path)
+
+        _translate_from_transcript(
+            transcript_path=src,
+            model_name="gemini-2.5-pro",
+            use_stdout=True,
+            force=False,
+            thinking_budget=512,
+        )
+
+        assert captured["kwargs"]["thinking_budget"] == 512
+
+    def test_flash_model_does_not_get_auto_budget(self, monkeypatch, tmp_path):
+        captured = self._install_gemini_stubs(monkeypatch)
+        src = self._write_sample(tmp_path)
+
+        _translate_from_transcript(
+            transcript_path=src,
+            model_name="gemini-2.5-flash",
+            use_stdout=True,
+            force=False,
+        )
+
+        assert captured["kwargs"]["thinking_budget"] is None
+
+    def test_passes_header_fields_as_prompt_context(self, monkeypatch, tmp_path):
+        captured = self._install_gemini_stubs(monkeypatch)
+        src = self._write_sample(tmp_path)
+
+        _translate_from_transcript(
+            transcript_path=src,
+            model_name="gemini-2.5-pro",
+            use_stdout=True,
+            force=False,
+        )
+
+        assert captured["kwargs"]["video_title"] == "Sample Video Title"
+        assert captured["kwargs"]["source_url"] == "https://www.youtube.com/watch?v=hLQbPCvV8W8"

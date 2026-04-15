@@ -654,6 +654,7 @@ SOURCE_MODE_LABELS = {
     "captions-manual": "YouTube captions (manually authored)",
     "captions-autogen": "YouTube captions (auto-generated, cleaned up via Gemini)",
     "video": "Direct video audio (no captions available)",
+    "transcript": "Local transcript file (from video_intel.py transcript)",
 }
 
 
@@ -1500,6 +1501,55 @@ def translate_captions_text(
     return _stream_with_timeouts(client, model, captions_block, config)
 
 
+def build_transcript_prompt(video_title: str, source_url: str) -> str:
+    """Load the transcript-translation prompt with grounding context filled.
+
+    Unlike `build_srt_prompt`, this prompt has no line-count invariant —
+    a rich transcript mixes speech lines, SCREEN sections, and optional
+    OCR lines, so "one output per input" does not apply. Instead the
+    prompt lists the structural elements to preserve verbatim and the
+    content elements to translate.
+    """
+    base = load_prompt("translate-bcs-from-transcript")
+    return base.replace("{{VIDEO_TITLE}}", video_title).replace("{{SOURCE_URL}}", source_url).strip() + "\n"
+
+
+def translate_transcript_text(
+    client,
+    types,
+    model: str,
+    transcript_body: str,
+    video_title: str,
+    source_url: str,
+    thinking_budget: int | None = None,
+) -> tuple[str, dict | None, str | None]:
+    """Translate a rich transcript markdown body to BCS via Gemini.
+
+    Parallel to `translate_captions_text` — separate helper rather than a
+    shared refactor to keep the diff small and leave the stable captions
+    path untouched. Streaming text-only request through the same
+    `_stream_with_timeouts` pipeline, same safety settings, same
+    thinking_budget plumbing.
+
+    `transcript_body` should be the post-header body of a
+    `video_intel.py transcript` output file (the caller strips the YAML-ish
+    header lines before passing the content in).
+
+    Returns: (text, usage_metadata, finish_reason).
+    """
+    system_prompt = build_transcript_prompt(video_title=video_title, source_url=source_url)
+    config_kwargs: dict = {
+        "system_instruction": system_prompt,
+        "max_output_tokens": MAX_OUTPUT_TOKENS,
+        "temperature": 0.2,
+        "safety_settings": build_permissive_safety_settings(types),
+    }
+    if thinking_budget is not None:
+        config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=thinking_budget)
+    config = types.GenerateContentConfig(**config_kwargs)
+    return _stream_with_timeouts(client, model, transcript_body, config)
+
+
 # ---------------------------------------------------------------------------
 # Main workflow
 # ---------------------------------------------------------------------------
@@ -1755,6 +1805,177 @@ def _translate_via_captions(
     tmp_path.replace(output_path)
 
     line_count = text.count("\n") + 1
+    log.info("Written to %s", output_path)
+    log.info(format_stats(elapsed, line_count, usage))
+
+
+# ---------------------------------------------------------------------------
+# Transcript-input translation path (`--from-transcript`)
+# ---------------------------------------------------------------------------
+
+
+TRANSCRIPT_MAX_BYTES = 500_000
+TRANSCRIPT_TIMESTAMP_RE = re.compile(r"^\[(?:\d{1,2}:)?\d{1,2}:\d{2}\]", re.MULTILINE)
+
+
+def parse_transcript_header(text: str) -> dict[str, str]:
+    """Best-effort extraction of title / source URL / published date.
+
+    Scans the first ~25 lines. Missing fields come back absent from the
+    dict — the caller falls back to filename-derived defaults. Never
+    raises on malformed headers; this is grounding context for the
+    prompt, not a correctness gate.
+    """
+    header: dict[str, str] = {}
+    for line in text.splitlines()[:25]:
+        stripped = line.strip()
+        if stripped.startswith("# Transcript:") and "title" not in header:
+            header["title"] = stripped[len("# Transcript:") :].strip()
+        elif stripped.startswith("**Source:**") and "source" not in header:
+            header["source"] = stripped[len("**Source:**") :].strip()
+        elif stripped.startswith("**Published:**") and "published" not in header:
+            header["published"] = stripped[len("**Published:**") :].strip()
+    return header
+
+
+def _translate_from_transcript(
+    *,
+    transcript_path: Path,
+    model_name: str,
+    use_stdout: bool,
+    force: bool,
+    thinking_budget: int | None = None,
+) -> None:
+    """Translate a pre-generated transcript markdown file into BCS.
+
+    Permissive validation: file exists, within size guard, contains at
+    least one `[MM:SS]` timestamp line. No structural canaries, no
+    overshoot detector — a rich transcript has no single invariant that
+    would flag hallucination reliably. If `thinking_budget` is None and
+    the model is 2.5 Pro, applies `SRT_DEFAULT_THINKING_BUDGET` (same
+    mitigation used on the captions path).
+
+    Output: sibling file with `.translate-bcs.txt` extension next to the
+    input transcript. Respects `--stdout` (print, write nothing) and
+    `--force` (overwrite existing sibling).
+    """
+    if not transcript_path.exists():
+        log.error("Transcript file not found: %s", transcript_path)
+        sys.exit(1)
+
+    try:
+        size = transcript_path.stat().st_size
+    except OSError as e:
+        log.error("Cannot stat transcript file %s: %s", transcript_path, e)
+        sys.exit(1)
+
+    if size > TRANSCRIPT_MAX_BYTES:
+        log.error(
+            "Transcript file %s is %d bytes (>%d limit). Is this really a transcript?",
+            transcript_path,
+            size,
+            TRANSCRIPT_MAX_BYTES,
+        )
+        sys.exit(1)
+
+    try:
+        text = transcript_path.read_text(encoding="utf-8")
+    except OSError as e:
+        log.error("Cannot read transcript file %s: %s", transcript_path, e)
+        sys.exit(1)
+
+    if not TRANSCRIPT_TIMESTAMP_RE.search(text):
+        log.error(
+            "Transcript %s contains no [MM:SS] timestamp lines - does not look like a "
+            "transcript produced by `video_intel.py transcript`.",
+            transcript_path,
+        )
+        sys.exit(1)
+
+    header_fields = parse_transcript_header(text)
+    title = header_fields.get("title") or transcript_path.stem.removesuffix(".transcript")
+    source_url = header_fields.get("source") or f"file://{transcript_path.resolve()}"
+    published = header_fields.get("published") or "unknown"
+
+    # Output: sibling to input, `.translate-bcs.txt` replacing `.transcript.md`.
+    # Fall back to simple `<stem>.translate-bcs.txt` when suffix pattern differs.
+    name = transcript_path.name
+    if name.endswith(".transcript.md"):
+        output_name = name.removesuffix(".transcript.md") + ".translate-bcs.txt"
+    else:
+        output_name = transcript_path.stem + ".translate-bcs.txt"
+    output_path = transcript_path.parent / output_name
+
+    if not use_stdout and output_path.exists() and not force:
+        log.info("Already translated: %s (use --force to redo)", output_path)
+        return
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        log.error("GEMINI_API_KEY not set.")
+        sys.exit(1)
+
+    _, types = require_gemini()
+    client = create_client(api_key)
+
+    effective_budget = thinking_budget
+    if effective_budget is None and "2.5-pro" in model_name:
+        effective_budget = SRT_DEFAULT_THINKING_BUDGET
+        log.info("Thinking:  budget=%d (SRT default for 2.5 Pro)", effective_budget)
+
+    log.info("Model:     %s", model_name)
+    log.info("Input:     %s (%d bytes)", transcript_path, size)
+    log.info("Title:     %s", title)
+    if not use_stdout:
+        log.info("Output:    %s", output_path)
+
+    start_time = time.time()
+    log.info("Sending to Gemini...")
+    translated, usage, finish_reason = translate_transcript_text(
+        client,
+        types,
+        model_name,
+        text,
+        video_title=title,
+        source_url=source_url,
+        thinking_budget=effective_budget,
+    )
+    elapsed = time.time() - start_time
+
+    if finish_reason and finish_reason != "STOP":
+        log.warning("finish_reason: %s (not STOP)", finish_reason)
+
+    if not translated or not translated.strip():
+        log.error("Gemini returned empty response after %s", format_elapsed(elapsed))
+        sys.exit(1)
+
+    # Minimal sanity check per plan: output must contain at least one
+    # [MM:SS] timestamp. Zero means catastrophic structural collapse.
+    if not TRANSCRIPT_TIMESTAMP_RE.search(translated):
+        log.warning(
+            "Translated output contains no [MM:SS] timestamps - structure may have been lost. "
+            "Content preserved; review manually."
+        )
+
+    if use_stdout:
+        print(translated)
+        line_count = translated.count("\n") + 1
+        log.info(format_stats(elapsed, line_count, usage))
+        return
+
+    header_block = build_header(
+        title,
+        source_url,
+        published,
+        model_name,
+        finish_reason=finish_reason,
+        source_mode="transcript",
+    )
+    tmp_path = output_path.with_suffix(".txt.tmp")
+    tmp_path.write_text(header_block + translated, encoding="utf-8")
+    tmp_path.replace(output_path)
+
+    line_count = translated.count("\n") + 1
     log.info("Written to %s", output_path)
     log.info(format_stats(elapsed, line_count, usage))
 
@@ -2193,7 +2414,12 @@ Examples:
   %(prog)s "https://www.youtube.com/watch?v=VIDEO_ID" --output-dir ./translations
         """,
     )
-    parser.add_argument("url", help="YouTube video URL")
+    parser.add_argument(
+        "url",
+        nargs="?",
+        default=None,
+        help="YouTube video URL (required unless --from-transcript is used)",
+    )
     parser.add_argument(
         "--model",
         "-m",
@@ -2250,6 +2476,22 @@ Examples:
         ),
     )
     parser.add_argument(
+        "--from-transcript",
+        dest="from_transcript",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Translate a pre-generated transcript markdown file (from "
+            "`video_intel.py transcript`) into BCS. Preserves timestamps, SCREEN "
+            "sections, speaker labels, and on-screen text. Use when YouTube "
+            "captions miss too much on-screen context. Output is written as a "
+            "`.translate-bcs.txt` sibling next to the input transcript. "
+            "Mutually exclusive with URL and with --srt-only/--force-video/--stitch/"
+            "--chunk-minutes/--start/--end."
+        ),
+    )
+    parser.add_argument(
         "--thinking-budget",
         type=int,
         default=None,
@@ -2282,6 +2524,25 @@ Examples:
         parser.error("--srt-only and --thinking-budget are mutually exclusive (no Gemini call to configure)")
     if args.srt_only and args.stitch:
         parser.error("--srt-only and --stitch are mutually exclusive")
+
+    # Exactly one input mode: either a URL (positional) or a transcript file.
+    if args.from_transcript is None and args.url is None:
+        parser.error("either URL or --from-transcript PATH is required")
+    if args.from_transcript is not None and args.url is not None:
+        parser.error("URL and --from-transcript are mutually exclusive")
+    if args.from_transcript is not None:
+        if args.srt_only:
+            parser.error("--from-transcript and --srt-only are mutually exclusive")
+        if args.force_video:
+            parser.error("--from-transcript and --force-video are mutually exclusive")
+        if args.stitch:
+            parser.error("--from-transcript and --stitch are mutually exclusive")
+        if args.start is not None or args.end is not None:
+            parser.error("--from-transcript and --start/--end are mutually exclusive")
+        # --chunk-minutes has a non-None default (20), so compare against that
+        # to detect an actual user override rather than the argparse default.
+        if args.chunk_minutes != 20:
+            parser.error("--from-transcript and --chunk-minutes are mutually exclusive")
 
     # Validate --thinking-budget against the target model's allowed range.
     # Raises SystemExit with a clear message when misconfigured.
@@ -2341,6 +2602,17 @@ Examples:
             duration_seconds=total_duration,
         )
         log.info("Stitched → %s", result)
+        return
+
+    # --from-transcript: translate a local transcript file, no YouTube calls.
+    if args.from_transcript is not None:
+        _translate_from_transcript(
+            transcript_path=Path(args.from_transcript).expanduser(),
+            model_name=args.model,
+            use_stdout=args.stdout,
+            force=args.force,
+            thinking_budget=args.thinking_budget,
+        )
         return
 
     translate_video(
