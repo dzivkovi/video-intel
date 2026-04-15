@@ -5,7 +5,17 @@
 > [README](../README.md).
 
 Video-intel follows the open [Agent Skills](https://agentskills.io/specification)
-standard. One skill directory, multiple platforms.
+standard.
+
+**As of v1.5.0**, the repo ships as a **Claude Code plugin** containing two
+skills (`video-intel` and `translate-bcs`). On Claude Code, install the whole
+plugin to `~/.claude/plugins/video-intel/` to get both skills. On other
+platforms that expect a single-skill layout (Gemini CLI, Cursor, Copilot,
+etc.), copy the specific skill folder you want — `skills/video-intel/` for
+transcription/discovery, `skills/translate-bcs/` for subtitle translation —
+into the platform's skills directory. The per-platform tables below still
+apply for single-skill installs; just copy the `skills/video-intel/`
+subdirectory instead of the repo root.
 
 ## Prerequisites
 

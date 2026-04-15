@@ -50,7 +50,23 @@ Optional: `VOYAGE_API_KEY` (for vector search, free at https://dash.voyageai.com
 
 ## Architecture
 
-**Skill entry point:** `SKILL.md` — the YAML frontmatter `description` field controls when Claude Code triggers this skill. The body tells Claude how to invoke the scripts and manage config.
+**Plugin, not single skill.** This repo ships as a **plugin** — a container that holds multiple independent skills — per the current Anthropic plugin format. Layout:
+
+```text
+video-intel/                          ← plugin root (git repo root)
+├── .claude-plugin/plugin.json        ← plugin manifest (name, version, skill list)
+├── skills/
+│   ├── video-intel/SKILL.md          ← scan / transcript / concepts / search
+│   └── translate-bcs/SKILL.md        ← BCS subtitle translation
+├── scripts/                          ← shared by both skills
+├── prompts/                          ← shared by both skills
+├── config.yaml                       ← video-intel skill only
+└── tests/                            ← covers shared scripts
+```
+
+Each `SKILL.md` has its own frontmatter description and is independently triggered by Claude Code. Scripts and prompts are shared at the plugin root so the two skills can reuse `translate_video.py`, `gemini_common.py`, etc., without duplication. The operational-separation rule (translate_video.py does not read video-intel's config/taxonomy/meta.json) is unchanged — scripts stay independent even though they ship in the same plugin.
+
+**When the plugin is installed**, both skills become available to Claude. A user asking "scan my channels" triggers `video-intel`; a user asking "translate this video to Bosnian" triggers `translate-bcs`. No cross-skill invocation is required — each skill's body tells Claude which CLI commands to run, and Claude executes them from the plugin's shared scripts directory.
 
 **Shared utilities:** `scripts/gemini_common.py` — Gemini retry logic (`get_retry_delay`), client factory with httpx timeouts (`create_client`), lazy imports (`require_gemini`, `require_youtube`). Used by both scripts; kept minimal.
 
@@ -103,44 +119,37 @@ All commands support `--force` to regenerate existing output files.
 - `SKILL_DIR` is resolved from the script's own path (`Path(__file__).resolve().parent.parent`), making the skill relocatable across `~/.claude/skills/`, `~/.gemini/skills/`, or `~/.agents/skills/`.
 - Lazy imports (`require_gemini()`, `require_youtube()`) in `gemini_common.py` give clear error messages when dependencies are missing instead of cryptic ImportErrors.
 
-## Packaging
+## Packaging and Distribution
 
-The skill packager has no `.skillignore` or `.dockerignore` equivalent. It hardcodes exclusions for `__pycache__/`, `node_modules/`, `*.pyc`, `.DS_Store`, and `evals/` only. **Everything else in the skill folder gets packaged.**
+**Plugins are distributed as git repositories, not as packaged archive files.** The current Claude Code plugin docs describe two real consumption paths, and neither involves uploading a `.zip` or `.skill` artifact to a GitHub release:
 
-To package: "Package my video-intel skill" — this validates SKILL.md and produces `video-intel.skill`.
+1. **Marketplace install** (end users): the plugin author publishes the repo, then a Claude Code marketplace points at it (a `.claude-plugin/marketplace.json` somewhere lists this repo by URL/ref). End users install via `/plugin install video-intel@<marketplace-name>` from inside Claude Code.
+2. **Local `--plugin-dir` install** (developers / power users): the user clones the repo and starts Claude Code with `--plugin-dir /path/to/this/repo`. Claude Code reads the `.claude-plugin/plugin.json` manifest and discovers both skills from `skills/`.
 
-Before packaging, ensure the skill folder contains only shippable files:
+The earlier project convention of producing a `video-intel.skill` file and uploading it as a GitHub release asset is **not part of the documented current distribution flow**. Whether `.skill` files still load on current Claude Code versions is an open question; see the docs at code.claude.com/docs/en/plugins-reference.md for the authoritative current spec.
 
-- `SKILL.md`, `config.yaml`, `scripts/`, `prompts/`
+What matters for shipping a release of this repo:
 
-Dev artifacts that must NOT be present when packaging:
+- Tag the commit on `main` with `vX.Y.Z`. Push the tag.
+- Make sure `.claude-plugin/plugin.json` `version` matches the tag.
+- That's it for distribution. Marketplaces (or `--plugin-dir` users) pull from the tagged ref directly.
 
-- `.env*`, `.gitignore`, `CLAUDE.md`, `README.md`, output directories (`video-intel/`), `__pycache__/`
-
-If developing in-place (skill folder is also the repo), package from a clean temp copy:
-
-```bash
-# Create clean copy with only shippable files
-mkdir -p /tmp/video-intel-clean
-cp SKILL.md config.yaml README.md /tmp/video-intel-clean/
-cp -r scripts prompts /tmp/video-intel-clean/
-
-# Package from clean copy (run from skill-creator directory)
-cd ~/.claude/skills/skill-creator
-python -m scripts.package_skill /tmp/video-intel-clean
-```
-
-The `output_dir` in config should point outside the skill folder (e.g. `~/video-intel`) for production use.
+The `output_dir` in `config.yaml` should point outside the plugin folder (e.g. `~/video-intel`) for production use, so user data does not live inside the cached plugin directory that Claude Code manages.
 
 ## Release Process
 
-1. Commit changes and tag: `git tag -a v1.x.0 -m "description"`
-2. Package the skill (see Packaging above)
-3. Copy `.skill` file to project: `cp ~/.claude/skills/skill-creator/video-intel-clean.skill ./video-intel.skill`
-4. Push commits and tag: `git push origin main --tags`
-5. Create GitHub release with asset: `gh release create v1.x.0 video-intel.skill --title "v1.x.0 - Title" --notes "description"`
+1. Bump `.claude-plugin/plugin.json` `version` to match the upcoming tag.
+2. Commit the bump.
+3. Tag the commit:
 
-The `.skill` file is a build artifact (like a Docker image) - it lives in GitHub Releases, not in git. It's in `.gitignore`.
+   ```bash
+   git tag -a vX.Y.Z -m "short description"
+   ```
+
+4. Push commits and tag: `git push origin main --tags`
+5. (Optional) Create a GitHub Release tied to the tag with release notes — useful for humans browsing changes, even though Claude Code itself does not consume a release asset under the documented install paths.
+
+**Users installing from a previous release:** The repo went from "single skill at repo root" to "plugin with two skills under `skills/`." Anyone who previously installed by copying the old layout to `~/.claude/skills/video-intel/` should remove that directory and re-install via one of the documented plugin paths. Claude Code manages the actual plugin cache itself (`~/.claude/plugins/cache/...`); end users do not copy files there directly.
 
 ## Development
 

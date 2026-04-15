@@ -1,0 +1,8 @@
+{
+  "name": "video-intel",
+  "version": "1.5.0",
+  "description": "YouTube video intelligence via Gemini: channel scanning, rich multimodal transcripts with on-screen content, concept taxonomy, hybrid search, and Bosnian/Croatian/Serbian subtitle translation. Two independent skills in one plugin.",
+  "author": {
+    "name": "Daniel Zivkovic"
+  }
+}

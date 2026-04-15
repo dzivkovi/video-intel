@@ -128,6 +128,21 @@ cards, badges, slide footers) with evidence provided for each identification.
 - **Per-channel config.** Daily creators get `since: 10d`. Monthly creators get `since: 120d`. Each channel captures your relationship with that creator.
 - **The skill only does Gemini work.** Triage and deep-dive are conversations with Claude, not API calls. They were in the design, then deliberately cut.
 
+## Plugin Contents — Two Skills
+
+As of v1.5.0, this repo ships as a **plugin** containing two independent skills.
+Both get installed together; Claude picks the right one based on what you ask.
+
+| Skill | What it does | Trigger phrases |
+| ----- | ------------ | --------------- |
+| **video-intel** | Scan YouTube channels, generate mind maps, produce rich transcripts with on-screen content, extract concepts, hybrid search across the library | "scan my channels", "transcribe this video", "what videos cover X", "what should I watch" |
+| **translate-bcs** | Translate YouTube videos and rich transcripts into Bosnian/Croatian/Serbian subtitles; also downloads just the English SRT on request | "translate to Bosnian/Croatian/Serbian", "BCS subtitles", "titl na bosanski", "just give me the SRT" |
+
+The two skills stay operationally independent — `translate-bcs` does not read video-intel's
+channel config, taxonomy, or meta files. The integration point is a file handoff:
+for context-heavy videos, `translate-bcs` reads a rich transcript that `video-intel`
+produced. Claude orchestrates both CLI steps in a single conversation.
+
 ## Quick Start
 
 ```bash
@@ -136,24 +151,41 @@ export GEMINI_API_KEY=your_key    # https://aistudio.google.com/apikey
 export YOUTUBE_API_KEY=your_key   # https://console.cloud.google.com/apis/credentials
 
 # 2. Dependencies
-pip install google-genai google-api-python-client pyyaml
+pip install google-genai google-api-python-client pyyaml youtube-transcript-api
 
-# 3. Install (pick your platform)
-cp -r video-intel ~/.claude/skills/    # Claude Code
-cp -r video-intel ~/.gemini/skills/    # Gemini CLI
-cp -r video-intel ~/.agents/skills/    # Cross-platform
-
+# 3. Install the plugin in Claude Code. Two real options:
+#
+#    (a) End user, once published to a Claude Code marketplace:
+#        Inside Claude Code, run:  /plugin install video-intel@<marketplace-name>
+#        Claude Code fetches and caches the plugin automatically.
+#
+#    (b) Local development or ad-hoc use (no marketplace required):
+#        Start Claude Code with --plugin-dir pointing at this repo.
+#        Both skills are discovered from skills/video-intel/ and skills/translate-bcs/.
+#        Example:  claude --plugin-dir /path/to/this/repo
+#
 # 4. Configure channels in config.yaml, then:
 python scripts/video_intel.py scan
 ```
 
-Or in Claude Code, just say: **"scan my channels"**
+Or in Claude Code, just say:
 
-For detailed installation across all platforms (Gemini CLI, Cursor, Copilot,
-Codex, Databricks, NPX, symlinks), see
-[INSTALLATION.md](INSTALLATION.md). Tested locally with Claude Code -
-other platforms follow the same Agent Skills spec but are not yet validated.
-Community feedback welcome.
+- **"scan my channels"** → video-intel skill
+- **"translate this YouTube video to Bosnian"** → translate-bcs skill
+
+For detailed installation guidance across platforms, see
+[INSTALLATION.md](INSTALLATION.md). The plugin format is Claude Code-specific; on
+other tools that consume the open Agent Skills format, the individual skill
+folders (`skills/video-intel/` or `skills/translate-bcs/`) may be usable
+independently — interoperability with non-Claude-Code tools has not been verified
+by this repo.
+
+**Upgrading from v1.4.x or earlier:** The repo went from "single skill" to "plugin
+with two skills." If you previously installed by copying the repo into
+`~/.claude/skills/video-intel/`, remove that directory and re-install via one of
+the plugin paths above. Claude Code manages the actual on-disk plugin cache
+itself (under `~/.claude/plugins/cache/...`); users do not copy files there
+directly.
 
 ## Configuration
 
@@ -609,9 +641,17 @@ force IPv4 connections as a workaround.
 
 ## Cross-Platform Compatibility
 
-This skill uses the open Agent Skills format (SKILL.md + scripts/).
-It works with Claude Code, Gemini CLI, Cursor, GitHub Copilot, and others
-supporting the skills spec. API keys are read from environment variables.
+This repo ships as a Claude Code **plugin**: a `.claude-plugin/plugin.json`
+manifest plus a `skills/` directory holding two independent skills, with
+`scripts/` and `prompts/` shared at the plugin root. The `plugin.json` format
+and the plugin auto-discovery flow are Claude Code-specific.
+
+The two `SKILL.md` files themselves follow the open Agent Skills format
+(agentskills.io). Other tools that consume that spec — Gemini CLI, Cursor,
+Copilot, and others — *may* be able to use `skills/video-intel/` or
+`skills/translate-bcs/` as standalone skill folders, but this interoperability
+has not been verified by this repo. If you try a non-Claude-Code setup, results
+welcome as feedback. API keys are read from environment variables in all cases.
 
 ## Packaging
 
