@@ -219,13 +219,36 @@ channels:
 | url | Yes | YouTube channel URL |
 | prompt | No | Override default prompt |
 | auto_transcript | No | "all" or "none" (default: none) |
-| since | No | Override default lookback window |
+| since | No | Override default lookback window (ignored in selective mode) |
+| playlists | No | List of playlist names to scan (enables selective mode) |
+| keywords | No | List of search terms to scan (enables selective mode) |
+
+### Selective Mode
+
+Channels with `playlists` or `keywords` skip the date-based scan and only process
+matching videos. This is useful for prolific creators where you only care about
+specific topics or curated collections.
+
+```yaml
+  - name: seankochel
+    url: https://youtube.com/@iamseankochel
+    playlists:
+      - Agent Skills
+    keywords:
+      - ux design
+    auto_transcript: all
+```
+
+- Playlist names are resolved via YouTube API (case-insensitive contains matching)
+- Keywords search the entire channel history (capped at 200 results per keyword)
+- `since` and `--since` are ignored for selective channels
+- Videos from multiple playlists/keywords are deduplicated by video ID
 
 ### Since Formats
 
 - Relative: `7d`, `10d`, `30d`, `120d`
 - Absolute: `2026-01-15`
-- Command-line `--since` overrides per-channel and default settings
+- Command-line `--since` overrides per-channel and default settings (non-selective channels only)
 
 ## Usage
 

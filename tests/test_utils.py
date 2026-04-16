@@ -9,6 +9,7 @@ import pytest
 
 from video_intel import (
     DEFAULT_MODEL,
+    KEYWORD_MAX_PAGES,
     MAX_OUTPUT_TOKENS,
     SALVAGE_MIN_SPEECH_ENTRIES,
     TRANSCRIPT_PARSE_RETRY_LIMIT,
@@ -18,7 +19,11 @@ from video_intel import (
     build_taxonomy,
     call_gemini,
     chunk_transcript,
+    cmd_scan,
     fetch_channel_videos,
+    fetch_keyword_videos,
+    fetch_playlist_videos,
+    fetch_selective_videos,
     find_mindmap_source,
     is_processed,
     isolate_json,
@@ -28,6 +33,7 @@ from video_intel import (
     parse_since,
     process_transcript,
     resolve_model,
+    resolve_playlist_ids,
     salvage_transcript_sections,
     search_corpus,
     slugify,
@@ -1336,3 +1342,361 @@ class TestTokenConfig:
         from translate_video import MAX_OUTPUT_TOKENS as TRANSLATE_MAX
 
         assert MAX_OUTPUT_TOKENS == TRANSLATE_MAX
+
+
+# ---------------------------------------------------------------------------
+# resolve_playlist_ids
+# ---------------------------------------------------------------------------
+
+
+class TestResolvePlaylistIds:
+    def _make_youtube_mock(self, playlists: list[dict]) -> MagicMock:
+        youtube = MagicMock()
+        youtube.playlists.return_value.list.return_value.execute.return_value = {
+            "items": [{"id": p["id"], "snippet": {"title": p["title"]}} for p in playlists],
+        }
+        return youtube
+
+    def test_resolves_exact_name(self):
+        youtube = self._make_youtube_mock(
+            [
+                {"id": "PL_agent", "title": "Agent Skills"},
+                {"id": "PL_vibe", "title": "Vibe Coding Tips"},
+            ]
+        )
+        result = resolve_playlist_ids(youtube, "UC123", ["Agent Skills"])
+        assert len(result) == 1
+        assert result[0] == ("PL_agent", "Agent Skills")
+
+    def test_case_insensitive_contains_matching(self):
+        youtube = self._make_youtube_mock(
+            [
+                {"id": "PL_agent", "title": "Agent Skills Deep Dive"},
+                {"id": "PL_vibe", "title": "Vibe Coding Tips"},
+            ]
+        )
+        result = resolve_playlist_ids(youtube, "UC123", ["agent skills"])
+        assert len(result) == 1
+        assert result[0][0] == "PL_agent"
+
+    def test_matches_multiple_playlists(self):
+        youtube = self._make_youtube_mock(
+            [
+                {"id": "PL_a1", "title": "Agent Skills Part 1"},
+                {"id": "PL_a2", "title": "Agent Skills Part 2"},
+                {"id": "PL_other", "title": "Other"},
+            ]
+        )
+        result = resolve_playlist_ids(youtube, "UC123", ["Agent Skills"])
+        assert len(result) == 2
+
+    def test_unresolved_name_returns_empty(self):
+        youtube = self._make_youtube_mock(
+            [
+                {"id": "PL_vibe", "title": "Vibe Coding Tips"},
+            ]
+        )
+        result = resolve_playlist_ids(youtube, "UC123", ["Nonexistent Playlist"])
+        assert len(result) == 0
+
+    def test_multiple_names_resolved_independently(self):
+        youtube = self._make_youtube_mock(
+            [
+                {"id": "PL_agent", "title": "Agent Skills"},
+                {"id": "PL_vibe", "title": "Vibe Coding Tips"},
+                {"id": "PL_ux", "title": "UX Design"},
+            ]
+        )
+        result = resolve_playlist_ids(youtube, "UC123", ["Agent Skills", "UX Design"])
+        assert len(result) == 2
+        ids = {r[0] for r in result}
+        assert ids == {"PL_agent", "PL_ux"}
+
+
+# ---------------------------------------------------------------------------
+# fetch_playlist_videos
+# ---------------------------------------------------------------------------
+
+
+class TestFetchPlaylistVideos:
+    def test_fetches_videos_from_playlist_id(self):
+        youtube = MagicMock()
+        youtube.playlistItems.return_value.list.return_value.execute.return_value = {
+            "items": [
+                {
+                    "snippet": {"title": "Video One", "publishedAt": "2026-03-01T00:00:00Z"},
+                    "contentDetails": {"videoId": "vid1", "videoPublishedAt": "2026-03-01T00:00:00Z"},
+                },
+            ],
+        }
+
+        videos = fetch_playlist_videos(youtube, "PL_agent_skills")
+        assert len(videos) == 1
+        assert videos[0]["video_id"] == "vid1"
+        assert videos[0]["title"] == "Video One"
+        assert videos[0]["published"] == "2026-03-01"
+        assert videos[0]["url"] == "https://www.youtube.com/watch?v=vid1"
+
+        # Verify it used the playlist ID directly (not UU prefix)
+        call_kwargs = youtube.playlistItems.return_value.list.call_args[1]
+        assert call_kwargs["playlistId"] == "PL_agent_skills"
+
+    def test_no_date_filtering(self):
+        """Playlist fetch returns all videos regardless of age."""
+        youtube = MagicMock()
+        youtube.playlistItems.return_value.list.return_value.execute.return_value = {
+            "items": [
+                {
+                    "snippet": {"title": "Recent", "publishedAt": "2026-03-01T00:00:00Z"},
+                    "contentDetails": {"videoId": "new1", "videoPublishedAt": "2026-03-01T00:00:00Z"},
+                },
+                {
+                    "snippet": {"title": "Very Old", "publishedAt": "2020-01-01T00:00:00Z"},
+                    "contentDetails": {"videoId": "old1", "videoPublishedAt": "2020-01-01T00:00:00Z"},
+                },
+            ],
+        }
+
+        videos = fetch_playlist_videos(youtube, "PL_test")
+        assert len(videos) == 2
+
+
+# ---------------------------------------------------------------------------
+# fetch_keyword_videos
+# ---------------------------------------------------------------------------
+
+
+class TestFetchKeywordVideos:
+    def test_normalizes_search_results_to_video_format(self):
+        youtube = MagicMock()
+        youtube.search.return_value.list.return_value.execute.return_value = {
+            "items": [
+                {
+                    "id": {"videoId": "vid1"},
+                    "snippet": {"title": "UX Design Tips", "publishedAt": "2026-02-15T00:00:00Z"},
+                },
+            ],
+        }
+
+        videos = fetch_keyword_videos(youtube, "UC123", "ux design")
+        assert len(videos) == 1
+        assert videos[0] == {
+            "video_id": "vid1",
+            "title": "UX Design Tips",
+            "published": "2026-02-15",
+            "url": "https://www.youtube.com/watch?v=vid1",
+        }
+
+    def test_passes_correct_search_params(self):
+        youtube = MagicMock()
+        youtube.search.return_value.list.return_value.execute.return_value = {"items": []}
+
+        fetch_keyword_videos(youtube, "UC123", "agent skills")
+        call_kwargs = youtube.search.return_value.list.call_args[1]
+        assert call_kwargs["channelId"] == "UC123"
+        assert call_kwargs["q"] == "agent skills"
+        assert call_kwargs["type"] == "video"
+        assert call_kwargs["order"] == "date"
+
+    def test_respects_max_pages_cap(self):
+        youtube = MagicMock()
+        # Return a page with nextPageToken to simulate pagination
+        page_with_next = {
+            "items": [
+                {"id": {"videoId": f"vid{i}"}, "snippet": {"title": f"V{i}", "publishedAt": "2026-01-01T00:00:00Z"}}
+                for i in range(50)
+            ],
+            "nextPageToken": "next",
+        }
+        last_page = {
+            "items": [
+                {"id": {"videoId": "vidlast"}, "snippet": {"title": "Last", "publishedAt": "2026-01-01T00:00:00Z"}}
+            ],
+        }
+        youtube.search.return_value.list.return_value.execute.side_effect = [
+            page_with_next,
+            page_with_next,
+            page_with_next,
+            page_with_next,
+            last_page,
+        ]
+
+        fetch_keyword_videos(youtube, "UC123", "test", max_pages=KEYWORD_MAX_PAGES)
+        # Should stop after KEYWORD_MAX_PAGES pages even if more available
+        assert youtube.search.return_value.list.return_value.execute.call_count == KEYWORD_MAX_PAGES
+
+
+# ---------------------------------------------------------------------------
+# fetch_selective_videos
+# ---------------------------------------------------------------------------
+
+
+class TestFetchSelectiveVideos:
+    def test_fetches_from_playlists_and_keywords(self, monkeypatch):
+        playlist_videos = [
+            {
+                "video_id": "pl1",
+                "title": "From Playlist",
+                "published": "2026-01-01",
+                "url": "https://youtube.com/watch?v=pl1",
+            },
+        ]
+        keyword_videos = [
+            {
+                "video_id": "kw1",
+                "title": "From Keyword",
+                "published": "2026-02-01",
+                "url": "https://youtube.com/watch?v=kw1",
+            },
+        ]
+
+        monkeypatch.setattr("video_intel.resolve_playlist_ids", lambda _yt, _cid, _names: [("PL1", "Test Playlist")])
+        monkeypatch.setattr("video_intel.fetch_playlist_videos", lambda _yt, _pid: playlist_videos)
+        monkeypatch.setattr("video_intel.fetch_keyword_videos", lambda _yt, _cid, _kw, **_kw2: keyword_videos)
+
+        youtube = MagicMock()
+        config = {"playlists": ["Test Playlist"], "keywords": ["test"]}
+        videos = fetch_selective_videos(youtube, "UC123", config)
+
+        assert len(videos) == 2
+        ids = {v["video_id"] for v in videos}
+        assert ids == {"pl1", "kw1"}
+
+    def test_deduplicates_by_video_id(self, monkeypatch):
+        shared_video = {
+            "video_id": "shared1",
+            "title": "Shared",
+            "published": "2026-01-01",
+            "url": "https://youtube.com/watch?v=shared1",
+        }
+
+        monkeypatch.setattr("video_intel.resolve_playlist_ids", lambda _yt, _cid, _names: [("PL1", "P1")])
+        monkeypatch.setattr("video_intel.fetch_playlist_videos", lambda _yt, _pid: [shared_video])
+        monkeypatch.setattr("video_intel.fetch_keyword_videos", lambda _yt, _cid, _kw, **_kw2: [shared_video.copy()])
+
+        youtube = MagicMock()
+        config = {"playlists": ["P1"], "keywords": ["test"]}
+        videos = fetch_selective_videos(youtube, "UC123", config)
+
+        assert len(videos) == 1
+        assert videos[0]["video_id"] == "shared1"
+
+    def test_playlists_only_no_keywords(self, monkeypatch):
+        monkeypatch.setattr("video_intel.resolve_playlist_ids", lambda _yt, _cid, _names: [("PL1", "P1")])
+        monkeypatch.setattr(
+            "video_intel.fetch_playlist_videos",
+            lambda _yt, _pid: [
+                {"video_id": "v1", "title": "V1", "published": "2026-01-01", "url": "https://youtube.com/watch?v=v1"},
+            ],
+        )
+
+        youtube = MagicMock()
+        config = {"playlists": ["P1"]}
+        videos = fetch_selective_videos(youtube, "UC123", config)
+
+        assert len(videos) == 1
+
+    def test_keywords_only_no_playlists(self, monkeypatch):
+        monkeypatch.setattr(
+            "video_intel.fetch_keyword_videos",
+            lambda _yt, _cid, _kw, **_kw2: [
+                {"video_id": "v1", "title": "V1", "published": "2026-01-01", "url": "https://youtube.com/watch?v=v1"},
+            ],
+        )
+
+        youtube = MagicMock()
+        config = {"keywords": ["test"]}
+        videos = fetch_selective_videos(youtube, "UC123", config)
+
+        assert len(videos) == 1
+
+
+# ---------------------------------------------------------------------------
+# cmd_scan selective mode integration
+# ---------------------------------------------------------------------------
+
+
+class TestCmdScanSelectiveMode:
+    def test_selective_channel_uses_fetch_selective_videos(self, monkeypatch, tmp_path):
+        """Channels with playlists/keywords use selective fetch, not uploads scan."""
+        captured = {}
+
+        def fake_fetch_selective(_yt, _cid, ch_config):
+            captured["called"] = True
+            captured["config"] = ch_config
+            return [
+                {
+                    "video_id": "sel1",
+                    "title": "Selective",
+                    "published": "2026-01-01",
+                    "url": "https://youtube.com/watch?v=sel1",
+                }
+            ]
+
+        def fake_process_mindmap(_client, _types, _video, _prompt, _model, *a, **kw):
+            return "2026-01-01-selective", "done"
+
+        monkeypatch.setattr("video_intel.require_gemini", lambda: (MagicMock(), MagicMock()))
+        monkeypatch.setattr("video_intel.require_youtube", lambda: MagicMock())
+        monkeypatch.setattr("video_intel.create_client", lambda _key: MagicMock())
+        monkeypatch.setenv("GEMINI_API_KEY", "fake")
+        monkeypatch.setenv("YOUTUBE_API_KEY", "fake")
+        monkeypatch.setattr("video_intel.resolve_output_dir", lambda _cfg: tmp_path)
+        monkeypatch.setattr("video_intel.load_prompt", lambda _name: "prompt text")
+        monkeypatch.setattr("video_intel.get_channel_id", lambda _yt, _url: ("UC123", "Test Channel"))
+        monkeypatch.setattr("video_intel.is_processed", lambda *a, **kw: False)
+        monkeypatch.setattr("video_intel.is_skipped", lambda *a, **kw: False)
+        monkeypatch.setattr("video_intel.fetch_selective_videos", fake_fetch_selective)
+        monkeypatch.setattr("video_intel.process_mindmap", fake_process_mindmap)
+
+        args = argparse.Namespace(
+            model=None,
+            channel=None,
+            since=None,
+            dry_run=False,
+            force=False,
+        )
+        config = {
+            "channels": [
+                {
+                    "name": "testch",
+                    "url": "https://youtube.com/@test",
+                    "playlists": ["Agent Skills"],
+                },
+            ],
+        }
+
+        cmd_scan(args, config)
+        assert captured.get("called") is True
+
+    def test_non_selective_channel_uses_date_scan(self, monkeypatch, tmp_path):
+        """Channels without playlists/keywords use the standard uploads scan."""
+        captured = {}
+
+        def fake_fetch_channel_videos(_yt, _cid, _since):
+            captured["uploads_scan"] = True
+            return []
+
+        monkeypatch.setattr("video_intel.require_gemini", lambda: (MagicMock(), MagicMock()))
+        monkeypatch.setattr("video_intel.require_youtube", lambda: MagicMock())
+        monkeypatch.setattr("video_intel.create_client", lambda _key: MagicMock())
+        monkeypatch.setenv("GEMINI_API_KEY", "fake")
+        monkeypatch.setenv("YOUTUBE_API_KEY", "fake")
+        monkeypatch.setattr("video_intel.resolve_output_dir", lambda _cfg: tmp_path)
+        monkeypatch.setattr("video_intel.get_channel_id", lambda _yt, _url: ("UC123", "Test"))
+        monkeypatch.setattr("video_intel.fetch_channel_videos", fake_fetch_channel_videos)
+
+        args = argparse.Namespace(
+            model=None,
+            channel=None,
+            since=None,
+            dry_run=False,
+            force=False,
+        )
+        config = {
+            "channels": [{"name": "standard", "url": "https://youtube.com/@standard"}],
+            "default_since": "10d",
+        }
+
+        cmd_scan(args, config)
+        assert captured.get("uploads_scan") is True

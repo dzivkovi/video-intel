@@ -32,3 +32,12 @@ channels:
     url: https://youtube.com/@graceleungyl
     auto_transcript: all
     since: 270d
+
+  - name: seankochel
+    url: https://youtube.com/@iamseankochel
+    playlists:
+      - Agent Skills
+    keywords:
+      - ux
+      - design
+    auto_transcript: none

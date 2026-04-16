@@ -46,6 +46,7 @@ DEFAULT_MODEL = "gemini-3-flash-preview"
 MAX_OUTPUT_TOKENS = 65536
 TRANSCRIPT_PARSE_RETRY_LIMIT = 1
 SALVAGE_MIN_SPEECH_ENTRIES = 5
+KEYWORD_MAX_PAGES = 4  # 200 results max per keyword, 400 quota units
 
 
 def load_config():
@@ -209,6 +210,165 @@ def fetch_channel_videos(youtube, channel_id, since_dt):
             break
 
     return videos
+
+
+# ---------------------------------------------------------------------------
+# Selective scanning: playlists and keywords
+# ---------------------------------------------------------------------------
+
+
+def resolve_playlist_ids(youtube, channel_id: str, playlist_names: list[str]) -> list[tuple[str, str]]:
+    """Resolve playlist names to (playlist_id, playlist_title) pairs.
+
+    Uses case-insensitive contains matching. Logs warning for unresolved names
+    with available playlist titles.
+    """
+    # Enumerate all playlists on the channel
+    all_playlists: list[dict] = []
+    next_page = None
+    while True:
+        resp = (
+            youtube.playlists()
+            .list(
+                part="snippet",
+                channelId=channel_id,
+                maxResults=50,
+                pageToken=next_page,
+            )
+            .execute()
+        )
+        all_playlists.extend(resp.get("items", []))
+        next_page = resp.get("nextPageToken")
+        if not next_page:
+            break
+
+    # Match each requested name
+    matched: list[tuple[str, str]] = []
+    available_titles = [p["snippet"]["title"] for p in all_playlists]
+
+    for name in playlist_names:
+        name_lower = name.lower()
+        found = False
+        for p in all_playlists:
+            title = p["snippet"]["title"]
+            if name_lower in title.lower():
+                matched.append((p["id"], title))
+                log.info('    Resolved playlist: "%s" -> %s (%s)', name, p["id"], title)
+                found = True
+        if not found:
+            log.warning('    Playlist "%s" not found. Available: %s', name, available_titles)
+
+    return matched
+
+
+def fetch_playlist_videos(youtube, playlist_id: str) -> list[dict]:
+    """Fetch all videos from a specific playlist (no date filtering)."""
+    videos: list[dict] = []
+    next_page = None
+
+    while True:
+        resp = (
+            youtube.playlistItems()
+            .list(
+                part="snippet,contentDetails",
+                playlistId=playlist_id,
+                maxResults=50,
+                pageToken=next_page,
+            )
+            .execute()
+        )
+
+        for item in resp.get("items", []):
+            published_str = item["contentDetails"].get("videoPublishedAt", item["snippet"]["publishedAt"])
+            video_id = item["contentDetails"]["videoId"]
+            videos.append(
+                {
+                    "video_id": video_id,
+                    "title": unescape(item["snippet"]["title"]),
+                    "published": published_str[:10],
+                    "url": f"https://www.youtube.com/watch?v={video_id}",
+                }
+            )
+
+        next_page = resp.get("nextPageToken")
+        if not next_page:
+            break
+
+    return videos
+
+
+def fetch_keyword_videos(youtube, channel_id: str, keyword: str, *, max_pages: int = KEYWORD_MAX_PAGES) -> list[dict]:
+    """Search a channel for videos matching a keyword (capped pagination)."""
+    videos: list[dict] = []
+    next_page = None
+    pages = 0
+
+    log.info('    Keyword search: "%s" (~%d quota units)', keyword, max_pages * 100)
+
+    while pages < max_pages:
+        resp = (
+            youtube.search()
+            .list(
+                part="snippet",
+                channelId=channel_id,
+                q=keyword,
+                type="video",
+                order="date",
+                maxResults=50,
+                pageToken=next_page,
+            )
+            .execute()
+        )
+        pages += 1
+
+        for item in resp.get("items", []):
+            video_id = item["id"]["videoId"]
+            published_str = item["snippet"]["publishedAt"]
+            videos.append(
+                {
+                    "video_id": video_id,
+                    "title": unescape(item["snippet"]["title"]),
+                    "published": published_str[:10],
+                    "url": f"https://www.youtube.com/watch?v={video_id}",
+                }
+            )
+
+        next_page = resp.get("nextPageToken")
+        if not next_page:
+            break
+
+    return videos
+
+
+def fetch_selective_videos(youtube, channel_id: str, channel_config: dict) -> list[dict]:
+    """Fetch videos from playlists and/or keywords, deduplicated by video_id."""
+    all_videos: list[dict] = []
+    seen_ids: set[str] = set()
+
+    # Playlist sources
+    playlist_names = channel_config.get("playlists", [])
+    if playlist_names:
+        resolved = resolve_playlist_ids(youtube, channel_id, playlist_names)
+        for pl_id, pl_title in resolved:
+            pl_videos = fetch_playlist_videos(youtube, pl_id)
+            log.info('    Playlist "%s": %d videos', pl_title, len(pl_videos))
+            for v in pl_videos:
+                if v["video_id"] not in seen_ids:
+                    seen_ids.add(v["video_id"])
+                    all_videos.append(v)
+
+    # Keyword sources
+    keywords = channel_config.get("keywords", [])
+    for kw in keywords:
+        kw_videos = fetch_keyword_videos(youtube, channel_id, kw)
+        log.info('    Keyword "%s": %d results', kw, len(kw_videos))
+        for v in kw_videos:
+            if v["video_id"] not in seen_ids:
+                seen_ids.add(v["video_id"])
+                all_videos.append(v)
+
+    log.info("  Total: %d unique videos after dedup", len(all_videos))
+    return all_videos
 
 
 # ---------------------------------------------------------------------------
@@ -928,13 +1088,19 @@ def cmd_scan(args, config):
 
         log.info("[%s] %s", ch_name, channel_title)
 
-        # Determine time window
-        since_str = args.since or ch.get("since") or config.get("default_since", "10d")
-        since_dt = parse_since(since_str)
-        log.info("  Looking back to %s", since_dt.strftime("%Y-%m-%d"))
+        # Determine fetch strategy: selective (playlists/keywords) or date-based
+        is_selective = bool(ch.get("playlists") or ch.get("keywords"))
 
-        # Fetch videos
-        videos = fetch_channel_videos(youtube, channel_id, since_dt)
+        if is_selective:
+            if args.since:
+                log.info("  Note: --since ignored for %s (using playlists/keywords)", ch_name)
+            log.info("  Selective mode: playlists=%s, keywords=%s", ch.get("playlists", []), ch.get("keywords", []))
+            videos = fetch_selective_videos(youtube, channel_id, ch)
+        else:
+            since_str = args.since or ch.get("since") or config.get("default_since", "10d")
+            since_dt = parse_since(since_str)
+            log.info("  Looking back to %s", since_dt.strftime("%Y-%m-%d"))
+            videos = fetch_channel_videos(youtube, channel_id, since_dt)
         if not videos:
             log.info("  No new videos found.")
             continue
