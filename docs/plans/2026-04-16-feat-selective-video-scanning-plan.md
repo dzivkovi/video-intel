@@ -172,24 +172,24 @@ For selective channels, dry-run should show:
 
 ## Acceptance Criteria
 
-- [ ] Channels with `playlists` field scan only those playlists (not uploads)
-- [ ] Channels with `keywords` field search only for those keywords
-- [ ] Channels with both use union of playlists + keywords, deduplicated
-- [ ] Channels without either retain current date-based behavior
-- [ ] Playlist names resolved via case-insensitive contains matching
-- [ ] Unresolved playlist names logged as WARNING with available names
-- [ ] Keyword search capped at 200 results (4 pages) per keyword
-- [ ] Keyword search logs quota warning at info level
-- [ ] `since` and `--since` ignored for selective channels with info notice
-- [ ] `--dry-run` shows playlist resolution, keyword results, dedup count
-- [ ] `--force` works with selective channels
-- [ ] `--channel` filter works with selective channels
-- [ ] `auto_transcript` and `auto_concepts` work with selective channels
+- [x] Channels with `playlists` field scan only those playlists (not uploads)
+- [x] Channels with `keywords` field search only for those keywords
+- [x] Channels with both use union of playlists + keywords, deduplicated
+- [x] Channels without either retain current date-based behavior
+- [x] Playlist names resolved via case-insensitive contains matching
+- [x] Unresolved playlist names logged as WARNING with available names
+- [x] Keyword search capped at 200 results (4 pages) per keyword
+- [x] Keyword search logs quota warning at info level
+- [x] `since` is additive for selective channels (fetches recent uploads too)
+- [x] `--dry-run` shows playlist resolution, keyword results, dedup count
+- [x] `--force` works with selective channels
+- [x] `--channel` filter works with selective channels
+- [x] `auto_transcript` and `auto_concepts` work with selective channels
 - [ ] Config validated: playlists/keywords must be list of strings
-- [ ] All new functions have type hints and tests
-- [ ] Existing tests still pass (backward compatibility)
-- [ ] SKILL.md, CLAUDE.md, README.md updated
-- [ ] `config.yaml` updated with seankochel example
+- [x] All new functions have type hints and tests
+- [x] Existing tests still pass (backward compatibility)
+- [x] SKILL.md, CLAUDE.md, README.md updated
+- [x] `config.yaml` updated with seankochel example
 
 ## Success Metrics
 

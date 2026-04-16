@@ -221,14 +221,15 @@ channels:
       - Agent Skills
     keywords:                       # Channel-scoped search terms
       - ux design
-    auto_transcript: all
+    auto_transcript: none             # mindmaps for discovery, transcript manually
+    since: 30d                        # also catch recent uploads (additive)
 ```
 
-**Selective scanning:** Channels with `playlists` or `keywords` skip the date-based
-scan and only process matching videos. Playlist names are resolved via YouTube API
+**Selective scanning:** Channels with `playlists` or `keywords` target specific
+content instead of scanning all uploads. Playlist names are resolved via YouTube API
 (case-insensitive contains matching). Keywords search the entire channel history
-(capped at 200 results per keyword). The `since` field is ignored for selective
-channels.
+(capped at 200 results per keyword). If `since` is also set, recent uploads are
+fetched as an additional source alongside playlists/keywords.
 
 ### Prompt files
 

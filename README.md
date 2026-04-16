@@ -219,7 +219,7 @@ channels:
 | url | Yes | YouTube channel URL |
 | prompt | No | Override default prompt |
 | auto_transcript | No | "all" or "none" (default: none) |
-| since | No | Override default lookback window (ignored in selective mode) |
+| since | No | Override default lookback window (additive in selective mode) |
 | playlists | No | List of playlist names to scan (enables selective mode) |
 | keywords | No | List of search terms to scan (enables selective mode) |
 
@@ -236,19 +236,22 @@ specific topics or curated collections.
       - Agent Skills
     keywords:
       - ux design
-    auto_transcript: all
+    auto_transcript: none
+    since: 30d
 ```
 
 - Playlist names are resolved via YouTube API (case-insensitive contains matching)
 - Keywords search the entire channel history (capped at 200 results per keyword)
-- `since` and `--since` are ignored for selective channels
+- `since` is additive for selective channels: also fetches recent uploads alongside playlists/keywords
+- Without `since`, only playlists and keywords are fetched
 - Videos from multiple playlists/keywords are deduplicated by video ID
 
 ### Since Formats
 
 - Relative: `7d`, `10d`, `30d`, `120d`
 - Absolute: `2026-01-15`
-- Command-line `--since` overrides per-channel and default settings (non-selective channels only)
+- Command-line `--since` overrides per-channel and default settings
+- For selective channels, `since` adds recent uploads alongside playlists/keywords
 
 ## Usage
 
