@@ -208,7 +208,7 @@ channels:
 | output_dir | ~/video-intel | Where output files are saved |
 | default_since | 10d | Default lookback window |
 | default_prompt | mindmap-light | Default prompt for mind maps |
-| model | gemini-3-flash-preview | Gemini model to use |
+| model | gemini-3-flash-preview | Gemini model (overridable via `--model` CLI flag) |
 | max_parallel | 10 | Concurrent Gemini requests (paid tier can go 50+) |
 
 ### Channel Settings
@@ -244,6 +244,10 @@ python scripts/video_intel.py scan --dry-run
 
 # Transcribe a specific video (channel auto-detected from config)
 python scripts/video_intel.py transcript \
+  --url "https://www.youtube.com/watch?v=XXXXX"
+
+# Override Gemini model for a single command
+python scripts/video_intel.py --model gemini-2.5-pro transcript \
   --url "https://www.youtube.com/watch?v=XXXXX"
 
 # Extract concepts from all existing mindmaps
@@ -391,6 +395,7 @@ the [rate limits docs](https://ai.google.dev/gemini-api/docs/rate-limits).
 
 Over time you will improve prompts, switch models, or want to rebuild artifacts.
 All commands support `--force` to regenerate even when output files already exist.
+Use `--model` / `-m` to switch models without editing config.yaml:
 
 ### Regenerate mindmaps (e.g., after changing prompt)
 
@@ -405,6 +410,10 @@ python scripts/video_intel.py scan --channel natebjones --force
 python scripts/video_intel.py mindmap \
   --url "https://www.youtube.com/watch?v=XXXXX" \
   --prompt mindmap-knowledge --force
+
+# Retry failed transcripts with a different model
+python scripts/video_intel.py --model gemini-2.5-pro transcript \
+  --url "https://www.youtube.com/watch?v=XXXXX" --force
 ```
 
 ### Regenerate concepts (e.g., after tuning concepts prompt)
@@ -440,8 +449,33 @@ python scripts/video_intel.py concepts --force
 python scripts/video_intel.py taxonomy-build
 ```
 
-Transcripts are independent of mindmaps and concepts — they only need
+Transcripts are independent of mindmaps and concepts - they only need
 regeneration if you change the transcript prompt.
+
+## Transcript Resilience
+
+Gemini sometimes returns malformed JSON for transcript requests (truncated
+strings, missing brackets, stray prose around the JSON payload). The transcript
+command handles this gracefully:
+
+1. **Direct parse** - try the raw response as-is.
+2. **Isolation** - strip markdown fences and surrounding prose, find the JSON.
+3. **Salvage** - if full parse fails, recover individual sections (speech
+   entries, screen content, speakers) from the partial response.
+4. **Bounded retry** - if salvage produces too little content, retry once.
+
+Partial transcripts are written with a visible warning and `transcript_status:
+"partial"` in meta.json. They are useful for casual browsing and search but may
+be incomplete. For strategically important videos, rerun with a different model
+or retry later:
+
+```bash
+python scripts/video_intel.py --model gemini-2.5-pro transcript \
+  --url "https://www.youtube.com/watch?v=XXXXX" --force
+```
+
+On parse failure, the raw Gemini response is saved as a `.transcript.raw.txt`
+sidecar file for debugging.
 
 ## Bosnian/Croatian/Serbian (BCS) Translation Utility
 

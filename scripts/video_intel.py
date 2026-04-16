@@ -23,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime, timedelta
 from html import unescape
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -41,6 +42,10 @@ log = logging.getLogger("video_intel")
 # ---------------------------------------------------------------------------
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
+DEFAULT_MODEL = "gemini-3-flash-preview"
+MAX_OUTPUT_TOKENS = 65536
+TRANSCRIPT_PARSE_RETRY_LIMIT = 1
+SALVAGE_MIN_SPEECH_ENTRIES = 5
 
 
 def load_config():
@@ -58,6 +63,11 @@ def resolve_output_dir(config):
         output_dir = SKILL_DIR / output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
+
+
+def resolve_model(args: argparse.Namespace, config: dict[str, Any]) -> str:
+    """Resolve Gemini model: --model flag > config.yaml > DEFAULT_MODEL."""
+    return args.model or config.get("model") or DEFAULT_MODEL
 
 
 def normalize_prompt_name(name: str) -> str:
@@ -273,7 +283,7 @@ def call_gemini(client, types, video_url, prompt_text, model, response_json=Fals
     """Send a video to Gemini for multimodal analysis with retry on rate limits."""
     config_kwargs = {
         "temperature": 0.3,
-        "max_output_tokens": 16384,
+        "max_output_tokens": MAX_OUTPUT_TOKENS,
         "safety_settings": build_permissive_safety_settings(types),
     }
     if response_json:
@@ -470,8 +480,147 @@ def timestamp_to_seconds(ts):
     return 0
 
 
+def isolate_json(text: str) -> str:
+    """Best-effort JSON isolation: strip fences, trim prose, find outermost JSON."""
+    cleaned = text.strip()
+    # Strip markdown code fences
+    if cleaned.startswith("```"):
+        lines = cleaned.split("\n")
+        # Remove opening fence (```json or ```)
+        lines = lines[1:]
+        # Remove closing fence
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+    # Find outermost { ... } or [ ... ]
+    for opener, closer in [("{", "}"), ("[", "]")]:
+        start = cleaned.find(opener)
+        if start == -1:
+            continue
+        end = cleaned.rfind(closer)
+        if end > start:
+            return cleaned[start : end + 1]
+    return text
+
+
+def try_parse_transcript_json(text: str) -> tuple[dict | list | None, str | None]:
+    """Attempt to parse transcript JSON: direct first, then after isolation."""
+    # Try direct parse
+    try:
+        return json.loads(text), None
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # Try after isolation
+    isolated = isolate_json(text)
+    if isolated != text:
+        try:
+            return json.loads(isolated), None
+        except (json.JSONDecodeError, ValueError) as e:
+            return None, str(e)
+    return None, "No valid JSON found"
+
+
+def salvage_transcript_sections(text: str) -> tuple[dict, str | None]:
+    """Try to recover valid JSON arrays for transcripts/screen_content/speakers."""
+    result: dict[str, list] = {"transcripts": [], "screen_content": [], "speakers": []}
+    warning = None
+
+    for key in ("transcripts", "screen_content", "speakers"):
+        # Find "key": [ and try to extract the array
+        pattern = f'"{key}"\\s*:\\s*\\['
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        arr_start = match.end() - 1  # Position of the [
+        # Try progressively shorter substrings to find valid JSON array
+        depth = 0
+        last_valid_end = None
+        for i in range(arr_start, len(text)):
+            if text[i] == "[":
+                depth += 1
+            elif text[i] == "]":
+                depth -= 1
+                if depth == 0:
+                    last_valid_end = i + 1
+                    break
+        # If we found a balanced array, try to parse it
+        if last_valid_end:
+            try:
+                result[key] = json.loads(text[arr_start:last_valid_end])
+                continue
+            except (json.JSONDecodeError, ValueError):
+                pass
+        # Fallback: try to parse entries one at a time from the array content
+        if arr_start < len(text):
+            entries = []
+            # Find individual objects within the array
+            obj_depth = 0
+            obj_start = None
+            for i in range(arr_start + 1, len(text)):
+                if text[i] == "{" and obj_depth == 0:
+                    obj_start = i
+                    obj_depth = 1
+                elif text[i] == "{":
+                    obj_depth += 1
+                elif text[i] == "}" and obj_depth > 0:
+                    obj_depth -= 1
+                    if obj_depth == 0 and obj_start is not None:
+                        try:
+                            entry = json.loads(text[obj_start : i + 1])
+                            entries.append(entry)
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                        obj_start = None
+                elif text[i] == "]" and obj_depth == 0:
+                    break
+            if entries:
+                result[key] = entries
+
+    if result["transcripts"] or result["screen_content"]:
+        warning = "Salvaged from malformed JSON response"
+    return result, warning
+
+
+def _write_transcript_md(
+    path: Path,
+    video: dict,
+    fused: str,
+    *,
+    status: str = "Complete",
+    recovery: str | None = None,
+    warning: str | None = None,
+) -> None:
+    """Write a transcript markdown file with header and optional warning block."""
+    header = (
+        f"# Transcript: {video['title']}\n\n"
+        f"**Source:** {video['url']}\n"
+        f"**Published:** {video['published']}\n"
+        f"**Processed:** {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}\n"
+        f"**Status:** {status}\n"
+    )
+    if recovery:
+        header += f"**Recovery:** {recovery}\n"
+    header += "\n---\n\n"
+
+    body = ""
+    if warning:
+        body += (
+            f"## Warning: Incomplete transcript\n\n"
+            f"{warning}\n\n"
+            f"- Speech coverage may stop early.\n"
+            f"- `SCREEN` sections may be missing or incomplete.\n"
+            f"- Speaker identification may be incomplete.\n\n"
+            f"---\n\n"
+        )
+    body += fused
+
+    tmp_path = path.with_suffix(".md.tmp")
+    tmp_path.write_text(header + body, encoding="utf-8")
+    tmp_path.replace(path)
+
+
 def process_transcript(client, types, video, prompt_text, model, output_dir, channel_name, *, force=False):
-    """Generate a fused transcript for a single video."""
+    """Generate a fused transcript for a single video with layered JSON resilience."""
     prefix = video_file_prefix(video)
     channel_dir = output_dir / channel_name
     channel_dir.mkdir(parents=True, exist_ok=True)
@@ -482,44 +631,77 @@ def process_transcript(client, types, video, prompt_text, model, output_dir, cha
     if transcript_path.exists() and not force:
         return prefix, "skipped (exists)"
 
-    try:
-        raw = call_gemini(client, types, video["url"], prompt_text, model, response_json=True)
+    for attempt in range(1 + TRANSCRIPT_PARSE_RETRY_LIMIT):
+        try:
+            raw = call_gemini(client, types, video["url"], prompt_text, model, response_json=True)
+        except Exception as e:
+            if meta_path.exists():
+                meta = json.loads(meta_path.read_text())
+                meta["last_error"] = str(e)
+                meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            return prefix, f"error: {e}"
 
-        # Parse JSON response
-        raw_json = json.loads(raw)
+        # Layer 1: try full parse (direct + isolation)
+        raw_json, parse_error = try_parse_transcript_json(raw)
 
-        # Merge into fused markdown
-        fused = merge_transcript_json(raw_json, {})
+        if raw_json is not None:
+            # Full parse succeeded - write transcript, no raw sidecar
+            fused = merge_transcript_json(raw_json, {})
+            _write_transcript_md(transcript_path, video, fused)
+            update_meta(
+                meta_path,
+                {"processed": datetime.now(UTC).isoformat(), "transcript_status": "complete"},
+                "transcript",
+            )
+            return prefix, "done"
 
-        # Save
-        header = (
-            f"# Transcript: {video['title']}\n\n"
-            f"**Source:** {video['url']}\n"
-            f"**Published:** {video['published']}\n"
-            f"**Processed:** {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}\n\n"
-            f"---\n\n"
-        )
-        tmp_path = transcript_path.with_suffix(".md.tmp")
-        tmp_path.write_text(header + fused, encoding="utf-8")
-        tmp_path.replace(transcript_path)
+        # Full parse failed - save raw sidecar for forensics
+        raw_suffix = ".transcript.raw.txt" if attempt == 0 else f".transcript.raw.{attempt + 1}.txt"
+        raw_path = channel_dir / f"{prefix}{raw_suffix}"
+        raw_path.write_text(raw or "", encoding="utf-8")
+        log.warning("  %s: JSON parse failed (attempt %d): %s", prefix, attempt + 1, parse_error)
 
-        # Update metadata (merge, don't overwrite)
-        update_meta(meta_path, {"processed": datetime.now(UTC).isoformat()}, "transcript")
+        # Layer 2: try salvage
+        salvaged, salvage_warning = salvage_transcript_sections(raw or "")
+        speech_count = len(salvaged.get("transcripts", []))
 
-        return prefix, "done"
+        if speech_count >= SALVAGE_MIN_SPEECH_ENTRIES:
+            # Salvage produced usable content - write partial transcript
+            fused = merge_transcript_json(salvaged, {})
+            _write_transcript_md(
+                transcript_path,
+                video,
+                fused,
+                status="Partial transcript",
+                recovery="salvaged_sections",
+                warning="Gemini returned malformed JSON. This transcript was salvaged from a partial response and may be incomplete.",
+            )
+            update_meta(
+                meta_path,
+                {
+                    "processed": datetime.now(UTC).isoformat(),
+                    "transcript_status": "partial",
+                    "transcript_recovery": "salvaged_sections",
+                    "transcript_parse_error": parse_error,
+                    "transcript_warning": salvage_warning,
+                },
+                "transcript",
+            )
+            log.info("  %s: salvaged partial transcript (%d speech entries)", prefix, speech_count)
+            return prefix, f"partial ({speech_count} entries salvaged)"
 
-    except json.JSONDecodeError as e:
-        if meta_path.exists():
-            meta = json.loads(meta_path.read_text())
-            meta["last_error"] = f"JSON parse error: {e}"
-            meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-        return prefix, f"error parsing JSON: {e}"
-    except Exception as e:
-        if meta_path.exists():
-            meta = json.loads(meta_path.read_text())
-            meta["last_error"] = str(e)
-            meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-        return prefix, f"error: {e}"
+        # Salvage insufficient - retry if budget remains
+        if attempt < TRANSCRIPT_PARSE_RETRY_LIMIT:
+            log.info("  %s: salvage insufficient (%d entries), retrying...", prefix, speech_count)
+            continue
+
+    # All attempts exhausted
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text())
+        meta["last_error"] = f"JSON parse error: {parse_error}"
+        meta["transcript_parse_error"] = parse_error
+        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    return prefix, f"error parsing JSON: {parse_error}"
 
 
 # ---------------------------------------------------------------------------
@@ -723,7 +905,7 @@ def cmd_scan(args, config):
     client = create_client(gemini_key)
     youtube = yt_build("youtube", "v3", developerKey=yt_key)
     output_dir = resolve_output_dir(config)
-    model = config.get("model", "gemini-3-flash-preview")
+    model = resolve_model(args, config)
     max_parallel = config.get("max_parallel", 10)
 
     # Filter channels if --channel specified
@@ -894,7 +1076,7 @@ def cmd_mindmap(args, config):
 
     client = create_client(gemini_key)
     output_dir = resolve_output_dir(config)
-    model = config.get("model", "gemini-3-flash-preview")
+    model = resolve_model(args, config)
 
     # Resolve prompt
     prompt_name = normalize_prompt_name(args.prompt or config.get("default_prompt", "mindmap-light"))
@@ -963,7 +1145,7 @@ def cmd_transcript(args, config):
 
     client = create_client(gemini_key)
     output_dir = resolve_output_dir(config)
-    model = config.get("model", "gemini-3-flash-preview")
+    model = resolve_model(args, config)
     prompt_text = load_prompt("transcript")
 
     # Build video object from URL
@@ -1032,7 +1214,7 @@ def cmd_concepts(args, config):
 
     client = create_client(gemini_key)
     output_dir = resolve_output_dir(config)
-    model = config.get("model", "gemini-3-flash-preview")
+    model = resolve_model(args, config)
     taxonomy = load_taxonomy(output_dir)
 
     # Collect all videos that have mindmaps but no concepts.json
@@ -1697,9 +1879,22 @@ Examples:
     )
     parser.add_argument(
         "--log-level",
-        default="warning",
+        default="info",
         choices=["debug", "info", "warning", "error"],
-        help="Set logging verbosity (default: warning)",
+        help="Set logging verbosity (default: info)",
+    )
+    parser.add_argument(
+        "--model",
+        "-m",
+        default=None,
+        help=(
+            "Gemini model override (default: config.yaml model field, "
+            "or gemini-3-flash-preview). "
+            "Gemini 3.x Flash: best for video understanding (mindmaps, screen content). "
+            "Gemini 2.5 Pro: more reliable structured JSON output, higher token limit "
+            "- prefer for transcripts when Flash truncates. "
+            "Applies to: scan, mindmap, transcript, concepts."
+        ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 

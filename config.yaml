@@ -20,7 +20,7 @@ channels:
 
   - name: samwitteveenai
     url: https://youtube.com/@samwitteveenai
-    auto_transcript: none
+    auto_transcript: all
     since: 120d
 
   - name: mark_kashef

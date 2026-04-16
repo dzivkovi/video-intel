@@ -74,11 +74,35 @@ If prerequisites are missing, tell the user what's needed and where to get it.
 
 Gemini API calls read video frames and audio — they take **1-5 minutes per video**. A scan of 10 videos can take 10-30 minutes. This is normal.
 
-- **Always use `--log-level info`** so progress is visible between API calls.
+- **Default log level is `info`** - progress is visible without extra flags.
 - **Use a long bash timeout** (at least 600000ms / 10 minutes) for scan and transcript commands. The default 2-minute timeout WILL kill multi-video scans prematurely.
-- **Silence between log lines is normal.** Gemini is processing video — don't diagnose or interrupt.
+- **Silence between log lines is normal.** Gemini is processing video - don't diagnose or interrupt.
 - **For large scans (10+ videos):** run in the background so the user isn't blocked. Check the output directory afterward for results.
 - **For single transcripts:** 1-3 minutes is typical. Wait for the "Saved:" line before proceeding.
+- **Transcripts are resilient to malformed JSON.** If Gemini returns broken JSON, the script tries to salvage partial content (speech entries, screen content) and writes a partial transcript with a visible warning. A partial transcript is useful for curiosity/search. For strategically important videos, rerun with `--model gemini-2.5-pro` or retry later.
+- **Raw Gemini responses are saved on failure** as `.transcript.raw.txt` sidecars for debugging.
+
+## Model Selection
+
+The default model (`gemini-3-flash-preview` from config.yaml) works for most
+operations. Override with `--model` / `-m` when needed:
+
+| Scenario | Model | Why |
+|----------|-------|-----|
+| Default (mindmaps, concepts, scan) | `gemini-3-flash-preview` | Best deep video understanding |
+| Transcripts failing with JSON errors | `gemini-2.5-pro` | More reliable structured JSON, higher output token limit |
+| Gemini 3.x backend unreliable / 503s | `gemini-2.5-pro` | Stable fallback |
+| Long videos (>60 min transcripts) | `gemini-2.5-pro` | Less likely to truncate mid-output |
+
+```bash
+# Override model for a single command
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" --model gemini-2.5-pro transcript --url "URL"
+
+# Model for scan (all videos in batch use this model)
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" --model gemini-2.5-pro scan --channel natebjones
+```
+
+Precedence: `--model` flag > `config.yaml` `model` field > `gemini-3-flash-preview`.
 
 ## How to Use
 
@@ -182,6 +206,7 @@ output_dir: ~/video-intel          # Where output files are saved
 default_since: 10d                 # Default lookback window
 default_prompt: mindmap-knowledge  # Which prompt to use by default
 auto_concepts: true                # Extract concepts after mindmap generation
+model: gemini-3-flash-preview     # Gemini model (overridable via --model)
 
 channels:
   - name: natebjones               # Folder name for output

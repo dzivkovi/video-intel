@@ -32,6 +32,9 @@ python scripts/video_intel.py scan --since 30d
 # Transcribe a specific video (channel auto-detected from config)
 python scripts/video_intel.py transcript --url "https://www.youtube.com/watch?v=XXXXX"
 
+# Override Gemini model (e.g., Pro for transcripts when Flash truncates)
+python scripts/video_intel.py --model gemini-2.5-pro transcript --url "URL"
+
 # Install dependencies
 pip install google-genai google-api-python-client pyyaml
 
@@ -72,14 +75,14 @@ Each `SKILL.md` has its own frontmatter description and is independently trigger
 
 **Single script:** `scripts/video_intel.py` — all logic in one file, subcommands:
 - `scan` — uses YouTube Data API to discover new videos per channel, then calls Gemini in parallel (`ThreadPoolExecutor`) to generate mind maps. Optionally chains transcript and concept generation.
-- `transcript` — calls Gemini with `response_json=True`, parses the three-task JSON response (speech + screen_content + speakers), and merges them into a fused markdown document via `merge_transcript_json()`.
+- `transcript` — calls Gemini with `response_json=True`, parses the three-task JSON response (speech + screen_content + speakers), and merges them into a fused markdown document via `merge_transcript_json()`. Resilient to malformed JSON: tries direct parse, then `isolate_json()` cleanup, then `salvage_transcript_sections()` to recover partial content. Saves raw Gemini response as `.transcript.raw.txt` sidecar on failure for forensics. One bounded retry if salvage fails. Partial transcripts are written with a visible warning block and `transcript_status: "partial"` in meta.json.
 - `mindmap` — generate a mind map for a single video URL with a specific prompt.
 - `concepts` — extract and normalize concepts from existing mindmaps against a growing canonical vocabulary (thesaurus). Text-only Gemini calls reading mindmap markdown, not video.
 - `taxonomy-build` — rebuild `taxonomy.json` by aggregating all per-video `concepts.json` files. This is a derived artifact, always rebuildable.
 - `search` — search corpus by concept label/alias (default) or hybrid BM25+vector (`--vector`). Concept search returns matching videos with artifact paths. Hybrid search returns ranked transcript chunks by combined keyword and semantic relevance (RRF fusion). Use this FIRST when the user asks about topics — avoids reading the entire corpus.
 - `index` — build search index (vector embeddings + FTS on title/text) from all transcripts using LanceDB + Voyage AI. Required before `search --vector`. Rebuildable at any time.
 
-All commands support `--force` to regenerate existing output files.
+All commands support `--force` to regenerate existing output files. Gemini-calling commands (scan, mindmap, transcript, concepts) accept `--model` / `-m` at the top level to override the config.yaml model. Precedence: CLI flag > config.yaml > `DEFAULT_MODEL` constant. `MAX_OUTPUT_TOKENS = 65536` caps Gemini output (matches `translate_video.py`). Default log level is `info` (visible progress without extra flags).
 
 **Standalone utility:** `scripts/translate_video.py` — BCS subtitle translation. **This is NOT part of the video-intel pipeline.** It shares the same Gemini API patterns (lazy imports, retry logic, FileData for YouTube URLs) and lives in this repo for convenience, but has no dependency on `video_intel.py`, `config.yaml`, or the scan/transcript/concepts workflow. It has its own CLI args, its own output directory (`./examples` by default), and its own tests. Do not integrate it into the main script or add pipeline features (meta.json, concept extraction, etc.) to it. Default model is `gemini-2.5-pro` (GA, stable, best translation quality and timestamp compliance).
 
