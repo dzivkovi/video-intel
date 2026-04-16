@@ -185,7 +185,7 @@ For selective channels, dry-run should show:
 - [x] `--force` works with selective channels
 - [x] `--channel` filter works with selective channels
 - [x] `auto_transcript` and `auto_concepts` work with selective channels
-- [ ] Config validated: playlists/keywords must be list of strings
+- [x] Config validated: playlists/keywords must be list of strings
 - [x] All new functions have type hints and tests
 - [x] Existing tests still pass (backward compatibility)
 - [x] SKILL.md, CLAUDE.md, README.md updated

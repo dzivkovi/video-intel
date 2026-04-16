@@ -1111,6 +1111,16 @@ def cmd_scan(args, config):
 
         log.info("[%s] %s", ch_name, channel_title)
 
+        # Validate selective config fields
+        skip_channel = False
+        for field in ("playlists", "keywords"):
+            val = ch.get(field)
+            if val is not None and (not isinstance(val, list) or not all(isinstance(v, str) for v in val)):
+                log.error("[%s] '%s' must be a list of strings, got: %s", ch_name, field, type(val).__name__)
+                skip_channel = True
+        if skip_channel:
+            continue
+
         # Determine fetch strategy: selective (playlists/keywords) or date-based
         is_selective = bool(ch.get("playlists") or ch.get("keywords"))
 

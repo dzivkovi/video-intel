@@ -1748,3 +1748,30 @@ class TestCmdScanSelectiveMode:
 
         cmd_scan(args, config)
         assert captured.get("uploads_scan") is True
+
+    def test_skips_channel_when_playlists_is_not_list(self, monkeypatch, tmp_path):
+        """Invalid playlists config (string instead of list) skips the channel."""
+        monkeypatch.setattr("video_intel.require_gemini", lambda: (MagicMock(), MagicMock()))
+        monkeypatch.setattr("video_intel.require_youtube", lambda: MagicMock())
+        monkeypatch.setattr("video_intel.create_client", lambda _key: MagicMock())
+        monkeypatch.setenv("GEMINI_API_KEY", "fake")
+        monkeypatch.setenv("YOUTUBE_API_KEY", "fake")
+        monkeypatch.setattr("video_intel.resolve_output_dir", lambda _cfg: tmp_path)
+        monkeypatch.setattr("video_intel.get_channel_id", lambda _yt, _url: ("UC123", "Test"))
+
+        # Track whether any fetch function was called
+        fetch_called = {"value": False}
+        monkeypatch.setattr(
+            "video_intel.fetch_selective_videos", lambda *a, **kw: (fetch_called.update(value=True), [])[1]
+        )
+        monkeypatch.setattr(
+            "video_intel.fetch_channel_videos", lambda *a, **kw: (fetch_called.update(value=True), [])[1]
+        )
+
+        args = argparse.Namespace(model=None, channel=None, since=None, dry_run=False, force=False)
+        config = {
+            "channels": [{"name": "bad", "url": "https://youtube.com/@bad", "playlists": "not a list"}],
+        }
+
+        cmd_scan(args, config)
+        assert fetch_called["value"] is False
