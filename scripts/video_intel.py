@@ -340,8 +340,14 @@ def fetch_keyword_videos(youtube, channel_id: str, keyword: str, *, max_pages: i
     return videos
 
 
-def fetch_selective_videos(youtube, channel_id: str, channel_config: dict) -> list[dict]:
-    """Fetch videos from playlists and/or keywords, deduplicated by video_id."""
+def fetch_selective_videos(
+    youtube, channel_id: str, channel_config: dict, *, since_dt: datetime | None = None
+) -> list[dict]:
+    """Fetch videos from playlists and/or keywords, deduplicated by video_id.
+
+    If since_dt is provided, also fetches recent uploads as an additional source
+    (additive - playlists and keywords are still fetched regardless of date).
+    """
     all_videos: list[dict] = []
     seen_ids: set[str] = set()
 
@@ -366,6 +372,23 @@ def fetch_selective_videos(youtube, channel_id: str, channel_config: dict) -> li
             if v["video_id"] not in seen_ids:
                 seen_ids.add(v["video_id"])
                 all_videos.append(v)
+
+    # Recent uploads (additive when since is configured)
+    if since_dt is not None:
+        recent = fetch_channel_videos(youtube, channel_id, since_dt)
+        new_count = 0
+        for v in recent:
+            if v["video_id"] not in seen_ids:
+                seen_ids.add(v["video_id"])
+                all_videos.append(v)
+                new_count += 1
+        if recent:
+            log.info(
+                "    Recent uploads (since %s): %d videos, %d new",
+                since_dt.strftime("%Y-%m-%d"),
+                len(recent),
+                new_count,
+            )
 
     log.info("  Total: %d unique videos after dedup", len(all_videos))
     return all_videos
@@ -1092,10 +1115,11 @@ def cmd_scan(args, config):
         is_selective = bool(ch.get("playlists") or ch.get("keywords"))
 
         if is_selective:
-            if args.since:
-                log.info("  Note: --since ignored for %s (using playlists/keywords)", ch_name)
             log.info("  Selective mode: playlists=%s, keywords=%s", ch.get("playlists", []), ch.get("keywords", []))
-            videos = fetch_selective_videos(youtube, channel_id, ch)
+            # since is additive for selective channels (also fetch recent uploads)
+            since_str = args.since or ch.get("since") or config.get("default_since")
+            selective_since = parse_since(since_str) if since_str else None
+            videos = fetch_selective_videos(youtube, channel_id, ch, since_dt=selective_since)
         else:
             since_str = args.since or ch.get("since") or config.get("default_since", "10d")
             since_dt = parse_since(since_str)

@@ -1610,6 +1610,54 @@ class TestFetchSelectiveVideos:
 
         assert len(videos) == 1
 
+    def test_since_adds_recent_uploads_to_selective(self, monkeypatch):
+        """since_dt is additive: playlists + recent uploads, deduplicated."""
+        playlist_video = {
+            "video_id": "pl1",
+            "title": "Playlist",
+            "published": "2026-01-01",
+            "url": "https://youtube.com/watch?v=pl1",
+        }
+        recent_video = {
+            "video_id": "new1",
+            "title": "Recent Upload",
+            "published": "2026-04-10",
+            "url": "https://youtube.com/watch?v=new1",
+        }
+
+        monkeypatch.setattr("video_intel.resolve_playlist_ids", lambda _yt, _cid, _names: [("PL1", "P1")])
+        monkeypatch.setattr("video_intel.fetch_playlist_videos", lambda _yt, _pid: [playlist_video])
+        monkeypatch.setattr("video_intel.fetch_channel_videos", lambda _yt, _cid, _since: [recent_video])
+
+        youtube = MagicMock()
+        config = {"playlists": ["P1"]}
+        since = datetime(2026, 4, 1, tzinfo=UTC)
+        videos = fetch_selective_videos(youtube, "UC123", config, since_dt=since)
+
+        assert len(videos) == 2
+        ids = {v["video_id"] for v in videos}
+        assert ids == {"pl1", "new1"}
+
+    def test_since_deduplicates_with_selective(self, monkeypatch):
+        """A video in both playlist and recent uploads appears only once."""
+        shared = {
+            "video_id": "shared1",
+            "title": "Shared",
+            "published": "2026-04-01",
+            "url": "https://youtube.com/watch?v=shared1",
+        }
+
+        monkeypatch.setattr("video_intel.resolve_playlist_ids", lambda _yt, _cid, _names: [("PL1", "P1")])
+        monkeypatch.setattr("video_intel.fetch_playlist_videos", lambda _yt, _pid: [shared])
+        monkeypatch.setattr("video_intel.fetch_channel_videos", lambda _yt, _cid, _since: [shared.copy()])
+
+        youtube = MagicMock()
+        config = {"playlists": ["P1"]}
+        since = datetime(2026, 3, 1, tzinfo=UTC)
+        videos = fetch_selective_videos(youtube, "UC123", config, since_dt=since)
+
+        assert len(videos) == 1
+
 
 # ---------------------------------------------------------------------------
 # cmd_scan selective mode integration
@@ -1621,7 +1669,7 @@ class TestCmdScanSelectiveMode:
         """Channels with playlists/keywords use selective fetch, not uploads scan."""
         captured = {}
 
-        def fake_fetch_selective(_yt, _cid, ch_config):
+        def fake_fetch_selective(_yt, _cid, ch_config, **_kwargs):
             captured["called"] = True
             captured["config"] = ch_config
             return [
