@@ -75,6 +75,7 @@ If prerequisites are missing, tell the user what's needed and where to get it.
 Gemini API calls read video frames and audio — they take **1-5 minutes per video**. A scan of 10 videos can take 10-30 minutes. This is normal.
 
 - **Default log level is `info`** - progress is visible without extra flags.
+- **`--dry-run` is preview only** - shows what would be processed but creates no files and makes no Gemini calls. Use it to verify config before committing to a real scan.
 - **Use a long bash timeout** (at least 600000ms / 10 minutes) for scan and transcript commands. The default 2-minute timeout WILL kill multi-video scans prematurely.
 - **Silence between log lines is normal.** Gemini is processing video - don't diagnose or interrupt.
 - **For large scans (10+ videos):** run in the background so the user isn't blocked. Check the output directory afterward for results.
@@ -213,7 +214,22 @@ channels:
     url: https://youtube.com/@natebjones
     auto_transcript: all            # all | none
     since: 10d                      # Override default lookback
+
+  - name: seankochel               # Selective mode: playlists + keywords
+    url: https://youtube.com/@iamseankochel
+    playlists:                      # Playlist names (resolved via YouTube API)
+      - Agent Skills
+    keywords:                       # Channel-scoped search terms
+      - ux design
+    auto_transcript: none             # mindmaps for discovery, transcript manually
+    since: 30d                        # also catch recent uploads (additive)
 ```
+
+**Selective scanning:** Channels with `playlists` or `keywords` target specific
+content instead of scanning all uploads. Playlist names are resolved via YouTube API
+(case-insensitive contains matching). Keywords search the entire channel history
+(capped at 200 results per keyword). If `since` is also set, recent uploads are
+fetched as an additional source alongside playlists/keywords.
 
 ### Prompt files
 
