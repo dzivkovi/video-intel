@@ -1,0 +1,12 @@
+[
+  {"query": "Translate this YouTube video to Bosnian: https://www.youtube.com/watch?v=dQw4w9WgXcQ", "should_trigger": true, "tag": "bosnian-translation-explicit"},
+  {"query": "prevedi mi ovaj video na srpski: https://youtube.com/watch?v=abc123", "should_trigger": true, "tag": "serbian-prompt-latin-script"},
+  {"query": "Just give me the English SRT file for this video, no translation needed: https://youtube.com/watch?v=abc123", "should_trigger": true, "tag": "srt-only-intent"},
+  {"query": "Make Croatian subtitles for https://youtube.com/watch?v=abc123 — my parents don't speak English well", "should_trigger": true, "tag": "croatian-subtitles"},
+  {"query": "I need BCS captions for the new Bret Weinstein interview at https://youtube.com/watch?v=xyz789 so I can share with family back home", "should_trigger": true, "tag": "bcs-captions-with-context"},
+  {"query": "Translate this video to French please: https://youtube.com/watch?v=abc123", "should_trigger": false, "tag": "wrong-language-family"},
+  {"query": "What videos in my library cover MCP servers and the Model Context Protocol?", "should_trigger": false, "tag": "cross-skill-discovery"},
+  {"query": "Transcribe this video to English with on-screen content preserved: https://youtube.com/watch?v=abc123", "should_trigger": false, "tag": "cross-skill-english-transcript"},
+  {"query": "Catch up on Grace Leung's videos I'm missing", "should_trigger": false, "tag": "cross-skill-backlog"},
+  {"query": "Fix the bug in scripts/translate_video.py around line 42 where the retry loop never exits", "should_trigger": false, "tag": "repo-coding-task"}
+]

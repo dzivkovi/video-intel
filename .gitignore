@@ -23,3 +23,11 @@ examples/*.txt.tmp
 .codex-review-smoke2-out/
 
 .claude/scheduled_tasks.lock
+
+# Skill eval workspace — default-exclude, allow signal-bearing artifacts.
+# See skill-eval-workspace/README.md for the lifecycle convention.
+skill-eval-workspace/**
+!skill-eval-workspace/**/
+!skill-eval-workspace/**/*-report.html
+!skill-eval-workspace/**/*-trigger-eval.json
+!skill-eval-workspace/README.md
