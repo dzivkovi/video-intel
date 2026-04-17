@@ -3,13 +3,16 @@ name: video-intel
 description: >
   Multimodal video intelligence via Gemini API. Use whenever the user wants
   to: find videos about a topic across channels; browse concepts in the
-  library; scan a YouTube channel for new videos and get mind maps; triage
-  which videos are worth watching; get a diarized transcript with on-screen
-  content (slides, diagrams, code) captured; add/remove monitored channels;
-  change scan settings. Trigger phrases: "what videos cover [topic]", "find
-  videos about [concept]", "which creators talk about [subject]", "scan
-  channel", "what's new from [creator]", "watch this for me", "transcribe
-  this video", "add [channel] to my watchlist", "what should I watch",
+  library; scan a YouTube channel for new videos and get mind maps; backfill
+  a creator's backlog or catch up on missing videos; triage which videos are
+  worth watching; get a diarized transcript with on-screen content (slides,
+  diagrams, code) captured; add/remove monitored channels; change scan
+  settings. Trigger phrases: "what videos cover [topic]", "find videos
+  about [concept]", "which creators talk about [subject]", "scan channel",
+  "what's new from [creator]", "watch this for me", "transcribe this
+  video", "transcribe [creator]'s backlog", "videos I'm missing from
+  [creator]", "catch up on [creator]", "fully scan [creator]", "backfill
+  [creator]", "add [channel] to my watchlist", "what should I watch",
   "summarize this video", "is this worth watching", any YouTube URL +
   question, "show my channels", "what concepts are in my library", "what
   topics recur across channels". Calls Gemini as multimodal proxy (frames +
@@ -82,6 +85,49 @@ Gemini API calls read video frames and audio — they take **1-5 minutes per vid
 - **For single transcripts:** 1-3 minutes is typical. Wait for the "Saved:" line before proceeding.
 - **Transcripts are resilient to malformed JSON.** If Gemini returns broken JSON, the script tries to salvage partial content (speech entries, screen content) and writes a partial transcript with a visible warning. A partial transcript is useful for curiosity/search. For strategically important videos, rerun with `--model gemini-2.5-pro` or retry later.
 - **Raw Gemini responses are saved on failure** as `.transcript.raw.txt` sidecars for debugging.
+
+## Interpreting User Intent
+
+The verb a user reaches for doesn't always match a CLI command name. This
+table is the canonical mapping — read it before picking a command.
+
+| User says (intent) | Run | Notes |
+|---|---|---|
+| "find videos about X", "what covers Y" | `search "X"` | Discovery — fast, no API calls |
+| "what did they say about X", "evidence for Y" | `search "X" --vector` | Hybrid search; returns transcript passages |
+| "transcribe this video" + URL | `transcript --url URL` | Single video |
+| "scan", "what's new", "check for new videos" | `scan` | All channels, configured `since` |
+| "what's new from [creator]" | `scan --channel X` | Single channel, configured `since` |
+| "transcribe [creator]'s backlog", "videos I'm missing from [creator]", "catch up on [creator]" | `scan --channel X --since 2y` (or wider) | **Always `--dry-run` first** to surface scope |
+| "fully scan [creator]", "everything from [creator]" | `scan --channel X --since 2005-01-01` | **Always `--dry-run` first** — implies entire channel history |
+| Backlog of N videos to transcribe | `scan` with `auto_transcript: all` configured | NOT N separate `transcript --url` calls |
+
+### Channel name resolution
+
+When the user names a creator (e.g. "Grace Leung", "Nate Jones"):
+
+1. Read `${CLAUDE_SKILL_DIR}/../../config.yaml` and match the name
+   case-insensitively against both the `name` field and the handle in `url`.
+2. If exactly one match — use that channel's `name`.
+3. If multiple matches — list them and ask which one.
+4. If zero matches — list available channels and ask whether to add the
+   creator. **Do not invent a YouTube handle and proceed.**
+
+### When to pause and confirm
+
+Before running `scan` (which costs Gemini quota), run `--dry-run` first if
+any of these are true:
+
+- The user said "all", "fully", "missing", "backlog", or "catch up"
+  without an explicit date window
+- The implied scope is more than ~10 new videos
+- The channel name was fuzzy and required config-file resolution
+- `auto_transcript: all` is set on the target channel (each new video =
+  2 Gemini calls — mindmap + transcript)
+
+Report the count of new videos and the estimated Gemini call count
+(videos × 2 if `auto_transcript: all`, otherwise videos × 1). Wait for
+the user's go-ahead before running the real scan.
 
 ## Model Selection
 
