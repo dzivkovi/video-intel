@@ -104,6 +104,17 @@ Resolve `{channel, video_id, title, published, published_source, video_url, pref
 7. **`published` fallback to `input_path.stat().st_mtime`** (date-only, formatted `YYYY-MM-DD`). `published_source = "mtime"`. Only applies when steps 1–3 didn't produce a date.
 8. **`video_url = https://www.youtube.com/watch?v=<video_id>`** if `video_id` is known. Otherwise left empty (local-only content without a canonical URL).
 
+**Flag-override precedence within a G2 match.** When step 2 (G2 dedup) fires
+and explicit flags are also present, the flags update the matched canonical
+meta's **content fields** in place (`title`, `published`, `video_url` if
+derivable). `published_source` becomes `"cli_flag"` in that case, overwriting
+whatever the canonical meta carried before. Flags do **not** change
+`channel_dir` or `prefix` — those stay canonical to honor uniqueness
+invariant F11; otherwise the same video would split across two meta files.
+`--video-id` cannot override a G2 match since G2 uses `video_id` as the
+match key in the first place (passing a different `--video-id` sends the
+resolver to step 3 instead of step 2).
+
 Important: unlike revision 2, this design does not refuse when only local
 metadata exists. The user's real workflow is manual and channel-aware, so a
 pragmatic fallback is better than a hard stop. The `published_source` field
