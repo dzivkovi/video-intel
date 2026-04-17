@@ -272,6 +272,13 @@ python scripts/video_intel.py scan --dry-run
 python scripts/video_intel.py transcript \
   --url "https://www.youtube.com/watch?v=XXXXX"
 
+# Transcribe a local MP4 file (output next to source)
+python scripts/video_intel.py transcript --file ~/Videos/meeting.mp4
+
+# Transcribe a segment of a local MP4 (required for files >500MB)
+python scripts/video_intel.py transcript \
+  --file ~/Videos/long-demo.mp4 --start 05:30 --end 18:45
+
 # Override Gemini model for a single command
 python scripts/video_intel.py --model gemini-2.5-pro transcript \
   --url "https://www.youtube.com/watch?v=XXXXX"
