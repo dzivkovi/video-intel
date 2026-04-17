@@ -47,6 +47,7 @@ MAX_OUTPUT_TOKENS = 65536
 TRANSCRIPT_PARSE_RETRY_LIMIT = 1
 SALVAGE_MIN_SPEECH_ENTRIES = 5
 KEYWORD_MAX_PAGES = 4  # 200 results max per keyword, 400 quota units
+LARGE_FILE_THRESHOLD_BYTES = 500 * 1024 * 1024  # 500MB - segment required above this
 
 
 def load_config():
@@ -462,8 +463,22 @@ def is_skipped(output_dir, channel_name, video):
 # ---------------------------------------------------------------------------
 
 
-def call_gemini(client, types, video_url, prompt_text, model, response_json=False):
-    """Send a video to Gemini for multimodal analysis with retry on rate limits."""
+def call_gemini(
+    client,
+    types,
+    video_url,
+    prompt_text,
+    model,
+    response_json=False,
+    *,
+    start_offset: int | None = None,
+    end_offset: int | None = None,
+):
+    """Send a video to Gemini for multimodal analysis with retry on rate limits.
+
+    Optional start_offset/end_offset (in seconds) clip the video to a segment
+    via Gemini's VideoMetadata. Works for both YouTube URLs and uploaded file URIs.
+    """
     config_kwargs = {
         "temperature": 0.3,
         "max_output_tokens": MAX_OUTPUT_TOKENS,
@@ -472,9 +487,18 @@ def call_gemini(client, types, video_url, prompt_text, model, response_json=Fals
     if response_json:
         config_kwargs["response_mime_type"] = "application/json"
 
+    part_kwargs = {"file_data": types.FileData(file_uri=video_url)}
+    if start_offset is not None or end_offset is not None:
+        meta_kwargs = {}
+        if start_offset is not None:
+            meta_kwargs["start_offset"] = f"{start_offset}s"
+        if end_offset is not None:
+            meta_kwargs["end_offset"] = f"{end_offset}s"
+        part_kwargs["video_metadata"] = types.VideoMetadata(**meta_kwargs)
+
     contents = types.Content(
         parts=[
-            types.Part(file_data=types.FileData(file_uri=video_url)),
+            types.Part(**part_kwargs),
             types.Part(text=prompt_text),
         ]
     )
@@ -663,6 +687,59 @@ def timestamp_to_seconds(ts):
     return 0
 
 
+def parse_time_to_seconds(value: str) -> int:
+    """Parse time string to seconds. Accepts 'MM:SS', 'HH:MM:SS', or raw seconds.
+
+    Examples: '05:30' -> 330, '01:15:45' -> 4545, '330' -> 330.
+    """
+    if not value or not value.strip():
+        raise ValueError("Empty time value")
+    stripped = value.strip()
+    parts = stripped.split(":")
+    if len(parts) == 1:
+        return int(parts[0])
+    if len(parts) == 2:
+        return int(parts[0]) * 60 + int(parts[1])
+    if len(parts) == 3:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+    raise ValueError(f"Invalid time format: {value!r}. Use MM:SS, HH:MM:SS, or raw seconds.")
+
+
+FILE_ACTIVE_POLL_SECONDS = 5
+FILE_ACTIVE_TIMEOUT_SECONDS = 600
+
+
+def upload_local_video(client, path: Path) -> str:
+    """Upload a local video to Gemini Files API, return the file URI.
+
+    Polls until the file reaches ACTIVE state (video files require server-side
+    processing after upload). Raises TimeoutError after FILE_ACTIVE_TIMEOUT_SECONDS.
+    Does not manage lifecycle - Gemini auto-deletes uploads after 48 hours.
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"Video file not found: {path}")
+    if path.suffix.lower() not in {".mp4", ".mov", ".webm", ".mkv", ".avi"}:
+        log.warning("Unusual video extension: %s (expected .mp4/.mov/.webm)", path.suffix)
+    log.info("Uploading video: %s (%.1f MB)", path.name, path.stat().st_size / 1024 / 1024)
+    file_obj = client.files.upload(file=path)
+    log.info("Uploaded: %s (processing...)", file_obj.uri)
+
+    # Poll until file is ACTIVE (videos need server-side processing)
+    waited = 0
+    while waited < FILE_ACTIVE_TIMEOUT_SECONDS:
+        file_obj = client.files.get(name=file_obj.name)
+        state = getattr(file_obj.state, "name", str(file_obj.state))
+        if state == "ACTIVE":
+            log.info("File ready: %s", file_obj.uri)
+            return file_obj.uri
+        if state == "FAILED":
+            raise RuntimeError(f"Gemini file processing failed: {file_obj.uri}")
+        time.sleep(FILE_ACTIVE_POLL_SECONDS)
+        waited += FILE_ACTIVE_POLL_SECONDS
+        log.info("  ...still processing (%ds, state=%s)", waited, state)
+    raise TimeoutError(f"File did not become ACTIVE within {FILE_ACTIVE_TIMEOUT_SECONDS}s: {file_obj.uri}")
+
+
 def isolate_json(text: str) -> str:
     """Best-effort JSON isolation: strip fences, trim prose, find outermost JSON."""
     cleaned = text.strip()
@@ -802,10 +879,29 @@ def _write_transcript_md(
     tmp_path.replace(path)
 
 
-def process_transcript(client, types, video, prompt_text, model, output_dir, channel_name, *, force=False):
-    """Generate a fused transcript for a single video with layered JSON resilience."""
-    prefix = video_file_prefix(video)
-    channel_dir = output_dir / channel_name
+def process_transcript(
+    client,
+    types,
+    video,
+    prompt_text,
+    model,
+    channel_dir: Path,
+    prefix: str,
+    *,
+    force=False,
+    start_offset: int | None = None,
+    end_offset: int | None = None,
+):
+    """Generate a fused transcript for a single video with layered JSON resilience.
+
+    Output paths are derived from channel_dir + prefix:
+    - {channel_dir}/{prefix}.transcript.md
+    - {channel_dir}/{prefix}.meta.json
+    - {channel_dir}/{prefix}.transcript.raw.txt (on parse failure)
+
+    Optional start_offset/end_offset (in seconds) pass through to Gemini for
+    segment clipping. Applies on initial call and any retries.
+    """
     channel_dir.mkdir(parents=True, exist_ok=True)
 
     transcript_path = channel_dir / f"{prefix}.transcript.md"
@@ -816,7 +912,16 @@ def process_transcript(client, types, video, prompt_text, model, output_dir, cha
 
     for attempt in range(1 + TRANSCRIPT_PARSE_RETRY_LIMIT):
         try:
-            raw = call_gemini(client, types, video["url"], prompt_text, model, response_json=True)
+            raw = call_gemini(
+                client,
+                types,
+                video["url"],
+                prompt_text,
+                model,
+                response_json=True,
+                start_offset=start_offset,
+                end_offset=end_offset,
+            )
         except Exception as e:
             if meta_path.exists():
                 meta = json.loads(meta_path.read_text())
@@ -1208,8 +1313,8 @@ def cmd_scan(args, config):
                             v,
                             transcript_prompt,
                             model,
-                            output_dir,
-                            ch_name,
+                            output_dir / ch_name,
+                            video_file_prefix(v),
                         ): v
                         for v in transcript_videos
                     }
@@ -1335,7 +1440,7 @@ def cmd_mindmap(args, config):
 
 
 def cmd_transcript(args, config):
-    """Generate a transcript for a single video."""
+    """Generate a transcript for a single video (YouTube URL or local MP4)."""
     _, types = require_gemini()
 
     gemini_key = os.environ.get("GEMINI_API_KEY")
@@ -1344,57 +1449,102 @@ def cmd_transcript(args, config):
         sys.exit(1)
 
     client = create_client(gemini_key)
-    output_dir = resolve_output_dir(config)
     model = resolve_model(args, config)
     prompt_text = load_prompt("transcript")
 
-    # Build video object from URL
-    video_id_match = re.search(r"(?:v=|/)([a-zA-Z0-9_-]{11})", args.url)
-    if not video_id_match:
-        log.error("Could not extract video ID from: %s", args.url)
-        sys.exit(1)
+    # Parse segment offsets (shared between URL and file paths)
+    start_offset = parse_time_to_seconds(args.start) if args.start else None
+    end_offset = parse_time_to_seconds(args.end) if args.end else None
 
-    video_id = video_id_match.group(1)
-    channel_name = args.channel
-    title = args.title
-    date = args.date
+    if args.file:
+        # Local file path
+        input_path = Path(args.file).resolve()
+        if not input_path.exists():
+            log.error("File not found: %s", input_path)
+            sys.exit(1)
 
-    # Fetch video metadata from YouTube API
-    if not channel_name or not title or not date:
-        yt_key = os.environ.get("YOUTUBE_API_KEY")
-        if yt_key:
-            yt_build = require_youtube()
-            youtube = yt_build("youtube", "v3", developerKey=yt_key)
-            resp = youtube.videos().list(part="snippet", id=video_id).execute()
-            if resp.get("items"):
-                snippet = resp["items"][0]["snippet"]
-                title = title or unescape(snippet["title"])
-                date = date or snippet["publishedAt"][:10]
-                if not channel_name:
-                    # Match against configured channels by channel ID
-                    yt_channel_id = snippet["channelId"]
-                    for ch in config.get("channels", []):
-                        ch_id, _ = get_channel_id(youtube, ch["url"])
-                        if ch_id == yt_channel_id:
-                            channel_name = ch["name"]
-                            break
+        size = input_path.stat().st_size
+        has_segment = start_offset is not None or end_offset is not None
+        if size > LARGE_FILE_THRESHOLD_BYTES and not has_segment:
+            size_gb = size / 1024 / 1024 / 1024
+            log.error(
+                "File is %.1fGB. Specify --start and --end to transcribe a segment "
+                "(Gemini's 2GB upload limit applies).",
+                size_gb,
+            )
+            sys.exit(1)
+
+        file_uri = upload_local_video(client, input_path)
+
+        video = {
+            "video_id": input_path.stem,
+            "url": file_uri,
+            "title": input_path.stem,
+            "published": datetime.fromtimestamp(input_path.stat().st_mtime).strftime("%Y-%m-%d"),
+        }
+        channel_dir = input_path.parent
+        prefix = input_path.stem
+        log.info("Transcribing local file: %s", input_path.name)
+    else:
+        # YouTube URL path
+        output_dir = resolve_output_dir(config)
+        video_id_match = re.search(r"(?:v=|/)([a-zA-Z0-9_-]{11})", args.url)
+        if not video_id_match:
+            log.error("Could not extract video ID from: %s", args.url)
+            sys.exit(1)
+
+        video_id = video_id_match.group(1)
+        channel_name = args.channel
+        title = args.title
+        date = args.date
+
+        # Fetch video metadata from YouTube API
+        if not channel_name or not title or not date:
+            yt_key = os.environ.get("YOUTUBE_API_KEY")
+            if yt_key:
+                yt_build = require_youtube()
+                youtube = yt_build("youtube", "v3", developerKey=yt_key)
+                resp = youtube.videos().list(part="snippet", id=video_id).execute()
+                if resp.get("items"):
+                    snippet = resp["items"][0]["snippet"]
+                    title = title or unescape(snippet["title"])
+                    date = date or snippet["publishedAt"][:10]
                     if not channel_name:
-                        channel_name = slugify(snippet["channelTitle"])
+                        # Match against configured channels by channel ID
+                        yt_channel_id = snippet["channelId"]
+                        for ch in config.get("channels", []):
+                            ch_id, _ = get_channel_id(youtube, ch["url"])
+                            if ch_id == yt_channel_id:
+                                channel_name = ch["name"]
+                                break
+                        if not channel_name:
+                            channel_name = slugify(snippet["channelTitle"])
 
-    channel_name = channel_name or "_standalone"
+        channel_name = channel_name or "_standalone"
 
-    video = {
-        "video_id": video_id,
-        "url": f"https://www.youtube.com/watch?v={video_id}",
-        "title": title or video_id,
-        "published": date or datetime.now().strftime("%Y-%m-%d"),
-    }
+        video = {
+            "video_id": video_id,
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+            "title": title or video_id,
+            "published": date or datetime.now().strftime("%Y-%m-%d"),
+        }
+        channel_dir = output_dir / channel_name
+        prefix = video_file_prefix(video)
+        log.info("Transcribing: %s", video["url"])
 
-    log.info("Transcribing: %s", video["url"])
     prefix, status = process_transcript(
-        client, types, video, prompt_text, model, output_dir, channel_name, force=args.force
+        client,
+        types,
+        video,
+        prompt_text,
+        model,
+        channel_dir,
+        prefix,
+        force=args.force,
+        start_offset=start_offset,
+        end_offset=end_offset,
     )
-    out_path = output_dir / channel_name / f"{prefix}.transcript.md"
+    out_path = channel_dir / f"{prefix}.transcript.md"
     log.info("  %s: %s", prefix, status)
 
     if status == "done":
@@ -2116,10 +2266,14 @@ Examples:
 
     # transcript command
     tx_parser = subparsers.add_parser("transcript", help="Transcribe a specific video")
-    tx_parser.add_argument("--url", required=True, help="YouTube video URL")
-    tx_parser.add_argument("--channel", help="Channel name for output folder")
-    tx_parser.add_argument("--title", help="Video title (auto-detected if omitted)")
-    tx_parser.add_argument("--date", help="Publish date YYYY-MM-DD (defaults to today)")
+    tx_source = tx_parser.add_mutually_exclusive_group(required=True)
+    tx_source.add_argument("--url", help="YouTube video URL")
+    tx_source.add_argument("--file", help="Path to local MP4 file")
+    tx_parser.add_argument("--start", help="Segment start time (MM:SS, HH:MM:SS, or raw seconds)")
+    tx_parser.add_argument("--end", help="Segment end time (MM:SS, HH:MM:SS, or raw seconds)")
+    tx_parser.add_argument("--channel", help="Channel name for output folder (YouTube only)")
+    tx_parser.add_argument("--title", help="Video title (auto-detected if omitted; YouTube only)")
+    tx_parser.add_argument("--date", help="Publish date YYYY-MM-DD (defaults to today; YouTube only)")
     tx_parser.add_argument("--force", action="store_true", help="Regenerate even if transcript exists")
 
     # concepts command

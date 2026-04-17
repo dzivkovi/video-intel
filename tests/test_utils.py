@@ -3,6 +3,7 @@
 import argparse
 import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -10,6 +11,7 @@ import pytest
 from video_intel import (
     DEFAULT_MODEL,
     KEYWORD_MAX_PAGES,
+    LARGE_FILE_THRESHOLD_BYTES,
     MAX_OUTPUT_TOKENS,
     SALVAGE_MIN_SPEECH_ENTRIES,
     TRANSCRIPT_PARSE_RETRY_LIMIT,
@@ -20,6 +22,7 @@ from video_intel import (
     call_gemini,
     chunk_transcript,
     cmd_scan,
+    cmd_transcript,
     fetch_channel_videos,
     fetch_keyword_videos,
     fetch_playlist_videos,
@@ -31,6 +34,7 @@ from video_intel import (
     merge_transcript_json,
     normalize_prompt_name,
     parse_since,
+    parse_time_to_seconds,
     process_transcript,
     resolve_model,
     resolve_playlist_ids,
@@ -40,6 +44,7 @@ from video_intel import (
     timestamp_to_seconds,
     try_parse_transcript_json,
     update_meta,
+    upload_local_video,
     video_file_prefix,
 )
 
@@ -1100,10 +1105,13 @@ class TestModelFlagWiring:
         args = argparse.Namespace(
             model="gemini-2.5-pro",
             url="https://www.youtube.com/watch?v=abc12345678",
+            file=None,
             channel="testch",
             title="Test Video",
             date="2026-01-01",
             force=False,
+            start=None,
+            end=None,
         )
         config = {"model": "gemini-3-flash-preview"}
 
@@ -1265,7 +1273,9 @@ class TestProcessTranscriptResilience:
     def test_no_raw_sidecar_on_success(self, monkeypatch, tmp_path):
         client, types = self._setup_mocks(monkeypatch, [VALID_TRANSCRIPT_JSON])
         video = self._make_video()
-        prefix, status = process_transcript(client, types, video, "prompt", "gemini-test", tmp_path, "testch")
+        prefix, status = process_transcript(
+            client, types, video, "prompt", "gemini-test", tmp_path / "testch", "2026-01-01-test-video"
+        )
         assert status == "done"
         # Transcript written
         assert (tmp_path / "testch" / f"{prefix}.transcript.md").exists()
@@ -1275,7 +1285,9 @@ class TestProcessTranscriptResilience:
     def test_writes_raw_sidecar_on_parse_failure(self, monkeypatch, tmp_path):
         client, types = self._setup_mocks(monkeypatch, [UNSALVAGEABLE_JSON, UNSALVAGEABLE_JSON])
         video = self._make_video()
-        prefix, status = process_transcript(client, types, video, "prompt", "gemini-test", tmp_path, "testch")
+        prefix, status = process_transcript(
+            client, types, video, "prompt", "gemini-test", tmp_path / "testch", "2026-01-01-test-video"
+        )
         assert "error" in status
         # Raw sidecar written
         assert (tmp_path / "testch" / f"{prefix}.transcript.raw.txt").exists()
@@ -1283,7 +1295,9 @@ class TestProcessTranscriptResilience:
     def test_salvages_partial_transcript_when_full_parse_fails(self, monkeypatch, tmp_path):
         client, types = self._setup_mocks(monkeypatch, [SALVAGEABLE_JSON])
         video = self._make_video()
-        prefix, status = process_transcript(client, types, video, "prompt", "gemini-test", tmp_path, "testch")
+        prefix, status = process_transcript(
+            client, types, video, "prompt", "gemini-test", tmp_path / "testch", "2026-01-01-test-video"
+        )
         assert "partial" in status
         transcript_path = tmp_path / "testch" / f"{prefix}.transcript.md"
         assert transcript_path.exists()
@@ -1299,7 +1313,7 @@ class TestProcessTranscriptResilience:
         meta_path = channel_dir / "2026-01-01-test-video.meta.json"
         meta_path.write_text(json.dumps({"video_url": video["url"]}))
 
-        process_transcript(client, types, video, "prompt", "gemini-test", tmp_path, "testch")
+        process_transcript(client, types, video, "prompt", "gemini-test", tmp_path / "testch", "2026-01-01-test-video")
         meta = json.loads(meta_path.read_text())
         assert meta.get("transcript_status") == "partial"
 
@@ -1307,7 +1321,9 @@ class TestProcessTranscriptResilience:
         # First attempt: unsalvageable. Second attempt: valid.
         client, types = self._setup_mocks(monkeypatch, [UNSALVAGEABLE_JSON, VALID_TRANSCRIPT_JSON])
         video = self._make_video()
-        prefix, status = process_transcript(client, types, video, "prompt", "gemini-test", tmp_path, "testch")
+        prefix, status = process_transcript(
+            client, types, video, "prompt", "gemini-test", tmp_path / "testch", "2026-01-01-test-video"
+        )
         assert status == "done"
         assert (tmp_path / "testch" / f"{prefix}.transcript.md").exists()
 
@@ -1315,7 +1331,9 @@ class TestProcessTranscriptResilience:
         # Both attempts unsalvageable - both raw files should exist
         client, types = self._setup_mocks(monkeypatch, [UNSALVAGEABLE_JSON, UNSALVAGEABLE_JSON])
         video = self._make_video()
-        prefix, status = process_transcript(client, types, video, "prompt", "gemini-test", tmp_path, "testch")
+        prefix, status = process_transcript(
+            client, types, video, "prompt", "gemini-test", tmp_path / "testch", "2026-01-01-test-video"
+        )
         assert "error" in status
         assert (tmp_path / "testch" / f"{prefix}.transcript.raw.txt").exists()
         assert (tmp_path / "testch" / f"{prefix}.transcript.raw.2.txt").exists()
@@ -1325,7 +1343,9 @@ class TestProcessTranscriptResilience:
         failures = [UNSALVAGEABLE_JSON] * (TRANSCRIPT_PARSE_RETRY_LIMIT + 2)
         client, types = self._setup_mocks(monkeypatch, failures)
         video = self._make_video()
-        _prefix, status = process_transcript(client, types, video, "prompt", "gemini-test", tmp_path, "testch")
+        _prefix, status = process_transcript(
+            client, types, video, "prompt", "gemini-test", tmp_path / "testch", "2026-01-01-test-video"
+        )
         assert "error" in status
 
 
@@ -1775,3 +1795,261 @@ class TestCmdScanSelectiveMode:
 
         cmd_scan(args, config)
         assert fetch_called["value"] is False
+
+
+# ---------------------------------------------------------------------------
+# parse_time_to_seconds
+# ---------------------------------------------------------------------------
+
+
+class TestParseTimeToSeconds:
+    def test_mm_ss_returns_seconds(self):
+        assert parse_time_to_seconds("05:30") == 330
+
+    def test_hh_mm_ss_returns_seconds(self):
+        assert parse_time_to_seconds("01:15:45") == 4545
+
+    def test_raw_seconds_string(self):
+        assert parse_time_to_seconds("330") == 330
+
+    def test_zero_value(self):
+        assert parse_time_to_seconds("0") == 0
+        assert parse_time_to_seconds("00:00") == 0
+
+    def test_leading_zeros_in_components(self):
+        assert parse_time_to_seconds("00:05:00") == 300
+
+    def test_whitespace_tolerated(self):
+        assert parse_time_to_seconds(" 05:30 ") == 330
+
+    def test_empty_string_raises(self):
+        with pytest.raises(ValueError):
+            parse_time_to_seconds("")
+
+    def test_non_numeric_raises(self):
+        with pytest.raises(ValueError):
+            parse_time_to_seconds("not-a-time")
+
+    def test_too_many_colons_raises(self):
+        with pytest.raises(ValueError):
+            parse_time_to_seconds("1:2:3:4")
+
+
+# ---------------------------------------------------------------------------
+# upload_local_video
+# ---------------------------------------------------------------------------
+
+
+class TestUploadLocalVideo:
+    def _make_active_file(self, uri="files/abc123"):
+        """Build a MagicMock simulating an ACTIVE Gemini file."""
+        file_obj = MagicMock()
+        file_obj.uri = uri
+        file_obj.name = uri
+        file_obj.state.name = "ACTIVE"
+        return file_obj
+
+    def test_uploads_and_returns_uri_when_active(self, tmp_path):
+        mp4 = tmp_path / "clip.mp4"
+        mp4.write_bytes(b"fake mp4 content")
+        active = self._make_active_file()
+        client = MagicMock()
+        client.files.upload.return_value = active
+        client.files.get.return_value = active
+
+        uri = upload_local_video(client, mp4)
+        assert uri == "files/abc123"
+        client.files.upload.assert_called_once()
+
+    def test_polls_until_active(self, tmp_path, monkeypatch):
+        """When file is PROCESSING on first check, poll until ACTIVE."""
+        monkeypatch.setattr("video_intel.time.sleep", lambda _s: None)
+        mp4 = tmp_path / "clip.mp4"
+        mp4.write_bytes(b"fake content")
+
+        processing = MagicMock()
+        processing.uri = "files/xyz"
+        processing.name = "files/xyz"
+        processing.state.name = "PROCESSING"
+
+        active = self._make_active_file(uri="files/xyz")
+        client = MagicMock()
+        client.files.upload.return_value = processing
+        # First get() returns PROCESSING, second returns ACTIVE
+        client.files.get.side_effect = [processing, active]
+
+        uri = upload_local_video(client, mp4)
+        assert uri == "files/xyz"
+        assert client.files.get.call_count == 2
+
+    def test_raises_on_failed_state(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("video_intel.time.sleep", lambda _s: None)
+        mp4 = tmp_path / "clip.mp4"
+        mp4.write_bytes(b"fake content")
+
+        failed = MagicMock()
+        failed.uri = "files/bad"
+        failed.name = "files/bad"
+        failed.state.name = "FAILED"
+
+        client = MagicMock()
+        client.files.upload.return_value = failed
+        client.files.get.return_value = failed
+
+        with pytest.raises(RuntimeError, match="processing failed"):
+            upload_local_video(client, mp4)
+
+    def test_raises_on_missing_file(self, tmp_path):
+        client = MagicMock()
+        with pytest.raises(FileNotFoundError):
+            upload_local_video(client, tmp_path / "nonexistent.mp4")
+
+    def test_large_file_threshold_is_500mb(self):
+        assert LARGE_FILE_THRESHOLD_BYTES == 500 * 1024 * 1024
+
+
+# ---------------------------------------------------------------------------
+# call_gemini offsets
+# ---------------------------------------------------------------------------
+
+
+class TestCallGeminiOffsets:
+    def _make_client_and_types(self):
+        response = MagicMock(text="ok")
+        client = MagicMock()
+        client.models.generate_content.return_value = response
+        types = MagicMock()
+        return client, types
+
+    def test_no_offsets_omits_video_metadata(self):
+        client, types = self._make_client_and_types()
+        call_gemini(client, types, "https://youtube.com/watch?v=x", "prompt", "gemini-test")
+        # Part should be called once with only file_data
+        part_calls = [c.kwargs for c in types.Part.call_args_list]
+        video_part_call = next((c for c in part_calls if "file_data" in c), None)
+        assert video_part_call is not None
+        assert "video_metadata" not in video_part_call
+
+    def test_start_offset_only_sets_start(self):
+        client, types = self._make_client_and_types()
+        call_gemini(client, types, "files/abc", "prompt", "gemini-test", start_offset=330)
+        # VideoMetadata should be constructed with start_offset="330s"
+        types.VideoMetadata.assert_called_once_with(start_offset="330s")
+
+    def test_both_offsets_set(self):
+        client, types = self._make_client_and_types()
+        call_gemini(
+            client,
+            types,
+            "files/abc",
+            "prompt",
+            "gemini-test",
+            start_offset=330,
+            end_offset=1125,
+        )
+        types.VideoMetadata.assert_called_once_with(start_offset="330s", end_offset="1125s")
+
+
+# ---------------------------------------------------------------------------
+# cmd_transcript --file branch
+# ---------------------------------------------------------------------------
+
+
+class TestCmdTranscriptFile:
+    def _setup_common(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("video_intel.require_gemini", lambda: (MagicMock(), MagicMock()))
+        monkeypatch.setattr("video_intel.create_client", lambda _key: MagicMock())
+        monkeypatch.setenv("GEMINI_API_KEY", "fake")
+        monkeypatch.setattr("video_intel.resolve_output_dir", lambda _cfg: tmp_path)
+        monkeypatch.setattr("video_intel.load_prompt", lambda _name: "prompt text")
+
+    def test_local_file_calls_upload_and_process_transcript(self, monkeypatch, tmp_path):
+        """--file path uploads file and passes URI + offsets to process_transcript."""
+        self._setup_common(monkeypatch, tmp_path)
+        captured = {}
+
+        monkeypatch.setattr("video_intel.upload_local_video", lambda _c, _p: "files/xyz")
+
+        def fake_process(_client, _types, video, _prompt, _model, channel_dir, prefix, **kw):
+            captured["video_url"] = video["url"]
+            captured["channel_dir"] = channel_dir
+            captured["prefix"] = prefix
+            captured["start_offset"] = kw.get("start_offset")
+            captured["end_offset"] = kw.get("end_offset")
+            return prefix, "done"
+
+        monkeypatch.setattr("video_intel.process_transcript", fake_process)
+
+        mp4 = tmp_path / "meeting.mp4"
+        mp4.write_bytes(b"fake content")
+        args = argparse.Namespace(
+            model=None,
+            url=None,
+            file=mp4,
+            channel=None,
+            title=None,
+            date=None,
+            force=False,
+            start="05:30",
+            end="18:45",
+        )
+        cmd_transcript(args, {})
+
+        assert captured["video_url"] == "files/xyz"
+        assert captured["channel_dir"] == mp4.parent
+        assert captured["prefix"] == "meeting"
+        assert captured["start_offset"] == 330
+        assert captured["end_offset"] == 1125
+
+    def test_local_file_large_without_segment_exits(self, monkeypatch, tmp_path):
+        """File over threshold without --start/--end should sys.exit with error."""
+        self._setup_common(monkeypatch, tmp_path)
+
+        mp4 = tmp_path / "huge.mp4"
+        # Stub os.stat through Path to simulate large file without writing 500MB
+        original_stat = Path.stat
+
+        def fake_stat(self, *a, **kw):
+            st = MagicMock()
+            st.st_size = LARGE_FILE_THRESHOLD_BYTES + 1
+            st.st_mtime = 1700000000
+            return st
+
+        monkeypatch.setattr(Path, "stat", fake_stat)
+        mp4.write_bytes(b"small placeholder")
+
+        args = argparse.Namespace(
+            model=None,
+            url=None,
+            file=mp4,
+            channel=None,
+            title=None,
+            date=None,
+            force=False,
+            start=None,
+            end=None,
+        )
+
+        with pytest.raises(SystemExit):
+            cmd_transcript(args, {})
+
+        # Restore
+        monkeypatch.setattr(Path, "stat", original_stat)
+
+    def test_local_file_nonexistent_exits(self, monkeypatch, tmp_path):
+        """Missing file should sys.exit."""
+        self._setup_common(monkeypatch, tmp_path)
+
+        args = argparse.Namespace(
+            model=None,
+            url=None,
+            file=tmp_path / "missing.mp4",
+            channel=None,
+            title=None,
+            date=None,
+            force=False,
+            start=None,
+            end=None,
+        )
+        with pytest.raises(SystemExit):
+            cmd_transcript(args, {})

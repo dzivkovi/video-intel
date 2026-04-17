@@ -199,14 +199,33 @@ Options:
 
 ### Transcribe a specific video
 
+**YouTube URL:**
+
 ```bash
 python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" --log-level info transcript \
   --url "https://www.youtube.com/watch?v=XXXXX"
 ```
 
+**Local MP4 file** (works for screen recordings, meetings, Dropbox/GDrive sync folders):
+
+```bash
+# Full file (<500MB)
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" --log-level info transcript \
+  --file ~/Videos/meeting.mp4
+
+# Specific segment (required for files >500MB)
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" --log-level info transcript \
+  --file ~/Videos/meeting.mp4 --start 05:30 --end 18:45
+```
+
+Local files produce `{name}.transcript.md` and `{name}.meta.json` in the same
+directory as the source. Uploaded files auto-expire from Gemini after 48 hours.
+
 Options:
-- `--channel natebjones` - Save output under this channel's folder
-- `--url` - YouTube URL to transcribe
+- `--url` - YouTube URL to transcribe (mutually exclusive with `--file`)
+- `--file` - Path to local MP4 (mutually exclusive with `--url`)
+- `--start`/`--end` - Segment time offsets (accepts `MM:SS`, `HH:MM:SS`, or raw seconds)
+- `--channel natebjones` - Save output under this channel's folder (YouTube only)
 - `--force` - Regenerate even if transcript exists
 
 ### Hybrid search (evidence queries)
