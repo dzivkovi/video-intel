@@ -58,14 +58,14 @@ birds before you cast a line and read the water before you commit to a spot.
 │                            └─────────────────────────────────┘  │
 ├─────────────────────────────────────────────────────────────────┤
 │  SEARCH (the retrieval)                    Cost: ~$0.02/query   │
-│  ┌────────────────────────────────────────────────────────────┐  │
-│  │ Concept search: taxonomy.json labels + aliases (free)      │  │
-│  │ Hybrid search: BM25 keyword + vector semantic + RRF fusion │  │
-│  │   Voyage AI embeds (voyage-4-large docs, voyage-4-lite     │  │
-│  │   queries), LanceDB stores + searches, BM25 matches exact  │  │
-│  │   words in titles + text. Results include full transcript   │  │
-│  │   passages + clickable YouTube URLs with timestamp links.   │  │
-│  └────────────────────────────────────────────────────────────┘  │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │ Concept search: taxonomy.json labels + aliases (free)     │  │
+│  │ Hybrid search: BM25 keyword + vector semantic + RRF fusion│  │
+│  │   Voyage AI embeds (voyage-4-large docs, voyage-4-lite    │  │
+│  │   queries), LanceDB stores + searches, BM25 matches exact │  │
+│  │   words in titles + text. Results include full transcript │  │
+│  │   passages + clickable YouTube URLs with timestamp links. │  │
+│  └───────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -739,6 +739,26 @@ cookbook. This is the kitchen.
 | API patterns | Google ([video](https://ai.google.dev/gemini-api/docs/video-understanding) & [audio](https://ai.google.dev/gemini-api/docs/audio) docs) | Token economics, context caching, multimodal config |
 | Gemini vs Whisper | [Voice Writer](https://voicewriter.io/blog/best-speech-recognition-api-2025), [Brown CCV](https://docs.ccv.brown.edu/ai-tools/services/transcribe/comparing-speech-to-text-models) | Single-model Gemini beats multi-model Whisper + pyannote pipeline |
 | Skills ecosystem | Mark Kashef, [Early AI-dopters](https://www.skool.com/earlyaidopters) community | Pointed to Google's [gemini-skills](https://github.com/google-gemini/gemini-skills) repo; built on the open cross-platform [Agent Skills format](https://code.claude.com/docs/en/skills) |
+
+### How this project is built: Compound Engineering
+
+![Compound Engineering flywheel from every.to/guides/compound-engineering](images/Compound-Engineering.jpg)
+
+Every feature here goes through the [Compound Engineering](https://every.to/guides/compound-engineering)
+loop from Every.to: a brainstorm shapes the idea, a plan turns it into a
+blueprint, work implements it on a branch, review catches issues, and the
+learnings get compounded so the next feature is easier. The four artifacts each
+answer a different question and do not duplicate each other: brainstorm answers
+"what and why" (in `docs/brainstorms/`), plan answers "exactly how" (in
+`docs/plans/`), the GitHub issue is a backlog pointer to the plan, and the PR
+closes both with code. See the
+[internal learning doc](docs/solutions/workflow-issues/compound-engineering-four-artifacts-20260417.md)
+for why issue bodies in this repo link to plan files rather than copy them.
+
+The diagram above is from Every's methodology guide and evolves with the
+plugin; some boxes shown (for example the initial ideate box and the post-ship
+polish box) are newer additions I have not adopted yet, so treat the picture as
+the direction of travel rather than the current workflow.
 
 Architected through iterative conversation with [Claude Desktop](https://claude.ai/) -
 from use case discovery through research synthesis to working prototype.

@@ -69,6 +69,11 @@ The system is evolving toward a two-tier architecture:
 The current single-script design serves both tiers. The separation will happen
 when the storage layer moves to cloud.
 
+Development methodology follows Compound Engineering (see
+[README "Design Influences & Sources"](README.md#design-influences--sources)).
+Brainstorms, plans, and compounded learnings live in `docs/brainstorms/`,
+`docs/plans/`, `docs/solutions/` respectively.
+
 ## Architectural Decisions
 
 Decisions are recorded as ADRs in [docs/adr/](docs/adr/). Summary:
