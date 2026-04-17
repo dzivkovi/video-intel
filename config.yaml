@@ -41,3 +41,8 @@ channels:
       - ux
       - design
     auto_transcript: none
+
+  - name: everyinc
+    url: https://youtube.com/@EveryInc
+    auto_transcript: all
+    since: 30d
