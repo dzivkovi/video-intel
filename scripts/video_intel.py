@@ -82,15 +82,21 @@ def normalize_prompt_name(name: str) -> str:
 
 
 def update_meta(meta_path: Path, fields: dict, mode: str) -> None:
-    """Read existing meta.json, merge fields, ensure mode in modes_completed, write back."""
+    """Read existing meta.json, merge fields, ensure mode in modes_completed, write back.
+
+    The sentinel mode="identity" is a no-op for modes_completed: identity is metadata
+    bootstrap (filling video_id, title, etc.) before a processing stage runs, not a
+    stage itself. See plan rev 4 F11 and technical approach section 6.
+    """
     meta: dict = {}
     if meta_path.exists():
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
     meta.update(fields)
-    modes = meta.get("modes_completed", [])
-    if mode not in modes:
-        modes.append(mode)
-    meta["modes_completed"] = modes
+    if mode != "identity":
+        modes = meta.get("modes_completed", [])
+        if mode not in modes:
+            modes.append(mode)
+        meta["modes_completed"] = modes
     meta["last_error"] = None
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
@@ -414,6 +420,235 @@ def video_file_prefix(video):
     return f"{video['published']}-{slugify(video['title'])}"
 
 
+# Regex for an 11-character YouTube video ID: base64url-ish charset, exactly 11.
+# Used by local-file identity resolution to decide when a filename stem is a video_id.
+_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+
+def infer_channel_from_file_path(input_path: Path, output_dir: Path, config: dict) -> str | None:
+    """Return the configured channel name if input_path lives directly under output_dir/<channel>/.
+
+    Used by --file local-recovery paths to derive the channel from the file's parent folder,
+    matching Daniel's workflow of dropping gated videos straight into the corpus folder.
+
+    Only the input file's immediate parent is checked against the configured channel list;
+    files nested more deeply under a channel folder (e.g., output_dir/everyinc/archive/x.mp4)
+    do not match, because we cannot safely assume they belong to the channel.
+    """
+    try:
+        output_dir_r = output_dir.resolve()
+        parent_r = input_path.parent.resolve()
+    except OSError:
+        return None
+
+    # Parent must be exactly output_dir/<something>
+    try:
+        rel = parent_r.relative_to(output_dir_r)
+    except ValueError:
+        return None
+    if len(rel.parts) != 1:
+        return None
+
+    candidate = rel.parts[0]
+    configured = {c["name"] for c in config.get("channels", [])}
+    return candidate if candidate in configured else None
+
+
+def _find_canonical_meta_by_video_id(channel_dir: Path, video_id: str) -> Path | None:
+    """Search a channel folder for a .meta.json whose 'video_id' matches.
+
+    Per plan F11 uniqueness invariant, at most one such file should exist per
+    {channel, video_id}. If more than one is found, emit a WARNING log (the
+    situation is a pre-existing data integrity issue worth surfacing) and
+    deterministically return the lexicographically-first filename so the
+    resolver can still make progress. Do not fail hard: blocking recovery on
+    a pre-existing data issue is worse than proceeding with a well-defined
+    pick.
+    """
+    if not channel_dir.exists() or not video_id:
+        return None
+    matches: list[Path] = []
+    for meta_file in sorted(channel_dir.glob("*.meta.json")):
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if meta.get("video_id") == video_id:
+            matches.append(meta_file)
+    if len(matches) > 1:
+        log.warning(
+            "Multiple canonical meta.json files share video_id=%s in %s: %s. "
+            "Picking the first (%s). Investigate and remove duplicates to honor F11.",
+            video_id,
+            channel_dir,
+            [m.name for m in matches],
+            matches[0].name,
+        )
+    return matches[0] if matches else None
+
+
+def resolve_local_file_identity(
+    input_path: Path,
+    *,
+    channel_name: str | None,
+    channel_dir: Path | None,
+    args,
+) -> dict:
+    """Resolve identity for a local MP4 under the --file path.
+
+    Priority order (plan rev 4, with the flag-override rule applied to both
+    persistent-state steps for consistency):
+      1. Sibling .meta.json for the same filename stem. Adopts fields verbatim
+         EXCEPT where an explicit CLI flag (--video-id, --title, --date) is
+         given; those flags override the sibling field on a per-field basis.
+         This is what makes ``--force --video-id <id>`` actually update a stale
+         sibling's empty ``video_id`` / ``video_url``.
+      2. G2 dedup: channel-wide video_id match against canonical scan metas.
+         Same flag-override rule as step 1 applies to content fields; prefix
+         stays canonical regardless of flags (F11 uniqueness).
+      3. Explicit CLI flags (--video-id, --title, --date) when no sibling / G2
+         match is available.
+      4. Parent-folder inference fills channel (done by caller, passed in).
+      5. Filename stem becomes title by default.
+      6. Filename stem becomes video_id only if it matches ^[A-Za-z0-9_-]{11}$.
+      7. mtime fallback for published (published_source="mtime").
+      8. video_url derived from video_id when known; empty otherwise.
+
+    Returns a dict with: channel, video_id, url, title, published, published_source,
+    prefix, channel_dir, meta_path.
+    """
+    stem = input_path.stem
+
+    # --- Step 1: sibling meta.json next to the input file ---
+    # Explicit CLI flags override sibling-meta fields on a per-field basis. Reason:
+    # a stale sibling from a prior run should NEVER silently shadow explicit user
+    # input (`--video-id`, `--title`, `--date`). Only unflagged fields are adopted
+    # verbatim. This mirrors the flag-override rule for step 2 (G2 canonical match).
+    sibling_meta = input_path.with_suffix(".meta.json")
+    if sibling_meta.exists():
+        try:
+            meta = json.loads(sibling_meta.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            meta = {}
+        if meta:
+            flag_video_id = getattr(args, "video_id", None)
+            flag_title = getattr(args, "title", None)
+            flag_date = getattr(args, "date", None)
+
+            final_video_id = flag_video_id or meta.get("video_id", "")
+            final_title = flag_title or meta.get("title", stem)
+            if flag_date:
+                final_published = flag_date
+                final_source: str = "cli_flag"
+            else:
+                final_published = meta.get("published", "")
+                final_source = "sibling_meta"
+            # Derive URL from whichever video_id won (flag or stored)
+            if flag_video_id:
+                final_url = f"https://www.youtube.com/watch?v={flag_video_id}"
+            else:
+                final_url = meta.get("video_url", "")
+
+            return {
+                "channel": meta.get("channel") or channel_name,
+                "video_id": final_video_id,
+                "url": final_url,
+                "title": final_title,
+                "published": final_published,
+                "published_source": final_source,
+                "prefix": stem,
+                "channel_dir": input_path.parent,
+                "meta_path": sibling_meta,
+            }
+
+    # --- Step 2: G2 dedup by video_id against canonical scan metas ---
+    # Candidate video_id comes from --video-id flag first, else stem if it looks like one.
+    candidate_video_id = getattr(args, "video_id", None)
+    if not candidate_video_id and _VIDEO_ID_RE.match(stem):
+        candidate_video_id = stem
+
+    if candidate_video_id and channel_dir is not None:
+        canonical = _find_canonical_meta_by_video_id(channel_dir, candidate_video_id)
+        if canonical is not None:
+            canonical_meta = json.loads(canonical.read_text(encoding="utf-8"))
+            canonical_prefix = canonical.name[: -len(".meta.json")]
+
+            # Flag-override precedence within G2: flags update content fields in place,
+            # but prefix / channel_dir / meta_path stay canonical (F11).
+            flag_title = getattr(args, "title", None)
+            flag_date = getattr(args, "date", None)
+
+            final_title = flag_title or canonical_meta.get("title", stem)
+            if flag_date:
+                final_published = flag_date
+                final_source = "cli_flag"
+            else:
+                final_published = canonical_meta.get("published", "")
+                final_source = canonical_meta.get("published_source", "youtube_api")
+
+            return {
+                "channel": canonical_meta.get("channel") or channel_name,
+                "video_id": candidate_video_id,
+                "url": canonical_meta.get("video_url") or f"https://www.youtube.com/watch?v={candidate_video_id}",
+                "title": final_title,
+                "published": final_published,
+                "published_source": final_source,
+                "prefix": canonical_prefix,
+                "channel_dir": channel_dir,
+                "meta_path": canonical,
+            }
+
+    # --- Steps 3-8: flags + parent folder + filename + mtime fallback ---
+    effective_channel_dir = channel_dir if channel_dir is not None else input_path.parent
+
+    flag_video_id = getattr(args, "video_id", None)
+    flag_title = getattr(args, "title", None)
+    flag_date = getattr(args, "date", None)
+
+    # video_id: flag > stem-if-11-char > empty
+    video_id = flag_video_id or (stem if _VIDEO_ID_RE.match(stem) else "")
+
+    # title: --title flag > stem. Warn if --video-id was given but --title wasn't,
+    # since an arbitrary filename stem is a low-confidence title for a specific video.
+    if flag_video_id and not flag_title:
+        log.warning(
+            "%s: --video-id given without --title; falling back to filename stem %r as title. "
+            "Pass --title to override if the stem is not meaningful.",
+            input_path.name,
+            stem,
+        )
+    title = flag_title or stem
+
+    # published: --date flag > mtime fallback
+    if flag_date:
+        published = flag_date
+        published_source = "cli_flag"
+    else:
+        if flag_video_id:
+            log.warning(
+                "%s: --video-id given without --date; falling back to mtime for published. "
+                "Pass --date YYYY-MM-DD to override.",
+                input_path.name,
+            )
+        mtime = datetime.fromtimestamp(input_path.stat().st_mtime)
+        published = mtime.strftime("%Y-%m-%d")
+        published_source = "mtime"
+
+    url = f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
+
+    return {
+        "channel": channel_name,
+        "video_id": video_id,
+        "url": url,
+        "title": title,
+        "published": published,
+        "published_source": published_source,
+        "prefix": stem,
+        "channel_dir": effective_channel_dir,
+        "meta_path": effective_channel_dir / f"{stem}.meta.json",
+    }
+
+
 def is_processed(
     output_dir: Path,
     channel_name: str,
@@ -466,7 +701,7 @@ def is_skipped(output_dir, channel_name, video):
 def call_gemini(
     client,
     types,
-    video_url,
+    media_uri,
     prompt_text,
     model,
     response_json=False,
@@ -476,8 +711,15 @@ def call_gemini(
 ):
     """Send a video to Gemini for multimodal analysis with retry on rate limits.
 
+    ``media_uri`` is the Gemini-side input URI: either a YouTube URL (canonical case)
+    or a Gemini Files API URI (``files/xyz``) from ``upload_local_video``. Callers
+    can keep a separate canonical ``video_url`` on the video dict for persistence
+    while passing ``media_uri`` here for the actual upload source. This split is
+    what keeps ``file_uri`` out of persisted artifacts on the local-recovery path
+    (plan rev 4 F8).
+
     Optional start_offset/end_offset (in seconds) clip the video to a segment
-    via Gemini's VideoMetadata. Works for both YouTube URLs and uploaded file URIs.
+    via Gemini's VideoMetadata.
     """
     config_kwargs = {
         "temperature": 0.3,
@@ -487,7 +729,7 @@ def call_gemini(
     if response_json:
         config_kwargs["response_mime_type"] = "application/json"
 
-    part_kwargs = {"file_data": types.FileData(file_uri=video_url)}
+    part_kwargs = {"file_data": types.FileData(file_uri=media_uri)}
     if start_offset is not None or end_offset is not None:
         meta_kwargs = {}
         if start_offset is not None:
@@ -533,21 +775,43 @@ def call_gemini(
 
 
 def process_mindmap(
-    client, types, video, prompt_text, model, output_dir, channel_name, *, prompt_name=None, force=False
+    client,
+    types,
+    video,
+    prompt_text,
+    model,
+    output_dir,
+    channel_name,
+    *,
+    prompt_name=None,
+    force=False,
+    prefix: str | None = None,
+    channel_dir_override: Path | None = None,
+    media_uri: str | None = None,
 ):
-    """Generate a mind map for a single video."""
-    prefix = video_file_prefix(video)
-    channel_dir = output_dir / channel_name
-    channel_dir.mkdir(parents=True, exist_ok=True)
+    """Generate a mind map for a single video.
 
-    mindmap_path = channel_dir / f"{prefix}.mindmap.md"
-    meta_path = channel_dir / f"{prefix}.meta.json"
+    When called without keyword overrides, artifacts land at
+    ``output_dir/channel_name/{video_file_prefix(video)}.mindmap.md`` and Gemini
+    receives ``video["url"]`` as the media source. The three keyword overrides
+    (``prefix``, ``channel_dir_override``, ``media_uri``) exist for the local-file
+    recovery path (plan rev 4): the caller can route artifacts to a different
+    folder/prefix (e.g. a canonical scan-generated prefix when G2 dedup fires)
+    and feed Gemini a Files API URI while keeping ``video["url"]`` canonical.
+    """
+    resolved_prefix = prefix if prefix is not None else video_file_prefix(video)
+    resolved_channel_dir = channel_dir_override if channel_dir_override is not None else output_dir / channel_name
+    resolved_channel_dir.mkdir(parents=True, exist_ok=True)
+
+    mindmap_path = resolved_channel_dir / f"{resolved_prefix}.mindmap.md"
+    meta_path = resolved_channel_dir / f"{resolved_prefix}.meta.json"
 
     if mindmap_path.exists() and not force:
-        return prefix, "skipped (exists)"
+        return resolved_prefix, "skipped (exists)"
 
+    effective_media_uri = media_uri if media_uri is not None else video["url"]
     try:
-        result = call_gemini(client, types, video["url"], prompt_text, model)
+        result = call_gemini(client, types, effective_media_uri, prompt_text, model)
 
         # Save mind map
         header = (
@@ -573,11 +837,11 @@ def process_mindmap(
             meta_fields["prompt"] = prompt_name
         update_meta(meta_path, meta_fields, "scan")
 
-        return prefix, "done"
+        return resolved_prefix, "done"
 
     except Exception as e:
         # Record failure in meta.json (also merge-safe)
-        channel_dir.mkdir(parents=True, exist_ok=True)
+        resolved_channel_dir.mkdir(parents=True, exist_ok=True)
         meta: dict = {}
         if meta_path.exists():
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -594,7 +858,7 @@ def process_mindmap(
             }
         )
         meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-        return prefix, f"error: {e}"
+        return resolved_prefix, f"error: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -891,6 +1155,7 @@ def process_transcript(
     force=False,
     start_offset: int | None = None,
     end_offset: int | None = None,
+    media_uri: str | None = None,
 ):
     """Generate a fused transcript for a single video with layered JSON resilience.
 
@@ -901,6 +1166,11 @@ def process_transcript(
 
     Optional start_offset/end_offset (in seconds) pass through to Gemini for
     segment clipping. Applies on initial call and any retries.
+
+    Optional media_uri overrides what is sent to Gemini as the media source
+    (e.g. a Gemini Files API URI for locally-uploaded MP4s) while video["url"]
+    stays the canonical YouTube URL used in the transcript header and meta.json.
+    When media_uri is not set, video["url"] is used for both.
     """
     channel_dir.mkdir(parents=True, exist_ok=True)
 
@@ -910,12 +1180,13 @@ def process_transcript(
     if transcript_path.exists() and not force:
         return prefix, "skipped (exists)"
 
+    effective_media_uri = media_uri if media_uri is not None else video["url"]
     for attempt in range(1 + TRANSCRIPT_PARSE_RETRY_LIMIT):
         try:
             raw = call_gemini(
                 client,
                 types,
-                video["url"],
+                effective_media_uri,
                 prompt_text,
                 model,
                 response_json=True,
@@ -1043,14 +1314,21 @@ def process_concepts(
     source_file=None,
     source_prompt=None,
     force=False,
+    prefix: str | None = None,
 ):
-    """Extract and normalize concepts from a mindmap against the taxonomy."""
-    prefix = video_file_prefix(video)
+    """Extract and normalize concepts from a mindmap against the taxonomy.
+
+    When ``prefix`` is provided, it overrides ``video_file_prefix(video)`` for
+    determining artifact filenames. Used by the local-recovery path where the
+    meta.json filename stem is the authoritative prefix (plan rev 4 F12).
+    """
+    resolved_prefix = prefix if prefix is not None else video_file_prefix(video)
     channel_dir = output_dir / channel_name
     channel_dir.mkdir(parents=True, exist_ok=True)
 
-    concepts_path = channel_dir / f"{prefix}.concepts.json"
-    meta_path = channel_dir / f"{prefix}.meta.json"
+    concepts_path = channel_dir / f"{resolved_prefix}.concepts.json"
+    meta_path = channel_dir / f"{resolved_prefix}.meta.json"
+    prefix = resolved_prefix
 
     if concepts_path.exists() and not force:
         return prefix, "skipped (exists)"
@@ -1241,8 +1519,15 @@ def cmd_scan(args, config):
             log.info("  Looking back to %s", since_dt.strftime("%Y-%m-%d"))
             videos = fetch_channel_videos(youtube, channel_id, since_dt)
         if not videos:
-            log.info("  No new videos found.")
-            continue
+            # With auto_concepts enabled we still want to enumerate local-recovery
+            # artifacts via the *.meta.json glob below, even when YouTube has no
+            # new videos to pull. Without auto_concepts, there is nothing more to
+            # do for this channel and we can short-circuit.
+            auto_concepts_enabled = ch.get("auto_concepts", config.get("auto_concepts", False))
+            if not auto_concepts_enabled:
+                log.info("  No new videos found.")
+                continue
+            log.info("  No new videos from YouTube; checking local artifacts for concepts...")
 
         # Filter already processed or skipped (any_variant=True prevents backfill)
         if args.force:
@@ -1292,6 +1577,23 @@ def cmd_scan(args, config):
                     log.info("    %s: %s", prefix, status)
                     if status.startswith("error"):
                         errors.append((ch_name, prefix, status))
+                        # Plan rev 4: on 403 PERMISSION_DENIED, print a recovery
+                        # recipe so the user can fix a members-only gated video
+                        # without having to read documentation mid-scan.
+                        if "PERMISSION_DENIED" in status:
+                            log.info(
+                                "      -> Likely members-only. To recover: save the MP4 as %s.mp4 "
+                                "in any folder, then run:",
+                                v["video_id"],
+                            )
+                            log.info(
+                                "        python scripts/video_intel.py mindmap    --file <PATH> --channel %s",
+                                ch_name,
+                            )
+                            log.info(
+                                "        python scripts/video_intel.py transcript --file <PATH> --channel %s",
+                                ch_name,
+                            )
 
         # Auto-transcript if configured
         auto = ch.get("auto_transcript", "none")
@@ -1325,26 +1627,45 @@ def cmd_scan(args, config):
                         if status.startswith("error"):
                             errors.append((ch_name, prefix, status))
 
-        # Auto-concepts if configured
+        # Auto-concepts if configured.
+        # Plan rev 4 F12: enumerate via *.meta.json glob so both scan-generated
+        # ({date}-{slug}) and local-recovery (stem) artifacts are picked up without
+        # special-casing. Prefix is derived from the meta filename, not recomputed.
         auto_concepts = ch.get("auto_concepts", config.get("auto_concepts", False))
         if auto_concepts:
             taxonomy = load_taxonomy(output_dir)
             prompt_name = ch.get("prompt") or config.get("default_prompt", "mindmap-knowledge")
-            concept_videos = []
-            for v in videos:
-                prefix = video_file_prefix(v)
-                concepts_path = output_dir / ch_name / f"{prefix}.concepts.json"
-                if concepts_path.exists():
-                    continue
-                mindmap_path = find_mindmap_source(output_dir / ch_name, prefix)
-                if mindmap_path:
-                    concept_videos.append((v, mindmap_path))
+            channel_dir_for_concepts = output_dir / ch_name
+            concept_candidates: list[tuple[dict, Path, str]] = []
+            if channel_dir_for_concepts.exists():
+                for meta_file in sorted(channel_dir_for_concepts.glob("*.meta.json")):
+                    prefix = meta_file.name[: -len(".meta.json")]
+                    concepts_path = channel_dir_for_concepts / f"{prefix}.concepts.json"
+                    if concepts_path.exists():
+                        continue
+                    mindmap_path = find_mindmap_source(channel_dir_for_concepts, prefix)
+                    if not mindmap_path:
+                        continue
+                    try:
+                        meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                    except json.JSONDecodeError:
+                        log.warning("Skipping malformed meta.json: %s", meta_file)
+                        continue
+                    if meta.get("skip"):
+                        continue
+                    synthetic_video = {
+                        "video_id": meta.get("video_id", ""),
+                        "url": meta.get("video_url", ""),
+                        "title": meta.get("title", prefix),
+                        "published": meta.get("published", ""),
+                    }
+                    concept_candidates.append((synthetic_video, mindmap_path, prefix))
 
-            if concept_videos:
-                log.info("  Extracting concepts (%d videos)...", len(concept_videos))
-                for v, mindmap_path in concept_videos:
+            if concept_candidates:
+                log.info("  Extracting concepts (%d videos)...", len(concept_candidates))
+                for v, mindmap_path, prefix in concept_candidates:
                     mindmap_text = mindmap_path.read_text(encoding="utf-8")
-                    prefix, status = process_concepts(
+                    out_prefix, status = process_concepts(
                         client,
                         types,
                         v,
@@ -1355,10 +1676,11 @@ def cmd_scan(args, config):
                         ch_name,
                         source_file=mindmap_path.name,
                         source_prompt=prompt_name,
+                        prefix=prefix,
                     )
-                    log.info("    %s: %s", prefix, status)
+                    log.info("    %s: %s", out_prefix, status)
                     if status.startswith("error"):
-                        errors.append((ch_name, prefix, status))
+                        errors.append((ch_name, out_prefix, status))
 
     if errors:
         log.warning("--- %d FAILED ---", len(errors))
@@ -1371,7 +1693,7 @@ def cmd_scan(args, config):
 
 
 def cmd_mindmap(args, config):
-    """Generate a mind map for a single video with a specific prompt."""
+    """Generate a mind map for a single video (YouTube URL or local MP4)."""
     _, types = require_gemini()
 
     gemini_key = os.environ.get("GEMINI_API_KEY")
@@ -1384,10 +1706,96 @@ def cmd_mindmap(args, config):
     model = resolve_model(args, config)
 
     # Resolve prompt
-    prompt_name = normalize_prompt_name(args.prompt or config.get("default_prompt", "mindmap-light"))
+    prompt_name = normalize_prompt_name(getattr(args, "prompt", None) or config.get("default_prompt", "mindmap-light"))
     prompt_text = load_prompt(prompt_name)
 
-    # Build video object from URL
+    # --- Local-file path (plan rev 4) ---
+    if getattr(args, "file", None):
+        input_path = Path(args.file).resolve()
+        if not input_path.exists():
+            log.error("File not found: %s", input_path)
+            sys.exit(1)
+
+        channel_name = args.channel or infer_channel_from_file_path(input_path, output_dir, config)
+
+        if args.channel:
+            configured = {c["name"] for c in config.get("channels", [])}
+            if args.channel not in configured:
+                log.error("Channel '%s' not found in config.yaml", args.channel)
+                sys.exit(1)
+
+        if channel_name:
+            channel_dir_hint = output_dir / channel_name
+            identity = resolve_local_file_identity(
+                input_path, channel_name=channel_name, channel_dir=channel_dir_hint, args=args
+            )
+
+            # F7: honor skip flag from existing meta.json before any Gemini work.
+            if identity["meta_path"].exists():
+                try:
+                    existing = json.loads(identity["meta_path"].read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    existing = {}
+                if existing.get("skip"):
+                    log.info("Skipping %s (skip=true in meta.json)", identity["prefix"])
+                    return
+
+            video = {
+                "video_id": identity["video_id"],
+                "url": identity["url"],
+                "title": identity["title"],
+                "published": identity["published"],
+            }
+            file_uri = upload_local_video(client, input_path)
+            log.info("Generating mind map (%s, channel=%s): %s", prompt_name, channel_name, input_path.name)
+            prefix, status = process_mindmap(
+                client,
+                types,
+                video,
+                prompt_text,
+                model,
+                output_dir,
+                identity["channel"],
+                prompt_name=prompt_name,
+                force=args.force,
+                prefix=identity["prefix"],
+                channel_dir_override=identity["channel_dir"],
+                media_uri=file_uri,
+            )
+            log.info("  %s: %s", prefix, status)
+            if status == "done":
+                log.info("  Saved: %s", identity["channel_dir"] / f"{prefix}.mindmap.md")
+            return
+
+        # No channel inferrable: fall through to next-to-source output for loose files
+        file_uri = upload_local_video(client, input_path)
+        video = {
+            "video_id": input_path.stem,
+            "url": file_uri,  # no canonical URL known; file_uri is least-bad fallback
+            "title": input_path.stem,
+            "published": datetime.fromtimestamp(input_path.stat().st_mtime).strftime("%Y-%m-%d"),
+        }
+        log.info("Generating mind map (%s): %s", prompt_name, input_path.name)
+        prefix, status = process_mindmap(
+            client,
+            types,
+            video,
+            prompt_text,
+            model,
+            output_dir,
+            "_standalone",
+            prompt_name=prompt_name,
+            force=args.force,
+            prefix=input_path.stem,
+            channel_dir_override=input_path.parent,
+            media_uri=file_uri,
+        )
+        log.info("  %s: %s", prefix, status)
+        if status == "done":
+            log.info("  Saved: %s", input_path.parent / f"{prefix}.mindmap.md")
+        return
+
+    # --- YouTube URL path (unchanged) ---
     video_id_match = re.search(r"(?:v=|/)([a-zA-Z0-9_-]{11})", args.url)
     if not video_id_match:
         log.error("Could not extract video ID from: %s", args.url)
@@ -1474,17 +1882,74 @@ def cmd_transcript(args, config):
             )
             sys.exit(1)
 
-        file_uri = upload_local_video(client, input_path)
+        # Channel resolution: explicit --channel wins, else infer from parent folder.
+        output_dir = resolve_output_dir(config)
+        channel_name = args.channel or infer_channel_from_file_path(input_path, output_dir, config)
 
-        video = {
-            "video_id": input_path.stem,
-            "url": file_uri,
-            "title": input_path.stem,
-            "published": datetime.fromtimestamp(input_path.stat().st_mtime).strftime("%Y-%m-%d"),
-        }
-        channel_dir = input_path.parent
-        prefix = input_path.stem
-        log.info("Transcribing local file: %s", input_path.name)
+        if args.channel:
+            configured = {c["name"] for c in config.get("channels", [])}
+            if args.channel not in configured:
+                log.error("Channel '%s' not found in config.yaml", args.channel)
+                sys.exit(1)
+
+        media_uri: str | None = None
+        if channel_name:
+            # Channel-scoped in-place recovery path (plan rev 4).
+            channel_dir_hint = output_dir / channel_name
+            identity = resolve_local_file_identity(
+                input_path, channel_name=channel_name, channel_dir=channel_dir_hint, args=args
+            )
+            video = {
+                "video_id": identity["video_id"],
+                "url": identity["url"],  # canonical YouTube URL (or empty); never file_uri
+                "title": identity["title"],
+                "published": identity["published"],
+            }
+            channel_dir = identity["channel_dir"]
+            prefix = identity["prefix"]
+
+            # F7: honor skip flag from existing meta.json before any Gemini work.
+            if identity["meta_path"].exists():
+                try:
+                    existing = json.loads(identity["meta_path"].read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    existing = {}
+                if existing.get("skip"):
+                    log.info("Skipping %s (skip=true in meta.json)", prefix)
+                    return
+
+            # Two-step meta write: identity block lands BEFORE Gemini call so
+            # failures/partials still leave a complete meta.json. See plan F11.
+            identity_fields = {
+                "video_url": identity["url"],
+                "video_id": identity["video_id"],
+                "channel": identity["channel"],
+                "title": identity["title"],
+                "published": identity["published"],
+                "published_source": identity["published_source"],
+                "model": model,
+                "transcript_source": "local_file",
+            }
+            if start_offset is not None or end_offset is not None:
+                identity_fields["segments"] = [{"start": start_offset, "end": end_offset}]
+            channel_dir.mkdir(parents=True, exist_ok=True)
+            update_meta(identity["meta_path"], identity_fields, mode="identity")
+
+            file_uri = upload_local_video(client, input_path)
+            media_uri = file_uri
+            log.info("Transcribing local file (channel=%s): %s", channel_name, input_path.name)
+        else:
+            # No channel: preserve existing behavior (output next to source, stem prefix).
+            file_uri = upload_local_video(client, input_path)
+            video = {
+                "video_id": input_path.stem,
+                "url": file_uri,
+                "title": input_path.stem,
+                "published": datetime.fromtimestamp(input_path.stat().st_mtime).strftime("%Y-%m-%d"),
+            }
+            channel_dir = input_path.parent
+            prefix = input_path.stem
+            log.info("Transcribing local file: %s", input_path.name)
     else:
         # YouTube URL path
         output_dir = resolve_output_dir(config)
@@ -1530,6 +1995,7 @@ def cmd_transcript(args, config):
         }
         channel_dir = output_dir / channel_name
         prefix = video_file_prefix(video)
+        media_uri = None  # YouTube URL path: video["url"] is the media source
         log.info("Transcribing: %s", video["url"])
 
     prefix, status = process_transcript(
@@ -1543,6 +2009,7 @@ def cmd_transcript(args, config):
         force=args.force,
         start_offset=start_offset,
         end_offset=end_offset,
+        media_uri=media_uri,
     )
     out_path = channel_dir / f"{prefix}.transcript.md"
     log.info("  %s: %s", prefix, status)
@@ -2257,23 +2724,85 @@ Examples:
 
     # mindmap command
     mm_parser = subparsers.add_parser("mindmap", help="Generate mind map for a specific video")
-    mm_parser.add_argument("--url", required=True, help="YouTube video URL")
+    mm_source = mm_parser.add_mutually_exclusive_group(required=True)
+    mm_source.add_argument("--url", help="YouTube video URL")
+    mm_source.add_argument(
+        "--file",
+        help=(
+            "Path to local video file (.mp4/.mov/.mkv/.webm/.avi). Pair with --channel to "
+            "route artifacts into output_dir/<channel>/ for gated-video recovery."
+        ),
+    )
     mm_parser.add_argument("--prompt", help="Prompt name (default: config default_prompt)")
-    mm_parser.add_argument("--channel", help="Channel name for output folder")
-    mm_parser.add_argument("--title", help="Video title (auto-detected if omitted)")
-    mm_parser.add_argument("--date", help="Publish date YYYY-MM-DD (defaults to today)")
+    mm_parser.add_argument(
+        "--channel",
+        help=(
+            "Channel name for output folder. With --url: where artifacts land. "
+            "With --file: enables in-place recovery routing (inferred from parent folder "
+            "when the file lives under output_dir/<channel>/; explicit override otherwise)."
+        ),
+    )
+    mm_parser.add_argument(
+        "--video-id",
+        dest="video_id",
+        help=(
+            "11-char YouTube video ID. With --file + --channel: used to match an existing "
+            "canonical scan meta.json (G2 dedup) or to stamp the video_url in a fresh meta."
+        ),
+    )
+    mm_parser.add_argument(
+        "--title",
+        help="Video title. Auto-detected from YouTube snippet with --url; falls back to filename stem with --file.",
+    )
+    mm_parser.add_argument(
+        "--date",
+        help=(
+            "Publish date YYYY-MM-DD. Defaults to today with --url; falls back to the file's "
+            "mtime with --file when not given."
+        ),
+    )
     mm_parser.add_argument("--force", action="store_true", help="Regenerate even if mindmap exists")
 
     # transcript command
     tx_parser = subparsers.add_parser("transcript", help="Transcribe a specific video")
     tx_source = tx_parser.add_mutually_exclusive_group(required=True)
     tx_source.add_argument("--url", help="YouTube video URL")
-    tx_source.add_argument("--file", help="Path to local MP4 file")
+    tx_source.add_argument(
+        "--file",
+        help=(
+            "Path to local video file (.mp4/.mov/.mkv/.webm/.avi). Pair with --channel to "
+            "route artifacts into output_dir/<channel>/ for gated-video recovery."
+        ),
+    )
     tx_parser.add_argument("--start", help="Segment start time (MM:SS, HH:MM:SS, or raw seconds)")
     tx_parser.add_argument("--end", help="Segment end time (MM:SS, HH:MM:SS, or raw seconds)")
-    tx_parser.add_argument("--channel", help="Channel name for output folder (YouTube only)")
-    tx_parser.add_argument("--title", help="Video title (auto-detected if omitted; YouTube only)")
-    tx_parser.add_argument("--date", help="Publish date YYYY-MM-DD (defaults to today; YouTube only)")
+    tx_parser.add_argument(
+        "--channel",
+        help=(
+            "Channel name for output folder. With --url: where artifacts land. "
+            "With --file: enables in-place recovery routing (inferred from parent folder "
+            "when the file lives under output_dir/<channel>/; explicit override otherwise)."
+        ),
+    )
+    tx_parser.add_argument(
+        "--video-id",
+        dest="video_id",
+        help=(
+            "11-char YouTube video ID. With --file + --channel: used to match an existing "
+            "canonical scan meta.json (G2 dedup) or to stamp the video_url in a fresh meta."
+        ),
+    )
+    tx_parser.add_argument(
+        "--title",
+        help="Video title. Auto-detected from YouTube snippet with --url; falls back to filename stem with --file.",
+    )
+    tx_parser.add_argument(
+        "--date",
+        help=(
+            "Publish date YYYY-MM-DD. Defaults to today with --url; falls back to the file's "
+            "mtime with --file when not given."
+        ),
+    )
     tx_parser.add_argument("--force", action="store_true", help="Regenerate even if transcript exists")
 
     # concepts command

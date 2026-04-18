@@ -6,6 +6,7 @@ default_since: 10d
 default_prompt: mindmap-knowledge
 model: gemini-3-flash-preview
 max_parallel: 10
+auto_concepts: true
 
 channels:
   - name: natebjones

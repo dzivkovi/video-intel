@@ -279,6 +279,18 @@ python scripts/video_intel.py transcript --file ~/Videos/meeting.mp4
 python scripts/video_intel.py transcript \
   --file ~/Videos/long-demo.mp4 --start 05:30 --end 18:45
 
+# Members-only / gated video recovery:
+# drop the MP4 under output_dir/<channel>/ and artifacts land in the canonical
+# channel folder with the same meta.json shape as scan-generated ones.
+python scripts/video_intel.py mindmap \
+  --file "./video-intel/everyinc/Compound Engineering Camp.mkv"
+python scripts/video_intel.py transcript \
+  --file "./video-intel/everyinc/Compound Engineering Camp.mkv"
+
+# ...or keep the MP4 elsewhere and pass --channel explicitly:
+python scripts/video_intel.py transcript \
+  --file ~/Downloads/lfML5OJc-CM.mp4 --channel everyinc
+
 # Override Gemini model for a single command
 python scripts/video_intel.py --model gemini-2.5-pro transcript \
   --url "https://www.youtube.com/watch?v=XXXXX"
