@@ -219,13 +219,47 @@ python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" --log-level info trans
 ```
 
 Local files produce `{name}.transcript.md` and `{name}.meta.json` in the same
-directory as the source. Uploaded files auto-expire from Gemini after 48 hours.
+directory as the source by default. Uploaded files auto-expire from Gemini
+after 48 hours.
+
+**Members-only / gated video recovery** (when Gemini cannot fetch a YouTube URL
+because it is member-only, paid, or otherwise restricted and `scan` returned
+HTTP 403 PERMISSION_DENIED):
+
+1. Download the video locally. The simplest workflow is to save it directly
+   under `output_dir/<channel>/` (e.g., `./video-intel/everyinc/Compound Engineering Camp.mkv`);
+   the tool infers the channel from the parent folder. `.mkv`, `.mp4`, `.mov`,
+   `.webm`, and `.avi` are all accepted.
+2. Run `mindmap --file` then `transcript --file` on the local path. The
+   artifacts land in the canonical channel folder using the same `.meta.json`
+   shape as scan-generated ones so the concepts/search pipelines pick them
+   up on the next `scan` without special-casing.
+
+```bash
+# Drop the MP4 under video-intel/everyinc/ first, then:
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" mindmap \
+  --file "./video-intel/everyinc/Compound Engineering Camp.mkv"
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" transcript \
+  --file "./video-intel/everyinc/Compound Engineering Camp.mkv"
+
+# Or keep the MP4 elsewhere and pass --channel explicitly:
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" transcript \
+  --file "~/Downloads/lfML5OJc-CM.mp4" --channel everyinc
+```
+
+When the local filename is `<videoId>.mp4` (11-char YouTube ID), the tool
+matches it against an existing canonical scan-generated `.meta.json` in the
+channel folder and writes artifacts under the canonical `{YYYY-MM-DD}-{slug}`
+prefix, keeping a single meta.json per video. Otherwise the filename stem
+is used as both the title and the artifact prefix.
 
 Options:
 - `--url` - YouTube URL to transcribe (mutually exclusive with `--file`)
-- `--file` - Path to local MP4 (mutually exclusive with `--url`)
+- `--file` - Path to local MP4 / MKV / MOV / WebM / AVI (mutually exclusive with `--url`)
 - `--start`/`--end` - Segment time offsets (accepts `MM:SS`, `HH:MM:SS`, or raw seconds)
-- `--channel natebjones` - Save output under this channel's folder (YouTube only)
+- `--channel <NAME>` - Save output under this channel's folder; with `--file`, enables in-place recovery routing
+- `--video-id <ID>` - 11-char YouTube video ID for explicit canonical-meta matching
+- `--title <T>` / `--date YYYY-MM-DD` - Override filename-inferred defaults
 - `--force` - Regenerate even if transcript exists
 
 ### Hybrid search (evidence queries)
