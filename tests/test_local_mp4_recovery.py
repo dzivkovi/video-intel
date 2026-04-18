@@ -183,6 +183,72 @@ class TestResolveLocalFileIdentity:
         assert identity["channel_dir"] == channel_dir
         assert identity["meta_path"] == sibling
 
+    def test_step_1_sibling_meta_honors_explicit_flag_overrides(self, tmp_path):
+        """Regression: stale sibling meta must NOT silently shadow explicit CLI flags.
+
+        Triggered in the wild on 2026-04-17: user passed --video-id --force to
+        re-stamp a prior run's meta that had empty video_id="", but the sibling-meta
+        step adopted the empty field verbatim because step 1 didn't honor flag
+        overrides. Step 2 (G2) already did; step 1 now matches.
+        """
+        channel_dir = tmp_path / "everyinc"
+        channel_dir.mkdir()
+        mp4 = channel_dir / "Compound Engineering Camp.mkv"
+        mp4.write_bytes(b"x")
+        # Stale sibling: empty video_id/video_url from a prior run without --video-id
+        (channel_dir / "Compound Engineering Camp.meta.json").write_text(
+            json.dumps(
+                {
+                    "video_id": "",
+                    "video_url": "",
+                    "title": "Compound Engineering Camp",
+                    "published": "2026-04-17",
+                    "channel": "everyinc",
+                    "published_source": "mtime",
+                }
+            )
+        )
+
+        args = _make_args(video_id="lfML5OJc-CM", date="2026-04-18")
+        identity = resolve_local_file_identity(mp4, channel_name="everyinc", channel_dir=channel_dir, args=args)
+
+        # Flags won on their specific fields
+        assert identity["video_id"] == "lfML5OJc-CM"
+        assert identity["url"] == "https://www.youtube.com/watch?v=lfML5OJc-CM"
+        assert identity["published"] == "2026-04-18"
+        assert identity["published_source"] == "cli_flag"
+        # Sibling-meta-derived fields still win for non-flagged fields
+        assert identity["title"] == "Compound Engineering Camp"
+        assert identity["channel"] == "everyinc"
+        # Prefix stays stem-based (no G2 dedup available here)
+        assert identity["prefix"] == "Compound Engineering Camp"
+
+    def test_step_1_sibling_meta_without_flags_still_adopts_verbatim(self, tmp_path):
+        """Regression guard: no-flag path must stay unchanged after the override rule."""
+        channel_dir = tmp_path / "everyinc"
+        channel_dir.mkdir()
+        mp4 = channel_dir / "foo.mkv"
+        mp4.write_bytes(b"x")
+        (channel_dir / "foo.meta.json").write_text(
+            json.dumps(
+                {
+                    "video_id": "storedVidID",
+                    "video_url": "https://www.youtube.com/watch?v=storedVidID",
+                    "title": "Stored Title",
+                    "published": "2026-03-01",
+                    "channel": "everyinc",
+                }
+            )
+        )
+
+        identity = resolve_local_file_identity(mp4, channel_name="everyinc", channel_dir=channel_dir, args=_make_args())
+
+        assert identity["video_id"] == "storedVidID"
+        assert identity["url"] == "https://www.youtube.com/watch?v=storedVidID"
+        assert identity["title"] == "Stored Title"
+        assert identity["published"] == "2026-03-01"
+        assert identity["published_source"] == "sibling_meta"
+
     def test_step_2_g2_dedup_adopts_canonical_prefix(self, tmp_path):
         """When stem is a videoId matching a canonical scan meta, adopt that meta's prefix."""
         channel_dir = tmp_path / "everyinc"
@@ -706,6 +772,45 @@ class TestFileUriLeakGuard:
 # ---------------------------------------------------------------------------
 # cmd_scan concept enumeration pivot (G1)
 # ---------------------------------------------------------------------------
+
+
+class TestProcessMindmapExceptionPath:
+    """Regression guard: process_mindmap must record failure without NameError
+    when call_gemini raises (e.g. 403 PERMISSION_DENIED). Caught in the wild on
+    2026-04-17 when the resolved_channel_dir / resolved_prefix refactor left
+    the except block still referencing the old `channel_dir` / `prefix` names."""
+
+    def test_exception_path_writes_meta_and_returns_error(self, tmp_path, monkeypatch):
+        from video_intel import process_mindmap
+
+        types = MagicMock()
+        client = MagicMock()
+
+        def boom(*a, **kw):
+            raise RuntimeError("403 PERMISSION_DENIED")
+
+        monkeypatch.setattr("video_intel.call_gemini", boom)
+
+        output_dir = tmp_path / "video-intel"
+        video = {
+            "video_id": "failID12345",
+            "url": "https://www.youtube.com/watch?v=failID12345",
+            "title": "Fails Hard",
+            "published": "2026-04-17",
+        }
+
+        # Call WITHOUT prefix/channel_dir_override kwargs (the scan-path usage
+        # that originally triggered the NameError)
+        prefix, status = process_mindmap(client, types, video, "prompt", "gemini-test", output_dir, "everyinc")
+
+        assert status.startswith("error: 403 PERMISSION_DENIED"), f"Got: {status}"
+        assert prefix == "2026-04-17-fails-hard"  # video_file_prefix(video)
+
+        meta_path = output_dir / "everyinc" / "2026-04-17-fails-hard.meta.json"
+        assert meta_path.exists()
+        meta = json.loads(meta_path.read_text())
+        assert meta["last_error"] == "403 PERMISSION_DENIED"
+        assert meta["video_id"] == "failID12345"
 
 
 class TestScan403RecoveryRecipe:

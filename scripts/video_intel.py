@@ -496,12 +496,18 @@ def resolve_local_file_identity(
 ) -> dict:
     """Resolve identity for a local MP4 under the --file path.
 
-    Priority order (plan rev 4):
-      1. Sibling .meta.json for the same filename stem (adopts all fields verbatim).
-      2. G2 dedup: channel-wide video_id match against canonical scan metas. Adopts the
-         canonical meta's prefix (from the filename, not slug recomputation). Flags, if
-         present, override content fields but never the canonical prefix.
-      3. Explicit CLI flags (--video-id, --title, --date).
+    Priority order (plan rev 4, with the flag-override rule applied to both
+    persistent-state steps for consistency):
+      1. Sibling .meta.json for the same filename stem. Adopts fields verbatim
+         EXCEPT where an explicit CLI flag (--video-id, --title, --date) is
+         given; those flags override the sibling field on a per-field basis.
+         This is what makes ``--force --video-id <id>`` actually update a stale
+         sibling's empty ``video_id`` / ``video_url``.
+      2. G2 dedup: channel-wide video_id match against canonical scan metas.
+         Same flag-override rule as step 1 applies to content fields; prefix
+         stays canonical regardless of flags (F11 uniqueness).
+      3. Explicit CLI flags (--video-id, --title, --date) when no sibling / G2
+         match is available.
       4. Parent-folder inference fills channel (done by caller, passed in).
       5. Filename stem becomes title by default.
       6. Filename stem becomes video_id only if it matches ^[A-Za-z0-9_-]{11}$.
@@ -514,6 +520,10 @@ def resolve_local_file_identity(
     stem = input_path.stem
 
     # --- Step 1: sibling meta.json next to the input file ---
+    # Explicit CLI flags override sibling-meta fields on a per-field basis. Reason:
+    # a stale sibling from a prior run should NEVER silently shadow explicit user
+    # input (`--video-id`, `--title`, `--date`). Only unflagged fields are adopted
+    # verbatim. This mirrors the flag-override rule for step 2 (G2 canonical match).
     sibling_meta = input_path.with_suffix(".meta.json")
     if sibling_meta.exists():
         try:
@@ -521,13 +531,31 @@ def resolve_local_file_identity(
         except json.JSONDecodeError:
             meta = {}
         if meta:
+            flag_video_id = getattr(args, "video_id", None)
+            flag_title = getattr(args, "title", None)
+            flag_date = getattr(args, "date", None)
+
+            final_video_id = flag_video_id or meta.get("video_id", "")
+            final_title = flag_title or meta.get("title", stem)
+            if flag_date:
+                final_published = flag_date
+                final_source: str = "cli_flag"
+            else:
+                final_published = meta.get("published", "")
+                final_source = "sibling_meta"
+            # Derive URL from whichever video_id won (flag or stored)
+            if flag_video_id:
+                final_url = f"https://www.youtube.com/watch?v={flag_video_id}"
+            else:
+                final_url = meta.get("video_url", "")
+
             return {
                 "channel": meta.get("channel") or channel_name,
-                "video_id": meta.get("video_id", ""),
-                "url": meta.get("video_url", ""),
-                "title": meta.get("title", stem),
-                "published": meta.get("published", ""),
-                "published_source": "sibling_meta",
+                "video_id": final_video_id,
+                "url": final_url,
+                "title": final_title,
+                "published": final_published,
+                "published_source": final_source,
                 "prefix": stem,
                 "channel_dir": input_path.parent,
                 "meta_path": sibling_meta,
@@ -809,11 +837,11 @@ def process_mindmap(
             meta_fields["prompt"] = prompt_name
         update_meta(meta_path, meta_fields, "scan")
 
-        return prefix, "done"
+        return resolved_prefix, "done"
 
     except Exception as e:
         # Record failure in meta.json (also merge-safe)
-        channel_dir.mkdir(parents=True, exist_ok=True)
+        resolved_channel_dir.mkdir(parents=True, exist_ok=True)
         meta: dict = {}
         if meta_path.exists():
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -830,7 +858,7 @@ def process_mindmap(
             }
         )
         meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-        return prefix, f"error: {e}"
+        return resolved_prefix, f"error: {e}"
 
 
 # ---------------------------------------------------------------------------
