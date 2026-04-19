@@ -107,6 +107,8 @@ All commands support `--force` to regenerate existing output files. Gemini-calli
 
 **Config:** `config.yaml` — channels, output directory, model, parallelism, per-channel prompt/since overrides.
 
+- `vector_db_dir` (optional): path for the LanceDB vector index. Defaults to `output_dir / .lancedb`. Must be on a real local filesystem — cloud-synced mounts (Google Drive File Stream, OneDrive, Dropbox) do not support the atomic file operations LanceDB needs to commit its MVCC manifests. The `index` command runs a pre-flight probe (`probe_atomic_writes`) that does a throwaway LanceDB connect + create + drop round-trip against the target path; if that round-trip fails, the command aborts with an actionable diagnostic *before* any Voyage embedding call, saving the user from paying for embeddings on a write that cannot succeed. The vector index is a derived artifact (rebuildable from transcripts via `index`), so it is safe to live in a local cache directory (e.g., `~/.cache/video-intel/lancedb`) outside a cloud-synced `output_dir`. See [ADR-0016](docs/adr/ADR-0016-vector-db-path-config.md).
+
 **Idempotency:** `is_processed()` checks for existing output files by `{date}-{slug}.{mode}.md` naming. Re-running scan safely skips already-processed videos. All commands support `--force` to regenerate.
 
 **Output goes to** `~/video-intel/{channel_name}/` (configurable via `output_dir`), not into this repo. Master `taxonomy.json` lives at the output root.

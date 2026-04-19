@@ -17,8 +17,10 @@ import logging
 import os
 import random
 import re
+import shutil
 import sys
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime, timedelta
 from html import unescape
@@ -65,6 +67,59 @@ def resolve_output_dir(config):
         output_dir = SKILL_DIR / output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
+
+
+def resolve_vector_db_dir(config: dict[str, Any], output_dir: Path) -> Path:
+    """Resolve the LanceDB vector index location.
+
+    Precedence: config.yaml `vector_db_dir` (tilde-expanded) > output_dir / LANCEDB_DIR.
+    See ADR-0016 for why the index may need to live outside a cloud-synced output_dir.
+    """
+    override = config.get("vector_db_dir")
+    if override:
+        return Path(override).expanduser()
+    return output_dir / LANCEDB_DIR
+
+
+def probe_atomic_writes(path: Path) -> tuple[bool, str | None]:
+    """Probe whether LanceDB can commit at `path` by doing a tiny round-trip.
+
+    Returns (True, None) on success, (False, reason) on failure. Best-effort
+    cleans up the probe subdir on every exit path.
+
+    Why integration probe, not file-level probe: empirically (2026-04-18 smoke
+    test, two iterations) Google Drive File Stream permits Python-level
+    `os.replace` - including rename-over-existing - but still fails LanceDB's
+    Rust-side commit with `ERROR_INVALID_FUNCTION (os error 1)`. The failing
+    call is inside `lance-table/src/io/commit.rs` and uses object_store's
+    LocalFileSystem copy/rename path, which is a different Windows syscall
+    family than Python's. Mechanism probes that mimic the syscall all produce
+    false negatives on GDFS. The only reliable oracle is LanceDB itself, so
+    the probe creates a throwaway 1-row table in a sibling subdir and catches
+    whatever LanceDB raises. See ADR-0016.
+
+    Cost: ~100-300ms per call. Acceptable tax for catching the failure before
+    paying Voyage embedding tokens.
+    """
+    lancedb = require_lancedb()
+    probe_dir = path / f"_probe_{uuid.uuid4().hex[:12]}"
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        db = lancedb.connect(str(probe_dir))
+        db.create_table("probe", data=[{"v": 1}], mode="overwrite")
+        db.drop_table("probe")
+        return True, None
+    except (OSError, RuntimeError) as e:
+        reason = (
+            f"LanceDB commit failed at probe: {e}. This usually means the path is "
+            f"on a cloud-synced filesystem (Google Drive File Stream, OneDrive, "
+            f"Dropbox) that does not support the atomic file operations LanceDB's "
+            f"MVCC commit path requires. Set vector_db_dir in config.yaml to a "
+            f"local path."
+        )
+        return False, reason
+    finally:
+        shutil.rmtree(probe_dir, ignore_errors=True)
 
 
 def resolve_model(args: argparse.Namespace, config: dict[str, Any]) -> str:
@@ -2297,7 +2352,13 @@ def _embed_batch(vo_client, texts: list[str], model: str, input_type: str) -> li
     return all_embeddings
 
 
-def build_search_index(output_dir: Path, *, channel_filter: str | None = None, force: bool = False) -> int:
+def build_search_index(
+    output_dir: Path,
+    *,
+    channel_filter: str | None = None,
+    force: bool = False,
+    config: dict[str, Any] | None = None,
+) -> int:
     """Build or rebuild the LanceDB vector index from transcripts + concepts.
 
     Returns the number of chunks indexed.
@@ -2310,9 +2371,15 @@ def build_search_index(output_dir: Path, *, channel_filter: str | None = None, f
         log.error("VOYAGE_API_KEY not set. Sign up free at https://dash.voyageai.com/")
         sys.exit(1)
 
+    db_path = resolve_vector_db_dir(config or {}, output_dir)
+    ok, reason = probe_atomic_writes(db_path)
+    if not ok:
+        log.error("Cannot use vector_db_dir=%s", db_path)
+        log.error("%s", reason)
+        sys.exit(1)
+
     vo = voyageai.Client()
-    db_path = str(output_dir / LANCEDB_DIR)
-    db = lancedb.connect(db_path)
+    db = lancedb.connect(str(db_path))
 
     # Drop existing table if force rebuild
     if force and LANCEDB_TABLE in db.list_tables().tables:
@@ -2384,6 +2451,7 @@ def hybrid_search(
     *,
     channel_filter: str | None = None,
     limit: int = 10,
+    config: dict[str, Any] | None = None,
 ) -> list[dict]:
     """Search the LanceDB index with hybrid BM25 + vector + RRF fusion.
 
@@ -2397,8 +2465,8 @@ def hybrid_search(
         log.error("VOYAGE_API_KEY not set. Sign up free at https://dash.voyageai.com/")
         sys.exit(1)
 
-    db_path = str(output_dir / LANCEDB_DIR)
-    db = lancedb.connect(db_path)
+    db_path = resolve_vector_db_dir(config or {}, output_dir)
+    db = lancedb.connect(str(db_path))
 
     if LANCEDB_TABLE not in db.list_tables().tables:
         log.error("Search index not found. Run: video_intel.py index")
@@ -2463,7 +2531,7 @@ def cmd_index(args, config):
     """Build or rebuild the vector search index."""
     output_dir = resolve_output_dir(config)
     t0 = time.time()
-    count = build_search_index(output_dir, channel_filter=args.channel, force=args.force)
+    count = build_search_index(output_dir, channel_filter=args.channel, force=args.force, config=config)
     elapsed = time.time() - t0
 
     if count == 0:
@@ -2471,7 +2539,7 @@ def cmd_index(args, config):
     else:
         mins, secs = divmod(int(elapsed), 60)
         print(f"Indexed {count} chunks in {mins}m {secs:02d}s.")
-        print(f"  Index: {output_dir / LANCEDB_DIR}")
+        print(f"  Index: {resolve_vector_db_dir(config, output_dir)}")
         print("  Run 'search --vector \"query\"' to search.")
 
 
@@ -2584,7 +2652,7 @@ def cmd_search(args, config):
 
     # Hybrid search mode (BM25 + vector + RRF)
     if getattr(args, "vector", False):
-        hits = hybrid_search(output_dir, args.query, channel_filter=args.channel, limit=args.limit)
+        hits = hybrid_search(output_dir, args.query, channel_filter=args.channel, limit=args.limit, config=config)
         if not hits:
             print(f'No results for "{args.query}". Is the index built? Run: video_intel.py index')
             return

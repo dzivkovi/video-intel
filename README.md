@@ -190,6 +190,7 @@ directly.
 
 ```yaml
 output_dir: ~/video-intel
+vector_db_dir: ~/.cache/video-intel/lancedb  # optional; see note below
 default_since: 10d
 default_prompt: mindmap-light
 model: gemini-3-flash-preview
@@ -206,6 +207,7 @@ channels:
 | Field | Default | Description |
 | ----- | ------- | ----------- |
 | output_dir | ~/video-intel | Where output files are saved |
+| vector_db_dir | output_dir/.lancedb | LanceDB index location. Set this to a local path if `output_dir` is on a cloud-synced mount (Google Drive File Stream, OneDrive, Dropbox) - those filesystems do not support the atomic rename LanceDB needs. The `index` command runs a pre-flight probe and aborts with an actionable diagnostic before spending Voyage tokens if the path is incompatible. See [ADR-0016](docs/adr/ADR-0016-vector-db-path-config.md). |
 | default_since | 10d | Default lookback window |
 | default_prompt | mindmap-light | Default prompt for mind maps |
 | model | gemini-3-flash-preview | Gemini model (overridable via `--model` CLI flag) |
