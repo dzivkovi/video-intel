@@ -169,6 +169,11 @@ to your query, ranked by combined score.
   pointing to the exact moment the evidence was found — no scrubbing, no watching
   the full video
 
+**Date-window queries:** For "last N days" questions, add `--since 30d` (or any
+`Nd` / `YYYY-MM-DD` value). The filter is pushed into LanceDB *before* ranking,
+so every recent video is considered — recency doesn't get crowded out by older,
+higher-relevance hits. Use this by default for `last N days of [creator]` questions.
+
 **Fallback:** If vector search is unavailable (missing `VOYAGE_API_KEY` or index
 not built), the skill falls back to concept search (fast, no API calls). Results
 are video matches only; open the transcript file afterward to read detail.

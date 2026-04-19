@@ -2457,12 +2457,15 @@ def hybrid_search(
     query: str,
     *,
     channel_filter: str | None = None,
+    since_iso: str | None = None,
     limit: int = 10,
     config: dict[str, Any] | None = None,
 ) -> list[dict]:
     """Search the LanceDB index with hybrid BM25 + vector + RRF fusion.
 
-    Returns ranked chunks deduplicated by video.
+    Returns ranked chunks deduplicated by video. `since_iso` (YYYY-MM-DD) filters
+    chunks whose `published` column is >= the given date, applied pre-rank so
+    recency scope does not get crowded out by older, higher-relevance hits.
     """
     lancedb = require_lancedb()
     voyageai = require_voyageai()
@@ -2495,8 +2498,13 @@ def hybrid_search(
         .text(query)
         .limit(fetch_count)
     )
+    where_clauses = []
     if channel_filter:
-        search_builder = search_builder.where(f"channel = '{channel_filter}'")
+        where_clauses.append(f"channel = '{channel_filter}'")
+    if since_iso:
+        where_clauses.append(f"published >= '{since_iso}'")
+    if where_clauses:
+        search_builder = search_builder.where(" AND ".join(where_clauses))
 
     results = search_builder.to_pandas()
 
@@ -2552,8 +2560,20 @@ def cmd_index(args, config):
         print("  Run 'search --vector \"query\"' to search.")
 
 
-def search_corpus(output_dir: Path, query: str, *, channel_filter: str | None = None, limit: int = 20) -> dict:
-    """Search taxonomy + concepts for matching videos. Returns structured results."""
+def search_corpus(
+    output_dir: Path,
+    query: str,
+    *,
+    channel_filter: str | None = None,
+    since_iso: str | None = None,
+    limit: int = 20,
+) -> dict:
+    """Search taxonomy + concepts for matching videos. Returns structured results.
+
+    `since_iso` (YYYY-MM-DD) post-filters matching videos to those with
+    `published >= since_iso`. Concept data lives in JSON files, so this is
+    a post-rank filter (unlike hybrid_search, which pushes the filter to LanceDB).
+    """
     taxonomy = load_taxonomy(output_dir)
     query_lower = query.lower()
     query_terms = query_lower.split()
@@ -2641,6 +2661,10 @@ def search_corpus(output_dir: Path, query: str, *, channel_filter: str | None = 
                 }
             )
 
+    # Optional date-window filter (applied post-rank; concepts live in JSON, not a query store)
+    if since_iso:
+        matching_videos = [v for v in matching_videos if v.get("published", "") >= since_iso]
+
     # Sort by number of matched concepts (most relevant first), then date
     matching_videos.sort(key=lambda v: (-len(v["matched_concepts"]), v.get("published", "")))
 
@@ -2659,9 +2683,19 @@ def cmd_search(args, config):
     if args.limit is None:
         args.limit = 10 if getattr(args, "vector", False) else 20
 
+    since_raw = getattr(args, "since", None)
+    since_iso = parse_since(since_raw).date().isoformat() if since_raw else None
+
     # Hybrid search mode (BM25 + vector + RRF)
     if getattr(args, "vector", False):
-        hits = hybrid_search(output_dir, args.query, channel_filter=args.channel, limit=args.limit, config=config)
+        hits = hybrid_search(
+            output_dir,
+            args.query,
+            channel_filter=args.channel,
+            since_iso=since_iso,
+            limit=args.limit,
+            config=config,
+        )
         if not hits:
             print(f'No results for "{args.query}". Is the index built? Run: video_intel.py index')
             return
@@ -2703,7 +2737,13 @@ def cmd_search(args, config):
         return
 
     # Concept search mode (default)
-    results = search_corpus(output_dir, args.query, channel_filter=args.channel, limit=args.limit)
+    results = search_corpus(
+        output_dir,
+        args.query,
+        channel_filter=args.channel,
+        since_iso=since_iso,
+        limit=args.limit,
+    )
 
     if not results["concepts"]:
         print(f'No concepts matching "{args.query}".')
@@ -2910,6 +2950,10 @@ Examples:
         default=0.0,
         dest="min_relevance",
         help="Minimum relevance score for hybrid results (default: 0.0, RRF scale)",
+    )
+    search_parser.add_argument(
+        "--since",
+        help="Filter to videos published within a window. Accepts 'Nd' (e.g. '30d') or 'YYYY-MM-DD'.",
     )
 
     # index command
