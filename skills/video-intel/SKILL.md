@@ -151,6 +151,32 @@ python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" --model gemini-2.5-pro
 
 Precedence: `--model` flag > `config.yaml` `model` field > `gemini-3-flash-preview`.
 
+## Natural-Language Content Queries
+
+When you ask Claude Code about topics in your video library, the skill routes
+your question through grounded search automatically — you don't need to know
+whether to use vector, hybrid, or concept search internally. Here's what happens:
+
+**Default behavior:** Your question is routed to **hybrid search** (BM25 keyword +
+vector semantic embedding via Voyage AI + rank-reciprocal fusion). This finds
+passages in transcripts that are both keyword-relevant and semantically similar
+to your query, ranked by combined score.
+
+**Output shape:** Results come back as a **narrative summary** with:
+- A thematic headline (the cross-cutting thread)
+- One paragraph per video (what was said and in what context)
+- **Jump links with timestamps** (e.g. `[2:45](https://youtube.com/watch?v=xxx&t=165)`)
+  pointing to the exact moment the evidence was found — no scrubbing, no watching
+  the full video
+
+**Fallback:** If vector search is unavailable (missing `VOYAGE_API_KEY` or index
+not built), the skill falls back to concept search (fast, no API calls). Results
+are video matches only; open the transcript file afterward to read detail.
+
+**See also:** [ADR-0013](../../../docs/adr/ADR-0013-hybrid-search-rrf.md) (hybrid
+search design), [ADR-0016](../../../docs/adr/ADR-0016-vector-db-path-config.md)
+(vector index configuration).
+
 ## How to Use
 
 ### Find videos about a topic (start here)
