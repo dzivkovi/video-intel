@@ -9,7 +9,8 @@ description: >
   diagrams, code) captured; add/remove monitored channels; change scan
   settings. Trigger phrases: "what videos cover [topic]", "find videos
   about [concept]", "which creators talk about [subject]", "scan channel",
-  "what's new from [creator]", "watch this for me", "transcribe this
+  "what's new from [creator]", "last N days of [creator]", "recent
+  takeaways from [creator]", "watch this for me", "transcribe this
   video", "transcribe [creator]'s backlog", "videos I'm missing from
   [creator]", "catch up on [creator]", "fully scan [creator]", "backfill
   [creator]", "add [channel] to my watchlist", "what should I watch",
@@ -95,6 +96,7 @@ table is the canonical mapping — read it before picking a command.
 |---|---|---|
 | "find videos about X", "what covers Y" | `search "X"` | Discovery — fast, no API calls |
 | "what did they say about X", "evidence for Y" | `search "X" --vector` | Hybrid search; returns transcript passages |
+| "recent tips / takeaways from [creator]", "last N days of [creator]" | `search "X" --vector --channel Y --since Nd` | Query existing index over a date window; no Gemini calls |
 | "transcribe this video" + URL | `transcript --url URL` | Single video |
 | "scan", "what's new", "check for new videos" | `scan` | All channels, configured `since` |
 | "what's new from [creator]" | `scan --channel X` | Single channel, configured `since` |
