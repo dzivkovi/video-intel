@@ -1,7 +1,7 @@
 # Video Intel configuration
 # Edit this file to add/remove channels and adjust settings.
 
-output_dir: ./video-intel
+output_dir: G:/My Drive/video-intel
 
 # vector_db_dir: where the LanceDB vector index lives. Defaults to output_dir/.lancedb.
 # IMPORTANT: must be on a real local filesystem. Cloud-synced drives (Google Drive File
@@ -9,7 +9,7 @@ output_dir: ./video-intel
 # (os error 1) on Windows. If output_dir is on one of those, uncomment the line below
 # and point it at a local cache directory. The index is derived (rebuildable via the
 # `index` command), so it is safe to live outside output_dir. See ADR-0016.
-# vector_db_dir: ~/.cache/video-intel/lancedb
+vector_db_dir: C:/Users/danie/video-intel-cache/lancedb
 
 default_since: 10d
 default_prompt: mindmap-knowledge
