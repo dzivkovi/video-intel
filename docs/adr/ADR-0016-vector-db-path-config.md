@@ -143,16 +143,32 @@ LanceDB's own errors surface.
 
 - **One more config option** to document in `CLAUDE.md`, `README.md`, and
   `config.yaml.example` (when it exists).
-- **~100-300ms startup cost** on every `index` invocation. Probe does a
-  full LanceDB connect + create + drop round-trip. This is the correctness
-  tax for the integration-oracle approach; see "Why an integration probe"
-  above for why a cheaper mechanism probe was tried and rejected.
+- **Startup cost measured empirically on NTFS (2026-04-18, 5 runs in
+  fresh Python processes):** first call ~2.0s, warm calls ~20-30ms.
+  The first call is dominated by LanceDB's Rust init (Arrow imports,
+  tokio runtime spin-up). Because `build_search_index` calls
+  `lancedb.connect` and `create_table` regardless, this init tax would
+  be paid anyway; the probe only shifts it ~1.5s earlier. Incremental
+  cost of the probe itself (create_table + drop_table on a warm
+  process) is ~20-30ms. This is a trivial tax on a command that
+  typically runs for 1-2 minutes embedding thousands of chunks.
+- **Cleanup is best-effort, not guaranteed.** When the probe fails on
+  a broken filesystem, `shutil.rmtree(probe_dir, ignore_errors=True)`
+  may leave a partial `_probe_<hex>/` subdirectory if the OS refuses
+  to delete files LanceDB just wrote. The probe logs a debug message
+  when cleanup did not succeed, but does not raise. Fallout is
+  cosmetic (one more stranded dir on a path already known to be
+  broken) and the user is about to fix the underlying problem by
+  setting `vector_db_dir` anyway; automating more aggressive cleanup
+  is not worth the blast-radius risk.
 - **Probe is a near-perfect LanceDB oracle but still fallible**: false
   negatives (probe fails but LanceDB would succeed) remain theoretically
   possible on filesystems that behave differently for 1-row tables than
-  for full-sized ones. No such case has been observed. No opt-out flag
-  is added yet; if one appears, the user can point `vector_db_dir`
-  elsewhere.
+  for full-sized ones. No such case has been observed. The probe catches
+  every `Exception` subclass as a precaution against future LanceDB
+  versions introducing new exception types; a blanket catch is the right
+  call for a safety-net probe. No opt-out flag is added yet; if a false
+  negative appears, the user can point `vector_db_dir` elsewhere.
 
 ## Alternatives Considered
 

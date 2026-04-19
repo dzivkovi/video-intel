@@ -98,8 +98,11 @@ def probe_atomic_writes(path: Path) -> tuple[bool, str | None]:
     the probe creates a throwaway 1-row table in a sibling subdir and catches
     whatever LanceDB raises. See ADR-0016.
 
-    Cost: ~100-300ms per call. Acceptable tax for catching the failure before
-    paying Voyage embedding tokens.
+    Cost (measured on NTFS, 5 runs): ~2s on first call in a fresh process
+    (dominated by LanceDB's Rust init, which `build_search_index` would pay
+    anyway on its own `connect`+`create_table`), ~20-30ms on warm calls.
+    Trivial tax for catching the failure before paying Voyage embedding
+    tokens.
     """
     lancedb = require_lancedb()
     probe_dir = path / f"_probe_{uuid.uuid4().hex[:12]}"
@@ -109,7 +112,9 @@ def probe_atomic_writes(path: Path) -> tuple[bool, str | None]:
         db.create_table("probe", data=[{"v": 1}], mode="overwrite")
         db.drop_table("probe")
         return True, None
-    except (OSError, RuntimeError) as e:
+    except Exception as e:
+        # Blanket catch is deliberate - see docstring. Probe is a safety net; any
+        # failure here means the path is unusable, regardless of LanceDB's exception taxonomy.
         reason = (
             f"LanceDB commit failed at probe: {e}. This usually means the path is "
             f"on a cloud-synced filesystem (Google Drive File Stream, OneDrive, "
@@ -120,6 +125,8 @@ def probe_atomic_writes(path: Path) -> tuple[bool, str | None]:
         return False, reason
     finally:
         shutil.rmtree(probe_dir, ignore_errors=True)
+        if probe_dir.exists():
+            log.debug("probe cleanup could not remove %s; residual files may remain", probe_dir)
 
 
 def resolve_model(args: argparse.Namespace, config: dict[str, Any]) -> str:
@@ -2466,6 +2473,8 @@ def hybrid_search(
         sys.exit(1)
 
     db_path = resolve_vector_db_dir(config or {}, output_dir)
+    # No probe here: search is read-only and does not exercise LanceDB's commit path.
+    # The probe lives in build_search_index where it prevents wasted Voyage embeddings.
     db = lancedb.connect(str(db_path))
 
     if LANCEDB_TABLE not in db.list_tables().tables:
