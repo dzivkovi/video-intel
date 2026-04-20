@@ -44,6 +44,11 @@ Files are named: `ADR-NNNN-title-with-dashes.md`
 | [ADR-0010](ADR-0010-llm-concept-normalization.md) | LLM-powered concept normalization (thesaurus layer) | accepted | 2026-04-01 |
 | [ADR-0011](ADR-0011-structured-logging.md) | Structured logging via Python logging module | accepted | 2026-04-02 |
 | [ADR-0012](ADR-0012-vector-search-lancedb-voyage.md) | Vector search via LanceDB + Voyage AI embeddings | accepted | 2026-04-02 |
+| [ADR-0013](ADR-0013-hybrid-search-rrf-fusion.md) | Hybrid search via BM25 + vector + Reciprocal Rank Fusion | accepted | 2026-04-03 |
+| [ADR-0014](ADR-0014-standalone-bcs-translation-workflow.md) | Standalone BCS translation workflow for audio-first long-form video | accepted | 2026-04-11 |
+| [ADR-0015](ADR-0015-permissive-safety-filters-for-faithful-reporting.md) | Permissive safety filters for faithful reporting pipelines | accepted | 2026-04-11 |
+| [ADR-0016](ADR-0016-vector-db-path-config.md) | Decouple LanceDB vector index path from output_dir | accepted | 2026-04-18 |
+| [ADR-0017](ADR-0017-kb-layer-strategy.md) | Staged KB-layer strategy, gated by the 25-query eval | accepted | 2026-04-19 |
 
 ## Process
 
@@ -58,6 +63,8 @@ Files are named: `ADR-NNNN-title-with-dashes.md`
 - **`CLAUDE.md`**: Operational context for Claude Code (commands, packaging, release)
 - **`ARCHITECTURE.md`**: System overview and vision (WHERE it's heading)
 - **`docs/adr/`**: Decisions (WHY we chose this approach)
+- **[`docs/testing.md`](../testing.md)**: Testing discipline and the retrieval-eval harness (HOW we measure that we're still on track)
+- **[`docs/search-internals.md`](../search-internals.md)**: Hybrid-search mechanics — the pipeline the eval measures
 
 ## Working with AI Assistants
 
