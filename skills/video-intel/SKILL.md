@@ -374,6 +374,22 @@ Prompt templates live at the plugin root, `${CLAUDE_SKILL_DIR}/../../prompts/`:
 
 Each prompt is self-contained. Users can modify or add their own.
 
+## Evaluate Search Quality
+
+The repo ships a 25-query grounded golden dataset at `tests/evals/golden_dataset.yaml` that measures hybrid search against known-correct transcript passages. Run this before/after any change that touches retrieval (search ranking, chunking, KB layer, concept normalization) and record the before/after score in the PR description.
+
+```bash
+# Full run — ~1 min wall-clock, ~$0.01-0.05 in Voyage tokens
+pytest tests/evals/ -v -s
+
+# Smoke mode (Q01 only) — ~3 seconds, for iterating on the harness itself
+VIDEO_INTEL_EVAL_SMOKE=1 pytest tests/evals/ -v -s
+```
+
+The `-s` flag matters — the per-metric diagnostics are what tell you *why* a query failed, not just that it did. See `tests/evals/README.md` for the quick-start and `docs/testing.md` / `docs/adr/ADR-0017-kb-layer-strategy.md` for the baseline (1/25 as of 2026-04-19) and the staged-KB plan this eval gates.
+
+The golden dataset is a frozen contract per ADR-0017 — changing queries needs ADR-grade justification, not a silent edit.
+
 ## Output Structure
 
 ```

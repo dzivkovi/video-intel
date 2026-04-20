@@ -28,10 +28,21 @@ VIDEO_INTEL_EVAL_SMOKE=1 pytest tests/evals/ -v -s
 The `-s` flag matters — the harness prints per-metric diagnostics that
 pytest otherwise hides.
 
+## Privacy: DeepEval telemetry is opted out
+
+`tests/evals/__init__.py` sets `DEEPEVAL_TELEMETRY_OPT_OUT=YES` before
+any submodule triggers the `deepeval` import. Without that, DeepEval's
+telemetry layer would ship each `metric.measure()` call's metric name
+plus the developer's public IP and an anonymous unique ID to PostHog
+and a Sentry heartbeat — on the order of 100 outbound events per
+`pytest tests/evals/` run. The opt-out is load-bearing; do not remove
+it. `.gitignore` also excludes the `.deepeval*` caches that DeepEval
+writes to the repo root.
+
 ## Files
 
 | File | Role |
-|------|------|
+| ---- | ---- |
 | `golden_dataset.yaml` | 25 grounded queries, 90 timestamped expected hits across 7 channels. **Frozen contract** — edits require ADR-grade justification per ADR-0017. |
 | `metrics.py` | Four DeepEval `BaseMetric` subclasses: `RecallAtKMetric`, `MRRMetric` (non-gating), `ChannelCoverageMetric`, `TimestampPrecisionMetric`. All deterministic, no LLM judge. |
 | `_helpers.py` | `build_test_case()` — converts a gold entry + hybrid_search hits into a DeepEval `LLMTestCase`. Kept separate from `conftest.py` because pytest can't import conftest cross-package. |

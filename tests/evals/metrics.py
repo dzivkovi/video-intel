@@ -153,8 +153,7 @@ class ChannelCoverageMetric(BaseMetric):
         # success needs BOTH: threshold-fraction of expected channels AND the absolute min_channels floor
         self.success = self.score >= self.threshold and len(overlap) >= self.min_channels
         self.reason = (
-            f"{len(overlap)}/{len(expected_channels)} expected channels found "
-            f"(min required: {self.min_channels})"
+            f"{len(overlap)}/{len(expected_channels)} expected channels found (min required: {self.min_channels})"
         )
         return self.score
 
@@ -211,10 +210,7 @@ class TimestampPrecisionMetric(BaseMetric):
 
         self.score = satisfied / len(expected_hits)
         self.success = self.score >= self.threshold
-        self.reason = (
-            f"{satisfied}/{len(expected_hits)} expected hits had a retrieved chunk "
-            f"within ±{self.tolerance}s"
-        )
+        self.reason = f"{satisfied}/{len(expected_hits)} expected hits had a retrieved chunk within ±{self.tolerance}s"
         return self.score
 
     async def a_measure(self, test_case: LLMTestCase) -> float:

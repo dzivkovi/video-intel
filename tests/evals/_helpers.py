@@ -18,8 +18,7 @@ def build_test_case(gold: dict[str, Any], hits: list[dict]) -> LLMTestCase:
     data that doesn't fit DeepEval's LLM-output-centric model.
     """
     actual_output_lines = [
-        f"- [{h['channel']}] {h.get('title', '')} @ {h.get('timestamp', '?')} "
-        f"(score={h['relevance']:.3f})"
+        f"- [{h['channel']}] {h.get('title', '')} @ {h.get('timestamp', '?')} (score={h['relevance']:.3f})"
         for h in hits
     ]
 

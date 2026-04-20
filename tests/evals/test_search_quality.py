@@ -17,11 +17,10 @@ from typing import Any
 import pytest
 import yaml
 
-import sys
-from pathlib import Path as _Path
-sys.path.insert(0, str(_Path(__file__).parent))
-from _helpers import build_test_case  # noqa: E402
-from metrics import (  # noqa: E402
+import video_intel as vi  # scripts/ is on sys.path via pyproject.toml pythonpath
+
+from ._helpers import build_test_case
+from .metrics import (
     ChannelCoverageMetric,
     MRRMetric,
     RecallAtKMetric,
@@ -35,12 +34,6 @@ _all_queries: list[dict[str, Any]] = _data["queries"]
 
 if os.environ.get("VIDEO_INTEL_EVAL_SMOKE"):
     _all_queries = _all_queries[:1]
-
-# --- video_intel wiring ------------------------------------------------------
-import sys
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
-import video_intel as vi  # noqa: E402
 
 
 def _resolve_output_dir() -> tuple[Path, dict]:
@@ -105,6 +98,4 @@ def test_retrieval_quality(gold: dict[str, Any], search_context: tuple[Path, dic
         print(f"  {flag}  {name:<35} score={score:.3f}  {reason}")
 
     if failures:
-        pytest.fail(
-            f"{gold['id']}: {len(failures)} gating metric(s) failed:\n" + "\n".join(failures)
-        )
+        pytest.fail(f"{gold['id']}: {len(failures)} gating metric(s) failed:\n" + "\n".join(failures))
