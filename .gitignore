@@ -21,6 +21,9 @@ venv/
 .deepeval*
 temp_test_run_data.json
 
+# Per-run eval JSONL diagnostics — regenerated on every `pytest tests/evals/` run
+tests/evals/results/
+
 examples/*.part-*.txt
 examples/*.txt.tmp
 

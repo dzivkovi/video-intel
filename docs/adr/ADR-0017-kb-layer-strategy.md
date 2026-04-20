@@ -198,8 +198,8 @@ re-litigating a decision the data already made.
 | Date | Intervention | Score | Notes |
 | ---- | ------------ | ----- | ----- |
 | 2026-04-19 | Hybrid search (ADR-0012 + ADR-0013) | 1 / 25 | Q15 only. Vocabulary mismatch is primary failure. |
-| *Stage 1 TBD* | Query expansion via taxonomy aliases | — | Record here after `/workflows:work` completes. |
-| *Stage 2 TBD* | LightRAG layer | — | Only if Stage 1 insufficient. |
+| 2026-04-20 | Stage 1: Query expansion via taxonomy aliases | 1 / 25 | Q15 only. Headline unchanged, but **shape** shifted: 10/25 queries expanded at all (15 had no concept matches → taxonomy coverage is the real bottleneck); of the 10, Q04/Q06/Q13 dropped one failing metric each while Q03 gained one. Total failing metrics: 59 → 57. Sibling quality is noisy (verbose LLM-generated concept-extraction labels, e.g. *"Automated data fetching from external MCP servers"* as an alias of MCP) and hits the 12-cap on every matched query. **Per decision rule: `< 10 / 25` → proceed to Stage 2 (LightRAG).** JSONL diagnostics: `tests/evals/results/2026-04-20-{baseline,stage1}-expansion.jsonl`. |
+| *Stage 2 TBD* | LightRAG layer | — | Justified by Stage 1 result. Build own knowledge graph instead of relying on noisy concept-extraction output. |
 | *Stage 3 TBD* | LLM Wiki synthesis | — | Parallel-safe with Stage 2. |
 
 ## Alternatives Considered

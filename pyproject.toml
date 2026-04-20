@@ -50,3 +50,10 @@ known-first-party = ["video_intel", "gemini_common"]
 testpaths = ["tests"]
 pythonpath = ["scripts"]
 addopts = "-v"
+# Surface INFO-level log records during eval runs (-s) so the
+# query_expansion log lines from hybrid_search() are visible to humans
+# skimming pytest output. The structural JSONL file written by the eval
+# harness is the authoritative record — these are convenience logs only.
+log_cli = true
+log_cli_level = "INFO"
+log_cli_format = "%(levelname)-7s %(message)s"
