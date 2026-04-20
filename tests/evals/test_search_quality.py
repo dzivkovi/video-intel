@@ -86,8 +86,9 @@ def test_retrieval_quality(gold: dict[str, Any], search_context: tuple[Path, dic
     for metric in metrics:
         metric.measure(test_case)
         scores[metric.__name__] = (metric.score, metric.success, metric.reason)
-        if not metric.success and metric.__name__ != "MRR":
-            # MRR is informational (non-gating); all others are gates
+        if not metric.success and metric.gating:
+            # Non-gating metrics (e.g. MRR) are informational only — their
+            # score prints in the diagnostic report but never fails the test.
             failures.append(f"{metric.__name__}: {metric.reason} (score={metric.score:.3f})")
 
     # Always print the full per-metric report for visibility
