@@ -10,7 +10,7 @@ Last verified: 2026-04-19
 
 | Suite | Directory | What it guarantees | How to run |
 |-------|-----------|--------------------|------------|
-| Unit / integration | [`tests/`](../tests/) | Code correctness — parsing, idempotency, error handling, CLI flags. Runs in seconds. | `pytest tests/ -v` (excluding `tests/evals/`) |
+| Unit / integration | [`tests/`](../tests/) | Code correctness — parsing, idempotency, error handling, CLI flags. Runs in seconds. | `pytest tests/ --ignore=tests/evals -v` |
 | Retrieval eval | [`tests/evals/`](../tests/evals/) | Retrieval **quality** against 25 frozen grounded queries. Runs Voyage API, ~1 min and a few cents. | `pytest tests/evals/ -v -s` |
 | Search CLI smoke grid | [`evals/search-eval-queries.md`](../evals/search-eval-queries.md) | Human-run sanity grid for CLI features (`--preview`, `--min-similarity`, `--limit`, dedup). Prose benchmark, not pytest. | Read the file, run queries manually, score 0/1/2. |
 

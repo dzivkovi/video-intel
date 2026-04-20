@@ -63,6 +63,8 @@ Files are named: `ADR-NNNN-title-with-dashes.md`
 - **`CLAUDE.md`**: Operational context for Claude Code (commands, packaging, release)
 - **`ARCHITECTURE.md`**: System overview and vision (WHERE it's heading)
 - **`docs/adr/`**: Decisions (WHY we chose this approach)
+- **[`docs/testing.md`](../testing.md)**: Testing discipline and the retrieval-eval harness (HOW we measure that we're still on track)
+- **[`docs/search-internals.md`](../search-internals.md)**: Hybrid-search mechanics — the pipeline the eval measures
 
 ## Working with AI Assistants
 
