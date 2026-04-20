@@ -62,6 +62,51 @@ Step by step:
    - Default: up to 3000 chars per chunk, newlines preserved (speaker turns, SCREEN blocks)
    - `--preview`: 200 chars, flattened to single line
 
+## Query Expansion (Stage 1)
+
+As of 2026-04-20 ([ADR-0017](adr/ADR-0017-kb-layer-strategy.md)), hybrid search applies a taxonomy-driven query preprocessor before the Voyage embed and BM25 calls. The goal is to bridge user vocabulary to creator vocabulary — the query "browser automation" is extended with creator-specific terms like "Capybara" when the taxonomy connects them, so BM25 can land exact-token hits it would otherwise miss.
+
+### Algorithm
+
+`expand_query_via_taxonomy(query, taxonomy)` in `scripts/video_intel.py`:
+
+1. For each concept in `taxonomy.json`, scan the query for canonical-label-first, then aliases.
+2. Matching uses a **punctuation-aware boundary**: `(?:^|(?<=[^\w]))TERM(?=$|[^\w])`, case-insensitive. This matches aliases that stdlib `\b` misses — `C++`, `.NET`, `(MCP)`, `k3s` — because `\b` requires a word character on at least one side.
+3. When a canonical or alias matches, its *siblings* (the canonical plus the other aliases) are appended to the end of the query string. The original query stays at the prefix so BM25 TF/IDF still favors the user's terms.
+4. Two guardrails limit noise and dilution:
+   - `MIN_ALIAS_LEN = 2` — single-character aliases are skipped.
+   - `MAX_ALIAS_ADDITIONS = 12` — at most 12 siblings appended per query (embedding-dilution cap).
+5. Sibling deduplication is case-insensitive across all matched concepts.
+
+The expanded string is sent to **both** `.text()` (BM25 FTS) and `vo.embed()` (Voyage query embed). Expanding BM25-only would miss the vector-side bridge; the shared-input approach is the simplest v1. A future v2 may split the paths if eval shows vector-side regression.
+
+### Toggle and diagnostics
+
+```bash
+# Default: expansion ON
+python scripts/video_intel.py search "MCP" --vector
+
+# Disable expansion (A/B diagnostic)
+python scripts/video_intel.py search "MCP" --vector --no-expand
+
+# Show the expansion decision as it runs
+python scripts/video_intel.py --log-level info search "MCP" --vector
+# INFO  query_expansion input='MCP' matched=1 added=['Model Context Protocol', ...]
+```
+
+Per-query expansion records are also available structurally: pass `return_diagnostics=True` to `hybrid_search()` and it returns `(hits, {"expand_enabled", "original_query", "expanded_query", "matches"})`. The eval harness uses this to write `tests/evals/results/<run_tag>-expansion.jsonl` on every run.
+
+### Worked example
+
+- Query: `"what is MCP good for"`
+- Taxonomy concept has canonical `"Model Context Protocol"` and aliases `["MCP", "mcp-server"]`
+- Expanded query: `"what is MCP good for Model Context Protocol mcp-server"`
+- Match record: `{"concept_id": "mcp", "matched_term": "MCP", "added": ["Model Context Protocol", "mcp-server"]}`
+
+### Scope
+
+Stage 1 touches **only** `hybrid_search()`. The concept-search path (`search_corpus()`) already does its own alias-aware retrieval with a `_match_score` gate and is intentionally untouched. ADR-0017's eval gate measures `--vector` only, so scoping to hybrid is sufficient.
+
 ## Display Design
 
 ### Why full chunks instead of previews

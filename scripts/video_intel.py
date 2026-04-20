@@ -171,6 +171,118 @@ def load_taxonomy(output_dir: Path) -> dict:
     return {"version": 1, "built_from": 0, "concepts": {}}
 
 
+# ---------------------------------------------------------------------------
+# Stage 1 query expansion (ADR-0017, docs/plans/2026-04-20-feat-kb-stage1-*)
+# ---------------------------------------------------------------------------
+
+MIN_ALIAS_LEN = 2
+MAX_ALIAS_ADDITIONS = 12
+
+
+def _alias_boundary_pattern(term: str) -> re.Pattern[str]:
+    """Punctuation-aware word-boundary regex for a taxonomy term.
+
+    stdlib `\\b` only matches between a word and a non-word character, so it
+    silently fails for aliases that begin or end with punctuation
+    (e.g. "C++", ".NET", "(MCP)"). The boundary here treats any non-word
+    character OR the string edges as a boundary, which is what taxonomy
+    aliases actually need.
+    """
+    return re.compile(
+        r"(?:^|(?<=[^\w]))" + re.escape(term) + r"(?=$|[^\w])",
+        flags=re.IGNORECASE,
+    )
+
+
+def expand_query_via_taxonomy(
+    query: str,
+    taxonomy: dict,
+) -> tuple[str, list[dict]]:
+    """Expand a search query by appending taxonomy aliases for any concept
+    whose canonical label or alias appears in the query.
+
+    Stage 1 of ADR-0017. Bridges user vocabulary to creator vocabulary at
+    query time. See docs/plans/2026-04-20-feat-kb-stage1-query-expansion-plan.md
+    for the contract this honors.
+
+    Returns:
+        (expanded_query, match_records) where match_records is a list of
+        {"concept_id": str, "matched_term": str, "added": [str, ...]}.
+    """
+    concepts = taxonomy.get("concepts") or {}
+    if not concepts:
+        return query, []
+
+    match_records: list[dict] = []
+    added_terms: list[str] = []
+    seen_added_lower: set[str] = set()
+    remaining_cap = MAX_ALIAS_ADDITIONS
+
+    for cid, concept in concepts.items():
+        if remaining_cap <= 0:
+            break
+
+        label = (concept.get("preferred_label") or "").strip()
+        aliases = [a for a in (concept.get("aliases") or []) if isinstance(a, str)]
+
+        # Candidate terms to test against the query, ordered canonical-first
+        # so a canonical-label hit is preferred over an alias hit for the
+        # matched_term diagnostic.
+        candidates: list[str] = []
+        if label and len(label) >= MIN_ALIAS_LEN:
+            candidates.append(label)
+        for a in aliases:
+            a = a.strip()
+            if len(a) >= MIN_ALIAS_LEN:
+                candidates.append(a)
+
+        matched_term: str | None = None
+        for term in candidates:
+            if _alias_boundary_pattern(term).search(query):
+                matched_term = term
+                break
+        if matched_term is None:
+            continue
+
+        # Siblings = canonical + aliases, minus the term that matched.
+        all_siblings: list[str] = []
+        if label:
+            all_siblings.append(label)
+        all_siblings.extend(aliases)
+
+        to_add: list[str] = []
+        matched_lower = matched_term.lower()
+        for sibling in all_siblings:
+            s = sibling.strip()
+            if not s or len(s) < MIN_ALIAS_LEN:
+                continue
+            s_lower = s.lower()
+            if s_lower == matched_lower:
+                continue
+            if s_lower in seen_added_lower:
+                continue
+            to_add.append(s)
+            seen_added_lower.add(s_lower)
+            remaining_cap -= 1
+            if remaining_cap <= 0:
+                break
+
+        match_records.append(
+            {
+                "concept_id": cid,
+                "matched_term": matched_term,
+                "added": to_add,
+            }
+        )
+        added_terms.extend(to_add)
+
+    if not added_terms:
+        return query, match_records
+
+    expanded = query + " " + " ".join(added_terms)
+    return expanded, match_records
+
+
 def find_mindmap_source(channel_dir: Path, prefix: str) -> Path | None:
     """Find the best mindmap file for concept extraction.
 
@@ -2460,12 +2572,24 @@ def hybrid_search(
     since_iso: str | None = None,
     limit: int = 10,
     config: dict[str, Any] | None = None,
-) -> list[dict]:
+    expand: bool = True,
+    return_diagnostics: bool = False,
+) -> list[dict] | tuple[list[dict], dict]:
     """Search the LanceDB index with hybrid BM25 + vector + RRF fusion.
 
     Returns ranked chunks deduplicated by video. `since_iso` (YYYY-MM-DD) filters
     chunks whose `published` column is >= the given date, applied pre-rank so
     recency scope does not get crowded out by older, higher-relevance hits.
+
+    When `expand=True` (default), the query is preprocessed through
+    `expand_query_via_taxonomy()` and the expanded string is sent to both the
+    BM25 FTS call (`.text()`) and the Voyage embedding call. Original query
+    stays at the prefix so BM25 TF/IDF still favors the user's terms.
+
+    When `return_diagnostics=True`, returns `(hits, expansion_record)` where
+    `expansion_record` is `{"expand_enabled": bool, "original_query": str,
+    "expanded_query": str, "matches": [...]}`. Eval harness uses this to
+    write per-query JSONL logs independent of logging configuration.
     """
     lancedb = require_lancedb()
     voyageai = require_voyageai()
@@ -2475,27 +2599,51 @@ def hybrid_search(
         log.error("VOYAGE_API_KEY not set. Sign up free at https://dash.voyageai.com/")
         sys.exit(1)
 
+    # --- Stage 1 query expansion (ADR-0017) --------------------------------
+    effective_query = query
+    expansion_matches: list[dict] = []
+    if expand:
+        taxonomy = load_taxonomy(output_dir)
+        effective_query, expansion_matches = expand_query_via_taxonomy(query, taxonomy)
+        if expansion_matches:
+            added_flat = [a for m in expansion_matches for a in m["added"]]
+            log.info(
+                "query_expansion input=%r matched=%d added=%s",
+                query,
+                len(expansion_matches),
+                added_flat,
+            )
+
     db_path = resolve_vector_db_dir(config or {}, output_dir)
     # No probe here: search is read-only and does not exercise LanceDB's commit path.
     # The probe lives in build_search_index where it prevents wasted Voyage embeddings.
     db = lancedb.connect(str(db_path))
 
+    diagnostics = {
+        "expand_enabled": expand,
+        "original_query": query,
+        "expanded_query": effective_query,
+        "matches": expansion_matches,
+    }
+
     if LANCEDB_TABLE not in db.list_tables().tables:
         log.error("Search index not found. Run: video_intel.py index")
+        if return_diagnostics:
+            return [], diagnostics
         return []
 
     table = db.open_table(LANCEDB_TABLE)
 
     # Embed query with lite model (asymmetric retrieval)
     vo = voyageai.Client()
-    query_embedding = vo.embed([query], model=VOYAGE_QUERY_MODEL, input_type="query").embeddings[0]
+    query_embedding = vo.embed([effective_query], model=VOYAGE_QUERY_MODEL, input_type="query").embeddings[0]
 
     # Hybrid search: BM25 (FTS on title+text) + vector, merged by RRF (K=60 default)
     fetch_count = max(50, limit * 5)
     search_builder = (
         table.search(query_type="hybrid", fts_columns=["title", "text"])
         .vector(query_embedding)
-        .text(query)
+        .text(effective_query)
         .limit(fetch_count)
     )
     where_clauses = []
@@ -2526,7 +2674,10 @@ def hybrid_search(
             }
         )
 
-    return _dedup_by_video(raw_hits, limit)
+    hits = _dedup_by_video(raw_hits, limit)
+    if return_diagnostics:
+        return hits, diagnostics
+    return hits
 
 
 def _dedup_by_video(hits: list[dict], limit: int) -> list[dict]:
@@ -2695,6 +2846,7 @@ def cmd_search(args, config):
             since_iso=since_iso,
             limit=args.limit,
             config=config,
+            expand=not getattr(args, "no_expand", False),
         )
         if not hits:
             print(f'No results for "{args.query}". Is the index built? Run: video_intel.py index')
@@ -2954,6 +3106,15 @@ Examples:
     search_parser.add_argument(
         "--since",
         help="Filter to videos published within a window. Accepts 'Nd' (e.g. '30d') or 'YYYY-MM-DD'.",
+    )
+    search_parser.add_argument(
+        "--no-expand",
+        action="store_true",
+        dest="no_expand",
+        help=(
+            "Disable Stage-1 taxonomy query expansion (hybrid mode only). "
+            "Used for A/B diagnostic comparison against the baseline."
+        ),
     )
 
     # index command

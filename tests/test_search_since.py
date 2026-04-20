@@ -22,15 +22,17 @@ from video_intel import LANCEDB_TABLE
 
 
 class _CapturingBuilder:
-    """Fake LanceDB search builder that records .where() calls."""
+    """Fake LanceDB search builder that records .where() / .text() calls."""
 
     def __init__(self):
         self.where_clauses: list[str] = []
+        self.text_calls: list[str] = []
 
     def vector(self, _vec):
         return self
 
-    def text(self, _q):
+    def text(self, q):
+        self.text_calls.append(q)
         return self
 
     def limit(self, _n):
@@ -63,24 +65,43 @@ class _FakeDB:
         return self._table
 
 
+class _CapturingVoyage:
+    """Fake voyageai.Client that records embed() inputs for assertions."""
+
+    def __init__(self):
+        self.embed_calls: list[list[str]] = []
+
+    def embed(self, texts, *_args, **_kwargs):
+        # Normalize to list[str] — real API also accepts single strings
+        captured = list(texts) if isinstance(texts, list | tuple) else [texts]
+        self.embed_calls.append(captured)
+        return SimpleNamespace(embeddings=[[0.0] * 1024])
+
+
 @pytest.fixture
 def fake_lancedb(monkeypatch):
-    """Wire up a capturing LanceDB stack and return the builder for assertions."""
+    """Wire up a capturing LanceDB stack and return the builder for assertions.
+
+    The builder exposes `.where_clauses` (list[str]) and `.text_calls`
+    (list[str]). A `.voyage` attribute is attached so expansion-aware tests
+    can inspect `.embed_calls`.
+    """
     import video_intel as vi
 
     builder = _CapturingBuilder()
     table = _FakeTable(builder)
     db = _FakeDB(table)
+    voyage = _CapturingVoyage()
 
     monkeypatch.setattr(vi, "require_lancedb", lambda: SimpleNamespace(connect=lambda *_a, **_kw: db))
     monkeypatch.setattr(
         vi,
         "require_voyageai",
-        lambda: SimpleNamespace(
-            Client=lambda: SimpleNamespace(embed=lambda *_a, **_kw: SimpleNamespace(embeddings=[[0.0] * 1024]))
-        ),
+        lambda: SimpleNamespace(Client=lambda: voyage),
     )
     monkeypatch.setenv("VOYAGE_API_KEY", "fake-key")
+    # Make the voyage spy reachable from the test without a second return value
+    builder.voyage = voyage  # type: ignore[attr-defined]
     return builder
 
 
@@ -130,7 +151,7 @@ def test_cmd_search_parses_30d_and_passes_iso_to_hybrid(monkeypatch, tmp_path):
 
     captured: dict[str, str | None] = {"since_iso": "SENTINEL"}
 
-    def fake_hybrid(_output_dir, _query, *, channel_filter=None, since_iso=None, limit=10, config=None):
+    def fake_hybrid(_output_dir, _query, *, since_iso=None, **_kwargs):
         captured["since_iso"] = since_iso
         return []
 
@@ -160,7 +181,7 @@ def test_cmd_search_absolute_date_passes_through(monkeypatch, tmp_path):
 
     captured: dict[str, str | None] = {"since_iso": None}
 
-    def fake_hybrid(_output_dir, _query, *, channel_filter=None, since_iso=None, limit=10, config=None):
+    def fake_hybrid(_output_dir, _query, *, since_iso=None, **_kwargs):
         captured["since_iso"] = since_iso
         return []
 
