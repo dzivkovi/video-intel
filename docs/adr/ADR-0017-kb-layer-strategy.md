@@ -79,14 +79,28 @@ no new data model. Expected effort: 1–2 days. Exit criterion: re-run
 section.
 
 **Stage 2 — LightRAG as the recall-focused graph layer.**
-Only if Stage 1 uplift is insufficient. LightRAG's dual-level graph (local
-entity aggregation + global community detection) directly addresses the
-vocabulary-mismatch failure via alias / co-occurrence propagation, which
-is exactly the mechanism Stage 1's cheap version approximates. Separate
-worktree, dedicated plan via `/workflows:plan`, execution via
-`/workflows:work` with swarm-mode parallel sub-agents for independent
-workstreams (ingestion adapter, graph storage, retrieval integration, eval
-wiring). Exit criterion: same as Stage 1 — record N/25 here.
+LightRAG's dual-level graph (local entity aggregation + global community
+detection) directly addresses the vocabulary-mismatch failure via alias /
+co-occurrence propagation, which is exactly the mechanism Stage 1's cheap
+version approximates. Separate worktree, dedicated plan via
+`/workflows:plan`, execution via `/workflows:work` with swarm-mode
+parallel sub-agents for independent workstreams (ingestion adapter,
+graph storage, retrieval integration, eval wiring). Exit criterion: same
+as Stage 1 — record N/25 here.
+
+### Decision rule between stages
+
+"Stage 1 uplift is insufficient" is defined as: **< 10 of 25 queries
+passing all gating metrics** *and* **the shape of remaining failures is
+still vocabulary-mismatch-dominated** (per-query diagnostic trace on the
+failed queries still shows query-token / content-token divergence as the
+primary signal). If Stage 1 clears 10/25 *and* the remaining failures
+shift to a synthesis-shaped mode (failed queries are `cross_channel_synthesis`
+type with adequate recall but poor composition), skip Stage 2 and go
+straight to Stage 3. The 10/25 threshold is calibrated against the
+original April-16 brainstorm's "≥80% passes = ship wiki" rule, scaled
+down to "a recall intervention earns its week of infrastructure only if
+it closes at least a third of the gap."
 
 **Stage 3 — Karpathy-style LLM Wiki synthesis layer.**
 Addresses the orthogonal synthesis-gap failure mode, not vocabulary
@@ -133,7 +147,11 @@ re-litigating a decision the data already made.
   still lets the eval attribute uplift to the right intervention.
   Attacking both simultaneously with overlapping scopes would blur
   attribution — by explicitly naming "recall" vs "synthesis" as the
-  target of each stage, this ADR prevents that.
+  target of each stage, this ADR prevents that. *Partial overlap is
+  acknowledged*: LightRAG's graph community detection may also surface
+  co-occurrence signal that aids synthesis queries, so if the eval
+  shows synthesis-query uplift during Stage 2 the attribution claim
+  softens — a clean Stage-3 before/after score remains the tiebreaker.
 - **Keeps ADR-0010 / ADR-0013 in force.** The concept / taxonomy layer
   and the hybrid-search RRF fusion are not being replaced. Stages 1–3
   are additions, not migrations.
@@ -143,7 +161,19 @@ re-litigating a decision the data already made.
 - **The eval dataset becomes a frozen contract.** Adding or changing
   golden queries mid-stream invalidates stage-over-stage comparison.
   Dataset changes now need ADR-grade justification, documented at the
-  same level as a metric-threshold change.
+  same level as a metric-threshold change. **Corrections are exempt:**
+  fixing a typo in a query string, correcting a wrong `video_id`
+  (grounding error), or adjusting a `key_phrase` to match actual
+  transcript text are corrections — they remove measurement noise, not
+  recalibrate difficulty — and do not require a new ADR. What needs an
+  ADR is adding / removing queries, shifting a `query_type`, or changing
+  a per-query threshold.
+- **The dataset reflects a single author's framing.** The 25 queries
+  were written by the same person now designing the KB-layer
+  interventions. There is a latent risk that Stage 1–3 work subtly fits
+  this dataset rather than generalizing to external users. Mitigations
+  tracked in Related Debt: rotate in adversarial queries at stage
+  boundaries, and solicit external raters once a KB layer is live.
 - **Deterministic metrics don't measure synthesis quality.** The current
   four metrics (`RecallAtKMetric`, `MRRMetric`, `ChannelCoverageMetric`,
   `TimestampPrecisionMetric`) are all recall / precision metrics. The
