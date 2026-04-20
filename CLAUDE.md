@@ -117,6 +117,10 @@ All commands support `--force` to regenerate existing output files. Gemini-calli
 
 **Search internals:** Score math, pipeline mechanics, tuning levers, and empirical observations are documented in [`docs/search-internals.md`](docs/search-internals.md). Read this before modifying search behavior.
 
+**Testing and eval framework:** [`docs/testing.md`](docs/testing.md) is the operational reference for both test suites — unit/integration in `tests/` and the grounded-golden-dataset retrieval eval in `tests/evals/`. As of 2026-04-19 the hybrid-search eval baseline is 1/25; any PR that touches retrieval logic must re-run `pytest tests/evals/` and record the new N/25 in the description. The golden dataset at `tests/evals/golden_dataset.yaml` is a frozen contract per [ADR-0017](docs/adr/ADR-0017-kb-layer-strategy.md) — edits need ADR-grade justification.
+
+**KB-layer direction:** [`ADR-0017`](docs/adr/ADR-0017-kb-layer-strategy.md) establishes a staged approach (query expansion → LightRAG → LLM Wiki), each stage gated on eval uplift. Cognee is rejected. The April 2026 brainstorm lives in `work/2026-04-16/04-knowledge-layer-options-brainstorm.md` and `work/2026-04-16/03-architecture-futures-cognee-lightrag-llm-wiki.md` — ADR-0017 is the durable decision record on top of them.
+
 ## Key Design Decisions
 
 - Gemini is a multimodal proxy, not a competing assistant. Video understanding requires vision+audio that Claude doesn't have via API.
@@ -160,11 +164,14 @@ The `output_dir` in `config.yaml` should point outside the plugin folder (e.g. `
 # Install dev dependencies
 pip install -e ".[dev]"
 
-# Run tests
-pytest tests/ -v
+# Run unit/integration tests
+pytest tests/ -v --ignore=tests/evals
 
 # Run tests with coverage
-pytest --cov=scripts --cov-report=term-missing -v
+pytest --cov=scripts --cov-report=term-missing -v --ignore=tests/evals
+
+# Run retrieval eval (requires pip install deepeval, VOYAGE_API_KEY, built LanceDB index)
+pytest tests/evals/ -v -s
 
 # Lint and format
 ruff format .
