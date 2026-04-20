@@ -36,6 +36,8 @@ class RecallAtKMetric(BaseMetric):
     the score; extra retrieved videos beyond the expected set do not penalize.
     """
 
+    gating: bool = True
+
     def __init__(self, k: int, threshold: float):
         self.k = k
         self.threshold = threshold
@@ -77,6 +79,11 @@ class MRRMetric(BaseMetric):
     Score = 1/rank of the first expected hit (1.0 if at rank 1, 0.5 at rank 2,
     etc.). Score = 0.0 if no expected hit appears in results at all.
     """
+
+    # Non-gating: informational signal only. A query can legitimately pass
+    # RecallAtK while MRR looks weak (expected hits present but not at top
+    # ranks), and vice versa — so MRR score never fails the test.
+    gating: bool = False
 
     def __init__(self, threshold: float):
         self.threshold = threshold
@@ -126,6 +133,8 @@ class ChannelCoverageMetric(BaseMetric):
     videos found) while channel_coverage fails (diversity missing).
     """
 
+    gating: bool = True
+
     def __init__(self, min_channels: int, threshold: float):
         self.min_channels = min_channels
         self.threshold = threshold
@@ -173,6 +182,8 @@ class TimestampPrecisionMetric(BaseMetric):
     expected range. One retrieved hit can satisfy multiple expected hits
     for the same video if their ranges overlap.
     """
+
+    gating: bool = True
 
     def __init__(self, tolerance_sec: int, threshold: float):
         self.tolerance = tolerance_sec
