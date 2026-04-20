@@ -16,6 +16,11 @@ build/
 venv/
 .coverage
 
+# DeepEval local caches — must not be committed, contain developer fingerprint
+.deepeval/
+.deepeval*
+temp_test_run_data.json
+
 examples/*.part-*.txt
 examples/*.txt.tmp
 

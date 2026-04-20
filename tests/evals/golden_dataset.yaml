@@ -1,0 +1,1446 @@
+# Golden dataset for video-intel retrieval evaluation
+#
+# Status: SEED (5 of 25 queries). Awaiting user validation before scale-out.
+# Each entry is grounded — every (video_id, channel, timestamp_range) was
+# extracted from the actual transcript, not the mindmap or summary.
+#
+# Format version: 1
+# Generated: 2026-04-19
+# Corpus snapshot: 488 videos / 7 channels / 5294 vector chunks
+#
+# Scoring dimensions (used by tests/evals/test_search_quality.py):
+#   recall_at_k          — did expected video_ids surface in top-k? (deterministic)
+#   channel_coverage     — did all expected channels surface? (deterministic)
+#   timestamp_precision  — did returned chunks overlap the gold range? (deterministic)
+#   position_diversity   — G-Eval: did retrieved chunks expose distinct positions? (non-det.)
+#
+# For non-det dimensions, report as trend signal (not merge-blocking).
+
+version: 1
+snapshot_date: 2026-04-19
+queries:
+
+# =============================================================================
+# Q01 — Model Context Protocol (cross-channel comparative)
+# =============================================================================
+- id: Q01
+  query: "What are the different ways creators use and position Model Context Protocol (MCP) in their AI coding workflows?"
+  query_type: cross_channel_comparative
+  concept_ids: [ai-engineering.model_context_protocol]
+  known_good_answer: |
+    Three genuinely distinct positions surface across creators:
+    1. Ray (Ramjad) treats MCP servers as context injection for agent loops —
+       uses Exa MCP to search online for documentation that model training data
+       misses, combined with parallel sub-agents for multi-angle context gathering.
+    2. Nate B. Jones frames MCP at a higher architectural level: one of the
+       protocol layers (alongside skills) enabling secure autonomous agentic
+       computer use.
+    3. Mark Kashef is skeptical: positions MCP as one of three interaction methods
+       (CLI, MCP, Skills) but argues it has been superseded by skills for most
+       uses due to better token efficiency. Recommended order: CLI > Skills > MCP.
+  non_obvious_finding: |
+    No consensus on MCP's role — camp 1 treats it as essential infrastructure,
+    camp 3 as deprecated. An eval that surfaces only one position has failed.
+  expected_hits:
+    - video_id: sy65ARFI9Bg
+      channel: ramjad
+      timestamp_range: ["04:56", "05:46"]
+      key_phrase: "whether that's through MCP servers... Stripe refund system"
+      position: context_provider
+    - video_id: sy65ARFI9Bg
+      channel: ramjad
+      timestamp_range: ["16:37", "17:10"]
+      key_phrase: "Exa MCP server to search online... spin up three or four sub-agents"
+      position: context_provider
+    - video_id: LwKnvqVdUgA
+      channel: natebjones
+      timestamp_range: ["04:58", "05:30"]
+      key_phrase: "Through the Model Context Protocol layer, through skills"
+      position: protocol_layer
+    - video_id: 1Z1aECGwJh0
+      channel: mark_kashef
+      timestamp_range: ["03:06", "03:30"]
+      key_phrase: "CLI, MCP, or Skills... three ways Claude talks to Google"
+      position: categorical_framing
+    - video_id: 1Z1aECGwJh0
+      channel: mark_kashef
+      timestamp_range: ["03:41", "04:23"]
+      key_phrase: "MCP was all the rage... CLI first, then skills, then MCP"
+      position: deprecated
+  dimensions:
+    recall_at_k:         {k: 10, threshold: 0.80}
+    channel_coverage:    {min_channels: 3, threshold: 1.0}
+    timestamp_precision: {tolerance_sec: 30, threshold: 0.80}
+    position_diversity:  {min_distinct_positions: 2, threshold: 1.0}
+
+
+# =============================================================================
+# Q02 — Reliable agents per Nate B. Jones (single-channel baseline)
+# =============================================================================
+- id: Q02
+  query: "According to Nate B. Jones, what separates agents that reliably finish tasks from those that stall or hallucinate?"
+  query_type: baseline_single_channel
+  concept_ids:
+    - ai-engineering.validation_loops
+    - ai-engineering.agentic_loop
+  known_good_answer: |
+    Nate's position (drawing on the Ralph Wiggum / force-feed technique): the
+    difference isn't the model, it's the harness. Traditional evaluation is a
+    single-shot grade at the end ("did the model get it right?"). That fails
+    for autonomous agents because one-shot grading doesn't measure convergence.
+    What matters is whether the agent converges toward correctness when forced
+    to confront reality at every iteration. Practical technique: make evaluation
+    the STEERING WHEEL, not the finish line — force-feed evaluations throughout
+    the loop, never accept an initial output, keep pushing until the defined
+    task is actually done.
+  non_obvious_finding: |
+    Nate reframes "evaluation" from a post-hoc scoring artifact to a runtime
+    steering mechanism. This is the opposite of how most teams build eval
+    pipelines today (batch, offline, end-of-run).
+  expected_hits:
+    - video_id: JDAIOSWfPn0
+      channel: natebjones
+      timestamp_range: ["00:28", "00:50"]
+      key_phrase: "force-feeds the prompt to the model and doesn't let it stop"
+      position: force_feed_technique
+    - video_id: JDAIOSWfPn0
+      channel: natebjones
+      timestamp_range: ["01:32", "01:55"]
+      key_phrase: "make our evaluations the steering wheel for the entire process"
+      position: evaluation_as_steering
+    - video_id: JDAIOSWfPn0
+      channel: natebjones
+      timestamp_range: ["02:02", "02:30"]
+      key_phrase: "What matters is whether the agent converges toward correctness"
+      position: convergence_over_single_shot
+  dimensions:
+    recall_at_k:         {k: 5, threshold: 0.60}    # baseline — easier target
+    channel_coverage:    {min_channels: 1, threshold: 1.0}
+    timestamp_precision: {tolerance_sec: 30, threshold: 0.66}
+    position_diversity:  {min_distinct_positions: 2, threshold: 1.0}
+
+
+# =============================================================================
+# Q03 — Context window optimization (cross-channel comparative)
+# =============================================================================
+- id: Q03
+  query: "How do different creators approach context window optimization — what specific techniques do they recommend?"
+  query_type: cross_channel_comparative
+  concept_ids: [ai-engineering.context_window_optimization]
+  known_good_answer: |
+    Three distinct approaches surface:
+    1. Ray (Ramjad) describes Anthropic's upcoming "reversible context collapse":
+       per-block risk scores automatically summarize low-risk blocks (tool output)
+       while preserving high-risk ones (key decisions). Reversible — you can
+       expand a summarized block back if needed. Also flags "token budgets" as
+       a way to force deep work.
+    2. Mark Kashef proposes sub-context-window isolation: use /btw, /fork, and
+       skill.md `context: fork` directives to run tool-heavy work in a separate
+       Claude instance that hands back only a clean summary. "Same model, less
+       brainpower" is his diagnosis of context decay; shields are the fix.
+    3. Otis (samwitteveenai) offers a token-economics warning: Sonnet 4.6 is
+       40% cheaper per token than Opus 4.6, but empirically uses ~4x more tokens
+       on the same tasks (58M → 280M in one benchmark). Per-token cost can be
+       misleading; watch total spend.
+  non_obvious_finding: |
+    Only Otis connects context-window behavior to billing (token muncher problem).
+    Ray and Mark are both about *reducing* context pollution; Otis is about the
+    economic consequence of letting it happen. An eval that only surfaces the
+    reduce-pollution angle misses the money-gotcha.
+  expected_hits:
+    - video_id: YSbB5gc_1K8
+      channel: ramjad
+      timestamp_range: ["12:42", "13:43"]
+      key_phrase: "reversible context collapse... different risk score assigned"
+      position: reversible_compaction
+    - video_id: YSbB5gc_1K8
+      channel: ramjad
+      timestamp_range: ["06:10", "07:23"]
+      key_phrase: "token budgets as a way of forcing deep work"
+      position: token_budget_forcing
+    - video_id: iALzJyvgCoM
+      channel: mark_kashef
+      timestamp_range: ["00:14", "01:23"]
+      key_phrase: "it's you drowning in context... context decay"
+      position: context_decay_diagnosis
+    - video_id: iALzJyvgCoM
+      channel: mark_kashef
+      timestamp_range: ["01:24", "02:47"]
+      key_phrase: "/btw, /fork, and the newer context: fork portion of a skill.md"
+      position: sub_context_isolation
+    - video_id: iyLwNnU6BMA
+      channel: samwitteveenai
+      timestamp_range: ["04:17", "05:06"]
+      key_phrase: "Sonnet 4.6 used more than 4x the total tokens... token muncher"
+      position: token_economics_warning
+  dimensions:
+    recall_at_k:         {k: 10, threshold: 0.80}
+    channel_coverage:    {min_channels: 3, threshold: 1.0}
+    timestamp_precision: {tolerance_sec: 30, threshold: 0.80}
+    position_diversity:  {min_distinct_positions: 3, threshold: 1.0}
+
+
+# =============================================================================
+# Q04 — Parallel task execution (cross-channel coverage)
+# =============================================================================
+- id: Q04
+  query: "Which creators discuss parallel task execution via sub-agents, and what tradeoffs do they surface?"
+  query_type: cross_channel_coverage
+  concept_ids: [ai-engineering.parallel_task_execution]
+  known_good_answer: |
+    Two creators stake out substantively different positions:
+    1. Ray (Ramjad) operates at the practitioner level: runs 10-12 parallel
+       Claude Code sessions "like the game Factorio" across 3-4 projects, and
+       aggressively defers searching / codebase exploration / log analysis to
+       sub-agents via an explicit CLAUDE.md rule. Key insight: sub-agents
+       preserve signal in the main session by absorbing "search noise."
+    2. Sam Witteveen reviews Kimi K2.5 Agent Swarm at the research level: a
+       single orchestrator model can self-direct up to 100 sub-agents across
+       1,500 coordinated steps, trained via "Parallel-Agent RL" (PARL). Each
+       sub-agent gets its own tools. Tradeoff: opacity — you lose visibility
+       into individual sub-agent reasoning, and total token spend is
+       unpredictable.
+  non_obvious_finding: |
+    Ray's framing is tactical (ergonomics, context preservation); Sam's is
+    architectural (orchestration at scale). The two rarely appear in the same
+    search result even though they're answering the same question at different
+    abstraction levels. Good retrieval should surface both.
+  expected_hits:
+    - video_id: AzmnaoVP8sk
+      channel: ramjad
+      timestamp_range: ["06:08", "06:40"]
+      key_phrase: "treat it like the game Factorio... three, four or five instances"
+      position: factorio_workflow
+    - video_id: AzmnaoVP8sk
+      channel: ramjad
+      timestamp_range: ["13:40", "14:10"]
+      key_phrase: "aggressively offload online research... to subagents"
+      position: signal_preservation
+    - video_id: FfCqINSD8Tc
+      channel: samwitteveenai
+      timestamp_range: ["00:23", "01:59"]
+      key_phrase: "up to a hundred self-directed sub-agents... Parallel-Agent RL"
+      position: swarm_architecture
+    - video_id: FfCqINSD8Tc
+      channel: samwitteveenai
+      timestamp_range: ["05:52", "07:37"]
+      key_phrase: "orchestrator agent... decomposed into these parallelizable subtasks"
+      position: swarm_architecture
+  dimensions:
+    recall_at_k:         {k: 10, threshold: 0.75}
+    channel_coverage:    {min_channels: 2, threshold: 1.0}
+    timestamp_precision: {tolerance_sec: 30, threshold: 0.75}
+    position_diversity:  {min_distinct_positions: 2, threshold: 1.0}
+
+
+# =============================================================================
+# Q05 — Agentic tool use (cross-channel synthesis, stress test)
+# =============================================================================
+- id: Q05
+  query: "What is the emerging consensus across creators on how AI agents should use tools, and where does consensus break down?"
+  query_type: cross_channel_synthesis
+  concept_ids: [ai-engineering.agentic_tool_use]
+  known_good_answer: |
+    Consensus points: (a) tool use is architecturally *foundational*, not
+    ornamental — Nate frames it as Layer 4 of the agent infrastructure stack
+    ("integration and tools"), Sam Witteveen notes Gemma 4 now bakes function
+    calling in from scratch rather than bolting it on, Mark Kashef observes
+    Claude Code ships exactly 7 core tools (GLOB/GREP/READ/WRITE/EDIT/BASH/AGENT)
+    as a deliberate minimal set; (b) the N×M connector problem is real and
+    unsolved at enterprise scale (Nate on Composio).
+    Consensus breaks on: whether MCP becomes the universal standard (Nate
+    doubts enterprises will adopt fast; Ray already treats MCP servers as
+    production infra; Mark argues skills have already surpassed MCP for most
+    daily use). Also no consensus on how many tools a harness should expose —
+    Mark's minimal 7 vs. Composio's "hundreds of pre-built connectors."
+  non_obvious_finding: |
+    "Function calling was a 2024 problem; agentic tool use is a 2026 problem"
+    is implicit across all four creators but never stated by any single one.
+    The emergent thesis is only visible by reading across channels.
+    This is the query type where a future Wiki/synthesis layer would earn its
+    keep — hybrid retrieval alone can surface fragments; synthesizing the
+    emergent thesis is a separate capability.
+  expected_hits:
+    - video_id: 7HP1jFJ9W1c
+      channel: natebjones
+      timestamp_range: ["10:56", "12:17"]
+      key_phrase: "tools and integration for agents... N times M integration nightmare"
+      position: infrastructure_layer
+    - video_id: 7HP1jFJ9W1c
+      channel: natebjones
+      timestamp_range: ["12:34", "13:25"]
+      key_phrase: "if MCP truly becomes a universal, the value of a managed integration"
+      position: standardization_bet
+    - video_id: 5aqF1HVpjdc
+      channel: samwitteveenai
+      timestamp_range: ["02:27", "04:06"]
+      key_phrase: "function calling baked into it from scratch... multi-turn agentic flows"
+      position: native_tool_use
+    - video_id: 3qUg57KGSVY
+      channel: mark_kashef
+      timestamp_range: ["01:47", "02:20"]
+      key_phrase: "seven core tools... GLOB, GREP, READ, WRITE, EDIT, BASH, AGENT"
+      position: minimal_tool_set
+    - video_id: sy65ARFI9Bg
+      channel: ramjad
+      timestamp_range: ["16:37", "17:10"]
+      key_phrase: "Exa MCP server... three or four sub-agents in parallel"
+      position: tool_composition
+  dimensions:
+    recall_at_k:         {k: 15, threshold: 0.66}     # synthesis is the hardest
+    channel_coverage:    {min_channels: 3, threshold: 1.0}
+    timestamp_precision: {tolerance_sec: 45, threshold: 0.60}  # looser — synthesis
+    position_diversity:  {min_distinct_positions: 3, threshold: 1.0}
+
+
+# =============================================================================
+# Q06 — Ramjad configuration baseline (single-channel)
+# =============================================================================
+- id: Q06
+  query: "What does Ray Amjad recommend for configuring Claude Code for deep, productive work?"
+  query_type: baseline_single_channel
+  concept_ids:
+    - ai-engineering.agent_configuration
+    - ai-engineering.multi_agent_orchestration
+    - ai-engineering.context_window_optimization
+  known_good_answer: |
+    Three recommendations cohere into a workflow:
+    1. Use MCP servers to inject up-to-date external context (e.g., Exa MCP
+       for web search, documentation lookups) so agents aren't limited to
+       training-data knowledge.
+    2. Set user-level CLAUDE.md rules that aggressively offload research,
+       codebase exploration, and log analysis to sub-agents — this preserves
+       the main session's context for actual decision-making ("signal" over
+       "noise").
+    3. Use token budgets (when available) to force deep work: specify a
+       minimum token spend (e.g., "use at least 500K tokens") and let Claude
+       Code keep going until either the budget is nearly hit or progress slows.
+  non_obvious_finding: |
+    Ray's approach treats context as a resource to be *actively managed*, not
+    a passive byproduct. The CLAUDE.md rule for automatic sub-agent deferral
+    is a form of pre-commitment that overrides Claude's default behavior.
+  expected_hits:
+    - video_id: sy65ARFI9Bg
+      channel: ramjad
+      timestamp_range: ["04:56", "05:46"]
+      key_phrase: "whether that's through MCP servers... Stripe refund system"
+      position: mcp_context_injection
+      provenance: manual_verified    # re-used from Q01 verification
+      source: transcript
+    - video_id: AzmnaoVP8sk
+      channel: ramjad
+      timestamp_range: ["13:40", "14:10"]
+      key_phrase: "aggressively offload online research... to subagents"
+      position: claude_md_rules
+      provenance: manual_verified    # re-used from Q04 verification
+      source: transcript
+    - video_id: YSbB5gc_1K8
+      channel: ramjad
+      timestamp_range: ["06:10", "07:23"]
+      key_phrase: "token budgets as a way of forcing deep work"
+      position: token_budget_forcing
+      provenance: manual_verified    # re-used from Q03 verification
+      source: transcript
+  dimensions:
+    recall_at_k:         {k: 5, threshold: 0.66}
+    channel_coverage:    {min_channels: 1, threshold: 1.0}
+    timestamp_precision: {tolerance_sec: 30, threshold: 0.66}
+    position_diversity:  {min_distinct_positions: 2, threshold: 1.0}
+
+
+# =============================================================================
+# Q07 — Sam Witteveen on open-weight agentic capabilities (single-channel)
+# =============================================================================
+- id: Q07
+  query: "What does Sam Witteveen observe about the evolution of open-weight models for agentic and function-calling use cases?"
+  query_type: baseline_single_channel
+  concept_ids:
+    - ai-engineering.agentic_tool_use
+    - ai-engineering.token_economics
+    - ai-engineering.multi_agent_orchestration
+  known_good_answer: |
+    Sam's positions across three recent videos:
+    1. Open-weight models are now competitive for agentic workloads: Gemma 4
+       bakes function calling, vision, audio, and thinking into the architecture
+       rather than bolting them on (Apache 2 license, truly open).
+    2. Chinese open-weight models (Kimi K2.5) are pushing the frontier on
+       parallel sub-agent orchestration — up to 100 self-directed sub-agents
+       coordinated via Parallel-Agent RL (PARL), up to 1,500 steps.
+    3. Price-per-token is not a reliable signal for total cost: Sonnet 4.6 is
+       40% cheaper per token than Opus 4.6, but uses ~4x more tokens on the
+       same tasks (the "token muncher" problem). Evaluate total spend, not
+       unit price.
+  non_obvious_finding: |
+    Sam is the only creator systematically tracking the *economics* of model
+    choice alongside the capability evolution. His arguments are empirical
+    (benchmarks, token counts) rather than architectural framings — a
+    distinct signature in the corpus.
+  expected_hits:
+    - video_id: 5aqF1HVpjdc
+      channel: samwitteveenai
+      timestamp_range: ["02:27", "04:06"]
+      key_phrase: "function calling baked into it from scratch... multi-turn agentic flows"
+      position: native_agentic_capabilities
+      provenance: manual_verified    # re-used from Q05
+      source: transcript
+    - video_id: FfCqINSD8Tc
+      channel: samwitteveenai
+      timestamp_range: ["00:23", "01:59"]
+      key_phrase: "up to a hundred self-directed sub-agents... Parallel-Agent RL"
+      position: open_model_swarm
+      provenance: manual_verified    # re-used from Q04
+      source: transcript
+    - video_id: iyLwNnU6BMA
+      channel: samwitteveenai
+      timestamp_range: ["04:17", "05:06"]
+      key_phrase: "Sonnet 4.6 used more than 4x the total tokens... token muncher"
+      position: token_economics_empirical
+      provenance: manual_verified    # re-used from Q03
+      source: transcript
+  dimensions:
+    recall_at_k:         {k: 5, threshold: 0.66}
+    channel_coverage:    {min_channels: 1, threshold: 1.0}
+    timestamp_precision: {tolerance_sec: 30, threshold: 0.66}
+    position_diversity:  {min_distinct_positions: 2, threshold: 1.0}
+
+
+# =============================================================================
+# Q08 — Cross-channel definitional: what IS an autonomous agent?
+# =============================================================================
+- id: Q08
+  query: "How do different creators distinguish an autonomous AI agent from a simpler prompt-and-tool pipeline?"
+  query_type: cross_channel_comparative
+  concept_ids:
+    - ai-engineering.autonomous_ai_agents
+    - ai-engineering.agentic_loop
+  known_good_answer: |
+    Three distinct framings:
+    1. Nate B. Jones proposes "agent species" — agents diverge into at least
+       4 types (coding harness, dark factory, research agent, multi-agent
+       orchestra); the defining trait isn't the LLM but the harness that
+       constructs tools + loops + feedback around it.
+    2. Sam Witteveen observes autonomy emerges from *scale of parallelism*:
+       Kimi K2.5's Agent Swarm self-directs up to 100 sub-agents across
+       1,500 coordinated steps — autonomy as emergent property of
+       orchestration, not of individual agent capability.
+    3. Ray Amjad's practitioner framing: autonomy is where a single agent
+       decomposes its own context and spins up sub-agents on demand (e.g.,
+       Exa MCP sub-agents for research) — the agent decides when it needs
+       more capacity, not the human.
+  non_obvious_finding: |
+    None of the three creators defines autonomy by "the model makes decisions
+    humans normally make" — they all define it structurally: harness type,
+    orchestration scale, or self-decomposition capability. This suggests the
+    corpus has converged on a structural (not behavioral) definition.
+  expected_hits:
+    - video_id: YpPcDHc3e9U
+      channel: natebjones
+      timestamp_range: ["00:00", "02:00"]
+      key_phrase: "agents diverge into at least four different types... agent species"
+      position: agent_species_taxonomy
+      provenance: manual_verified
+      source: transcript
+    - video_id: FfCqINSD8Tc
+      channel: samwitteveenai
+      timestamp_range: ["00:23", "01:59"]
+      key_phrase: "up to a hundred self-directed sub-agents... Parallel-Agent RL"
+      position: autonomy_as_orchestration
+      provenance: manual_verified    # re-used from Q04/Q07
+      source: transcript
+    - video_id: sy65ARFI9Bg
+      channel: ramjad
+      timestamp_range: ["16:37", "17:10"]
+      key_phrase: "spin up three or four sub-agents in parallel... from different angles"
+      position: self_decomposition
+      provenance: manual_verified    # re-used from Q01
+      source: transcript
+  dimensions:
+    recall_at_k:         {k: 10, threshold: 0.75}
+    channel_coverage:    {min_channels: 2, threshold: 1.0}
+    timestamp_precision: {tolerance_sec: 45, threshold: 0.66}   # definitional queries often surface intro passages, wider windows
+    position_diversity:  {min_distinct_positions: 2, threshold: 1.0}
+
+
+# =============================================================================
+# Q09 — Cross-channel workflow comparison
+# =============================================================================
+- id: Q09
+  query: "What are the common building blocks creators use to structure an AI coding workflow, and where do they differ?"
+  query_type: cross_channel_comparative
+  concept_ids:
+    - ai-engineering.ai_agent_workflows
+    - ai-engineering.ai_agent_orchestration
+  known_good_answer: |
+    Building blocks that appear across creators:
+    - Parallel sessions / sub-agents (Ray Amjad's 10-12 Factorio sessions,
+      Sean Kochel's agent teams with mailbox communication at 10:28)
+    - Iterative review cycles (Sean Kochel's "Compound Engineering" — plan /
+      execute / review cycle at 4:23)
+    - CLAUDE.md or settings.json rules pinning behavior (Ray's user-level
+      CLAUDE.md subagent rules)
+    Where they differ:
+    - Coordination model: Ray uses human-driven parallelism (dictate prompts
+      to running sessions); Sean uses agent-driven parallelism (teammates
+      coordinate via shared task list + mailbox).
+    - Context granularity: Ray keeps work in persistent sessions; Sean's
+      agent teams have distinct context windows per teammate.
+  non_obvious_finding: |
+    Ray's model is *human-conducting-agents*; Sean's is *agents-conducting-
+    themselves*. Both are called "workflows" and would match keyword search
+    similarly, but they describe qualitatively different operational models.
+    An eval that treats them as equivalent misses the distinction.
+  expected_hits:
+    - video_id: AzmnaoVP8sk
+      channel: ramjad
+      timestamp_range: ["06:08", "06:40"]
+      key_phrase: "treat it like the game Factorio... three, four or five instances"
+      position: human_conducted_parallel
+      provenance: manual_verified    # re-used from Q04
+      source: transcript
+    - video_id: g5V3M_8flxc
+      channel: seankochel
+      timestamp_range: ["00:42", "01:30"]
+      key_phrase: "Team lead coordination and task assignment"
+      position: agent_conducted_team
+      provenance: concept_augmented_verified
+      source: mindmap     # seankochel has no transcript (auto_transcript: none)
+    - video_id: g5V3M_8flxc
+      channel: seankochel
+      timestamp_range: ["10:28", "11:00"]
+      key_phrase: "Mailbox system for inter-agent communication"
+      position: agent_conducted_team
+      provenance: concept_augmented_verified
+      source: mindmap
+    - video_id: QK0B1mbJ-VU
+      channel: seankochel
+      timestamp_range: ["04:23", "05:30"]
+      key_phrase: "Iterative cycle of planning, execution, and review"
+      position: compound_engineering
+      provenance: concept_augmented_verified
+      source: mindmap
+  dimensions:
+    recall_at_k:         {k: 10, threshold: 0.70}
+    channel_coverage:    {min_channels: 2, threshold: 1.0}
+    timestamp_precision: {tolerance_sec: 60, threshold: 0.50}   # mindmap timestamps are less precise than transcripts
+    position_diversity:  {min_distinct_positions: 2, threshold: 1.0}
+
+
+# =============================================================================
+# Q10 — Cross-channel: rapid iteration and prototyping techniques
+# =============================================================================
+- id: Q10
+  query: "What techniques do creators recommend for rapidly iterating on AI-built output — code, content, or design?"
+  query_type: cross_channel_comparative
+  concept_ids:
+    - software-development.rapid_prototyping
+    - ai-engineering.workflow_automation
+  known_good_answer: |
+    Three distinct iteration techniques:
+    1. Ray Amjad's "interactive artifacts" pattern: every Claude Code skill
+       should produce an HTML artifact as output, especially when deciding
+       between variations (e.g., `/design-variations` command generates
+       multiple component versions to compare side-by-side).
+    2. Sean Kochel's "vibe coding" approach: use AI for rapid prototyping
+       of applications (0:07), then layer in parallel multi-layer module
+       development (2:31) once the prototype is validated.
+    3. Sean Kochel's "CLI-Anything" pattern: convert open-source repositories
+       into agentic CLIs so that specialized tools (Excalidraw, GIMP, Blender,
+       LibreOffice) become callable from the agent — dramatically extends the
+       surface area of what the agent can iterate on.
+  non_obvious_finding: |
+    Ray's approach is iterate-on-output (compare variations visually, pick
+    one); Sean's is iterate-on-capability (give the agent more tools so
+    it can iterate on more things). Neither is wrong, but they're different
+    leverage points — Ray optimizes the last mile, Sean optimizes the span
+    of what can be prototyped in the first place.
+  expected_hits:
+    - video_id: ASAaKhK1B5w
+      channel: ramjad
+      timestamp_range: ["02:17", "03:30"]
+      key_phrase: "HTML artifact as an output for any of the skills... making decisions between many different variations"
+      position: interactive_artifacts
+      provenance: manual_verified
+      source: transcript
+    - video_id: g5V3M_8flxc
+      channel: seankochel
+      timestamp_range: ["00:07", "00:45"]
+      key_phrase: "Vibe coding applications for rapid prototyping"
+      position: vibe_prototyping
+      provenance: concept_augmented_verified
+      source: mindmap
+    - video_id: g5V3M_8flxc
+      channel: seankochel
+      timestamp_range: ["02:31", "03:15"]
+      key_phrase: "Parallel multi-layer module development"
+      position: parallel_scaling_up
+      provenance: concept_augmented_verified
+      source: mindmap
+    - video_id: QK0B1mbJ-VU
+      channel: seankochel
+      timestamp_range: ["00:30", "01:30"]
+      key_phrase: "Bridging gap between agents and world software... agentic CLIs"
+      position: cli_anything_surface_area
+      provenance: concept_augmented_verified
+      source: mindmap
+  dimensions:
+    recall_at_k:         {k: 10, threshold: 0.70}
+    channel_coverage:    {min_channels: 2, threshold: 1.0}
+    timestamp_precision: {tolerance_sec: 60, threshold: 0.50}
+    position_diversity:  {min_distinct_positions: 2, threshold: 1.0}
+
+
+# =============================================================================
+# Q11 — Grace Leung baseline: 5-stage AI mastery framework (single-channel)
+# =============================================================================
+- id: Q11
+  query: "According to Grace Leung, what is the end-to-end framework for mastering AI in daily work?"
+  query_type: baseline_single_channel
+  concept_ids: [ai-engineering.ai_agent_skills, ai-engineering.tacit_knowledge_extraction]
+  known_good_answer: |
+    Grace's 5-stage progression: (1) Effective prompting — task + context + format
+    covers 80% of cases; few-shot, perspective shifting, self-evaluation loop,
+    reverse prompting as the power techniques. (2) Model selection — master one
+    (ChatGPT / Gemini / Claude) for 30 days before expanding; each has specific
+    strengths (ChatGPT = high iteration, Gemini = long context + multimodal,
+    Claude = voice + artifacts + skills). (3) Context management — system
+    prompts, chat memory, project files, external connectors. (4) Verification
+    & refinement — source anchoring, chain of verification, cross-model
+    verification. (5) Scale via AI orchestration — workflow patterns combining
+    multiple tools (Perplexity → NotebookLM → deliverable).
+  non_obvious_finding: |
+    Grace's framework treats model-switching as a *strategic* discipline, not a
+    convenience. Cross-model verification (one model critiques another's output)
+    is her answer to hallucination — she's using Gemini to catch Claude's blind
+    spots rather than trusting any one model.
+  expected_hits:
+    - video_id: Dr3kvgEYIZI
+      channel: graceleungyl
+      timestamp_range: ["00:24", "02:00"]
+      key_phrase: "clear tasks... relevant context... output format"
+      position: prompting_core
+      provenance: manual_verified
+      source: transcript
+    - video_id: Dr3kvgEYIZI
+      channel: graceleungyl
+      timestamp_range: ["04:00", "06:00"]
+      key_phrase: "context management... system prompt... project files... external connectors"
+      position: context_management
+      provenance: manual_verified
+      source: transcript
+    - video_id: Dr3kvgEYIZI
+      channel: graceleungyl
+      timestamp_range: ["07:00", "09:00"]
+      key_phrase: "cross-model verification... different training bias... catch other's blind spots"
+      position: cross_model_verification
+      provenance: manual_verified
+      source: transcript
+  dimensions:
+    recall_at_k:         {k: 5, threshold: 0.66}
+    channel_coverage:    {min_channels: 1, threshold: 1.0}
+    timestamp_precision: {tolerance_sec: 60, threshold: 0.50}  # Grace's video packs many concepts into wide windows
+    position_diversity:  {min_distinct_positions: 2, threshold: 1.0}
+
+
+# =============================================================================
+# Q12 — Mark Kashef baseline: underutilized Claude Code patterns (single-channel)
+# =============================================================================
+- id: Q12
+  query: "According to Mark Kashef, what Claude Code features or patterns do most users underutilize?"
+  query_type: baseline_single_channel
+  concept_ids: [ai-engineering.agent_configuration, ai-engineering.context_window_optimization]
+  known_good_answer: |
+    Three patterns Mark consistently flags as underused:
+    (1) The /btw, /fork, and `context: fork` skill.md directives — cheap ways
+    to isolate context-heavy work into sub-context windows ("shields" against
+    context decay).
+    (2) The 7-core-tools mental model (GLOB, GREP, READ, WRITE, EDIT, BASH,
+    AGENT) — Claude Code is a small, well-defined set of primitives; knowing
+    them lets you anticipate how Claude will respond to a prompt.
+    (3) The CLI > Skills > MCP preference order — most users reach for MCP when
+    a skill would be more token-efficient, and a CLI call more appropriate still.
+  non_obvious_finding: |
+    Mark's recurring argument is that mental models matter more than feature
+    adoption — knowing HOW Claude Code decomposes a task (which tool it reaches
+    for first) is higher leverage than adopting more features. This reframes
+    productivity from "more tools" to "better priors."
+  expected_hits:
+    - video_id: iALzJyvgCoM
+      channel: mark_kashef
+      timestamp_range: ["01:24", "02:47"]
+      key_phrase: "/btw, /fork, and the newer context: fork portion of a skill.md"
+      position: sub_context_shields
+      provenance: manual_verified   # re-used from Q03
+      source: transcript
+    - video_id: 3qUg57KGSVY
+      channel: mark_kashef
+      timestamp_range: ["01:47", "02:20"]
+      key_phrase: "seven core tools... GLOB, GREP, READ, WRITE, EDIT, BASH, AGENT"
+      position: mental_model
+      provenance: manual_verified   # re-used from Q05
+      source: transcript
+    - video_id: 1Z1aECGwJh0
+      channel: mark_kashef
+      timestamp_range: ["03:41", "04:23"]
+      key_phrase: "CLI first, then skills once you crystallize, and then... MCP"
+      position: preference_order
+      provenance: manual_verified   # re-used from Q01
+      source: transcript
+  dimensions:
+    recall_at_k:         {k: 5, threshold: 0.66}
+    channel_coverage:    {min_channels: 1, threshold: 1.0}
+    timestamp_precision: {tolerance_sec: 30, threshold: 0.66}
+    position_diversity:  {min_distinct_positions: 2, threshold: 1.0}
+
+
+# =============================================================================
+# Q13 — Cross-channel: What are Claude Skills and why do creators care?
+# =============================================================================
+- id: Q13
+  query: "How do creators describe Claude Skills (a.k.a. Agent Skills) — what they are, why they matter, and how they compare to MCP or sub-agents?"
+  query_type: cross_channel_comparative
+  concept_ids: [ai-engineering.ai_agent_skills]
+  known_good_answer: |
+    Convergent framing: skills are reusable prompt+tool bundles that capture
+    repeatable workflows — "crystallize a process you've done the same way 3-4
+    times" (Mark Kashef). All major labs now support the format.
+    Comparative positions:
+    - Sam Witteveen: skills have become an open standard "much better than MCP"
+      for ease-of-use; adopted by OpenAI and DeepMind (Gemini CLI / Antigravity);
+      marketplace ecosystem emerging (skills.sh, skillsmp.com).
+    - Mark Kashef: skills beat MCP on token efficiency for most daily workflows
+      (preference order: CLI > Skills > MCP).
+    - Nate B. Jones: skills sit alongside MCP in the protocol-layer stack that
+      enables secure autonomous computer use.
+  non_obvious_finding: |
+    Sam's claim "better than MCP" and Mark's preference order agree
+    directionally but arrive from different reasoning (Sam: ease-of-use /
+    ecosystem, Mark: token efficiency). Convergent conclusion from divergent
+    reasoning is a stronger signal than either argument alone.
+  expected_hits:
+    - video_id: IjiaCOt7bP8
+      channel: samwitteveenai
+      timestamp_range: ["00:00", "00:51"]
+      key_phrase: "Claude skills... killer tool... open standard... better than MCP"
+      position: open_standard_winner
+      provenance: manual_verified
+      source: transcript
+    - video_id: 1Z1aECGwJh0
+      channel: mark_kashef
+      timestamp_range: ["03:41", "04:23"]
+      key_phrase: "CLI first, then skills once you crystallize, and then... MCP"
+      position: token_efficiency_winner
+      provenance: manual_verified   # re-used from Q01/Q12
+      source: transcript
+    - video_id: LwKnvqVdUgA
+      channel: natebjones
+      timestamp_range: ["04:58", "05:30"]
+      key_phrase: "Through the Model Context Protocol layer, through skills"
+      position: protocol_layer_peer
+      provenance: manual_verified   # re-used from Q01
+      source: transcript
+  dimensions:
+    recall_at_k:         {k: 10, threshold: 0.70}
+    channel_coverage:    {min_channels: 3, threshold: 1.0}
+    timestamp_precision: {tolerance_sec: 30, threshold: 0.66}
+    position_diversity:  {min_distinct_positions: 2, threshold: 1.0}
+
+
+# =============================================================================
+# Q14 — Cross-channel orchestration patterns
+# =============================================================================
+- id: Q14
+  query: "What patterns do creators recommend for orchestrating multiple AI agents — peer-to-peer, hub-and-spoke, or hierarchical?"
+  query_type: cross_channel_comparative
+  concept_ids: [ai-engineering.ai_agent_orchestration, ai-engineering.multi_agent_orchestration]
+  known_good_answer: |
+    Three patterns surface:
+    1. Hub-and-spoke with human conductor (Ramjad) — one user dictates prompts
+       across 10-12 parallel Claude Code sessions; the human is the orchestrator.
+    2. Peer-to-peer agent teams (Sean Kochel) — teammates with distinct context
+       windows coordinate via shared task list + mailbox; no single conductor.
+    3. Hierarchical orchestrator-swarm (Sam Witteveen on Kimi K2.5) — a single
+       trainable orchestrator model directs up to 100 sub-agents; orchestrator
+       earns its role via reinforcement learning (PARL).
+    Framing layer (Nate B. Jones): orchestration is the LAST and biggest gap in
+    the agent infrastructure stack — current tooling sits at framework level
+    (LangChain), not infrastructure level.
+  non_obvious_finding: |
+    The three patterns don't just differ in mechanics — they differ in WHO decides
+    WHEN to spawn more agents. Ray: human. Sean: collective / shared task list.
+    Sam/Kimi: a trained orchestrator model. That "who decides" dimension is
+    invisible to keyword search but is the actual design decision.
+  expected_hits:
+    - video_id: AzmnaoVP8sk
+      channel: ramjad
+      timestamp_range: ["06:08", "06:40"]
+      key_phrase: "treat it like the game Factorio... three, four or five instances"
+      position: human_hub
+      provenance: manual_verified
+      source: transcript
+    - video_id: g5V3M_8flxc
+      channel: seankochel
+      timestamp_range: ["10:28", "11:00"]
+      key_phrase: "Mailbox system for inter-agent communication"
+      position: peer_to_peer
+      provenance: concept_augmented_verified
+      source: mindmap
+    - video_id: FfCqINSD8Tc
+      channel: samwitteveenai
+      timestamp_range: ["05:52", "07:37"]
+      key_phrase: "orchestrator agent... decomposed into these parallelizable subtasks"
+      position: hierarchical_swarm
+      provenance: manual_verified
+      source: transcript
+    - video_id: 7HP1jFJ9W1c
+      channel: natebjones
+      timestamp_range: ["15:34", "16:30"]
+      key_phrase: "orchestration and coordination... biggest opportunity in the stack"
+      position: infrastructure_gap
+      provenance: manual_verified
+      source: transcript
+  dimensions:
+    recall_at_k:         {k: 15, threshold: 0.75}
+    channel_coverage:    {min_channels: 3, threshold: 1.0}
+    timestamp_precision: {tolerance_sec: 45, threshold: 0.66}
+    position_diversity:  {min_distinct_positions: 3, threshold: 1.0}
+
+
+# =============================================================================
+# Q15 — Cross-channel: How do creators benchmark new models?
+# =============================================================================
+- id: Q15
+  query: "When a new AI model drops (Opus 4.7, Gemma 4, Sonnet 4.6), how do different creators evaluate it — what signals matter to them?"
+  query_type: cross_channel_comparative
+  concept_ids: [ai-engineering.ai_agent_benchmarking]
+  known_good_answer: |
+    Two distinct evaluation cultures:
+    1. Every (Dan Shipper / Brandon Gell) — "vibe check": run the model on your
+       own real workflow (P&L to investor update, spin up OpenClaw) and compare
+       A/B against the previous model on the same prompt. Published benchmarks
+       (SWE-bench Pro, Verified) inform but don't replace the hands-on test.
+    2. Sam Witteveen — economic benchmarking: track total token consumption on
+       a fixed task across model versions. Sonnet 4.6 was 40% cheaper per token
+       but used 4x more tokens total than its predecessor; published price ≠
+       actual spend.
+    Both approaches share a skeptical stance: announcements say "our most capable
+    model yet" every release, so the signal must come from measurement, not
+    marketing.
+  non_obvious_finding: |
+    Every's "vibe check" is a qualitative evaluation run as a live-streamed ritual
+    — eval-as-performance. Sam's approach is quantitative eval published as an
+    article. Neither cites the other, but both independently reject benchmark
+    announcements as the primary signal.
+  expected_hits:
+    - video_id: W--hvgRLmJM
+      channel: everyinc
+      timestamp_range: ["00:20", "02:37"]
+      key_phrase: "we're doing an Opus 4.7 vibe check... our standard battery of tests"
+      position: hands_on_vibe_check
+      provenance: manual_verified
+      source: transcript
+    - video_id: W--hvgRLmJM
+      channel: everyinc
+      timestamp_range: ["04:28", "06:00"]
+      key_phrase: "how good it is at taking our P&L from Every... turning it into an investor update"
+      position: hands_on_vibe_check
+      provenance: manual_verified
+      source: transcript
+    - video_id: iyLwNnU6BMA
+      channel: samwitteveenai
+      timestamp_range: ["04:17", "05:06"]
+      key_phrase: "Sonnet 4.6 used more than 4x the total tokens"
+      position: total_token_empirical
+      provenance: manual_verified   # re-used from Q03/Q07
+      source: transcript
+  dimensions:
+    recall_at_k:         {k: 10, threshold: 0.70}
+    channel_coverage:    {min_channels: 2, threshold: 1.0}
+    timestamp_precision: {tolerance_sec: 45, threshold: 0.66}
+    position_diversity:  {min_distinct_positions: 2, threshold: 1.0}
+
+
+# =============================================================================
+# Q16 — Cross-channel: context engineering (vs context window)
+# =============================================================================
+- id: Q16
+  query: "What is 'context engineering' as a discipline, and how does it differ from managing the context window?"
+  query_type: cross_channel_comparative
+  concept_ids: [ai-engineering.context_engineering]
+  known_good_answer: |
+    The distinction that emerges across creators:
+    - Context window management = preventing pollution of the runtime context
+      (pruning, compacting, forking into sub-contexts).
+    - Context engineering = *designing* what goes into context in the first
+      place — progressive disclosure of skills, CLAUDE.md rules, system
+      prompts, project files, external connectors.
+    Sam Witteveen: skills use "progressive disclosure" — the skill.md header
+    is always visible, but the skill body only loads when the agent decides
+    it's needed. This is context engineering as *just-in-time context*.
+    Grace Leung: context engineering = persistent system prompts + chat memory
+    + project files + external connectors, set up once and applied across chats.
+    Ray Amjad: context engineering surfaces at the infrastructure level (e.g.,
+    user-level CLAUDE.md that defines the agent's default behaviors).
+  non_obvious_finding: |
+    "Context engineering" is becoming a unified term, but the three creators
+    frame it at different layers — Sam at the agent/skill level, Grace at the
+    user-configuration level, Ray at the infrastructure level. All three are
+    valid; the term is underspecified.
+  expected_hits:
+    - video_id: IjiaCOt7bP8
+      channel: samwitteveenai
+      timestamp_range: ["02:00", "04:00"]
+      key_phrase: "progressive disclosure... skill body only loads when needed"
+      position: progressive_disclosure
+      provenance: concept_augmented_verified   # verified concept label; exact quote not grep-recovered
+      source: transcript
+    - video_id: Dr3kvgEYIZI
+      channel: graceleungyl
+      timestamp_range: ["04:00", "06:00"]
+      key_phrase: "system prompt... project files... external connectors"
+      position: persistent_user_context
+      provenance: manual_verified   # re-used from Q11
+      source: transcript
+    - video_id: AzmnaoVP8sk
+      channel: ramjad
+      timestamp_range: ["13:40", "14:10"]
+      key_phrase: "user level CLAUDE.md file... aggressively offload"
+      position: infrastructure_rule
+      provenance: manual_verified   # re-used from Q04/Q06
+      source: transcript
+  dimensions:
+    recall_at_k:         {k: 10, threshold: 0.70}
+    channel_coverage:    {min_channels: 3, threshold: 1.0}
+    timestamp_precision: {tolerance_sec: 45, threshold: 0.60}
+    position_diversity:  {min_distinct_positions: 2, threshold: 1.0}
+
+
+# =============================================================================
+# Q17 — Cross-channel: token economics at scale
+# =============================================================================
+- id: Q17
+  query: "What are the real costs of running AI agents at scale, and how do creators recommend managing them?"
+  query_type: cross_channel_comparative
+  concept_ids: [ai-engineering.token_economics]
+  known_good_answer: |
+    Three angles on cost:
+    1. Sam Witteveen (technical-empirical): published price-per-token is
+       unreliable; measure total tokens on your own task. Sonnet 4.6 was 40%
+       cheaper per token but used 4x more tokens than predecessor.
+    2. Every (operational): distributing a personal Claude / OpenClaw to every
+       employee generates high token consumption but is justified by the
+       "Plus One" pattern — agents that reflect individual users build
+       trust and org-specific knowledge.
+    3. Ramjad (tactical): "token budgets" turn the cost into a design lever —
+       set a minimum spend to force deep work, let Claude stop when progress
+       slows or budget is hit.
+  non_obvious_finding: |
+    Cost is not just an operational worry — it's an active design lever. Ray's
+    token budget reframes "what does this cost?" as "what depth of work am I
+    buying?". This is the opposite of the usual cost-minimization framing.
+  expected_hits:
+    - video_id: iyLwNnU6BMA
+      channel: samwitteveenai
+      timestamp_range: ["04:17", "05:06"]
+      key_phrase: "Sonnet 4.6 used more than 4x the total tokens... token muncher"
+      position: empirical_total_cost
+      provenance: manual_verified   # re-used from Q03/Q07/Q15
+      source: transcript
+    - video_id: SRlTgIhESjw
+      channel: everyinc
+      timestamp_range: ["00:00", "01:56"]
+      key_phrase: "Claude is not mine. Claude is everybody's. A Claw or a Plus One is mine"
+      position: personal_agent_roi
+      provenance: manual_verified
+      source: transcript
+    - video_id: YSbB5gc_1K8
+      channel: ramjad
+      timestamp_range: ["06:10", "07:23"]
+      key_phrase: "token budgets as a way of forcing deep work"
+      position: budget_as_design_lever
+      provenance: manual_verified   # re-used from Q03/Q06
+      source: transcript
+  dimensions:
+    recall_at_k:         {k: 10, threshold: 0.70}
+    channel_coverage:    {min_channels: 3, threshold: 1.0}
+    timestamp_precision: {tolerance_sec: 45, threshold: 0.66}
+    position_diversity:  {min_distinct_positions: 2, threshold: 1.0}
+
+
+# =============================================================================
+# Q18 — Cross-channel: practical multimodal use cases
+# =============================================================================
+- id: Q18
+  query: "How are creators using multimodal AI (vision, audio) in 2026 — what use cases are actually working?"
+  query_type: cross_channel_comparative
+  concept_ids: [ai-engineering.multimodal_analysis]
+  known_good_answer: |
+    Two distinct uses surface:
+    1. Sam Witteveen (model/capability lens): Gemma 4 ships vision, audio,
+       function calling, and thinking natively in a single model family —
+       "on-device assistant" use cases (voice-first AI, local inference) are
+       now feasible with 128K context window at the edge.
+    2. Grace Leung (consumer productivity lens): Gemini's superior multi-modal
+       analyzes both visuals and audio simultaneously; recommended for large
+       document analysis, building Google Workspace workflows, and creating
+       data visualizations where visual beauty and analytical depth both matter.
+    Convergent conclusion: multimodal has moved from bolted-on capability
+    (whisper + LLM + stable diffusion pipelines) to native, single-model
+    capability — and this changes architecture decisions.
+  non_obvious_finding: |
+    Both creators independently arrive at "native > bolted-on" for multimodal,
+    but from opposite ends — Sam from model architecture (Gemma 4 design),
+    Grace from end-user workflow (what produces the best output for a task).
+    Technical and product signals converging.
+  expected_hits:
+    - video_id: 5aqF1HVpjdc
+      channel: samwitteveenai
+      timestamp_range: ["03:06", "04:06"]
+      key_phrase: "vision, audio, thinking, function calling... built in from the architecture level"
+      position: native_multimodal_arch
+      provenance: manual_verified   # re-used from Q05
+      source: transcript
+    - video_id: 5aqF1HVpjdc
+      channel: samwitteveenai
+      timestamp_range: ["11:09", "11:40"]
+      key_phrase: "on-device assistant... actual voice-first AI... run at the edge"
+      position: edge_voice_first
+      provenance: manual_verified   # re-used from Q05
+      source: transcript
+    - video_id: Dr3kvgEYIZI
+      channel: graceleungyl
+      timestamp_range: ["02:00", "04:00"]
+      key_phrase: "Gemini... multi-modal capability... analyzing both visuals and audio at the same time"
+      position: productivity_workflow
+      provenance: manual_verified   # re-used from Q11
+      source: transcript
+  dimensions:
+    recall_at_k:         {k: 10, threshold: 0.70}
+    channel_coverage:    {min_channels: 2, threshold: 1.0}
+    timestamp_precision: {tolerance_sec: 45, threshold: 0.66}
+    position_diversity:  {min_distinct_positions: 2, threshold: 1.0}
+
+
+# =============================================================================
+# Q19 — Synthesis: When skill vs sub-agent vs full agent?
+# =============================================================================
+- id: Q19
+  query: "When should someone reach for a Claude Skill vs a sub-agent vs a full custom agent? What decision framework do creators suggest?"
+  query_type: cross_channel_synthesis
+  concept_ids:
+    - ai-engineering.ai_agent_skills
+    - ai-engineering.multi_agent_orchestration
+    - ai-engineering.agent_configuration
+  known_good_answer: |
+    An implicit decision framework emerges by aggregating across creators:
+    - Start with CLI / direct prompt for one-off tasks (Mark Kashef's ordering).
+    - Crystallize into a Skill when you've done the task the same way 3-4 times
+      (Mark's "skills for crystallization"; Sam Witteveen's "open standard" point).
+    - Reach for sub-agents when the task has independent sub-tasks that pollute
+      main context (Ramjad's "aggressively offload online research to subagents"
+      rule; Sean Kochel's agent teams for parallel multi-layer work).
+    - Full custom agent / orchestrator only when the task is ongoing and needs
+      autonomy (Kimi K2.5 Agent Swarm as the extreme example; AgentMail as
+      the infrastructure bet).
+  non_obvious_finding: |
+    No single creator articulates this full framework; it's an emergent
+    synthesis. Each creator covers 1-2 levels but not all four. This is exactly
+    the query type where a Wiki/synthesis layer would earn its keep — hybrid
+    search can surface the four levels from four different videos; connecting
+    them into a framework is a separate cognitive act.
+  expected_hits:
+    - video_id: 1Z1aECGwJh0
+      channel: mark_kashef
+      timestamp_range: ["03:41", "04:23"]
+      key_phrase: "one-off tasks... crystallize this process as a skill"
+      position: crystallization_threshold
+      provenance: manual_verified
+      source: transcript
+    - video_id: IjiaCOt7bP8
+      channel: samwitteveenai
+      timestamp_range: ["00:00", "00:51"]
+      key_phrase: "agent skills... killer tool... open standard"
+      position: skills_as_standard
+      provenance: manual_verified
+      source: transcript
+    - video_id: AzmnaoVP8sk
+      channel: ramjad
+      timestamp_range: ["13:40", "14:10"]
+      key_phrase: "aggressively offload online research... to subagents"
+      position: subagent_offload
+      provenance: manual_verified
+      source: transcript
+    - video_id: FfCqINSD8Tc
+      channel: samwitteveenai
+      timestamp_range: ["00:23", "01:59"]
+      key_phrase: "up to a hundred self-directed sub-agents"
+      position: full_orchestrator
+      provenance: manual_verified
+      source: transcript
+  dimensions:
+    recall_at_k:         {k: 15, threshold: 0.66}
+    channel_coverage:    {min_channels: 3, threshold: 1.0}
+    timestamp_precision: {tolerance_sec: 45, threshold: 0.60}
+    position_diversity:  {min_distinct_positions: 3, threshold: 1.0}
+
+
+# =============================================================================
+# Q20 — Synthesis: Biggest unsolved problem in AI coding, April 2026
+# =============================================================================
+- id: Q20
+  query: "Across creators in early 2026, what do they see as the biggest unsolved problem or frontier in AI-assisted coding?"
+  query_type: cross_channel_synthesis
+  concept_ids:
+    - ai-engineering.ai_agent_orchestration
+    - ai-engineering.context_engineering
+    - ai-engineering.validation_loops
+  known_good_answer: |
+    Three distinct framings of "the frontier":
+    1. Nate B. Jones: orchestration is the biggest gap — multi-agent coordination
+       at enterprise scale (50 agents, failure recovery, cost control, audit
+       logging) is still hand-rolled by every team. Current tooling sits at
+       framework level (LangChain), not infrastructure level.
+    2. Mike Krieger (Anthropic, via Every podcast): models are good at ADDING
+       features but bad at figuring out what to CUT. The art and science of
+       software design in 2026 is deciding what the product should NOT do —
+       a taste problem, not a capability problem.
+    3. Nate (validation angle): autonomous agents can't be graded single-shot;
+       they need evaluation as a steering mechanism throughout the loop, and
+       no current framework does this well.
+  non_obvious_finding: |
+    All three "frontier" claims are about human-AI judgment calls at different
+    levels — orchestration (which agents to spawn when), cut decisions (what
+    shouldn't exist), and convergence (is this output good enough to accept).
+    The pattern: capability isn't the bottleneck anymore — judgment is. Models
+    do more; we have less clarity about when to stop them.
+  expected_hits:
+    - video_id: 7HP1jFJ9W1c
+      channel: natebjones
+      timestamp_range: ["15:34", "17:53"]
+      key_phrase: "orchestration and coordination... biggest opportunity in the stack"
+      position: orchestration_gap
+      provenance: manual_verified   # re-used from Q05/Q14
+      source: transcript
+    - video_id: KRv9GpJYrUA
+      channel: everyinc
+      timestamp_range: ["00:00", "00:20"]
+      key_phrase: "models today are good at adding features. They're not necessarily good about figuring out what to cut"
+      position: taste_problem
+      provenance: manual_verified
+      source: transcript
+    - video_id: KRv9GpJYrUA
+      channel: everyinc
+      timestamp_range: ["00:18", "00:40"]
+      key_phrase: "the art and science of software design in 2026"
+      position: taste_problem
+      provenance: manual_verified
+      source: transcript
+    - video_id: JDAIOSWfPn0
+      channel: natebjones
+      timestamp_range: ["01:32", "02:30"]
+      key_phrase: "make our evaluations the steering wheel for the entire process"
+      position: validation_frontier
+      provenance: manual_verified   # re-used from Q02
+      source: transcript
+  dimensions:
+    recall_at_k:         {k: 15, threshold: 0.60}     # synthesis = hardest
+    channel_coverage:    {min_channels: 2, threshold: 1.0}
+    timestamp_precision: {tolerance_sec: 45, threshold: 0.60}
+    position_diversity:  {min_distinct_positions: 3, threshold: 1.0}
+
+
+# =============================================================================
+# Q21 — Sam Witteveen baseline: the open-weight model ecosystem
+# =============================================================================
+- id: Q21
+  query: "According to Sam Witteveen, how is the open-weight model ecosystem evolving relative to proprietary frontier models?"
+  query_type: baseline_single_channel
+  concept_ids: [ai-engineering.agentic_tool_use, ai-engineering.multi_agent_orchestration]
+  known_good_answer: |
+    Sam's consistent thesis across recent videos:
+    (1) Open-weight models are now genuinely competitive for agentic workloads,
+    not just research — Gemma 4 ships under Apache 2 (no restrictive clauses)
+    with native function calling, vision, audio, and thinking in a single
+    architecture.
+    (2) Chinese open-weight labs (Moonshot / Kimi K2.5) are pushing the frontier
+    on *parallelism* specifically — 100-sub-agent swarms, PARL training — rather
+    than competing on raw parameter counts.
+    (3) The ecosystem around open-weight (Open Code, Roo, Cline) is maturing
+    faster than expected; open harnesses are starting to rival proprietary ones.
+    (4) Economics matter more than benchmarks — Sonnet 4.6's 4x token consumption
+    warning is a recurring theme.
+  non_obvious_finding: |
+    Sam reads model launches through three lenses simultaneously — capability,
+    ecosystem, and economics. Most creators pick one. His value is the
+    triangulation, not any single dimension.
+  expected_hits:
+    - video_id: 5aqF1HVpjdc
+      channel: samwitteveenai
+      timestamp_range: ["00:00", "01:00"]
+      key_phrase: "Gemma 4 ships under an Apache 2 license, not a custom license with weird restrictions"
+      position: license_as_signal
+      provenance: manual_verified
+      source: transcript
+    - video_id: FfCqINSD8Tc
+      channel: samwitteveenai
+      timestamp_range: ["00:23", "01:59"]
+      key_phrase: "scaling out and using lots of sub-agents... Parallel-Agent RL"
+      position: open_swarm_frontier
+      provenance: manual_verified   # re-used
+      source: transcript
+    - video_id: iyLwNnU6BMA
+      channel: samwitteveenai
+      timestamp_range: ["04:17", "05:06"]
+      key_phrase: "Sonnet 4.6 used more than 4x the total tokens"
+      position: economics_skeptic
+      provenance: manual_verified   # re-used
+      source: transcript
+  dimensions:
+    recall_at_k:         {k: 5, threshold: 0.66}
+    channel_coverage:    {min_channels: 1, threshold: 1.0}
+    timestamp_precision: {tolerance_sec: 30, threshold: 0.66}
+    position_diversity:  {min_distinct_positions: 2, threshold: 1.0}
+
+
+# =============================================================================
+# Q22 — Dan Shipper / Every baseline: AI-native organization design
+# =============================================================================
+- id: Q22
+  query: "According to Dan Shipper and the Every team, what does an AI-native organization look like in practice?"
+  query_type: baseline_single_channel
+  concept_ids: [ai-engineering.agent_configuration, ai-engineering.autonomous_ai_agents]
+  known_good_answer: |
+    Every's working definition of AI-native:
+    (1) "Claude is not mine. Claude is everybody's. A Claw or a Plus One is mine."
+    Every employee gets a personal agent (Open Claw) that modifies itself in
+    response to individual conversations — becomes a reflection of its user.
+    Personal agents > shared assistants because of identity / trust accrual.
+    (2) Evaluation is performed as a team ritual (live "vibe check" streams
+    with standard battery of tests on real workflows — P&L → investor update),
+    not delegated to benchmark announcements.
+    (3) Mike Krieger (Anthropic CPO, on the show) frames the frontier product
+    question: models are great at ADDING features but weak at deciding what to
+    CUT. "The art and science of software design in 2026" is taste-driven
+    subtraction, not AI-driven addition.
+  non_obvious_finding: |
+    Every's org model is unusual — most companies are trying to deploy ONE
+    powerful AI; Every is deploying many PERSONAL ones that each reflect a
+    specific human. That inversion (many agents, each pinned to an identity)
+    is the design decision most of their content converges on.
+  expected_hits:
+    - video_id: SRlTgIhESjw
+      channel: everyinc
+      timestamp_range: ["00:00", "01:00"]
+      key_phrase: "Claude is not mine. Claude is everybody's. A Claw or a Plus One is mine"
+      position: personal_agent_identity
+      provenance: manual_verified   # re-used from Q17
+      source: transcript
+    - video_id: W--hvgRLmJM
+      channel: everyinc
+      timestamp_range: ["00:20", "02:37"]
+      key_phrase: "standard battery of tests... vibe check"
+      position: evaluation_as_ritual
+      provenance: manual_verified   # re-used from Q15
+      source: transcript
+    - video_id: KRv9GpJYrUA
+      channel: everyinc
+      timestamp_range: ["00:00", "00:20"]
+      key_phrase: "good at adding features... not... figuring out what to cut"
+      position: subtraction_as_art
+      provenance: manual_verified   # re-used from Q20
+      source: transcript
+  dimensions:
+    recall_at_k:         {k: 5, threshold: 0.66}
+    channel_coverage:    {min_channels: 1, threshold: 1.0}
+    timestamp_precision: {tolerance_sec: 30, threshold: 0.66}
+    position_diversity:  {min_distinct_positions: 2, threshold: 1.0}
+
+
+# =============================================================================
+# Q23 — Cross-channel: first principles for working with AI
+# =============================================================================
+- id: Q23
+  query: "What first principles do creators independently surface when explaining how to work effectively with AI — patterns that transcend specific tools or models?"
+  query_type: cross_channel_comparative
+  concept_ids: [ai-engineering.tacit_knowledge_extraction, ai-engineering.context_engineering]
+  known_good_answer: |
+    Four principles recur across creators:
+    1. **Clarity of intent** (Grace): specify task + context + format; AI
+       confusion mirrors your confusion.
+    2. **Evaluation as steering** (Nate): evals shouldn't be post-hoc grades;
+       they should be the ongoing signal that drives the loop.
+    3. **Context as a resource** (Ray): actively manage what goes into context
+       — offload noisy work to sub-agents, reserve main-session context for
+       decisions.
+    4. **Taste over capability** (Mike Krieger): models add features fast;
+       humans decide what should not exist. First-principle is that the
+       bottleneck has moved from "can AI do X" to "should X exist at all."
+  non_obvious_finding: |
+    None of these principles is about the model. All four are about the *human's*
+    discipline in interacting with the model. That's the meta-principle the
+    corpus independently converges on: the model has become commodity; the
+    operator's discipline is the differentiator.
+  expected_hits:
+    - video_id: Dr3kvgEYIZI
+      channel: graceleungyl
+      timestamp_range: ["00:24", "01:30"]
+      key_phrase: "clear tasks... relevant context... output format"
+      position: clarity_of_intent
+      provenance: manual_verified   # re-used from Q11
+      source: transcript
+    - video_id: JDAIOSWfPn0
+      channel: natebjones
+      timestamp_range: ["01:32", "02:30"]
+      key_phrase: "evaluations the steering wheel for the entire process"
+      position: evaluation_as_steering
+      provenance: manual_verified   # re-used from Q02/Q20
+      source: transcript
+    - video_id: AzmnaoVP8sk
+      channel: ramjad
+      timestamp_range: ["13:40", "14:10"]
+      key_phrase: "aggressively offload online research... to subagents"
+      position: context_as_resource
+      provenance: manual_verified   # re-used
+      source: transcript
+    - video_id: KRv9GpJYrUA
+      channel: everyinc
+      timestamp_range: ["00:00", "00:20"]
+      key_phrase: "not necessarily good about figuring out what to cut out of the product"
+      position: taste_over_capability
+      provenance: manual_verified   # re-used from Q20/Q22
+      source: transcript
+  dimensions:
+    recall_at_k:         {k: 15, threshold: 0.66}
+    channel_coverage:    {min_channels: 3, threshold: 1.0}
+    timestamp_precision: {tolerance_sec: 45, threshold: 0.60}
+    position_diversity:  {min_distinct_positions: 3, threshold: 1.0}
+
+
+# =============================================================================
+# Q24 — Cross-channel: AI for content creators vs developers
+# =============================================================================
+- id: Q24
+  query: "How do creators design AI workflows for non-developers (marketing / content / operations) vs developers — where do the designs diverge?"
+  query_type: cross_channel_comparative
+  concept_ids: [ai-engineering.workflow_automation, ai-engineering.ai_agent_skills]
+  known_good_answer: |
+    Two distinct workflow-design philosophies:
+    1. **Non-developer (Grace Leung, marketing team build)** — 4-step process:
+       map your function, turn repeatable tasks into skills (one per workflow),
+       group skills into non-overlapping agent roles, connect as a team. Her
+       example: 5 agents + 12 skills for a travel brand. Emphasis on role
+       boundaries and reusable skill artifacts that produce polished outputs.
+    2. **Developer (Ray Amjad)** — low-level infrastructure: user-level
+       CLAUDE.md rules, aggressive sub-agent deferral, MCP servers for fresh
+       context, parallel Claude Code sessions as the dominant workflow.
+       Emphasis on context preservation and parallel throughput.
+    Point of divergence: Grace optimizes for *role clarity* (one agent = one
+    function); Ray optimizes for *throughput* (10 sessions doing many things).
+  non_obvious_finding: |
+    Grace's "one skill per workflow" is a strong abstraction for non-technical
+    users — she's essentially teaching them to think in terms of API / service
+    boundaries without calling it that. Ray's framing assumes you already think
+    in those terms. The same underlying concept (modular specialization)
+    presented in two opposite entry points based on the audience's starting
+    point.
+  expected_hits:
+    - video_id: yLXLHnD4fco
+      channel: graceleungyl
+      timestamp_range: ["00:24", "00:56"]
+      key_phrase: "four steps... map your marketing function... turn each repeatable task into a skill"
+      position: role_boundary_design
+      provenance: manual_verified
+      source: transcript
+    - video_id: yLXLHnD4fco
+      channel: graceleungyl
+      timestamp_range: ["00:39", "01:11"]
+      key_phrase: "group similar skills into non-overlapping agent roles"
+      position: role_boundary_design
+      provenance: manual_verified
+      source: transcript
+    - video_id: AzmnaoVP8sk
+      channel: ramjad
+      timestamp_range: ["06:08", "14:10"]
+      key_phrase: "Factorio... parallel Claude Code sessions... aggressively offload"
+      position: throughput_maximization
+      provenance: manual_verified   # re-used
+      source: transcript
+  dimensions:
+    recall_at_k:         {k: 10, threshold: 0.70}
+    channel_coverage:    {min_channels: 2, threshold: 1.0}
+    timestamp_precision: {tolerance_sec: 45, threshold: 0.66}
+    position_diversity:  {min_distinct_positions: 2, threshold: 1.0}
+
+
+# =============================================================================
+# Q25 — Synthesis: "60 minutes a day with AI — what's the highest-leverage use?"
+# =============================================================================
+- id: Q25
+  query: "If a professional had only 60 minutes a day with AI, how would different creators recommend spending that time for maximum compounding value?"
+  query_type: cross_channel_synthesis
+  concept_ids:
+    - ai-engineering.tacit_knowledge_extraction
+    - ai-engineering.workflow_automation
+    - ai-engineering.validation_loops
+  known_good_answer: |
+    An implicit consensus emerges across creators — none states the "60 minutes"
+    framing directly, but their high-leverage activities are remarkably convergent:
+    1. **Build a skill library (Grace, Sam, Mark)** — time spent crystallizing
+       a repeated workflow into a skill pays back every future invocation.
+       Convergent position: ~20 min/day on skill creation > 60 min/day on
+       one-off prompts.
+    2. **Run cross-model verification (Grace)** — 5-10 min validating any
+       important output against a different model catches hallucinations you
+       would otherwise propagate.
+    3. **Invest in context engineering artifacts (Ray, Grace)** — CLAUDE.md /
+       project files / system prompts are one-time cost with permanent return.
+    4. **Evaluate ruthlessly (Nate)** — if any of those artifacts isn't
+       delivering in a loop, kill it; evaluation is the steering, not the
+       finish line.
+  non_obvious_finding: |
+    The implicit consensus is that HIGH-LEVERAGE AI TIME IS META-WORK
+    (building skills, context, evals) rather than object-level work (prompting
+    for direct output). If you spend 60 min/day on direct prompts you're
+    running on a treadmill; if you spend 60 min/day on skills/context/evals
+    you're compounding capability. No single creator states this; it emerges
+    only across them.
+  expected_hits:
+    - video_id: Dr3kvgEYIZI
+      channel: graceleungyl
+      timestamp_range: ["04:00", "09:00"]
+      key_phrase: "context management... cross-model verification"
+      position: meta_work_context
+      provenance: manual_verified   # re-used from Q11/Q16/Q18
+      source: transcript
+    - video_id: yLXLHnD4fco
+      channel: graceleungyl
+      timestamp_range: ["00:24", "01:11"]
+      key_phrase: "turn each repeatable task into a skill"
+      position: meta_work_skill_library
+      provenance: manual_verified   # re-used from Q24
+      source: transcript
+    - video_id: AzmnaoVP8sk
+      channel: ramjad
+      timestamp_range: ["13:40", "14:10"]
+      key_phrase: "user level CLAUDE.md file"
+      position: meta_work_context
+      provenance: manual_verified   # re-used
+      source: transcript
+    - video_id: JDAIOSWfPn0
+      channel: natebjones
+      timestamp_range: ["01:32", "02:30"]
+      key_phrase: "evaluations the steering wheel"
+      position: meta_work_evaluation
+      provenance: manual_verified   # re-used from Q02/Q20/Q23
+      source: transcript
+    - video_id: 1Z1aECGwJh0
+      channel: mark_kashef
+      timestamp_range: ["03:41", "04:23"]
+      key_phrase: "crystallize this process as a skill"
+      position: meta_work_skill_library
+      provenance: manual_verified   # re-used
+      source: transcript
+  dimensions:
+    recall_at_k:         {k: 15, threshold: 0.60}     # synthesis = hardest
+    channel_coverage:    {min_channels: 3, threshold: 1.0}
+    timestamp_precision: {tolerance_sec: 45, threshold: 0.55}
+    position_diversity:  {min_distinct_positions: 3, threshold: 1.0}
