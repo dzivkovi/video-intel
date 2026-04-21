@@ -32,6 +32,9 @@ examples/*.txt.tmp
 
 .claude/scheduled_tasks.lock
 
+# Compound Engineering local config — example.yaml is committed, *.local.yaml is not
+.compound-engineering/*.local.yaml
+
 # Skill eval workspace — default-exclude, allow signal-bearing artifacts.
 # See skill-eval-workspace/README.md for the lifecycle convention.
 skill-eval-workspace/**
