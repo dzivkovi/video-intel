@@ -191,3 +191,13 @@ This project uses the [Compound Engineering plugin](https://github.com/EveryInc/
 Session plans are stored in `plans/` (configured via `.claude/settings.json`). Plans are session artifacts — historical, not living docs.
 
 Solved problems are recorded in `docs/solutions/` following the three-bucket rule (living / historical / decision records).
+
+## Code Review Guardrails
+
+Rules for review agents (auto-selected by `/ce-code-review`) and for anyone cutting a PR. These are the non-obvious checks — the general "does it work, does it have tests" bar is assumed.
+
+- **Bounded retries only.** The `transcript` path tries one JSON parse, then `isolate_json()`, then `salvage_transcript_sections()`, then one bounded retry if salvage fails. Do not promote this to an unbounded loop. Partial writes plus a `.transcript.raw.txt` sidecar are the designed failure mode, not something to "fix."
+- **Probe before you pay.** `probe_atomic_writes()` runs *before* any Voyage embedding call in `build_search_index`. Reordering that sequence (probe after embedding, probe conditional on a flag, probe only in verbose mode) costs ~$0.30 per failed run. See [ADR-0016](docs/adr/ADR-0016-vector-db-path-config.md). Reviewers: grep for `probe_atomic_writes` in any diff touching `build_search_index` or `index` CLI.
+- **Timestamps are data, not decoration.** Every retrieved chunk carries `timestamp_seconds`, surfaced as `&t=<seconds>` in result URLs. Changes to chunking, dedup, or rendering that drop or corrupt that field break user-visible behavior. Reviewers: grep for `timestamp_seconds` in diffs touching `hybrid_search`, `_dedup_by_video`, or chunk rendering.
+- **Skill-parity: same diff, not follow-up.** When a PR adds a new CLI subcommand or flag to `video_intel.py` or `translate_video.py`, the matching `SKILL.md` entry (natural-language routing) lives in the same PR. "I'll update the skill separately" is a regression — the plugin's skill surface drifts from its CLI surface and users can't reach the new capability through the skill.
+- **Out of scope for cleanup flags.** `docs/plans/*.md`, `docs/solutions/*.md`, `work/**/*`, and the root `plans/` directory are living or historical session artifacts. Review agents must not flag them for deletion, rewriting, or consolidation — that's the three-bucket rule at the end of the Workflows section.
