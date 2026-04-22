@@ -316,7 +316,20 @@ pip install lancedb voyageai
 python scripts/video_intel.py index                          # build index (one-time)
 python scripts/video_intel.py search "helium supply chain" --vector
 python scripts/video_intel.py search "code beats markdown" --vector --preview
+
+# Cross-creator nugget brief — consultant-grade synthesis across multiple creators
+# Retrieves top-K hybrid-search excerpts, then feeds them through a cross-creator
+# prompt that produces: consensus, divergence (with underlying frame-of-reference
+# differences), attributed nuggets (mental models, metaphors, warnings,
+# workarounds, business psychology), and "1+1=3" emergent insights that arise
+# from comparing creators' positions. Every claim cites [creator @ HH:MM].
+python scripts/video_intel.py nugget "LightRAG vs OpenBrain architectural tension"
+python scripts/video_intel.py nugget "context engineering" --since 90d
+python scripts/video_intel.py nugget "graph RAG" --channel engineerprompt
+python scripts/video_intel.py nugget "second brain patterns" --output brief.md
 ```
+
+See [`examples/nugget-lightrag-vs-openbrain-architectural-tension.md`](examples/nugget-lightrag-vs-openbrain-architectural-tension.md) for a sample output.
 
 ## Prompt Customization
 
@@ -329,6 +342,7 @@ Prompts live in `prompts/`. Each file is self-contained.
 | mindmap-heavy.md | Comprehensive extraction (6-10 branches, resources, perspectives) |
 | transcript.md | Three-task diarized transcript with screen content |
 | concepts.md | Concept extraction + normalization against taxonomy |
+| nugget-brief.md | Cross-creator consultant-grade synthesis (consensus / divergence / attributed nuggets / 1+1=3 emergent insights) |
 | translate-bcs.md | BCS subtitle translation, video-understanding fallback path (`translate_video.py`) |
 | translate-bcs-from-srt.md | BCS subtitle translation, captions-first path (`translate_video.py`) |
 | translate-bcs-from-transcript.md | BCS subtitle translation from a rich transcript (`translate_video.py --from-transcript`) |

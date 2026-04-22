@@ -16,7 +16,11 @@ description: >
   [creator]", "add [channel] to my watchlist", "what should I watch",
   "summarize this video", "is this worth watching", any YouTube URL +
   question, "show my channels", "what concepts are in my library", "what
-  topics recur across channels". Calls Gemini as multimodal proxy (frames +
+  topics recur across channels", "nugget brief on [topic]", "consultant
+  brief on [topic]", "what do [creators] say about [topic]", "agreements
+  and disagreements on [topic]", "synthesize insights across creators",
+  "mental models across creators", "find the nuggets about [topic]".
+  Calls Gemini as multimodal proxy (frames +
   on-screen text + audio). A taxonomy layer enables cross-video topic lookup
   without reading every file.
 ---
@@ -49,6 +53,7 @@ Three layers, designed as a narrowing funnel:
 |------------|----------|---------|
 | **Evidence** (who/what/when/how) | "which companies adopted X?", "what did they say about Y?" | `search "X" --vector` |
 | **Discovery** (which videos / themes) | "which videos cover X?", "what themes recur?" | `search "X"` (no flag) |
+| **Synthesis** (what do creators say, together) | "nugget brief on X", "what do creators agree/disagree about Y?", "consultant brief" | `nugget "X"` |
 
 - `--vector` uses **hybrid search** (BM25 keyword + vector semantic + RRF fusion).
   Results include full transcript passages — follow-up reads usually unnecessary.
@@ -97,6 +102,7 @@ table is the canonical mapping — read it before picking a command.
 | "find videos about X", "what covers Y" | `search "X"` | Discovery — fast, no API calls |
 | "what did they say about X", "evidence for Y" | `search "X" --vector` | Hybrid search; returns transcript passages |
 | "recent tips / takeaways from [creator]", "last N days of [creator]" | `search "X" --vector --channel Y --since Nd` | Query existing index over a date window; no Gemini calls |
+| "nugget brief on X", "consultant brief on X", "what do creators say about X (together)", "agreements and disagreements on X", "find the nuggets" | `nugget "X"` | Cross-creator synthesis; retrieves top-K excerpts and feeds consultant-grade prompt for attributed briefing with 1+1=3 emergent insights |
 | "transcribe this video" + URL | `transcript --url URL` | Single video |
 | "scan", "what's new", "check for new videos" | `scan` | All channels, configured `since` |
 | "what's new from [creator]" | `scan --channel X` | Single channel, configured `since` |
@@ -312,6 +318,34 @@ Hybrid search requires: `pip install 'video-intel[vector]'` and `VOYAGE_API_KEY`
 (free at https://dash.voyageai.com/). See the triage workflow table above for
 when to use `--vector` vs plain concept search.
 
+### Synthesize a consultant-grade nugget brief (cross-creator)
+
+```bash
+# Ask "what do creators say about X, together?"
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" nugget "LightRAG vs OpenBrain architectural tension"
+
+# Restrict to recent coverage
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" nugget "context engineering" --since 90d
+
+# Restrict to specific creators
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" nugget "graph RAG" --channel engineerprompt
+
+# Save the briefing to a file
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" nugget "second brain patterns" --output brief.md
+```
+
+The `nugget` command retrieves top-K excerpts via hybrid search, then feeds them through the `nugget-brief` prompt for a consultant-grade briefing. Output structure: Query in Focus → Creators Surveyed → Consensus → Divergence → Noteworthy Nuggets (mental models, metaphors, warnings, workarounds, business psychology) → Emergent Synthesis (1+1=3) → Follow-Up Questions. Every claim cites the creator and timestamp.
+
+Options:
+- `--limit N` - Max excerpts feeding synthesis (default: 15)
+- `--channel X` - Restrict to one creator
+- `--since Nd` - Time-window filter ('Nd' or 'YYYY-MM-DD')
+- `--min-relevance F` - Minimum RRF relevance score
+- `--no-expand` - Disable Stage-1 taxonomy query expansion
+- `--output PATH` - Write briefing to file instead of stdout
+
+Use when the user wants **grounded, multi-creator, citable analysis** — not a single-video summary and not raw evidence-search results. This is the "what do they say together, and what emerges from comparing them" mode.
+
 ### Extract and normalize concepts
 
 ```bash
@@ -371,6 +405,7 @@ Prompt templates live at the plugin root, `${CLAUDE_SKILL_DIR}/../../prompts/`:
 - `mindmap-heavy.md` - Comprehensive conceptual extraction
 - `transcript.md` - Full diarized transcript with screen content
 - `concepts.md` - Concept extraction + normalization against taxonomy
+- `nugget-brief.md` - Consultant-grade cross-creator synthesis with attributed nuggets
 
 Each prompt is self-contained. Users can modify or add their own.
 
