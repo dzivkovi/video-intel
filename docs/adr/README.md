@@ -49,6 +49,7 @@ Files are named: `ADR-NNNN-title-with-dashes.md`
 | [ADR-0015](ADR-0015-permissive-safety-filters-for-faithful-reporting.md) | Permissive safety filters for faithful reporting pipelines | accepted | 2026-04-11 |
 | [ADR-0016](ADR-0016-vector-db-path-config.md) | Decouple LanceDB vector index path from output_dir | accepted | 2026-04-18 |
 | [ADR-0017](ADR-0017-kb-layer-strategy.md) | Staged KB-layer strategy, gated by the 25-query eval | accepted | 2026-04-19 |
+| [ADR-0018](ADR-0018-nugget-cli-cross-creator-synthesis.md) | Nugget CLI for cross-creator synthesis — Path 1 before LightRAG Stage 2 | accepted | 2026-04-22 |
 
 ## Process
 

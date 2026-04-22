@@ -2938,6 +2938,120 @@ def cmd_taxonomy_build(args, config):
     print(f"  Saved: {output_dir / 'taxonomy.json'}")
 
 
+def _format_nugget_excerpt(hit: dict, index: int) -> str:
+    """Format one hybrid-search hit as an attributed excerpt for the nugget prompt."""
+    vid_url = f"https://www.youtube.com/watch?v={hit['video_id']}" if hit.get("video_id") else ""
+    ts_secs = hit.get("timestamp_seconds", 0)
+    if vid_url and ts_secs:
+        vid_url += f"&t={ts_secs}"
+    header = (
+        f"### Excerpt {index}\n"
+        f"- **Channel:** {hit['channel']}\n"
+        f"- **Published:** {hit['published']}\n"
+        f"- **Title:** {hit['title']}\n"
+        f"- **Timestamp:** [{hit['timestamp']}]\n"
+    )
+    if vid_url:
+        header += f"- **URL:** {vid_url}\n"
+    body = hit["text"].strip()
+    return f"{header}\n{body}\n"
+
+
+def build_nugget_prompt(template: str, query: str, hits: list[dict]) -> str:
+    """Fill the nugget-brief template with the query and formatted excerpts.
+
+    Pure function — no I/O, no Gemini calls. Separated from cmd_nugget so
+    the substitution logic is unit-testable.
+    """
+    excerpts_text = "\n".join(_format_nugget_excerpt(h, i) for i, h in enumerate(hits, 1))
+    return (
+        template.replace("{{QUERY}}", query)
+        .replace("{{NUM_CHUNKS}}", str(len(hits)))
+        .replace("{{EXCERPTS}}", excerpts_text)
+    )
+
+
+def cmd_nugget(args, config):
+    """Synthesize a consultant-grade multi-creator nugget brief for a query."""
+    output_dir = resolve_output_dir(config)
+    since_raw = getattr(args, "since", None)
+    since_iso = parse_since(since_raw).date().isoformat() if since_raw else None
+
+    log.info("Retrieving top-%d excerpts for: %s", args.limit, args.query)
+    hits = hybrid_search(
+        output_dir,
+        args.query,
+        channel_filter=args.channel,
+        since_iso=since_iso,
+        limit=args.limit,
+        config=config,
+        expand=not getattr(args, "no_expand", False),
+    )
+    if not hits:
+        print(f'No results for "{args.query}". Is the index built? Run: video_intel.py index')
+        return
+
+    min_rel = getattr(args, "min_relevance", 0.0)
+    strong = [h for h in hits if h["relevance"] >= min_rel]
+    if not strong:
+        print(f'No strong matches for "{args.query}" (best relevance: {hits[0]["relevance"]:.4f}).')
+        return
+
+    channels_seen = sorted({h["channel"] for h in strong})
+    log.info("Retrieved %d excerpts across %d channels: %s", len(strong), len(channels_seen), ", ".join(channels_seen))
+
+    prompt_template = load_prompt("nugget-brief")
+    filled_prompt = build_nugget_prompt(prompt_template, args.query, strong)
+
+    gemini_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+    if not gemini_key:
+        log.error("Missing GEMINI_API_KEY or GOOGLE_API_KEY environment variable.")
+        sys.exit(1)
+    client = create_client(gemini_key)
+    require_gemini()
+    from google.genai import types as genai_types
+
+    model = getattr(args, "model", None) or config.get("model", DEFAULT_MODEL)
+    log.info("Synthesizing with %s...", model)
+
+    # Use a direct text-in / text-out Gemini call (markdown output, not JSON).
+    config_kwargs = {
+        "temperature": 0.3,
+        "safety_settings": build_permissive_safety_settings(genai_types),
+    }
+    contents = genai_types.Content(parts=[genai_types.Part(text=filled_prompt)])
+    max_retries = 3
+    response_text = None
+    for attempt in range(max_retries + 1):
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=genai_types.GenerateContentConfig(**config_kwargs),
+            )
+            response_text = response.text
+            break
+        except Exception as e:
+            retry = get_retry_delay(e, attempt, max_retries_rate=max_retries, max_retries_server=max_retries)
+            if retry is None:
+                raise
+            kind, wait, _ = retry
+            log.warning("%s — retry %d/%d in %.0fs...", kind, attempt + 1, max_retries, wait)
+            time.sleep(wait)
+
+    if not response_text:
+        log.error("No response from Gemini after %d retries.", max_retries)
+        sys.exit(1)
+
+    if getattr(args, "output", None):
+        out_path = Path(args.output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(response_text, encoding="utf-8")
+        print(f"Nugget brief saved: {out_path}")
+    else:
+        print(response_text)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -3122,6 +3236,41 @@ Examples:
     index_parser.add_argument("--channel", help="Index only this channel")
     index_parser.add_argument("--force", action="store_true", help="Rebuild index from scratch")
 
+    # nugget command
+    nugget_parser = subparsers.add_parser(
+        "nugget",
+        help="Synthesize a consultant-grade nugget brief across creators for a query",
+    )
+    nugget_parser.add_argument("query", help="Research question to probe across creators")
+    nugget_parser.add_argument("--channel", help="Restrict to this channel (default: all)")
+    nugget_parser.add_argument(
+        "--limit",
+        type=int,
+        default=15,
+        help="Max excerpts feeding the synthesis (default: 15)",
+    )
+    nugget_parser.add_argument(
+        "--since",
+        help="Only consider videos published within this window. 'Nd' or 'YYYY-MM-DD'.",
+    )
+    nugget_parser.add_argument(
+        "--min-relevance",
+        type=float,
+        default=0.0,
+        dest="min_relevance",
+        help="Minimum relevance score (RRF scale) for inclusion (default: 0.0)",
+    )
+    nugget_parser.add_argument(
+        "--no-expand",
+        action="store_true",
+        dest="no_expand",
+        help="Disable Stage-1 taxonomy query expansion",
+    )
+    nugget_parser.add_argument(
+        "--output",
+        help="Write briefing to this file instead of stdout",
+    )
+
     # status command
     subparsers.add_parser("status", help="Show corpus status: output dir, channels, artifact counts")
 
@@ -3148,6 +3297,8 @@ Examples:
         cmd_search(args, config)
     elif args.command == "index":
         cmd_index(args, config)
+    elif args.command == "nugget":
+        cmd_nugget(args, config)
     elif args.command == "status":
         cmd_status(args, config)
 
