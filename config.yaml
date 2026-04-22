@@ -56,3 +56,13 @@ channels:
     url: https://youtube.com/@EveryInc
     auto_transcript: all
     since: 30d
+
+  - name: chase_h_ai
+    url: https://youtube.com/@Chase-H-AI
+    auto_transcript: all
+    since: 180d
+
+  - name: engineerprompt
+    url: https://youtube.com/@engineerprompt
+    auto_transcript: all
+    since: 400d
