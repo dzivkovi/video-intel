@@ -2396,7 +2396,7 @@ def _is_file_expiry_error_status(status: str) -> bool:
     Files API path, so that anchor disambiguates file-expiry from quota /
     safety / permission-denied errors that would otherwise share substrings.
     """
-    if not status or not status.startswith("error:"):
+    if not status or not status.startswith("error"):
         return False
     lowered = status.lower()
     if "files/" not in lowered:
@@ -2514,6 +2514,13 @@ def cmd_process(args, config):
     needs_transcript = (
         args.force or "transcript" not in modes_done or not transcript_path.exists() or raw_sidecar.exists()
     )
+    # When the orchestrator has decided a step needs work (missing artifact, stale
+    # modes_completed, or salvage sidecar present), the per-helper `force` flag
+    # must match - otherwise process_mindmap / process_transcript short-circuit on
+    # their own `file.exists() and not force` check and we pay for an upload with
+    # nothing to show for it.
+    mindmap_force = args.force or needs_mindmap
+    transcript_force = args.force or needs_transcript
 
     file_uri: str | None = None
     if needs_mindmap or needs_transcript:
@@ -2534,7 +2541,19 @@ def cmd_process(args, config):
         if start_offset is not None or end_offset is not None:
             identity_fields["segments"] = [{"start": start_offset, "end": end_offset}]
         update_meta(meta_path, identity_fields, mode="identity")
-        file_uri = upload_local_video(client, input_path)
+        try:
+            file_uri = upload_local_video(client, input_path)
+        except Exception as e:
+            log.error("Upload failed: %s", e)
+            # update_meta resets last_error to None at the end, so write directly
+            # to persist the failure marker for later runs / dashboards. Mirror
+            # process_mindmap's error-recording pattern at scripts/video_intel.py:1131.
+            meta: dict = {}
+            if meta_path.exists():
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta["last_error"] = f"upload: {e}"
+            meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            sys.exit(1)
         log.info("Processing local file (channel=%s): %s", channel_name or "_loose", input_path.name)
     else:
         log.info("All pipeline artifacts up to date for %s (no upload).", prefix)
@@ -2574,7 +2593,7 @@ def cmd_process(args, config):
             output_dir,
             channel_name or "",
             prompt_name=prompt_name,
-            force=args.force,
+            force=mindmap_force,
             prefix=prefix,
             channel_dir_override=channel_dir,
             media_uri=uri,
@@ -2582,7 +2601,11 @@ def cmd_process(args, config):
 
     _, mindmap_status = _call_with_file_expiry_retry("mindmap", _mindmap_call)
     log.info("  mindmap [%s]: %s", prefix, mindmap_status)
-    if mindmap_status.startswith("error:"):
+    # Loose prefix: process_mindmap / process_transcript surface errors as
+    # `error: <exception>` AND (for the JSON-parse-fail path) `error parsing JSON:`,
+    # so starts-with("error") catches both. Anything else ("done", "skipped (exists)")
+    # passes through.
+    if mindmap_status.startswith("error"):
         log.error("Mindmap failed; aborting before transcript.")
         sys.exit(1)
 
@@ -2596,7 +2619,7 @@ def cmd_process(args, config):
             model,
             channel_dir,
             prefix,
-            force=args.force,
+            force=transcript_force,
             start_offset=start_offset,
             end_offset=end_offset,
             media_uri=uri,
@@ -2604,7 +2627,7 @@ def cmd_process(args, config):
 
     _, transcript_status = _call_with_file_expiry_retry("transcript", _transcript_call)
     log.info("  transcript [%s]: %s", prefix, transcript_status)
-    if transcript_status.startswith("error:"):
+    if transcript_status.startswith("error"):
         log.warning("Transcript failed; skipping concepts. Mindmap artifact preserved.")
         return
 

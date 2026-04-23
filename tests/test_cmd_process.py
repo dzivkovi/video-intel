@@ -241,7 +241,12 @@ class TestCmdProcessLazyUpload:
         assert len(upload_calls) == 1
 
     def test_upload_happens_when_sidecar_raw_txt_present(self, stub_env, monkeypatch, tmp_path):
-        """A .transcript.raw.txt sidecar is a 'partial transcript' signal — treat transcript as incomplete."""
+        """A .transcript.raw.txt sidecar is a 'partial transcript' signal — treat transcript as incomplete.
+
+        Asserts both that the orchestrator uploads AND that it threads force=True to
+        process_transcript so the helper does not short-circuit on its own
+        `transcript_path.exists()` check (regression: CORR-02 from 2026-04-23 review).
+        """
         mp4, channel_dir = _prep_mp4(tmp_path)
         prefix = "video"
         (channel_dir / f"{prefix}.mindmap.md").write_text("m", encoding="utf-8")
@@ -269,9 +274,13 @@ class TestCmdProcessLazyUpload:
             "video_intel.process_mindmap",
             lambda *a, **kw: (kw.get("prefix") or "video", "skipped (exists)"),
         )
+        transcript_force_values: list[bool] = []
         monkeypatch.setattr(
             "video_intel.process_transcript",
-            lambda *a, **kw: (a[6] if len(a) > 6 else kw.get("prefix") or "video", "done"),
+            lambda *a, **kw: (
+                transcript_force_values.append(kw.get("force"))
+                or (a[6] if len(a) > 6 else kw.get("prefix") or "video", "done")
+            ),
         )
         monkeypatch.setattr(
             "video_intel.process_concepts",
@@ -282,6 +291,7 @@ class TestCmdProcessLazyUpload:
         cmd_process(args, _config())
 
         assert len(upload_calls) == 1  # sidecar forced regeneration path
+        assert transcript_force_values == [True]  # CORR-02: force must be threaded
 
     def test_force_bypasses_lazy_upload_when_all_artifacts_exist(self, stub_env, monkeypatch, tmp_path):
         mp4, channel_dir = _prep_mp4(tmp_path)
@@ -390,3 +400,75 @@ class TestCmdProcessExitCodeContract:
 
         args = _make_args(file=mp4, channel="everyinc")
         cmd_process(args, _config())  # must not raise
+
+
+class TestCmdProcessCodeReviewRegressions:
+    """Regression tests for P1 findings from 2026-04-23 code review.
+
+    Each test's docstring names the finding ID to keep the connection traceable.
+    """
+
+    def test_initial_upload_exception_exits_cleanly(self, stub_env, monkeypatch, tmp_path):
+        """REL-1 / ADV-1: initial upload failure must not propagate as uncaught traceback.
+
+        The initial upload_local_video call runs after the identity block is written
+        to meta.json with last_error=None. If the upload raises, the orchestrator
+        must catch, log the error to meta.json, and sys.exit(1).
+        """
+        mp4, channel_dir = _prep_mp4(tmp_path)
+
+        def fake_upload(_client, _path):
+            raise ConnectionError("network down")
+
+        monkeypatch.setattr("video_intel.upload_local_video", fake_upload)
+        # These should never be reached; if they are, the exit behavior is broken.
+        monkeypatch.setattr(
+            "video_intel.process_mindmap",
+            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("mindmap should not run")),
+        )
+        monkeypatch.setattr(
+            "video_intel.process_transcript",
+            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("transcript should not run")),
+        )
+
+        args = _make_args(file=mp4, channel="everyinc")
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_process(args, _config())
+        assert exc_info.value.code != 0
+
+        # Identity meta was written before the upload attempt; last_error must reflect the failure.
+        meta_path = channel_dir / f"{mp4.stem}.meta.json"
+        assert meta_path.exists()
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        assert "upload" in (meta.get("last_error") or "").lower()
+
+    def test_transcript_error_parsing_json_prefix_skips_concepts(self, stub_env, monkeypatch, tmp_path):
+        """CORR-01: `startswith('error:')` missed `error parsing JSON:` from process_transcript.
+
+        The looser prefix check must catch both 'error: ...' and 'error parsing JSON: ...'
+        so concepts never runs against a missing/partial transcript.
+        """
+        mp4, _ = _prep_mp4(tmp_path)
+
+        monkeypatch.setattr("video_intel.upload_local_video", lambda _c, _p: "files/test")
+        monkeypatch.setattr(
+            "video_intel.process_mindmap",
+            lambda *a, **kw: (kw.get("prefix") or "video", "done"),
+        )
+        monkeypatch.setattr(
+            "video_intel.process_transcript",
+            lambda *a, **kw: (
+                a[6] if len(a) > 6 else "video",
+                "error parsing JSON: unterminated string",
+            ),
+        )
+        concepts_called: list = []
+        monkeypatch.setattr(
+            "video_intel.process_concepts",
+            lambda *a, **kw: concepts_called.append(kw) or ("video", "done"),
+        )
+
+        args = _make_args(file=mp4, channel="everyinc")
+        cmd_process(args, _config())
+
+        assert concepts_called == []  # error-parsing-JSON path must be recognized as failure
