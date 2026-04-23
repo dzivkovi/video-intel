@@ -1822,9 +1822,12 @@ def cmd_scan(args, config):
         # in the channel index but whose title has changed gets its new title
         # recorded as an alt_title on the existing meta. Idempotent; no-op when
         # there is no rotation. Runs on every scan regardless of --force so SEO
-        # A/B-test signal is preserved continuously.
-        for v in videos:
-            record_alt_title_if_rotated(output_dir, ch_name, v)
+        # A/B-test signal is preserved continuously. Gated on not args.dry_run
+        # so --dry-run keeps its preview-only contract (the recorder mutates
+        # meta.json when it fires).
+        if not args.dry_run:
+            for v in videos:
+                record_alt_title_if_rotated(output_dir, ch_name, v)
 
         # Filter already processed or skipped (any_variant=True prevents backfill)
         if args.force:

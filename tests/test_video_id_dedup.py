@@ -379,3 +379,119 @@ def test_record_alt_title_noop_when_new_title_already_in_alts(tmp_path):
     vi.record_alt_title_if_rotated(tmp_path, "ch", seen_again)
 
     assert meta_path.read_text() == before
+
+
+# ---------------------------------------------------------------------------
+# cmd_scan integration: --dry-run must not mutate any meta.json
+# ---------------------------------------------------------------------------
+
+
+def test_scan_dry_run_does_not_call_alt_title_recorder(tmp_path, monkeypatch):
+    """P1 guard (PR #31 review): dry-run promises preview-only semantics.
+    The pre-scan alt_title recorder mutates meta.json when it fires, which
+    would silently break that contract for users who expect --dry-run to
+    make no disk changes. This test locks the gate in place."""
+    monkeypatch.setenv("GEMINI_API_KEY", "test")
+    monkeypatch.setenv("YOUTUBE_API_KEY", "test")
+
+    monkeypatch.setattr(vi, "require_gemini", lambda: (None, None))
+    monkeypatch.setattr(vi, "require_youtube", lambda: lambda *a, **kw: None)
+    monkeypatch.setattr(vi, "create_client", lambda *a, **kw: None)
+    monkeypatch.setattr(vi, "get_channel_id", lambda yt, url: ("chid", "ChTitle"))
+
+    rotated = [{"video_id": "v1", "title": "Rotated", "published": "2026-04-15"}]
+    monkeypatch.setattr(vi, "fetch_channel_videos", lambda yt, cid, since: rotated)
+
+    ch = tmp_path / "ch"
+    _write_meta(
+        ch,
+        "2026-04-15-original",
+        {
+            "video_id": "v1",
+            "title": "Original",
+            "published": "2026-04-15",
+            "processed": "2026-04-15T00:00:00+00:00",
+        },
+    )
+    _touch(ch / "2026-04-15-original.mindmap.md")
+
+    call_count = {"n": 0}
+    original_recorder = vi.record_alt_title_if_rotated
+
+    def counting_recorder(*a, **kw):
+        call_count["n"] += 1
+        return original_recorder(*a, **kw)
+
+    monkeypatch.setattr(vi, "record_alt_title_if_rotated", counting_recorder)
+
+    args = Namespace(
+        dry_run=True,
+        channel=None,
+        force=False,
+        since=None,
+        model=None,
+    )
+    config = {
+        "output_dir": str(tmp_path),
+        "channels": [{"name": "ch", "url": "https://example.com/ch"}],
+    }
+
+    vi.cmd_scan(args, config)
+
+    assert call_count["n"] == 0, "record_alt_title_if_rotated must not fire on --dry-run"
+
+
+def test_scan_without_dry_run_calls_alt_title_recorder_on_rotation(tmp_path, monkeypatch):
+    """Positive pair: when not in dry-run and the incoming title has rotated,
+    the recorder fires so the alt_title capture is wired. Gemini work is
+    mocked out to avoid network; we only assert the pre-scan hook runs."""
+    monkeypatch.setenv("GEMINI_API_KEY", "test")
+    monkeypatch.setenv("YOUTUBE_API_KEY", "test")
+
+    monkeypatch.setattr(vi, "require_gemini", lambda: (None, None))
+    monkeypatch.setattr(vi, "require_youtube", lambda: lambda *a, **kw: None)
+    monkeypatch.setattr(vi, "create_client", lambda *a, **kw: None)
+    monkeypatch.setattr(vi, "get_channel_id", lambda yt, url: ("chid", "ChTitle"))
+
+    rotated = [{"video_id": "v1", "title": "Rotated", "published": "2026-04-15"}]
+    monkeypatch.setattr(vi, "fetch_channel_videos", lambda yt, cid, since: rotated)
+
+    ch = tmp_path / "ch"
+    _write_meta(
+        ch,
+        "2026-04-15-original",
+        {
+            "video_id": "v1",
+            "title": "Original",
+            "published": "2026-04-15",
+            "processed": "2026-04-15T00:00:00+00:00",
+        },
+    )
+    _touch(ch / "2026-04-15-original.mindmap.md")
+
+    call_count = {"n": 0}
+    original_recorder = vi.record_alt_title_if_rotated
+
+    def counting_recorder(*a, **kw):
+        call_count["n"] += 1
+        return original_recorder(*a, **kw)
+
+    monkeypatch.setattr(vi, "record_alt_title_if_rotated", counting_recorder)
+
+    args = Namespace(
+        dry_run=False,
+        channel=None,
+        force=False,
+        since=None,
+        model=None,
+    )
+    config = {
+        "output_dir": str(tmp_path),
+        "channels": [{"name": "ch", "url": "https://example.com/ch"}],
+    }
+
+    vi.cmd_scan(args, config)
+
+    assert call_count["n"] == 1, "recorder must fire in a non-dry-run scan"
+    meta = json.loads((ch / "2026-04-15-original.meta.json").read_text())
+    assert meta["alt_titles"] == ["Rotated"]
