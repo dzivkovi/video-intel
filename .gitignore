@@ -34,6 +34,7 @@ examples/*.txt.tmp
 
 # Compound Engineering local config — example.yaml is committed, *.local.yaml is not
 .compound-engineering/*.local.yaml
+.context/
 
 # Skill eval workspace — default-exclude, allow signal-bearing artifacts.
 # See skill-eval-workspace/README.md for the lifecycle convention.
