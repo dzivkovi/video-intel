@@ -13,11 +13,6 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
-from tests.test_search_since import fake_lancedb  # re-use capturing fixture
-
-# Fixture re-used via pytest's implicit import; silence linter
-__all__ = ["fake_lancedb"]
-
 
 def _write_taxonomy(tmp_path, *concepts: dict) -> None:
     """Drop a minimal taxonomy.json shaped like load_taxonomy()'s output."""
