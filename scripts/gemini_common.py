@@ -10,6 +10,50 @@ RETRYABLE_SERVER_CODES: set[int] = {408, 500, 502, 503, 504}
 RETRYABLE_RATE_CODES: set[int] = {429}
 
 
+def _coerce_token_count(value: object) -> int:
+    """Coerce a Gemini usage_metadata field to a non-negative int.
+
+    Gemini SDK may return a bare int, None, or (on gemini-3 multimodal
+    responses) a list of ModalityTokenCount submodels. Anything that
+    isn't a plain numeric int is treated as 0 so the log format stays
+    machine-parseable across SDK shape drift.
+    """
+    if isinstance(value, bool):  # bool is a subclass of int; reject it
+        return 0
+    if isinstance(value, int):
+        return max(value, 0)
+    return 0
+
+
+def log_usage_metadata(response: object, label: str) -> None:
+    """Log a single info-level line summarizing Gemini token usage.
+
+    Emits: ``usage {label} prompt=N cached=N candidates=N total=N``.
+
+    Observability must never break the caller. Any unexpected shape
+    produces a warning log and returns — it does not raise.
+    """
+    try:
+        usage = getattr(response, "usage_metadata", None)
+        if usage is None:
+            log.warning("usage %s: response.usage_metadata missing or None", label)
+            return
+        prompt = _coerce_token_count(getattr(usage, "prompt_token_count", 0))
+        cached = _coerce_token_count(getattr(usage, "cached_content_token_count", 0))
+        candidates = _coerce_token_count(getattr(usage, "candidates_token_count", 0))
+        total = _coerce_token_count(getattr(usage, "total_token_count", 0))
+        log.info(
+            "usage %s prompt=%d cached=%d candidates=%d total=%d",
+            label,
+            prompt,
+            cached,
+            candidates,
+            total,
+        )
+    except Exception as exc:
+        log.warning("usage %s: failed to read usage_metadata (%s)", label, exc)
+
+
 # ---------------------------------------------------------------------------
 # Lazy imports
 # ---------------------------------------------------------------------------
