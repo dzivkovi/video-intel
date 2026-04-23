@@ -19,8 +19,10 @@ description: >
   topics recur across channels", "nugget brief on [topic]", "consultant
   brief on [topic]", "what do [creators] say about [topic]", "agreements
   and disagreements on [topic]", "synthesize insights across creators",
-  "mental models across creators", "find the nuggets about [topic]".
-  Calls Gemini as multimodal proxy (frames +
+  "mental models across creators", "find the nuggets about [topic]",
+  "find duplicate videos", "clean up duplicates", "dedupe my corpus",
+  "the same video got scanned twice", "why do I have two mindmaps for [video]",
+  "creator rotated the title". Calls Gemini as multimodal proxy (frames +
   on-screen text + audio). A taxonomy layer enables cross-video topic lookup
   without reading every file.
 ---
@@ -358,6 +360,40 @@ python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" --log-level info conce
 # Rebuild master taxonomy from all concept files (fast, no Gemini call)
 python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" taxonomy-build
 ```
+
+### Clean up title-rotation duplicates
+
+YouTube creators A/B-test video titles for SEO, which rotates the slug
+and can fool `is_processed()` into re-scanning the same `video_id` under
+a second prefix. Prevention is automatic (the video_id index inside
+`is_processed()` catches repeats across any slug change), but historical
+duplicates from earlier scans need a one-shot cleanup.
+
+```bash
+# Dry-run: report all video_id groups with >1 meta.json (no mutation)
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" dedupe
+
+# Restrict to one channel
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" dedupe --channel natebjones
+
+# Apply: merges discarded titles into canonical meta's alt_titles list,
+# moves any artifact only a loser has, deletes all loser siblings.
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" dedupe --apply
+```
+
+Canonical selection: latest `processed` timestamp wins. Tie-breaks:
+larger `modes_completed` set, then alphabetical prefix. Discarded titles
+are preserved as `alt_titles: [...]` on the surviving meta.
+
+After `dedupe --apply`, derived artifacts may be stale. Re-run:
+
+```bash
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" taxonomy-build
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" index --force
+```
+
+Dedupe is dry-run by default because it mutates shared state (disk).
+Only pass `--apply` after reviewing the dry-run report.
 
 ### Manage channels
 

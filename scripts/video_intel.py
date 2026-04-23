@@ -823,6 +823,59 @@ def resolve_local_file_identity(
     }
 
 
+# Per-channel {video_id: prefix} index. Populated lazily on first is_processed()
+# call for a given channel dir and reused for the rest of the run. The cache is
+# what gives us O(1) dedup after one glob per channel, and it survives across
+# all modes (scan / transcript / concepts) in the same process.
+#
+# Why this exists: YouTube creators rotate video titles for SEO A/B testing.
+# When the title changes, video_file_prefix() produces a different slug, so
+# a slug-only is_processed() check misses the match and re-processes the same
+# video_id under a second prefix. Production sweep on 2026-04-22 found 6 such
+# duplicate groups across 4 channels. The video_id index catches these.
+_VIDEO_ID_CACHE: dict[str, dict[str, str]] = {}
+
+
+def _load_video_id_index(channel_dir: Path) -> dict[str, str]:
+    """Return {video_id: prefix} for all meta.json files in channel_dir.
+
+    Cached per channel for the lifetime of the process. If the directory does
+    not exist, returns an empty dict (cached so we do not re-stat on misses).
+    Malformed meta.json files are skipped, not fatal - the index is advisory.
+    """
+    key = str(channel_dir)
+    if key in _VIDEO_ID_CACHE:
+        return _VIDEO_ID_CACHE[key]
+    index: dict[str, str] = {}
+    if channel_dir.exists():
+        for meta_path in channel_dir.glob("*.meta.json"):
+            try:
+                data = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            vid = data.get("video_id")
+            if vid:
+                prefix = meta_path.name.removesuffix(".meta.json")
+                # First-wins: earliest prefix seen for this video_id stays
+                # canonical from the prevention path's perspective. dedupe
+                # picks the true canonical separately by processed-timestamp.
+                index.setdefault(vid, prefix)
+    _VIDEO_ID_CACHE[key] = index
+    return index
+
+
+def _invalidate_video_id_cache(channel_dir: Path | None = None) -> None:
+    """Drop the video_id index cache for one channel or all channels.
+
+    Called by dedupe and record_alt_title_if_rotated after mutating meta.json
+    files so subsequent is_processed() calls re-glob.
+    """
+    if channel_dir is None:
+        _VIDEO_ID_CACHE.clear()
+    else:
+        _VIDEO_ID_CACHE.pop(str(channel_dir), None)
+
+
 def is_processed(
     output_dir: Path,
     channel_name: str,
@@ -833,28 +886,90 @@ def is_processed(
 ) -> bool:
     """Check if a video has already been processed for a given mode.
 
-    For scan mode with any_variant=True: checks for ANY .mindmap*.md file (prevents backfill).
-    For transcript mode: checks for .transcript.md (unchanged).
+    Primary path: consult the per-channel video_id index. If the video_id is
+    already claimed by some prefix, check that prefix's mode artifact. This
+    catches title-rotation duplicates (same video_id, different slug).
+
+    Fallback: if the video has no id or the id is not in the index, use the
+    slug-based existence check. This preserves behavior for legacy artifacts
+    missing meta.json and for genuinely new videos.
     """
-    prefix = video_file_prefix(video)
     channel_dir = output_dir / channel_name
 
+    vid = video.get("video_id")
+    if vid:
+        index = _load_video_id_index(channel_dir)
+        existing_prefix = index.get(vid)
+        if existing_prefix:
+            return _mode_artifact_present(channel_dir, existing_prefix, mode, any_variant=any_variant)
+
+    prefix = video_file_prefix(video)
+    return _mode_artifact_present(channel_dir, prefix, mode, any_variant=any_variant)
+
+
+def _mode_artifact_present(
+    channel_dir: Path,
+    prefix: str,
+    mode: str,
+    *,
+    any_variant: bool,
+) -> bool:
+    """True when the given mode's artifact exists and is non-empty under prefix."""
     if mode == "transcript":
         target = channel_dir / f"{prefix}.transcript.md"
         return target.exists() and target.stat().st_size > 0
 
-    # mode == "scan"
     if any_variant:
-        # Glob for any mindmap file — legacy .mindmap.md or .mindmap.*.md
         return (
             any(f.stat().st_size > 0 for f in channel_dir.glob(f"{prefix}.mindmap*.md"))
             if channel_dir.exists()
             else False
         )
 
-    # Default: check for standard .mindmap.md
     target = channel_dir / f"{prefix}.mindmap.md"
     return target.exists() and target.stat().st_size > 0
+
+
+def record_alt_title_if_rotated(
+    output_dir: Path,
+    channel_name: str,
+    video: dict,
+) -> bool:
+    """If this video_id already has a meta but the incoming title differs,
+    append the incoming title to that meta's alt_titles list.
+
+    Returns True if a write happened. Idempotent: no write if title matches
+    canonical or is already in alt_titles. Cache is invalidated on write so
+    the next is_processed() call sees the updated meta.
+    """
+    vid = video.get("video_id")
+    new_title = video.get("title")
+    if not vid or not new_title:
+        return False
+
+    channel_dir = output_dir / channel_name
+    index = _load_video_id_index(channel_dir)
+    existing_prefix = index.get(vid)
+    if not existing_prefix:
+        return False
+
+    meta_path = channel_dir / f"{existing_prefix}.meta.json"
+    try:
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return False
+
+    if data.get("title") == new_title:
+        return False
+    alts = list(data.get("alt_titles", []))
+    if new_title in alts:
+        return False
+
+    alts.append(new_title)
+    data["alt_titles"] = alts
+    meta_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    _invalidate_video_id_cache(channel_dir)
+    return True
 
 
 def is_skipped(output_dir, channel_name, video):
@@ -1702,6 +1817,14 @@ def cmd_scan(args, config):
                 log.info("  No new videos found.")
                 continue
             log.info("  No new videos from YouTube; checking local artifacts for concepts...")
+
+        # Capture title rotations before filtering: any video whose id is already
+        # in the channel index but whose title has changed gets its new title
+        # recorded as an alt_title on the existing meta. Idempotent; no-op when
+        # there is no rotation. Runs on every scan regardless of --force so SEO
+        # A/B-test signal is preserved continuously.
+        for v in videos:
+            record_alt_title_if_rotated(output_dir, ch_name, v)
 
         # Filter already processed or skipped (any_variant=True prevents backfill)
         if args.force:
@@ -2938,6 +3061,209 @@ def cmd_taxonomy_build(args, config):
     print(f"  Saved: {output_dir / 'taxonomy.json'}")
 
 
+# ---------------------------------------------------------------------------
+# dedupe subcommand - cleans up title-rotation duplicates
+# ---------------------------------------------------------------------------
+
+
+# Modes we track in meta.json, mapped to the artifact glob patterns that
+# constitute "this mode is complete under this prefix". Used when canonical
+# lacks a mode the loser has: we move the loser's artifacts over before
+# deleting the rest of the loser's siblings.
+_MODE_ARTIFACT_PATTERNS: dict[str, tuple[str, ...]] = {
+    "scan": ("{prefix}.mindmap.md", "{prefix}.mindmap.*.md"),
+    "transcript": ("{prefix}.transcript.md", "{prefix}.transcript.raw.txt"),
+    "concepts": ("{prefix}.concepts.json",),
+}
+
+
+def _pick_canonical(metas: list[tuple[Path, dict]]) -> tuple[Path, dict]:
+    """Pick canonical by (latest processed, most modes_completed, prefix).
+
+    Reverse-sort so index 0 is canonical. Stable tie-break on alphabetical
+    prefix keeps the choice deterministic when timestamps are identical.
+    """
+
+    def sort_key(item: tuple[Path, dict]) -> tuple[str, int, str]:
+        path, data = item
+        return (
+            data.get("processed", ""),
+            len(data.get("modes_completed", [])),
+            path.name,
+        )
+
+    ranked = sorted(metas, key=sort_key, reverse=True)
+    return ranked[0]
+
+
+def _merge_alt_titles(
+    canonical_data: dict,
+    metas: list[tuple[Path, dict]],
+    canonical_path: Path,
+) -> list[str]:
+    """Return the merged alt_titles list, ordered by ascending processed time.
+
+    Starts with canonical's existing alt_titles (may be empty), then appends
+    each loser's title in chronological order, skipping the canonical title
+    and any duplicates.
+    """
+    canonical_title = canonical_data.get("title")
+    existing = list(canonical_data.get("alt_titles", []))
+    loser_titles_in_order = [
+        data.get("title")
+        for path, data in sorted(metas, key=lambda m: m[1].get("processed", ""))
+        if path != canonical_path and data.get("title")
+    ]
+
+    merged: list[str] = []
+    seen = {canonical_title}
+    for title in existing + loser_titles_in_order:
+        if title and title not in seen:
+            merged.append(title)
+            seen.add(title)
+    return merged
+
+
+def _move_missing_mode_artifacts(
+    channel_dir: Path,
+    canonical_prefix: str,
+    loser_prefix: str,
+    missing_modes: set[str],
+) -> None:
+    """Move artifacts for each missing mode from loser_prefix to canonical_prefix.
+
+    Skips if the destination already exists (shouldn't happen when canonical
+    lacks the mode, but the guard avoids overwriting unrelated content).
+    """
+    for mode in missing_modes:
+        for pattern in _MODE_ARTIFACT_PATTERNS.get(mode, ()):
+            for src in channel_dir.glob(pattern.format(prefix=loser_prefix)):
+                suffix = src.name[len(loser_prefix) :]
+                dst = channel_dir / f"{canonical_prefix}{suffix}"
+                if not dst.exists():
+                    src.rename(dst)
+
+
+def _apply_dedupe_group(
+    channel_dir: Path,
+    metas: list[tuple[Path, dict]],
+) -> None:
+    """Apply the dedup to one video_id group: merge alts, move missing mode
+    artifacts, write canonical meta, delete all loser siblings."""
+    canonical_path, canonical_data = _pick_canonical(metas)
+    canonical_prefix = canonical_path.name.removesuffix(".meta.json")
+
+    # Union modes_completed and move any artifact only losers have.
+    canonical_modes = set(canonical_data.get("modes_completed", []))
+    for loser_path, loser_data in metas:
+        if loser_path == canonical_path:
+            continue
+        loser_prefix = loser_path.name.removesuffix(".meta.json")
+        loser_modes = set(loser_data.get("modes_completed", []))
+        missing = loser_modes - canonical_modes
+        if missing:
+            _move_missing_mode_artifacts(channel_dir, canonical_prefix, loser_prefix, missing)
+            canonical_modes |= missing
+
+    canonical_data["modes_completed"] = sorted(canonical_modes)
+    merged_alts = _merge_alt_titles(canonical_data, metas, canonical_path)
+    if merged_alts:
+        canonical_data["alt_titles"] = merged_alts
+
+    canonical_path.write_text(json.dumps(canonical_data, indent=2), encoding="utf-8")
+
+    # Sweep every loser prefix's remaining siblings.
+    for loser_path, _ in metas:
+        if loser_path == canonical_path:
+            continue
+        loser_prefix = loser_path.name.removesuffix(".meta.json")
+        for sibling in channel_dir.glob(f"{loser_prefix}.*"):
+            sibling.unlink()
+
+    _invalidate_video_id_cache(channel_dir)
+
+
+def _scan_duplicate_groups(channel_dir: Path) -> dict[str, list[tuple[Path, dict]]]:
+    """Return {video_id: [(meta_path, meta_data), ...]} for groups with >1 entry."""
+    groups: dict[str, list[tuple[Path, dict]]] = {}
+    if not channel_dir.exists():
+        return {}
+    for meta_path in channel_dir.glob("*.meta.json"):
+        try:
+            data = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        vid = data.get("video_id")
+        if vid:
+            groups.setdefault(vid, []).append((meta_path, data))
+    return {vid: metas for vid, metas in groups.items() if len(metas) > 1}
+
+
+def cmd_dedupe(args, config):
+    """Find and clean up video_id duplicates across channels.
+
+    Dry-run by default; pass --apply to mutate disk. Does NOT auto-rebuild
+    taxonomy or the LanceDB index - surface the user-facing next-step
+    reminder instead so the operator can decide when to pay that cost.
+    """
+    output_dir = resolve_output_dir(config)
+    channel_filter = getattr(args, "channel", None)
+    apply = bool(getattr(args, "apply", False))
+
+    channel_names = [channel_filter] if channel_filter else [c["name"] for c in config.get("channels", [])]
+
+    total_groups = 0
+    total_excess = 0
+
+    for ch_name in channel_names:
+        channel_dir = output_dir / ch_name
+        dup_groups = _scan_duplicate_groups(channel_dir)
+        if not dup_groups:
+            continue
+
+        log.info("[%s] %d duplicate group(s)", ch_name, len(dup_groups))
+        total_groups += len(dup_groups)
+
+        for vid, metas in sorted(dup_groups.items()):
+            canonical_path, canonical_data = _pick_canonical(metas)
+            log.info("  video_id=%s", vid)
+            log.info(
+                "    canonical: %s  '%s'  processed=%s",
+                canonical_path.name,
+                canonical_data.get("title", ""),
+                canonical_data.get("processed", "")[:19],
+            )
+            for loser_path, loser_data in metas:
+                if loser_path == canonical_path:
+                    continue
+                log.info(
+                    "    loser:     %s  '%s'  processed=%s",
+                    loser_path.name,
+                    loser_data.get("title", ""),
+                    loser_data.get("processed", "")[:19],
+                )
+                total_excess += 1
+
+            if apply:
+                _apply_dedupe_group(channel_dir, metas)
+
+    verb = "cleaned up" if apply else "would clean up"
+    if total_groups == 0:
+        log.info("No duplicates found.")
+        return
+
+    log.info(
+        "Summary: %d group(s), %d excess file(s) %s.",
+        total_groups,
+        total_excess,
+        verb,
+    )
+    if not apply:
+        log.info("Re-run with --apply to execute.")
+    else:
+        log.info("Next steps: run `taxonomy-build` and `index --force` to rebuild derived artifacts.")
+
+
 def _format_nugget_excerpt(hit: dict, index: int) -> str:
     """Format one hybrid-search hit as an attributed excerpt for the nugget prompt."""
     vid_url = f"https://www.youtube.com/watch?v={hit['video_id']}" if hit.get("video_id") else ""
@@ -3274,6 +3600,18 @@ Examples:
     # status command
     subparsers.add_parser("status", help="Show corpus status: output dir, channels, artifact counts")
 
+    # dedupe command
+    dedupe_parser = subparsers.add_parser(
+        "dedupe",
+        help="Find and clean up title-rotation duplicates (same video_id, different slug)",
+    )
+    dedupe_parser.add_argument("--channel", help="Restrict to this channel (default: all configured channels)")
+    dedupe_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually mutate disk. Default is dry-run (report only).",
+    )
+
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.WARNING,
@@ -3301,6 +3639,8 @@ Examples:
         cmd_nugget(args, config)
     elif args.command == "status":
         cmd_status(args, config)
+    elif args.command == "dedupe":
+        cmd_dedupe(args, config)
 
 
 if __name__ == "__main__":
