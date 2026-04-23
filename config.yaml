@@ -66,3 +66,12 @@ channels:
     url: https://youtube.com/@engineerprompt
     auto_transcript: all
     since: 400d
+
+  # Skool community, not YouTube. Do not run `scan` for this channel — there is no
+  # YouTube URL to resolve. Use `mindmap --file` / `transcript --file` with videos
+  # downloaded into G:/My Drive/video-intel/earlyaidopters/. Author metadata is
+  # captured but not yet consumed by the pipeline (Stage-2 KB work, ADR-0017).
+  - name: earlyaidopters
+    url: https://www.skool.com/earlyaidopters
+    author: "Mark Kashef"
+    author_aliases: ["Mark"]

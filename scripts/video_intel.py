@@ -21,6 +21,7 @@ import shutil
 import sys
 import time
 import uuid
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime, timedelta
 from html import unescape
@@ -33,6 +34,7 @@ from gemini_common import (
     build_permissive_safety_settings,
     create_client,
     get_retry_delay,
+    log_usage_metadata,
     require_gemini,
     require_youtube,
 )
@@ -997,6 +999,7 @@ def call_gemini(
     *,
     start_offset: int | None = None,
     end_offset: int | None = None,
+    on_response: Callable[[object], None] | None = None,
 ):
     """Send a video to Gemini for multimodal analysis with retry on rate limits.
 
@@ -1009,6 +1012,12 @@ def call_gemini(
 
     Optional start_offset/end_offset (in seconds) clip the video to a segment
     via Gemini's VideoMetadata.
+
+    Optional on_response callback receives the raw response object before
+    ``response.text`` is returned. Used for usage-token observability without
+    changing the return contract (callers already rely on a string return).
+    Observability must never break the call: the callback is invoked inside a
+    try/except that logs at warning on failure.
     """
     config_kwargs = {
         "temperature": 0.3,
@@ -1043,6 +1052,11 @@ def call_gemini(
                 contents=contents,
                 config=types.GenerateContentConfig(**config_kwargs),
             )
+            if on_response is not None:
+                try:
+                    on_response(response)
+                except Exception as obs_exc:
+                    log.warning("on_response callback failed: %s", obs_exc)
             return response.text
         except Exception as e:
             retry = get_retry_delay(
@@ -1100,7 +1114,14 @@ def process_mindmap(
 
     effective_media_uri = media_uri if media_uri is not None else video["url"]
     try:
-        result = call_gemini(client, types, effective_media_uri, prompt_text, model)
+        result = call_gemini(
+            client,
+            types,
+            effective_media_uri,
+            prompt_text,
+            model,
+            on_response=lambda r: log_usage_metadata(r, "mindmap"),
+        )
 
         # Save mind map
         header = (
@@ -1481,6 +1502,7 @@ def process_transcript(
                 response_json=True,
                 start_offset=start_offset,
                 end_offset=end_offset,
+                on_response=lambda r: log_usage_metadata(r, "transcript"),
             )
         except Exception as e:
             if meta_path.exists():
@@ -1557,8 +1579,20 @@ def process_transcript(
 # ---------------------------------------------------------------------------
 
 
-def call_gemini_text(client, types, text_content, model):
-    """Send text-only content to Gemini and get a JSON response."""
+def call_gemini_text(
+    client,
+    types,
+    text_content,
+    model,
+    *,
+    on_response: Callable[[object], None] | None = None,
+):
+    """Send text-only content to Gemini and get a JSON response.
+
+    Optional on_response callback mirrors ``call_gemini``'s behavior: the raw
+    response object is passed to the callback before ``.text`` is returned.
+    Callback failures are caught and logged at warning — they never break the call.
+    """
     config_kwargs = {
         "temperature": 0.3,
         "response_mime_type": "application/json",
@@ -1575,6 +1609,11 @@ def call_gemini_text(client, types, text_content, model):
                 contents=contents,
                 config=types.GenerateContentConfig(**config_kwargs),
             )
+            if on_response is not None:
+                try:
+                    on_response(response)
+                except Exception as obs_exc:
+                    log.warning("on_response callback failed: %s", obs_exc)
             return response.text
         except Exception as e:
             retry = get_retry_delay(
@@ -1629,7 +1668,13 @@ def process_concepts(
         prompt_with_taxonomy = prompt_text.replace("{{taxonomy}}", taxonomy_context)
 
         full_text = f"{prompt_with_taxonomy}\n\n---\n\n## Mind Map to Analyze\n\n{mindmap_text}"
-        raw = call_gemini_text(client, types, full_text, model)
+        raw = call_gemini_text(
+            client,
+            types,
+            full_text,
+            model,
+            on_response=lambda r: log_usage_metadata(r, "concepts"),
+        )
         result = json.loads(raw)
 
         # Normalize: ensure it has the expected structure
@@ -2318,6 +2363,280 @@ def cmd_transcript(args, config):
         log.info("  Saved: %s", out_path)
     elif "skipped" in status:
         log.info("  Exists: %s", out_path)
+
+
+_FILE_EXPIRY_POSITIVE_MARKERS: tuple[str, ...] = (
+    "failed state",
+    "not found",
+    "expired",
+)
+
+_FILE_EXPIRY_NEGATIVE_MARKERS: tuple[str, ...] = (
+    "quota",
+    "rate",
+    "safety",
+    "blocked",
+    "members only",
+    "permission_denied",
+    "permission denied",
+)
+
+
+def _is_file_expiry_error_status(status: str) -> bool:
+    """Decide whether a helper's error-status string signals a stale Gemini file_uri.
+
+    The helpers (``process_mindmap``, ``process_transcript``) catch exceptions
+    internally and return ``(prefix, "error: <stringified-exception>")``. This
+    detector parses that string and returns True only when the message references
+    a Gemini Files API resource AND carries a positive expiry/not-found/failed
+    marker AND lacks a negative marker that would indicate an unrelated failure
+    (quota, rate-limit, safety filter, members-only permission denial).
+
+    The files/<resource> presence matters: unrelated 403s rarely reference the
+    Files API path, so that anchor disambiguates file-expiry from quota /
+    safety / permission-denied errors that would otherwise share substrings.
+    """
+    if not status or not status.startswith("error:"):
+        return False
+    lowered = status.lower()
+    if "files/" not in lowered:
+        return False
+    if any(neg in lowered for neg in _FILE_EXPIRY_NEGATIVE_MARKERS):
+        return False
+    return any(pos in lowered for pos in _FILE_EXPIRY_POSITIVE_MARKERS)
+
+
+def cmd_process(args, config):
+    """Run the full local-file pipeline (mindmap + transcript + concepts) on one upload.
+
+    Wraps ``process_mindmap`` / ``process_transcript`` / ``process_concepts`` with a
+    single ``upload_local_video`` call and threads the returned ``file_uri`` to the
+    video-bearing helpers. The upload is skipped entirely when meta.json already
+    records the completed modes on disk (and ``--force`` is not set).
+
+    Exit-code contract: 0 if mindmap succeeded (regardless of transcript/concepts
+    outcome), non-zero if mindmap itself failed. Automation callers inspect
+    ``modes_completed`` in meta.json for finer-grained detection.
+    """
+    _, types = require_gemini()
+
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    if not gemini_key:
+        log.error("GEMINI_API_KEY not set.")
+        sys.exit(1)
+
+    client = create_client(gemini_key)
+    output_dir = resolve_output_dir(config)
+    model = resolve_model(args, config)
+
+    start_offset = parse_time_to_seconds(args.start) if args.start else None
+    end_offset = parse_time_to_seconds(args.end) if args.end else None
+
+    input_path = Path(args.file).resolve()
+    if not input_path.exists():
+        log.error("File not found: %s", input_path)
+        sys.exit(1)
+
+    size = input_path.stat().st_size
+    has_segment = start_offset is not None or end_offset is not None
+    if size > LARGE_FILE_THRESHOLD_BYTES and not has_segment:
+        size_gb = size / 1024 / 1024 / 1024
+        log.error(
+            "File is %.1fGB. Specify --start and --end to process a segment (Gemini's 2GB upload limit applies).",
+            size_gb,
+        )
+        sys.exit(1)
+
+    # Channel resolution mirrors cmd_transcript's --file path.
+    channel_name = args.channel or infer_channel_from_file_path(input_path, output_dir, config)
+    if args.channel:
+        configured = {c["name"] for c in config.get("channels", [])}
+        if args.channel not in configured:
+            log.error("Channel '%s' not found in config.yaml", args.channel)
+            sys.exit(1)
+
+    prompt_name = args.prompt or config.get("default_prompt", "mindmap-knowledge")
+    prompt_name = normalize_prompt_name(prompt_name)
+    mindmap_prompt = load_prompt(prompt_name)
+    transcript_prompt = load_prompt("transcript")
+
+    if channel_name:
+        channel_dir_hint = output_dir / channel_name
+        identity = resolve_local_file_identity(
+            input_path, channel_name=channel_name, channel_dir=channel_dir_hint, args=args
+        )
+        video = {
+            "video_id": identity["video_id"],
+            "url": identity["url"],
+            "title": identity["title"],
+            "published": identity["published"],
+        }
+        channel_dir = identity["channel_dir"]
+        prefix = identity["prefix"]
+        meta_path = identity["meta_path"]
+
+        if meta_path.exists():
+            try:
+                existing_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                existing_meta = {}
+            if existing_meta.get("skip"):
+                log.info("Skipping %s (skip=true in meta.json)", prefix)
+                return
+        else:
+            existing_meta = {}
+    else:
+        # No channel: loose-file mode, artifacts next to source (stem prefix).
+        video = {
+            "video_id": input_path.stem,
+            "url": "",
+            "title": input_path.stem,
+            "published": datetime.fromtimestamp(input_path.stat().st_mtime).strftime("%Y-%m-%d"),
+        }
+        channel_dir = input_path.parent
+        prefix = input_path.stem
+        meta_path = channel_dir / f"{prefix}.meta.json"
+        if meta_path.exists():
+            try:
+                existing_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                existing_meta = {}
+        else:
+            existing_meta = {}
+
+    # Lazy-upload decision: gated on meta.json modes_completed, not just filesystem.
+    modes_done = set(existing_meta.get("modes_completed", []))
+    mindmap_path = channel_dir / f"{prefix}.mindmap.md"
+    transcript_path = channel_dir / f"{prefix}.transcript.md"
+    raw_sidecar = channel_dir / f"{prefix}.transcript.raw.txt"
+
+    needs_mindmap = args.force or "scan" not in modes_done or not mindmap_path.exists()
+    needs_transcript = (
+        args.force or "transcript" not in modes_done or not transcript_path.exists() or raw_sidecar.exists()
+    )
+
+    file_uri: str | None = None
+    if needs_mindmap or needs_transcript:
+        channel_dir.mkdir(parents=True, exist_ok=True)
+        # Two-step meta write: identity block lands before the first Gemini call.
+        identity_fields = {
+            "video_url": video["url"],
+            "video_id": video["video_id"],
+            "channel": channel_name or "",
+            "title": video["title"],
+            "published": video["published"],
+            "model": model,
+            "prompt": prompt_name,
+            "transcript_source": "local_file",
+        }
+        if channel_name and "published_source" in identity:
+            identity_fields["published_source"] = identity["published_source"]
+        if start_offset is not None or end_offset is not None:
+            identity_fields["segments"] = [{"start": start_offset, "end": end_offset}]
+        update_meta(meta_path, identity_fields, mode="identity")
+        file_uri = upload_local_video(client, input_path)
+        log.info("Processing local file (channel=%s): %s", channel_name or "_loose", input_path.name)
+    else:
+        log.info("All pipeline artifacts up to date for %s (no upload).", prefix)
+
+    # Shared re-upload counter: bounded at one re-upload per invocation across
+    # both mindmap and transcript steps (file-expiry fallback, Unit 3).
+    reupload_available = [True]
+
+    def _call_with_file_expiry_retry(label: str, call_fn):
+        """Invoke a helper; on file-expiry, re-upload once and retry once."""
+        nonlocal file_uri
+        result = call_fn(file_uri)
+        status = result[1]
+        if _is_file_expiry_error_status(status) and reupload_available[0]:
+            reupload_available[0] = False
+            log.warning(
+                "File-expiry detected on %s (%s); re-uploading once and retrying.",
+                label,
+                status,
+            )
+            try:
+                file_uri = upload_local_video(client, input_path)
+            except Exception as e:
+                log.error("Re-upload failed: %s. Giving up on %s.", e, label)
+                return result
+            result = call_fn(file_uri)
+        return result
+
+    # Step 1: mindmap
+    def _mindmap_call(uri):
+        return process_mindmap(
+            client,
+            types,
+            video,
+            mindmap_prompt,
+            model,
+            output_dir,
+            channel_name or "",
+            prompt_name=prompt_name,
+            force=args.force,
+            prefix=prefix,
+            channel_dir_override=channel_dir,
+            media_uri=uri,
+        )
+
+    _, mindmap_status = _call_with_file_expiry_retry("mindmap", _mindmap_call)
+    log.info("  mindmap [%s]: %s", prefix, mindmap_status)
+    if mindmap_status.startswith("error:"):
+        log.error("Mindmap failed; aborting before transcript.")
+        sys.exit(1)
+
+    # Step 2: transcript
+    def _transcript_call(uri):
+        return process_transcript(
+            client,
+            types,
+            video,
+            transcript_prompt,
+            model,
+            channel_dir,
+            prefix,
+            force=args.force,
+            start_offset=start_offset,
+            end_offset=end_offset,
+            media_uri=uri,
+        )
+
+    _, transcript_status = _call_with_file_expiry_retry("transcript", _transcript_call)
+    log.info("  transcript [%s]: %s", prefix, transcript_status)
+    if transcript_status.startswith("error:"):
+        log.warning("Transcript failed; skipping concepts. Mindmap artifact preserved.")
+        return
+
+    # Step 3: concepts (text-only; channel must be configured).
+    if not channel_name:
+        log.warning("Channel not configured for %s; skipping concepts.", input_path.name)
+        return
+
+    if not mindmap_path.exists():
+        log.warning("Mindmap file not on disk; skipping concepts.")
+        return
+
+    mindmap_text = mindmap_path.read_text(encoding="utf-8")
+    taxonomy = load_taxonomy(output_dir)
+    try:
+        _, concepts_status = process_concepts(
+            client,
+            types,
+            video,
+            mindmap_text,
+            taxonomy,
+            model,
+            output_dir,
+            channel_name,
+            source_file=mindmap_path.name,
+            source_prompt=prompt_name,
+            force=args.force,
+            prefix=prefix,
+        )
+        log.info("  concepts [%s]: %s", prefix, concepts_status)
+    except Exception as e:
+        log.warning("Concepts failed for %s: %s (mindmap and transcript preserved)", prefix, e)
 
 
 def cmd_concepts(args, config):
@@ -3517,6 +3836,38 @@ Examples:
     )
     tx_parser.add_argument("--force", action="store_true", help="Regenerate even if transcript exists")
 
+    # process command: one-upload full pipeline for local MP4s
+    process_parser = subparsers.add_parser(
+        "process",
+        help="Full pipeline (mindmap + transcript + concepts) on one Gemini upload for a local video",
+    )
+    process_parser.add_argument(
+        "--file",
+        required=True,
+        help="Path to local video file. The channel is inferred from the parent folder (output_dir/<channel>/X.mp4) or passed explicitly via --channel.",
+    )
+    process_parser.add_argument(
+        "--channel",
+        help="Channel name (must exist in config.yaml). Overrides parent-folder inference.",
+    )
+    process_parser.add_argument(
+        "--video-id",
+        dest="video_id",
+        help="11-char YouTube video ID. Used for G2 dedup against existing canonical scan meta.json.",
+    )
+    process_parser.add_argument(
+        "--title",
+        help="Video title. Falls back to filename stem.",
+    )
+    process_parser.add_argument(
+        "--date",
+        help="Publish date YYYY-MM-DD. Falls back to the file's mtime.",
+    )
+    process_parser.add_argument("--start", help="Segment start time (MM:SS, HH:MM:SS, or raw seconds)")
+    process_parser.add_argument("--end", help="Segment end time (MM:SS, HH:MM:SS, or raw seconds)")
+    process_parser.add_argument("--force", action="store_true", help="Regenerate all artifacts from scratch")
+    process_parser.add_argument("--prompt", help="Mindmap prompt name (overrides config default)")
+
     # concepts command
     concepts_parser = subparsers.add_parser("concepts", help="Extract concepts from existing mindmaps")
     concepts_parser.add_argument("--channel", help="Process only this channel")
@@ -3630,6 +3981,8 @@ Examples:
         cmd_mindmap(args, config)
     elif args.command == "transcript":
         cmd_transcript(args, config)
+    elif args.command == "process":
+        cmd_process(args, config)
     elif args.command == "concepts":
         cmd_concepts(args, config)
     elif args.command == "taxonomy-build":

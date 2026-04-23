@@ -22,7 +22,9 @@ description: >
   "mental models across creators", "find the nuggets about [topic]",
   "find duplicate videos", "clean up duplicates", "dedupe my corpus",
   "the same video got scanned twice", "why do I have two mindmaps for [video]",
-  "creator rotated the title". Calls Gemini as multimodal proxy (frames +
+  "creator rotated the title", "process this local video", "run the full
+  pipeline on [file]", "mindmap plus transcript plus concepts on one upload",
+  "do everything on this MP4". Calls Gemini as multimodal proxy (frames +
   on-screen text + audio). A taxonomy layer enables cross-video topic lookup
   without reading every file.
 ---
@@ -106,6 +108,7 @@ table is the canonical mapping — read it before picking a command.
 | "recent tips / takeaways from [creator]", "last N days of [creator]" | `search "X" --vector --channel Y --since Nd` | Query existing index over a date window; no Gemini calls |
 | "nugget brief on X", "consultant brief on X", "what do creators say about X (together)", "agreements and disagreements on X", "find the nuggets" | `nugget "X"` | Cross-creator synthesis; retrieves top-K excerpts and feeds consultant-grade prompt for attributed briefing with 1+1=3 emergent insights |
 | "transcribe this video" + URL | `transcript --url URL` | Single video |
+| "run full pipeline on [local file]", "mindmap + transcript + concepts on one upload", "process this MP4" | `process --file PATH` | Local video only; single upload, lazy-skipped when artifacts already exist |
 | "scan", "what's new", "check for new videos" | `scan` | All channels, configured `since` |
 | "what's new from [creator]" | `scan --channel X` | Single channel, configured `since` |
 | "transcribe [creator]'s backlog", "videos I'm missing from [creator]", "catch up on [creator]" | `scan --channel X --since 2y` (or wider) | **Always `--dry-run` first** to surface scope |
@@ -302,6 +305,63 @@ Options:
 - `--video-id <ID>` - 11-char YouTube video ID for explicit canonical-meta matching
 - `--title <T>` / `--date YYYY-MM-DD` - Override filename-inferred defaults
 - `--force` - Regenerate even if transcript exists
+
+### Process a local video (full pipeline on one upload)
+
+Use `process --file` when the user has a local MP4 and wants the complete
+artifact set — mindmap + transcript + concepts — from a single Gemini upload.
+The existing `mindmap --file` and `transcript --file` commands still work for
+single-mode runs; `process` is the opt-in efficient path when both are wanted.
+
+```bash
+# Channel inferred from parent folder (drop the MP4 under output_dir/<channel>/)
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" --log-level info process \
+  --file "./video-intel/earlyaidopters/some-talk.mp4"
+
+# Or keep the MP4 anywhere and pass --channel explicitly
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" --log-level info process \
+  --file "~/Downloads/some-talk.mp4" --channel earlyaidopters
+
+# Regenerate everything from scratch (bypasses lazy-upload skip)
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" process \
+  --file "./video-intel/earlyaidopters/some-talk.mp4" --force
+```
+
+How `process` differs from calling `mindmap --file` then `transcript --file`:
+
+- **One upload** per invocation. The 40+MB MP4 is uploaded to Gemini Files
+  API exactly once and threaded to both the mindmap and transcript calls.
+  Old flow uploaded twice, costing bandwidth and wall-clock.
+- **Lazy upload skip.** When meta.json already shows all modes completed and
+  artifacts exist, `process` uploads nothing and exits quickly. A partial
+  prior run (e.g., mindmap succeeded but transcript did not) re-uploads
+  once and regenerates only the missing steps.
+- **File-expiry recovery.** If Gemini's 48h Files API TTL expires mid-run
+  (rare), `process` detects the expiry error, re-uploads once, retries
+  once, then fails cleanly.
+- **Observability.** Each Gemini call emits a
+  `usage <label> prompt=N cached=N candidates=N total=N` log line at info
+  level. `cached>0` on the transcript line means implicit caching fired and
+  you got a token discount; `cached=0` means it did not.
+- **Exit-code contract.** Exit 0 if mindmap succeeded, regardless of
+  transcript / concepts outcome. Automation callers that need partial-success
+  detail inspect `modes_completed` in the resulting meta.json.
+
+Concepts extraction runs inline when the channel is configured in
+`config.yaml`. For loose files (no channel match), concepts is skipped with
+a warning log and the run still exits 0.
+
+Options:
+
+- `--file PATH` - Path to local video file (required).
+- `--channel NAME` - Channel name (must exist in config.yaml). Overrides
+  parent-folder inference.
+- `--video-id ID` - 11-char YouTube video ID for G2 dedup against a canonical
+  scan meta.json.
+- `--title T` / `--date YYYY-MM-DD` - Override filename-inferred defaults.
+- `--start`/`--end` - Segment time offsets (shared across both video calls).
+- `--force` - Regenerate all artifacts from scratch.
+- `--prompt NAME` - Mindmap prompt override (default from config.yaml).
 
 ### Hybrid search (evidence queries)
 
