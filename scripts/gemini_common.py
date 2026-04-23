@@ -28,7 +28,12 @@ def _coerce_token_count(value: object) -> int:
 def log_usage_metadata(response: object, label: str) -> None:
     """Log a single info-level line summarizing Gemini token usage.
 
-    Emits: ``usage {label} prompt=N cached=N candidates=N total=N``.
+    Emits: ``usage {label} prompt=N cached=N thoughts=N candidates=N total=N``.
+
+    ``thoughts_token_count`` is Gemini 3.x-specific (the thinking process);
+    legacy 2.x responses omit it and we default to 0. Per Gemini usage_metadata
+    docs (ai.google.dev/gemini-api/docs/tokens), when thoughts > 0 the
+    ``total_token_count`` will exceed ``prompt + cached + candidates``.
 
     Observability must never break the caller. Any unexpected shape
     produces a warning log and returns — it does not raise.
@@ -40,13 +45,15 @@ def log_usage_metadata(response: object, label: str) -> None:
             return
         prompt = _coerce_token_count(getattr(usage, "prompt_token_count", 0))
         cached = _coerce_token_count(getattr(usage, "cached_content_token_count", 0))
+        thoughts = _coerce_token_count(getattr(usage, "thoughts_token_count", 0))
         candidates = _coerce_token_count(getattr(usage, "candidates_token_count", 0))
         total = _coerce_token_count(getattr(usage, "total_token_count", 0))
         log.info(
-            "usage %s prompt=%d cached=%d candidates=%d total=%d",
+            "usage %s prompt=%d cached=%d thoughts=%d candidates=%d total=%d",
             label,
             prompt,
             cached,
+            thoughts,
             candidates,
             total,
         )

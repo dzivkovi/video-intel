@@ -3995,7 +3995,13 @@ Examples:
         format="%(asctime)s %(levelname)-7s %(message)s",
         datefmt="%H:%M:%S",
     )
-    log.setLevel(getattr(logging, args.log_level.upper()))
+    configured_level = getattr(logging, args.log_level.upper())
+    log.setLevel(configured_level)
+    # gemini_common carries the usage_metadata observability logs introduced in
+    # PR #32 (feat(process)). Without this, log_usage_metadata's INFO lines are
+    # filtered by the WARNING-level root configured above and users never see
+    # the cached= / prompt= / total= token counts.
+    logging.getLogger("gemini_common").setLevel(configured_level)
     config = load_config()
 
     if args.command == "scan":

@@ -30,7 +30,7 @@ class TestLogUsageMetadataHappyPath:
         records = [r for r in caplog.records if r.name == "gemini_common"]
         assert len(records) == 1
         assert records[0].levelno == logging.INFO
-        assert records[0].getMessage() == "usage mindmap prompt=77312 cached=0 candidates=1204 total=78516"
+        assert records[0].getMessage() == "usage mindmap prompt=77312 cached=0 thoughts=0 candidates=1204 total=78516"
 
     def test_all_fields_present_when_transcript_uses_transcript_label(self, caplog):
         response = SimpleNamespace(
@@ -41,7 +41,10 @@ class TestLogUsageMetadataHappyPath:
 
         records = [r for r in caplog.records if r.name == "gemini_common"]
         assert len(records) == 1
-        assert records[0].getMessage() == "usage transcript prompt=77312 cached=77000 candidates=14807 total=169119"
+        assert (
+            records[0].getMessage()
+            == "usage transcript prompt=77312 cached=77000 thoughts=0 candidates=14807 total=169119"
+        )
 
 
 class TestLogUsageMetadataEdgeCases:
@@ -128,6 +131,46 @@ class TestLogUsageMetadataEdgeCases:
         response = SimpleNamespace()  # no usage_metadata attr at all
         with caplog.at_level(logging.WARNING, logger="gemini_common"):
             log_usage_metadata(response, "concepts")  # must not raise
+
+
+class TestLogUsageMetadataGemini3Thoughts:
+    def test_thoughts_token_count_present_when_gemini_3_thinking_budget_active_appears_in_log_line(self, caplog):
+        """Gemini 3.x thinking-enabled responses include thoughts_token_count.
+
+        Per ai.google.dev/gemini-api/docs/tokens: when thinking is active,
+        total_token_count > prompt + cached + candidates; the gap is thoughts.
+        """
+        meta = SimpleNamespace(
+            prompt_token_count=50000,
+            cached_content_token_count=0,
+            thoughts_token_count=3200,  # gemini-3-flash-preview with thinking
+            candidates_token_count=1200,
+            total_token_count=54400,
+        )
+        response = SimpleNamespace(usage_metadata=meta)
+        with caplog.at_level(logging.INFO, logger="gemini_common"):
+            log_usage_metadata(response, "transcript")
+
+        records = [r for r in caplog.records if r.name == "gemini_common" and r.levelno == logging.INFO]
+        assert len(records) == 1
+        assert "thoughts=3200" in records[0].getMessage()
+
+    def test_thoughts_field_missing_when_legacy_gemini_2_response_defaults_to_zero(self, caplog):
+        """Gemini 2.x responses have no thoughts_token_count attr — must default to 0, not crash."""
+        meta = SimpleNamespace(
+            prompt_token_count=1000,
+            cached_content_token_count=0,
+            candidates_token_count=200,
+            total_token_count=1200,
+            # thoughts_token_count intentionally absent
+        )
+        response = SimpleNamespace(usage_metadata=meta)
+        with caplog.at_level(logging.INFO, logger="gemini_common"):
+            log_usage_metadata(response, "mindmap")
+
+        records = [r for r in caplog.records if r.name == "gemini_common" and r.levelno == logging.INFO]
+        assert len(records) == 1
+        assert "thoughts=0" in records[0].getMessage()
 
 
 class TestLogUsageMetadataLabel:
