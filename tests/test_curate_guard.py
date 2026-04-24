@@ -167,3 +167,49 @@ class TestLooseFileGuardScope:
             pass  # expected - no --url or --file
         except Exception:
             pass
+
+    def test_mindmap_with_channel_and_missing_channels_fires_guard(self, monkeypatch, tmp_path):
+        """Positive case: ``cmd_mindmap --file X --channel Y`` with no
+        ``channels:`` in config MUST fire the guard. Without this test, a
+        silent revert of the guard insertion inside the ``if args.channel:``
+        branch would not be caught.
+
+        Uses the sentinel pattern from TestGuardWiring so we assert the guard
+        was called without relying on GEMINI_API_KEY or Gemini client setup.
+        """
+
+        class GuardCalled(Exception):
+            pass
+
+        def _sentinel(_config):
+            raise GuardCalled()
+
+        monkeypatch.setattr(vi, "require_channels_config", _sentinel)
+        # Stub out upstream calls that happen before the guard so the test
+        # reaches the `if args.channel:` block without env-var dependencies.
+        monkeypatch.setattr(vi, "require_gemini", lambda: (None, None))
+        monkeypatch.setattr(vi, "create_client", lambda *a, **kw: None)
+        monkeypatch.setenv("GEMINI_API_KEY", "fake-for-test")
+
+        import argparse
+
+        real_mp4 = tmp_path / "fake.mp4"
+        real_mp4.write_bytes(b"\x00")
+
+        config = {"output_dir": str(tmp_path)}  # no channels key
+        args = argparse.Namespace(
+            url=None,
+            file=str(real_mp4),
+            channel="earlyaidopters",  # triggers the args.channel branch
+            video_id=None,
+            title=None,
+            date=None,
+            start=None,
+            end=None,
+            force=False,
+            prompt=None,
+            model=None,
+        )
+
+        with pytest.raises(GuardCalled):
+            vi.cmd_mindmap(args, config)
