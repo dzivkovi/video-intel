@@ -1,6 +1,10 @@
 .env*
 *.skill
 consolidated_chat*.md
+
+# Local config.yaml is per-user (paths, channels). Copy config.yaml.example to
+# config.yaml and edit. See CLAUDE.md for the user-level install procedure.
+/config.yaml
 work/
 plans/*.md
 !plans/.gitkeep

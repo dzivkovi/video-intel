@@ -1,0 +1,40 @@
+# Video Intel configuration -- template.
+# Copy this file to config.yaml and edit for your own setup.
+# config.yaml is gitignored (per-user paths and channel list).
+
+# Where generated artifacts live (mindmaps, transcripts, meta.json, taxonomy.json,
+# and by default the LanceDB vector index). Use an absolute path. Cloud-synced
+# paths (Google Drive, OneDrive, Dropbox) are fine for text artifacts.
+output_dir: ~/video-intel
+
+# vector_db_dir: where the LanceDB vector index lives. Defaults to output_dir/.lancedb.
+# IMPORTANT: must be on a real local filesystem. Cloud-synced drives (Google Drive File
+# Stream, OneDrive, Dropbox) break LanceDB's MVCC commit with "Incorrect function"
+# (os error 1) on Windows. If output_dir is on one of those, uncomment the line below
+# and point it at a local cache directory. The index is derived (rebuildable via the
+# `index` command), so it is safe to live outside output_dir. See ADR-0016.
+# vector_db_dir: ~/.cache/video-intel/lancedb
+
+default_since: 10d
+default_prompt: mindmap-knowledge
+model: gemini-3-flash-preview
+max_parallel: 10
+auto_concepts: true
+
+# Channels to scan. Each channel is a YouTube handle; curate commands (scan, index,
+# concepts, etc.) require this list to be populated. Search commands do not.
+channels:
+  - name: example_creator
+    url: https://youtube.com/@example
+    auto_transcript: all
+    since: 90d
+
+  # Selective mode: only pull specific playlists or keyword-matched videos.
+  # Useful when a creator posts across many topics and you only want a slice.
+  - name: example_selective
+    url: https://youtube.com/@anotherexample
+    playlists:
+      - Some Playlist Name
+    keywords:
+      - specific topic
+    auto_transcript: none

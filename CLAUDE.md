@@ -54,6 +54,7 @@ python scripts/video_intel.py search "permission problems" --vector
 
 Required env vars: `GEMINI_API_KEY`, `YOUTUBE_API_KEY`.
 Optional: `VOYAGE_API_KEY` (for vector search, free at https://dash.voyageai.com/).
+Optional: `VIDEO_INTEL_OUTPUT_DIR` (absolute path to the corpus; reached only when the plugin's `config.yaml` is absent — see Corpus Discovery below).
 
 ## Architecture
 
@@ -63,17 +64,71 @@ Optional: `VOYAGE_API_KEY` (for vector search, free at https://dash.voyageai.com
 video-intel/                          ← plugin root (git repo root)
 ├── .claude-plugin/plugin.json        ← plugin manifest (name, version, skill list)
 ├── skills/
-│   ├── video-intel/SKILL.md          ← scan / transcript / concepts / search
+│   ├── video-intel/SKILL.md          ← curate: scan / transcript / mindmap / process / index / dedupe / concepts / taxonomy-build
+│   ├── video-intel-search/SKILL.md   ← read-only query: search / nugget / status (globally installable)
 │   └── translate-bcs/SKILL.md        ← BCS subtitle translation
-├── scripts/                          ← shared by both skills
-├── prompts/                          ← shared by both skills
-├── config.yaml                       ← video-intel skill only
+├── scripts/                          ← shared by all skills
+├── prompts/                          ← shared by all skills
+├── config.yaml                       ← gitignored; per-user. Copy config.yaml.example to create.
+├── config.yaml.example               ← committed template
 └── tests/                            ← covers shared scripts
 ```
 
-Each `SKILL.md` has its own frontmatter description and is independently triggered by Claude Code. Scripts and prompts are shared at the plugin root so the two skills can reuse `translate_video.py`, `gemini_common.py`, etc., without duplication. The operational-separation rule (translate_video.py does not read video-intel's config/taxonomy/meta.json) is unchanged — scripts stay independent even though they ship in the same plugin.
+Each `SKILL.md` has its own frontmatter description and is independently triggered by Claude Code. Scripts and prompts are shared at the plugin root so the skills can reuse `translate_video.py`, `gemini_common.py`, etc., without duplication. The operational-separation rule (translate_video.py does not read video-intel's config/taxonomy/meta.json) is unchanged — scripts stay independent even though they ship in the same plugin.
 
-**When the plugin is installed**, both skills become available to Claude. A user asking "scan my channels" triggers `video-intel`; a user asking "translate this video to Bosnian" triggers `translate-bcs`. No cross-skill invocation is required — each skill's body tells Claude which CLI commands to run, and Claude executes them from the plugin's shared scripts directory.
+**When the plugin is installed**, all three skills become available to Claude. A user asking "scan my channels" triggers `video-intel` (curate); a user asking "find videos about MCP" triggers `video-intel-search` (read-only); a user asking "translate this video to Bosnian" triggers `translate-bcs`. No cross-skill invocation is required — each skill's body tells Claude which CLI commands to run, and Claude executes them from the plugin's shared scripts directory.
+
+### Corpus Discovery
+
+`load_config()` in `scripts/video_intel.py` resolves `output_dir` via a four-step precedence chain (see KD1 of `docs/plans/2026-04-23-001-feat-search-skill-portability-plan.md`):
+
+1. **`SKILL_DIR/config.yaml`** — the plugin-local config, gitignored. Authored by the developer running curate workflows from a source checkout. Wins when present so a stale env var cannot silently redirect `scan` away from the canonical corpus.
+2. **`$VIDEO_INTEL_OUTPUT_DIR`** — env var override for users who point a cached plugin at a different corpus. Must be an absolute path.
+3. **`~/.video-intel/config.yaml`** — user-level minimal config accepting `output_dir` (required) and `vector_db_dir` (optional). Extra keys are ignored with one INFO log.
+4. **Hard error** naming both the env var and the user-config path.
+
+One INFO log line per invocation names the winning source (e.g. `"Config resolved from VIDEO_INTEL_OUTPUT_DIR=/foo"`).
+
+**Curate guard:** curate commands (`scan`, `concepts`, `dedupe`, and the `--channel` branch of `mindmap` / `transcript` / `process`) require `channels:` in the resolved config. Running them with the user-level minimal config (no channels) fails fast with an actionable message. Read-only commands (`search`, `nugget`, `status`, `index`, `taxonomy-build`) do not require `channels:`.
+
+### User-level install (`video-intel-search` skill anywhere)
+
+To make the read-only search skill available from any project (not just the plugin repo):
+
+1. **Add user-level marketplace entry.** Edit `~/.claude/settings.json` (Windows: `C:\Users\<you>\.claude\settings.json`; macOS/Linux: `~/.claude/settings.json`) and add:
+
+   ```json
+   {
+     "extraKnownMarketplaces": {
+       "video-intel-local": {
+         "source": { "source": "directory", "path": "C:/Users/<you>/ws/Skills/video-intel" }
+       }
+     },
+     "enabledPlugins": { "video-intel@video-intel-local": true }
+   }
+   ```
+
+   Use an **absolute path** to your plugin checkout. On macOS: `/Users/<you>/...`; on Linux: `/home/<you>/...`.
+
+2. **Point at the corpus** via one of:
+
+   - Env var in your shell profile: `export VIDEO_INTEL_OUTPUT_DIR="/absolute/path/to/your/corpus"`
+   - Or create `~/.video-intel/config.yaml` with:
+
+     ```yaml
+     output_dir: /absolute/path/to/your/corpus
+     # vector_db_dir: /local/cache/lancedb   # optional; see ADR-0016
+     ```
+
+3. **Verify** from any non-plugin directory:
+
+   ```bash
+   python /abs/path/to/plugin/scripts/video_intel.py status
+   ```
+
+   Should report corpus stats without errors.
+
+**Curate operations still require the plugin repo.** `scan`, `process`, `concepts`, `dedupe` all read `channels:` from the plugin-local `config.yaml`. Run them from CWD inside the plugin checkout; they will not work from a user-level install alone.
 
 **Shared utilities:** `scripts/gemini_common.py` — Gemini retry logic (`get_retry_delay`), client factory with httpx timeouts (`create_client`), lazy imports (`require_gemini`, `require_youtube`). Used by both scripts; kept minimal.
 

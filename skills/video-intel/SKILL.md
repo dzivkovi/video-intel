@@ -1,32 +1,31 @@
 ---
 name: video-intel
 description: >
-  Multimodal video intelligence via Gemini API. Use whenever the user wants
-  to: find videos about a topic across channels; browse concepts in the
-  library; scan a YouTube channel for new videos and get mind maps; backfill
-  a creator's backlog or catch up on missing videos; triage which videos are
-  worth watching; get a diarized transcript with on-screen content (slides,
-  diagrams, code) captured; add/remove monitored channels; change scan
-  settings. Trigger phrases: "what videos cover [topic]", "find videos
-  about [concept]", "which creators talk about [subject]", "scan channel",
-  "what's new from [creator]", "last N days of [creator]", "recent
-  takeaways from [creator]", "watch this for me", "transcribe this
-  video", "transcribe [creator]'s backlog", "videos I'm missing from
-  [creator]", "catch up on [creator]", "fully scan [creator]", "backfill
-  [creator]", "add [channel] to my watchlist", "what should I watch",
-  "summarize this video", "is this worth watching", any YouTube URL +
-  question, "show my channels", "what concepts are in my library", "what
-  topics recur across channels", "nugget brief on [topic]", "consultant
-  brief on [topic]", "what do [creators] say about [topic]", "agreements
-  and disagreements on [topic]", "synthesize insights across creators",
-  "mental models across creators", "find the nuggets about [topic]",
-  "find duplicate videos", "clean up duplicates", "dedupe my corpus",
-  "the same video got scanned twice", "why do I have two mindmaps for [video]",
-  "creator rotated the title", "process this local video", "run the full
-  pipeline on [file]", "mindmap plus transcript plus concepts on one upload",
-  "do everything on this MP4". Calls Gemini as multimodal proxy (frames +
-  on-screen text + audio). A taxonomy layer enables cross-video topic lookup
-  without reading every file.
+  Ingest/curate side of the video intelligence plugin. Use whenever the
+  user wants to modify or build the corpus: scan YouTube channels for new
+  videos and generate mind maps via Gemini; transcribe a video (URL or
+  local MP4); run the full mindmap+transcript+concepts pipeline on a local
+  video; extract and normalize concepts into the taxonomy; rebuild the
+  LanceDB hybrid-search index from existing transcripts; clean up
+  title-rotation duplicates; manage channel configuration. Trigger phrases:
+  "scan channel", "scan all channels", "what's new from [creator]" (with
+  scan intent), "last N days of [creator]", "transcribe this video",
+  "transcribe [creator]'s backlog", "videos I am missing from [creator]",
+  "catch up on [creator]", "fully scan [creator]", "backfill [creator]",
+  "add [channel] to my watchlist", "find duplicate videos", "clean up
+  duplicates", "dedupe my corpus", "the same video got scanned twice",
+  "why do I have two mindmaps for [video]", "creator rotated the title",
+  "process this local video", "run the full pipeline on [file]", "mindmap
+  plus transcript plus concepts on one upload", "do everything on this
+  MP4", "extract concepts", "rebuild the taxonomy", "rebuild the index",
+  "build the search index". Requires GEMINI_API_KEY, YOUTUBE_API_KEY, and
+  `channels:` configured in config.yaml - this skill must run from the
+  plugin repo checkout, not a globally-installed cache. Calls Gemini as
+  multimodal proxy (frames + on-screen text + audio). For read-only
+  queries against an already-built corpus (library search, cross-creator
+  synthesis, corpus-freshness reports, summarizing a video that is already
+  indexed), use the video-intel-search skill instead - that one is safe
+  to install globally and invoke from any project.
 ---
 
 # Video Intel
@@ -103,10 +102,6 @@ table is the canonical mapping — read it before picking a command.
 
 | User says (intent) | Run | Notes |
 |---|---|---|
-| "find videos about X", "what covers Y" | `search "X"` | Discovery — fast, no API calls |
-| "what did they say about X", "evidence for Y" | `search "X" --vector` | Hybrid search; returns transcript passages |
-| "recent tips / takeaways from [creator]", "last N days of [creator]" | `search "X" --vector --channel Y --since Nd` | Query existing index over a date window; no Gemini calls |
-| "nugget brief on X", "consultant brief on X", "what do creators say about X (together)", "agreements and disagreements on X", "find the nuggets" | `nugget "X"` | Cross-creator synthesis; retrieves top-K excerpts and feeds consultant-grade prompt for attributed briefing with 1+1=3 emergent insights |
 | "transcribe this video" + URL | `transcript --url URL` | Single video |
 | "run full pipeline on [local file]", "mindmap + transcript + concepts on one upload", "process this MP4" | `process --file PATH` | Local video only; single upload, lazy-skipped when artifacts already exist |
 | "scan", "what's new", "check for new videos" | `scan` | All channels, configured `since` |
@@ -114,6 +109,9 @@ table is the canonical mapping — read it before picking a command.
 | "transcribe [creator]'s backlog", "videos I'm missing from [creator]", "catch up on [creator]" | `scan --channel X --since 2y` (or wider) | **Always `--dry-run` first** to surface scope |
 | "fully scan [creator]", "everything from [creator]" | `scan --channel X --since 2005-01-01` | **Always `--dry-run` first** — implies entire channel history |
 | Backlog of N videos to transcribe | `scan` with `auto_transcript: all` configured | NOT N separate `transcript --url` calls |
+| "rebuild the index", "reindex after dedupe" | `index --force` | Write-path rebuild of LanceDB; query uses `video-intel-search` |
+| "rebuild taxonomy", "update master vocabulary" | `taxonomy-build` | Derived artifact; rebuildable anytime |
+| "find videos about X", "search for Y", "nugget brief on Z", "corpus status" | — | **Wrong skill.** These are read-only queries; use the **video-intel-search** skill. |
 
 ### Channel name resolution
 
@@ -164,64 +162,15 @@ python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" --model gemini-2.5-pro
 
 Precedence: `--model` flag > `config.yaml` `model` field > `gemini-3-flash-preview`.
 
-## Natural-Language Content Queries
+## Query Workflow (Different Skill)
 
-When you ask Claude Code about topics in your video library, the skill routes
-your question through grounded search automatically — you don't need to know
-whether to use vector, hybrid, or concept search internally. Here's what happens:
-
-**Default behavior:** Your question is routed to **hybrid search** (BM25 keyword +
-vector semantic embedding via Voyage AI + rank-reciprocal fusion). This finds
-passages in transcripts that are both keyword-relevant and semantically similar
-to your query, ranked by combined score.
-
-**Output shape:** Results come back as a **narrative summary** with:
-- A thematic headline (the cross-cutting thread)
-- One paragraph per video (what was said and in what context)
-- **Jump links with timestamps** (e.g. `[2:45](https://youtube.com/watch?v=xxx&t=165)`)
-  pointing to the exact moment the evidence was found — no scrubbing, no watching
-  the full video
-
-**Date-window queries:** For "last N days" questions, add `--since 30d` (or any
-`Nd` / `YYYY-MM-DD` value). The filter is pushed into LanceDB *before* ranking,
-so every recent video is considered — recency doesn't get crowded out by older,
-higher-relevance hits. Use this by default for `last N days of [creator]` questions.
-
-**Fallback:** If vector search is unavailable (missing `VOYAGE_API_KEY` or index
-not built), the skill falls back to concept search (fast, no API calls). Results
-are video matches only; open the transcript file afterward to read detail.
-
-**See also:** [ADR-0013](../../../docs/adr/ADR-0013-hybrid-search-rrf.md) (hybrid
-search design), [ADR-0016](../../../docs/adr/ADR-0016-vector-db-path-config.md)
-(vector index configuration).
+For searching the corpus, nugget briefs, corpus status, or summarizing a video
+that is already indexed, use the **video-intel-search** skill. It is read-only,
+globally installable, and reads the same `output_dir` this skill writes to.
+This skill covers the write path only: scan, transcribe, process, index,
+concepts, dedupe, taxonomy-build.
 
 ## How to Use
-
-### Find videos about a topic (start here)
-
-```bash
-# "Which videos cover X?" — concept match, no API calls
-python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" search "skills standard"
-
-# "What did someone say about X?" — semantic search over transcripts
-python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" search "150-line skill limit" --vector
-
-# Filter either mode to a channel
-python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" search "context window" --channel natebjones
-
-# Check corpus status
-python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" status
-```
-
-**Mode reference:**
-- **`search "X"`** — concept match. Matches labels/aliases in taxonomy.json.
-  Fast, no API calls. Returns video list with artifact paths.
-- **`search "X" --vector`** — hybrid search (BM25 + vector + RRF fusion).
-  Returns full transcript passages (up to 3000 chars) with speaker turns and
-  SCREEN blocks preserved. Searches both video titles and transcript text.
-  Requires `VOYAGE_API_KEY`. Add `--preview` for compact 200-char output.
-- Hybrid results include evidence directly — follow-up transcript reads are
-  usually unnecessary. Only read the source file if you need surrounding context.
 
 ### Scan channels for new videos
 
@@ -363,50 +312,18 @@ Options:
 - `--force` - Regenerate all artifacts from scratch.
 - `--prompt NAME` - Mindmap prompt override (default from config.yaml).
 
-### Hybrid search (evidence queries)
+### Build the search index
 
 ```bash
-# Build the search index from all transcripts (requires VOYAGE_API_KEY)
+# Build or rebuild the LanceDB index from all transcripts (requires VOYAGE_API_KEY)
 python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" index
 
-# Hybrid search — BM25 keyword + vector semantic, merged by RRF
-python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" search "permission problems" --vector
-
-# Filter to a channel
-python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" search "150-line skill limit" --vector --channel natebjones
+# Force a rebuild from scratch after dedupe or large corpus changes
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" index --force
 ```
 
-Hybrid search requires: `pip install 'video-intel[vector]'` and `VOYAGE_API_KEY`
-(free at https://dash.voyageai.com/). See the triage workflow table above for
-when to use `--vector` vs plain concept search.
-
-### Synthesize a consultant-grade nugget brief (cross-creator)
-
-```bash
-# Ask "what do creators say about X, together?"
-python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" nugget "LightRAG vs OpenBrain architectural tension"
-
-# Restrict to recent coverage
-python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" nugget "context engineering" --since 90d
-
-# Restrict to specific creators
-python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" nugget "graph RAG" --channel engineerprompt
-
-# Save the briefing to a file
-python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" nugget "second brain patterns" --output brief.md
-```
-
-The `nugget` command retrieves top-K excerpts via hybrid search, then feeds them through the `nugget-brief` prompt for a consultant-grade briefing. Output structure: Query in Focus → Creators Surveyed → Consensus → Divergence → Noteworthy Nuggets (mental models, metaphors, warnings, workarounds, business psychology) → Emergent Synthesis (1+1=3) → Follow-Up Questions. Every claim cites the creator and timestamp.
-
-Options:
-- `--limit N` - Max excerpts feeding synthesis (default: 15)
-- `--channel X` - Restrict to one creator
-- `--since Nd` - Time-window filter ('Nd' or 'YYYY-MM-DD')
-- `--min-relevance F` - Minimum RRF relevance score
-- `--no-expand` - Disable Stage-1 taxonomy query expansion
-- `--output PATH` - Write briefing to file instead of stdout
-
-Use when the user wants **grounded, multi-creator, citable analysis** — not a single-video summary and not raw evidence-search results. This is the "what do they say together, and what emerges from comparing them" mode.
+The `index` command is a write-path operation (rebuilds the LanceDB hybrid
+index). Querying the index belongs to the `video-intel-search` skill.
 
 ### Extract and normalize concepts
 
@@ -504,22 +421,6 @@ Prompt templates live at the plugin root, `${CLAUDE_SKILL_DIR}/../../prompts/`:
 - `nugget-brief.md` - Consultant-grade cross-creator synthesis with attributed nuggets
 
 Each prompt is self-contained. Users can modify or add their own.
-
-## Evaluate Search Quality
-
-The repo ships a 25-query grounded golden dataset at `tests/evals/golden_dataset.yaml` that measures hybrid search against known-correct transcript passages. Run this before/after any change that touches retrieval (search ranking, chunking, KB layer, concept normalization) and record the before/after score in the PR description.
-
-```bash
-# Full run — ~1 min wall-clock, ~$0.01-0.05 in Voyage tokens
-pytest tests/evals/ -v -s
-
-# Smoke mode (Q01 only) — ~3 seconds, for iterating on the harness itself
-VIDEO_INTEL_EVAL_SMOKE=1 pytest tests/evals/ -v -s
-```
-
-The `-s` flag matters — the per-metric diagnostics are what tell you *why* a query failed, not just that it did. See `tests/evals/README.md` for the quick-start and `docs/testing.md` / `docs/adr/ADR-0017-kb-layer-strategy.md` for the baseline (1/25 as of 2026-04-19) and the staged-KB plan this eval gates.
-
-The golden dataset is a frozen contract per ADR-0017 — changing queries needs ADR-grade justification, not a silent edit.
 
 ## Output Structure
 
