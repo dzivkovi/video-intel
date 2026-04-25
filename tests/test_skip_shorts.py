@@ -504,3 +504,220 @@ class TestCmdScanSkipShorts:
         assert len(meta_files) == 1
         meta = json.loads(meta_files[0].read_text(encoding="utf-8"))
         assert meta.get("duration_seconds") == 600, f"duration_seconds missing: {meta}"
+
+
+# ---------------------------------------------------------------------------
+# Unit 4: cmd_prune_shorts subcommand
+# ---------------------------------------------------------------------------
+
+
+def _prune_args(**overrides):
+    """Build a Namespace mirroring the cmd_prune_shorts argparse contract."""
+    from argparse import Namespace
+
+    base = {"channel": None, "apply": False}
+    base.update(overrides)
+    return Namespace(**base)
+
+
+def _prune_setup(monkeypatch):
+    """Common cmd_prune_shorts mocking. Stubs out the YouTube client lookup
+    so legacy-meta enrichment paths can run without network."""
+    monkeypatch.setenv("YOUTUBE_API_KEY", "test")
+    monkeypatch.setattr(vi, "require_youtube", lambda: lambda *a, **kw: None)
+    # No legacy metas in most tests → enrich never fires; install a stub that
+    # returns all-None just in case (would treat unknown durations as long-form).
+    monkeypatch.setattr(
+        vi,
+        "enrich_with_durations",
+        lambda _yt, video_ids: dict.fromkeys(video_ids),
+    )
+
+
+def _make_short_artifacts(channel_dir: Path, prefix: str, video_id: str, duration_seconds: int = 30):
+    """Create the four canonical Shorts artifacts plus a meta.json with cached
+    duration_seconds so cmd_prune_shorts classifies via the duration short-circuit
+    (no network calls required)."""
+    _write_meta(
+        channel_dir,
+        prefix,
+        {
+            "video_id": video_id,
+            "title": f"Short {video_id}",
+            "published": "2026-04-15",
+            "duration_seconds": duration_seconds,
+        },
+    )
+    _touch(channel_dir / f"{prefix}.mindmap.md")
+    _touch(channel_dir / f"{prefix}.transcript.md")
+    _touch(channel_dir / f"{prefix}.concepts.json")
+
+
+class TestPruneShorts:
+    def test_dry_run_lists_short_does_not_delete(self, tmp_path, monkeypatch):
+        _prune_setup(monkeypatch)
+        ch = tmp_path / "ch1"
+        _make_short_artifacts(ch, "2026-04-15-short1", "short1")
+
+        config = {"output_dir": str(tmp_path), "channels": [{"name": "ch1"}]}
+        vi.cmd_prune_shorts(_prune_args(channel="ch1"), config)
+
+        # All 4 artifacts must still exist (dry-run preview-only)
+        assert (ch / "2026-04-15-short1.meta.json").exists()
+        assert (ch / "2026-04-15-short1.mindmap.md").exists()
+        assert (ch / "2026-04-15-short1.transcript.md").exists()
+        assert (ch / "2026-04-15-short1.concepts.json").exists()
+
+    def test_apply_deletes_four_artifacts(self, tmp_path, monkeypatch):
+        _prune_setup(monkeypatch)
+        ch = tmp_path / "ch1"
+        _make_short_artifacts(ch, "2026-04-15-short1", "short1")
+
+        config = {"output_dir": str(tmp_path), "channels": [{"name": "ch1"}]}
+        vi.cmd_prune_shorts(_prune_args(channel="ch1", apply=True), config)
+
+        assert not (ch / "2026-04-15-short1.meta.json").exists()
+        assert not (ch / "2026-04-15-short1.mindmap.md").exists()
+        assert not (ch / "2026-04-15-short1.transcript.md").exists()
+        assert not (ch / "2026-04-15-short1.concepts.json").exists()
+
+    def test_apply_preserves_translate_bcs_sidecars(self, tmp_path, monkeypatch):
+        """CRITICAL regression: translate_video.py produces .en.srt and
+        .translate-bcs.txt siblings sharing the prefix. They MUST survive
+        prune-shorts --apply because translate-bcs is operationally separate
+        from curate. Locks the suffix-allowlist contract in place."""
+        _prune_setup(monkeypatch)
+        ch = tmp_path / "ch1"
+        _make_short_artifacts(ch, "2026-04-15-short1", "short1")
+        # Sidecars from the translate-bcs workflow:
+        _touch(ch / "2026-04-15-short1.en.srt", "1\n00:00:00,000 --> 00:00:01,000\nhi\n")
+        _touch(ch / "2026-04-15-short1.translate-bcs.txt", "Bosnian translation")
+        _touch(ch / "2026-04-15-short1.unrelated.txt", "unrelated future feature")
+
+        config = {"output_dir": str(tmp_path), "channels": [{"name": "ch1"}]}
+        vi.cmd_prune_shorts(_prune_args(channel="ch1", apply=True), config)
+
+        # Targets gone:
+        assert not (ch / "2026-04-15-short1.meta.json").exists()
+        assert not (ch / "2026-04-15-short1.mindmap.md").exists()
+        # Sidecars survive:
+        assert (ch / "2026-04-15-short1.en.srt").exists(), "translate-bcs SRT must survive"
+        assert (ch / "2026-04-15-short1.translate-bcs.txt").exists(), "BCS translation must survive"
+        assert (ch / "2026-04-15-short1.unrelated.txt").exists(), "unknown sidecars must survive"
+
+    def test_apply_deletes_mindmap_variants(self, tmp_path, monkeypatch):
+        """Knowledge / light / heavy mindmap variants share the prefix
+        (e.g., {prefix}.mindmap.knowledge.md). All variants delete."""
+        _prune_setup(monkeypatch)
+        ch = tmp_path / "ch1"
+        _make_short_artifacts(ch, "2026-04-15-short1", "short1")
+        _touch(ch / "2026-04-15-short1.mindmap.knowledge.md")
+        _touch(ch / "2026-04-15-short1.mindmap.light.md")
+
+        config = {"output_dir": str(tmp_path), "channels": [{"name": "ch1"}]}
+        vi.cmd_prune_shorts(_prune_args(channel="ch1", apply=True), config)
+
+        assert not (ch / "2026-04-15-short1.mindmap.knowledge.md").exists()
+        assert not (ch / "2026-04-15-short1.mindmap.light.md").exists()
+
+    def test_apply_deletes_transcript_raw_forensic_sidecars(self, tmp_path, monkeypatch):
+        """{prefix}.transcript.raw.txt (and bounded-retry .raw.2.txt) are
+        salvage-path forensic sidecars from the curate side — they DO get
+        cleaned up by prune-shorts."""
+        _prune_setup(monkeypatch)
+        ch = tmp_path / "ch1"
+        _make_short_artifacts(ch, "2026-04-15-short1", "short1")
+        _touch(ch / "2026-04-15-short1.transcript.raw.txt")
+        _touch(ch / "2026-04-15-short1.transcript.raw.2.txt")
+
+        config = {"output_dir": str(tmp_path), "channels": [{"name": "ch1"}]}
+        vi.cmd_prune_shorts(_prune_args(channel="ch1", apply=True), config)
+
+        assert not (ch / "2026-04-15-short1.transcript.raw.txt").exists()
+        assert not (ch / "2026-04-15-short1.transcript.raw.2.txt").exists()
+
+    def test_meta_without_video_id_skipped(self, tmp_path, monkeypatch):
+        _prune_setup(monkeypatch)
+        ch = tmp_path / "ch1"
+        _write_meta(ch, "2026-04-15-orphan", {"title": "no video_id", "duration_seconds": 30})
+        _touch(ch / "2026-04-15-orphan.mindmap.md")
+
+        config = {"output_dir": str(tmp_path), "channels": [{"name": "ch1"}]}
+        vi.cmd_prune_shorts(_prune_args(channel="ch1", apply=True), config)
+
+        # Cannot classify without video_id → leave artifacts alone
+        assert (ch / "2026-04-15-orphan.meta.json").exists()
+        assert (ch / "2026-04-15-orphan.mindmap.md").exists()
+
+    def test_long_form_video_not_deleted(self, tmp_path, monkeypatch):
+        _prune_setup(monkeypatch)
+        # also stub _is_youtube_short_url so this test is offline-clean
+        monkeypatch.setattr(vi, "_is_youtube_short_url", lambda video_id: False)
+        ch = tmp_path / "ch1"
+        _write_meta(
+            ch,
+            "2026-04-15-long",
+            {
+                "video_id": "long1",
+                "title": "10 min long-form",
+                "published": "2026-04-15",
+                "duration_seconds": 600,
+            },
+        )
+        _touch(ch / "2026-04-15-long.mindmap.md")
+        _touch(ch / "2026-04-15-long.meta.json")  # already created by _write_meta but explicit
+
+        config = {"output_dir": str(tmp_path), "channels": [{"name": "ch1"}]}
+        vi.cmd_prune_shorts(_prune_args(channel="ch1", apply=True), config)
+
+        assert (ch / "2026-04-15-long.meta.json").exists(), "long-form must not be deleted"
+        assert (ch / "2026-04-15-long.mindmap.md").exists()
+
+    def test_legacy_meta_without_duration_seconds_triggers_enrich(self, tmp_path, monkeypatch):
+        _prune_setup(monkeypatch)
+        # Stub out the network-bound URL check too
+        monkeypatch.setattr(vi, "_is_youtube_short_url", lambda video_id: False)
+
+        enrich_calls = {"video_ids": []}
+
+        def counting_enrich(_yt, video_ids):
+            enrich_calls["video_ids"].extend(video_ids)
+            return {video_ids[0]: "PT30S"}  # treat as short
+
+        monkeypatch.setattr(vi, "enrich_with_durations", counting_enrich)
+
+        ch = tmp_path / "ch1"
+        # No duration_seconds field → triggers enrich call
+        _write_meta(
+            ch,
+            "2026-04-15-legacy",
+            {"video_id": "legacy1", "title": "Legacy short", "published": "2026-04-15"},
+        )
+        _touch(ch / "2026-04-15-legacy.mindmap.md")
+
+        config = {"output_dir": str(tmp_path), "channels": [{"name": "ch1"}]}
+        vi.cmd_prune_shorts(_prune_args(channel="ch1", apply=True), config)
+
+        assert enrich_calls["video_ids"] == ["legacy1"], "Missing duration_seconds must trigger enrich"
+        assert not (ch / "2026-04-15-legacy.meta.json").exists(), "30s legacy short should be deleted"
+
+    def test_empty_channel_directory_no_error(self, tmp_path, monkeypatch):
+        _prune_setup(monkeypatch)
+        # Channel dir doesn't exist on disk
+        config = {"output_dir": str(tmp_path), "channels": [{"name": "nonexistent"}]}
+        vi.cmd_prune_shorts(_prune_args(channel="nonexistent"), config)
+        # No assertion needed — passing without exception is the test
+
+    def test_apply_invalidates_video_id_cache(self, tmp_path, monkeypatch):
+        _prune_setup(monkeypatch)
+        ch = tmp_path / "ch1"
+        _make_short_artifacts(ch, "2026-04-15-short1", "short1")
+
+        # Prime the cache
+        vi._load_video_id_index(ch)
+        assert str(ch) in vi._VIDEO_ID_CACHE
+
+        config = {"output_dir": str(tmp_path), "channels": [{"name": "ch1"}]}
+        vi.cmd_prune_shorts(_prune_args(channel="ch1", apply=True), config)
+
+        assert str(ch) not in vi._VIDEO_ID_CACHE, "cache must be invalidated after --apply"

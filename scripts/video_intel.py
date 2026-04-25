@@ -3871,6 +3871,167 @@ def cmd_dedupe(args, config):
         log.info("Next steps: run `taxonomy-build` and `index --force` to rebuild derived artifacts.")
 
 
+# ---------------------------------------------------------------------------
+# prune-shorts subcommand
+# ---------------------------------------------------------------------------
+# Cleans up YouTube Shorts that polluted the corpus before the scan-time
+# skip_shorts filter existed. Dry-run by default; --apply mutates disk.
+# Mirrors the dedupe contract — manual taxonomy-build + index --force after
+# --apply, NOT auto-rebuilt (predictable blast radius).
+
+# Explicit suffix allowlist for deletion. Critical: NOT the whole-prefix glob
+# that _apply_dedupe_group uses, because translate_video.py produces siblings
+# (.en.srt, .translate-bcs.txt) that share the prefix and must survive a
+# Shorts prune. translate-bcs is operationally separate from curate.
+PRUNE_SHORTS_DELETION_PATTERNS = (
+    "{prefix}.mindmap.md",
+    "{prefix}.mindmap.*.md",  # knowledge / light / heavy variants
+    "{prefix}.transcript.md",
+    "{prefix}.transcript.raw.txt",
+    "{prefix}.transcript.raw.*.txt",
+    "{prefix}.concepts.json",
+    "{prefix}.meta.json",
+)
+
+
+def _collect_short_candidates(channel_dir: Path, youtube) -> list[tuple[Path, dict, int]]:
+    """Return [(meta_path, meta_data, duration_seconds), ...] for Shorts.
+
+    Walks meta.json files. Metas without video_id are skipped (cannot
+    classify safely). For metas with duration_seconds cached (post-Unit-3
+    scans), uses that. For metas missing the field (legacy), batches a
+    videos.list lookup. is_short() makes the final classification per its
+    fail-safe-to-long-form contract.
+    """
+    if not channel_dir.exists():
+        return []
+
+    metas: list[tuple[Path, dict]] = []
+    needs_lookup: list[str] = []
+    for meta_path in sorted(channel_dir.glob("*.meta.json")):
+        try:
+            data = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        vid = data.get("video_id")
+        if not vid:
+            continue
+        metas.append((meta_path, data))
+        if data.get("duration_seconds") is None:
+            needs_lookup.append(vid)
+
+    fetched_durations: dict[str, str | None] = {}
+    if needs_lookup:
+        fetched_durations = enrich_with_durations(youtube, needs_lookup)
+
+    candidates: list[tuple[Path, dict, int]] = []
+    for meta_path, data in metas:
+        vid = data["video_id"]
+        cached_seconds = data.get("duration_seconds")
+        if cached_seconds is not None:
+            duration_iso: str | None = f"PT{int(cached_seconds)}S"
+            duration_for_log = int(cached_seconds)
+        else:
+            duration_iso = fetched_durations.get(vid)
+            parsed = _parse_iso8601_duration(duration_iso)
+            duration_for_log = parsed if parsed is not None else 0
+        if is_short(vid, duration_iso):
+            candidates.append((meta_path, data, duration_for_log))
+    return candidates
+
+
+def _apply_prune_shorts(
+    channel_dir: Path,
+    candidates: list[tuple[Path, dict, int]],
+) -> int:
+    """Delete artifacts for each candidate Short via PRUNE_SHORTS_DELETION_PATTERNS.
+
+    Sidecar files outside the allowlist (.en.srt, .translate-bcs.txt, etc.)
+    are preserved. Returns the total number of files deleted. Calls
+    _invalidate_video_id_cache after the loop so subsequent is_processed()
+    calls re-glob.
+    """
+    deleted = 0
+    for meta_path, _data, _seconds in candidates:
+        prefix = meta_path.name.removesuffix(".meta.json")
+        for pattern in PRUNE_SHORTS_DELETION_PATTERNS:
+            for path in channel_dir.glob(pattern.format(prefix=prefix)):
+                path.unlink()
+                deleted += 1
+    if candidates:
+        _invalidate_video_id_cache(channel_dir)
+    return deleted
+
+
+def _count_artifacts_for_prefix(channel_dir: Path, prefix: str) -> int:
+    """Count files matching PRUNE_SHORTS_DELETION_PATTERNS for one prefix."""
+    return sum(1 for pattern in PRUNE_SHORTS_DELETION_PATTERNS for _ in channel_dir.glob(pattern.format(prefix=prefix)))
+
+
+def cmd_prune_shorts(args, config):
+    """Find and delete YouTube Shorts artifacts.
+
+    Dry-run by default; pass --apply to mutate disk. Mirrors dedupe — does
+    NOT auto-rebuild taxonomy or the LanceDB index. The user runs
+    `taxonomy-build` and `index --force` afterward.
+    """
+    require_channels_config(config)
+    output_dir = resolve_output_dir(config)
+    channel_filter = getattr(args, "channel", None)
+    apply = bool(getattr(args, "apply", False))
+
+    yt_key = os.environ.get("YOUTUBE_API_KEY")
+    if not yt_key:
+        log.error("YOUTUBE_API_KEY not set. Required to fetch durations for legacy metas.")
+        sys.exit(1)
+    yt_build = require_youtube()
+    youtube = yt_build("youtube", "v3", developerKey=yt_key)
+
+    channel_names = [channel_filter] if channel_filter else [c["name"] for c in config.get("channels", [])]
+
+    total_shorts = 0
+    total_artifacts = 0
+
+    for ch_name in channel_names:
+        channel_dir = output_dir / ch_name
+        candidates = _collect_short_candidates(channel_dir, youtube)
+        if not candidates:
+            continue
+
+        log.info("[%s] %d Short(s) detected", ch_name, len(candidates))
+        ch_artifact_count = 0
+        for meta_path, data, seconds in candidates:
+            prefix = meta_path.name.removesuffix(".meta.json")
+            url = data.get("video_url") or f"https://youtube.com/watch?v={data.get('video_id', '')}"
+            artifact_count = _count_artifacts_for_prefix(channel_dir, prefix)
+            log.info(
+                "  %-60s | %d:%02d | %s | %d artifacts",
+                (data.get("title") or "")[:60],
+                seconds // 60,
+                seconds % 60,
+                url,
+                artifact_count,
+            )
+            ch_artifact_count += artifact_count
+        log.info("  Channel summary: %d Shorts, %d artifacts", len(candidates), ch_artifact_count)
+        total_shorts += len(candidates)
+        total_artifacts += ch_artifact_count
+
+        if apply:
+            _apply_prune_shorts(channel_dir, candidates)
+
+    if total_shorts == 0:
+        log.info("No Shorts found.")
+        return
+
+    verb = "deleted" if apply else "would delete"
+    log.info("Summary: %d Shorts, %d artifacts %s.", total_shorts, total_artifacts, verb)
+    if not apply:
+        log.info("Re-run with --apply to execute.")
+    else:
+        log.info("Next steps: run `taxonomy-build` and `index --force` to rebuild derived artifacts.")
+
+
 def _format_nugget_excerpt(hit: dict, index: int) -> str:
     """Format one hybrid-search hit as an attributed excerpt for the nugget prompt."""
     vid_url = f"https://www.youtube.com/watch?v={hit['video_id']}" if hit.get("video_id") else ""
@@ -4251,6 +4412,21 @@ Examples:
         help="Actually mutate disk. Default is dry-run (report only).",
     )
 
+    # prune-shorts command
+    prune_parser = subparsers.add_parser(
+        "prune-shorts",
+        help="Find and delete YouTube Shorts artifacts (mindmap, transcript, concepts, meta)",
+    )
+    prune_parser.add_argument(
+        "--channel",
+        help="Restrict to this channel (default: all configured channels)",
+    )
+    prune_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually mutate disk. Default is dry-run (report only).",
+    )
+
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.WARNING,
@@ -4288,6 +4464,8 @@ Examples:
         cmd_status(args, config)
     elif args.command == "dedupe":
         cmd_dedupe(args, config)
+    elif args.command == "prune-shorts":
+        cmd_prune_shorts(args, config)
 
 
 if __name__ == "__main__":
