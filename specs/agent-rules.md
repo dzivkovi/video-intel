@@ -45,6 +45,7 @@
 * **Don't rush commits.** Wait for peer review before committing if we are still mid-discussion. The cost of a follow-up commit is nothing; the cost of an unwanted commit is context loss and noisy history.
 * **Revert on failure.** If you break the test suite while iterating, `git reset --hard` back to the last green state rather than guessing fixes by overwriting files. If there are uncommitted changes you did not create, confirm before resetting.
 * **Execution strategy.** Default to sequential work for coupled changes: write one file, test it, verify, move on. Use parallel sub-agents only when tasks are truly independent and touch separate files.
+* **Worktrees for parallel sessions.** When the working tree is unfamiliar (untracked files you did not create, branch differs from session start, `git status` shows changes you did not make), suspect a concurrent Claude session. Do not stash, checkout, or reset; that overwrites the other session's in-flight work. Isolate via `git worktree add ../<repo>-<feature> <your-branch>` and continue from the worktree (shared `.git` is safe, only the working tree needs isolation). CE's `ce-worktree` skill is opt-in, so invoke it proactively when parallel work is anticipated rather than recovering after the conflict. *Why:* parallel Claude sessions share one index/HEAD without a worktree, so one will silently lose work.
 
 ## 5. Architectural Authority
 
