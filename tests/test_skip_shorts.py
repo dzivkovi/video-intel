@@ -324,3 +324,183 @@ class TestEnrichWithDurations:
         yt = _FakeYoutube(items)
         result = vi.enrich_with_durations(yt, ["abc"])
         assert result == {"abc": None}
+
+
+# ---------------------------------------------------------------------------
+# Unit 3: cmd_scan integration with skip_shorts filter
+# ---------------------------------------------------------------------------
+
+
+def _scan_args(**overrides):
+    """Build a Namespace mirroring the cmd_scan argparse contract."""
+    from argparse import Namespace
+
+    base = {
+        "dry_run": False,
+        "channel": None,
+        "force": False,
+        "since": None,
+        "model": None,
+    }
+    base.update(overrides)
+    return Namespace(**base)
+
+
+def _scan_setup(monkeypatch, videos, durations=None, raise_on_enrich=None):
+    """Common cmd_scan mocking. Returns a dict that test bodies can read to
+    inspect which videos hit process_mindmap.
+
+    durations: dict[video_id, duration_iso] — what enrich_with_durations returns.
+        Defaults to all-None (treated as long-form by is_short fallback).
+    raise_on_enrich: optional Exception instance to raise from enrich.
+    """
+    monkeypatch.setenv("GEMINI_API_KEY", "test")
+    monkeypatch.setenv("YOUTUBE_API_KEY", "test")
+    monkeypatch.setattr(vi, "require_gemini", lambda: (None, None))
+    monkeypatch.setattr(vi, "require_youtube", lambda: lambda *a, **kw: None)
+    monkeypatch.setattr(vi, "create_client", lambda *a, **kw: None)
+    monkeypatch.setattr(vi, "get_channel_id", lambda yt, url: ("chid", "ChTitle"))
+    monkeypatch.setattr(vi, "fetch_channel_videos", lambda yt, cid, since: list(videos))
+
+    durations = durations or {}
+
+    def fake_enrich(_yt, video_ids):
+        if raise_on_enrich is not None:
+            raise raise_on_enrich
+        return dict.fromkeys(video_ids) | {k: v for k, v in durations.items() if k in video_ids}
+
+    monkeypatch.setattr(vi, "enrich_with_durations", fake_enrich)
+    # Default URL check returns False (long-form) so cmd_scan tests don't hit
+    # real YouTube. Tests that want a "short via URL" decision pass durations
+    # under 60s so the duration short-circuit fires before the URL check.
+    monkeypatch.setattr(vi, "_is_youtube_short_url", lambda video_id: False)
+
+    captured = {"processed": []}
+
+    def fake_process_mindmap(*args, **kwargs):
+        # Real signature is (client, types, video, prompt_text, model, output_dir,
+        # channel_name, *, prompt_name=, force=, ...). video is positional arg [2].
+        video = args[2] if len(args) > 2 else kwargs.get("video")
+        captured["processed"].append(video)
+        return (video.get("video_id", "prefix"), "done")
+
+    monkeypatch.setattr(vi, "process_mindmap", fake_process_mindmap)
+    return captured
+
+
+class TestCmdScanSkipShorts:
+    def test_default_filters_shorts_before_process_mindmap(self, tmp_path, monkeypatch):
+        """Default behavior (no skip_shorts in config) drops Shorts."""
+        videos = [
+            {"video_id": "short1", "title": "30s Short", "published": "2026-04-15"},
+            {"video_id": "long1", "title": "10min Long-form", "published": "2026-04-15"},
+        ]
+        durations = {"short1": "PT30S", "long1": "PT10M"}
+        captured = _scan_setup(monkeypatch, videos, durations=durations)
+
+        config = {"output_dir": str(tmp_path), "channels": [{"name": "ch", "url": "https://example.com/ch"}]}
+        vi.cmd_scan(_scan_args(), config)
+
+        ids = [v["video_id"] for v in captured["processed"]]
+        assert "short1" not in ids, "Short must be filtered out by default"
+        assert "long1" in ids, "Long-form must still process"
+
+    def test_skip_shorts_false_keeps_shorts(self, tmp_path, monkeypatch):
+        videos = [
+            {"video_id": "short1", "title": "30s Short", "published": "2026-04-15"},
+            {"video_id": "long1", "title": "10min Long-form", "published": "2026-04-15"},
+        ]
+        durations = {"short1": "PT30S", "long1": "PT10M"}
+        captured = _scan_setup(monkeypatch, videos, durations=durations)
+
+        config = {
+            "output_dir": str(tmp_path),
+            "channels": [{"name": "ch", "url": "https://example.com/ch", "skip_shorts": False}],
+        }
+        vi.cmd_scan(_scan_args(), config)
+
+        ids = [v["video_id"] for v in captured["processed"]]
+        assert "short1" in ids, "Short must be kept when skip_shorts=false"
+        assert "long1" in ids
+
+    def test_quota_exceeded_skips_channel_continues_to_next(self, tmp_path, monkeypatch):
+        videos = [{"video_id": "v1", "title": "a", "published": "2026-04-15"}]
+        captured = _scan_setup(
+            monkeypatch,
+            videos,
+            raise_on_enrich=RuntimeError("<HttpError 403 ... reason: quotaExceeded ...>"),
+        )
+
+        config = {"output_dir": str(tmp_path), "channels": [{"name": "ch", "url": "https://example.com/ch"}]}
+        vi.cmd_scan(_scan_args(), config)
+
+        # No video reached process_mindmap because the channel was aborted
+        assert captured["processed"] == []
+
+    def test_empty_video_list_skips_enrich_call(self, tmp_path, monkeypatch):
+        enrich_calls = {"n": 0}
+
+        def counting_enrich(_yt, video_ids):
+            enrich_calls["n"] += 1
+            return dict.fromkeys(video_ids)
+
+        # Empty fetch → cmd_scan early-returns or doesn't call enrich
+        monkeypatch.setenv("GEMINI_API_KEY", "test")
+        monkeypatch.setenv("YOUTUBE_API_KEY", "test")
+        monkeypatch.setattr(vi, "require_gemini", lambda: (None, None))
+        monkeypatch.setattr(vi, "require_youtube", lambda: lambda *a, **kw: None)
+        monkeypatch.setattr(vi, "create_client", lambda *a, **kw: None)
+        monkeypatch.setattr(vi, "get_channel_id", lambda yt, url: ("chid", "ChTitle"))
+        monkeypatch.setattr(vi, "fetch_channel_videos", lambda yt, cid, since: [])
+        monkeypatch.setattr(vi, "enrich_with_durations", counting_enrich)
+
+        config = {"output_dir": str(tmp_path), "channels": [{"name": "ch", "url": "https://example.com/ch"}]}
+        vi.cmd_scan(_scan_args(), config)
+
+        assert enrich_calls["n"] == 0, "enrich_with_durations must not be called for empty video lists"
+
+    def test_meta_json_records_duration_seconds_after_scan(self, tmp_path, monkeypatch):
+        """Forward-fix: meta.json should persist duration_seconds so future
+        prune-shorts runs avoid re-fetching from YouTube."""
+        videos = [{"video_id": "long1", "title": "10min Long-form", "published": "2026-04-15"}]
+        durations = {"long1": "PT10M"}
+        _scan_setup(monkeypatch, videos, durations=durations)
+
+        # Replace the fake process_mindmap with one that actually writes meta.json
+        def real_process_mindmap(*args, **kwargs):
+            # Signature: (client, types, video, prompt_text, model, output_dir, channel_name, *, ...)
+            video = args[2] if len(args) > 2 else kwargs["video"]
+            model = args[4] if len(args) > 4 else kwargs.get("model", "test-model")
+            output_dir = args[5] if len(args) > 5 else kwargs["output_dir"]
+            channel_name = args[6] if len(args) > 6 else kwargs["channel_name"]
+
+            from datetime import UTC, datetime
+
+            channel_dir = output_dir / channel_name
+            channel_dir.mkdir(parents=True, exist_ok=True)
+            prefix = f"{video['published']}-{video['title'].replace(' ', '-').lower()}"
+            meta_fields = {
+                "video_url": f"https://www.youtube.com/watch?v={video['video_id']}",
+                "video_id": video["video_id"],
+                "channel": channel_name,
+                "title": video["title"],
+                "published": video["published"],
+                "processed": datetime.now(UTC).isoformat(),
+                "model": model,
+            }
+            duration_seconds = vi._parse_iso8601_duration(video.get("duration_iso"))
+            if duration_seconds is not None:
+                meta_fields["duration_seconds"] = duration_seconds
+            meta_path = channel_dir / f"{prefix}.meta.json"
+            vi.update_meta(meta_path, meta_fields, "scan")
+            return (prefix, "done")
+
+        monkeypatch.setattr(vi, "process_mindmap", real_process_mindmap)
+
+        config = {"output_dir": str(tmp_path), "channels": [{"name": "ch", "url": "https://example.com/ch"}]}
+        vi.cmd_scan(_scan_args(), config)
+
+        meta_files = list((tmp_path / "ch").glob("*.meta.json"))
+        assert len(meta_files) == 1
+        meta = json.loads(meta_files[0].read_text(encoding="utf-8"))
+        assert meta.get("duration_seconds") == 600, f"duration_seconds missing: {meta}"

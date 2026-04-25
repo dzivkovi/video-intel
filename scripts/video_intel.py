@@ -1358,6 +1358,12 @@ def process_mindmap(
         }
         if prompt_name:
             meta_fields["prompt"] = prompt_name
+        # Forward-fix: persist duration_seconds when scan-time enrichment supplied it,
+        # so future prune-shorts runs avoid re-fetching from YouTube. Optional —
+        # legacy metas without this field still classify via on-demand fallback.
+        duration_seconds = _parse_iso8601_duration(video.get("duration_iso"))
+        if duration_seconds is not None:
+            meta_fields["duration_seconds"] = duration_seconds
         update_meta(meta_path, meta_fields, "scan")
 
         return resolved_prefix, "done"
@@ -2098,6 +2104,32 @@ def cmd_scan(args, config):
         if not args.dry_run:
             for v in videos:
                 record_alt_title_if_rotated(output_dir, ch_name, v)
+
+        # Shorts classification + filter (per docs/plans/2026-04-24-002).
+        # Always fetch durations so meta.json carries duration_seconds going
+        # forward; the filter only applies when skip_shorts is true (default).
+        # Quota-exhaustion: bail this channel cleanly instead of silently
+        # admitting Shorts the filter was supposed to drop.
+        skip_shorts = ch.get("skip_shorts", config.get("skip_shorts", True))
+        try:
+            durations = enrich_with_durations(youtube, [v["video_id"] for v in videos])
+        except Exception as e:
+            if "quotaExceeded" in str(e):
+                log.error(
+                    "[%s] YouTube quota exhausted while classifying Shorts; aborting this channel.",
+                    ch_name,
+                )
+                log.error("  Re-run scan after quota resets (typically next midnight Pacific).")
+                continue
+            raise
+        for v in videos:
+            v["duration_iso"] = durations.get(v["video_id"])
+        if skip_shorts:
+            kept = [v for v in videos if not is_short(v["video_id"], v["duration_iso"])]
+            n_skipped = len(videos) - len(kept)
+            if n_skipped:
+                log.info("  Skipped %d Shorts (skip_shorts=true).", n_skipped)
+            videos = kept
 
         # Filter already processed or skipped (any_variant=True prevents backfill)
         if args.force:
