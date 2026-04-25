@@ -38,3 +38,13 @@ channels:
     keywords:
       - specific topic
     auto_transcript: none
+
+  # One-off creator: not pulled by regular `scan`, but kept in config so
+  # `mindmap --url --channel <name>`, `transcript --url --channel <name>`,
+  # and `concepts --channel <name>` route artifacts here. Use this when a
+  # creator posts occasional gold but you do not want their full feed.
+  # Removing `enabled: false` re-enables regular scanning.
+  - name: example_oneoff
+    url: https://youtube.com/@oneoffcreator
+    auto_transcript: all
+    enabled: false

@@ -95,6 +95,7 @@ Gemini API calls read video frames and audio — they take **1-5 minutes per vid
 - **For single transcripts:** 1-3 minutes is typical. Wait for the "Saved:" line before proceeding.
 - **Transcripts are resilient to malformed JSON.** If Gemini returns broken JSON, the script tries to salvage partial content (speech entries, screen content) and writes a partial transcript with a visible warning. A partial transcript is useful for curiosity/search. For strategically important videos, rerun with `--model gemini-2.5-pro` or retry later.
 - **Raw Gemini responses are saved on failure** as `.transcript.raw.txt` sidecars for debugging.
+- **Exit 0 ≠ success on `--url` paths. Always verify.** `mindmap --url` and `transcript --url` exit 0 even when Gemini returns `403 PERMISSION_DENIED` (members-only, age-gated, region-locked, or otherwise restricted videos). The error is logged inline but not re-raised, so the script can keep going inside a `scan` batch. After any URL run, grep the captured output for `PERMISSION_DENIED` (or check that the expected `<prefix>.mindmap.md` / `<prefix>.transcript.md` actually landed on disk) before reporting success to the user. If 403 is found, jump to **"When a YouTube URL returns 403"** below.
 
 ## Interpreting User Intent
 
@@ -103,7 +104,8 @@ table is the canonical mapping — read it before picking a command.
 
 | User says (intent) | Run | Notes |
 |---|---|---|
-| "transcribe this video" + URL | `transcript --url URL` | Single video |
+| "transcribe this video" + URL | `transcript --url URL --channel <NAME>` | Single video. Grep log for `PERMISSION_DENIED` before reporting success. |
+| "scan this single video" + URL, "process this URL", "full pipeline on this URL", "do everything on [URL]" | `mindmap --url URL --channel <NAME>` then `transcript --url URL --channel <NAME>` then `concepts --channel <NAME>` | No single-shot URL command exists (`process --file` is local-only). After each URL step, **grep log for `PERMISSION_DENIED`** — exit 0 lies on gated content. Run mindmap and transcript in parallel for wall-time savings; concepts is text-only and runs last. |
 | "run full pipeline on [local file]", "mindmap + transcript + concepts on one upload", "process this MP4" | `process --file PATH` | Local video only; single upload, lazy-skipped when artifacts already exist |
 | "scan", "what's new", "check for new videos" | `scan` | All channels, configured `since` |
 | "what's new from [creator]" | `scan --channel X` | Single channel, configured `since` |
@@ -216,25 +218,60 @@ Local files produce `{name}.transcript.md` and `{name}.meta.json` in the same
 directory as the source by default. Uploaded files auto-expire from Gemini
 after 48 hours.
 
-**Members-only / gated video recovery** (when Gemini cannot fetch a YouTube URL
-because it is member-only, paid, or otherwise restricted and `scan` returned
-HTTP 403 PERMISSION_DENIED):
+**When a YouTube URL returns 403 (members-only / gated content)**
 
-1. Download the video locally. The simplest workflow is to save it directly
-   under `output_dir/<channel>/` (e.g., `./video-intel/everyinc/Compound Engineering Camp.mkv`);
-   the tool infers the channel from the parent folder. `.mkv`, `.mp4`, `.mov`,
-   `.webm`, and `.avi` are all accepted.
-2. Run `mindmap --file` then `transcript --file` on the local path. The
-   artifacts land in the canonical channel folder using the same `.meta.json`
-   shape as scan-generated ones so the concepts/search pipelines pick them
-   up on the next `scan` without special-casing.
+**Detection.** Gemini cannot fetch members-only, paid, age-gated, or
+region-locked videos and returns `403 PERMISSION_DENIED`. The script logs
+the error and exits 0 — there will be a stub `<prefix>.meta.json` on disk
+with `modes_completed: []` and `last_error: "...PERMISSION_DENIED..."`,
+but no `.mindmap.md` or `.transcript.md`. This applies to `scan`,
+`mindmap --url`, and `transcript --url` alike. The stub meta is **not
+garbage** — it carries the canonical identity (`video_id`, `title`,
+`published`, `channel`) and the recovery flow below will reuse it to
+write artifacts under the canonical `{YYYY-MM-DD}-{slug}` prefix.
+
+**Hint.** If `output_dir/<channel>/` already contains an MKV/MP4 with a
+companion `.transcript.md`, the user has done this recovery before for
+the same creator — follow the same pattern.
+
+**Recovery (preferred: `process --file` — one upload, both modes):**
+
+1. Download the video locally via the user's member access. The script
+   does not download for you.
+2. Save under `output_dir/<channel>/` named `<videoId>.mp4` (the 11-char
+   YouTube ID). This makes the tool G2-dedup against any existing stub
+   meta and route artifacts to the canonical `{YYYY-MM-DD}-{slug}`
+   prefix automatically. `.mkv`, `.mp4`, `.mov`, `.webm`, `.avi` are all
+   accepted.
+3. Run `process --file`:
 
 ```bash
-# Drop the MP4 under video-intel/everyinc/ first, then:
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" --log-level info process \
+  --file "${OUTPUT_DIR}/everyinc/jPrwIL2B56Q.mp4" \
+  --video-id jPrwIL2B56Q \
+  --title "Camp: Codex for Knowledge Work" \
+  --date 2026-04-24
+```
+
+`--video-id` / `--title` / `--date` are redundant when a stub
+`.meta.json` already exists with those fields, but passing them is
+harmless and explicit. With a `<videoId>.mp4` filename and no stub,
+they let the tool stamp identity into a fresh canonical meta.
+
+**Why `process --file` over separate `mindmap --file` + `transcript --file`:**
+single Gemini upload (the legacy form uploaded twice), lazy-skip when
+artifacts already exist, automatic file-expiry recovery if Gemini's 48h
+TTL expires mid-run, and inline concepts when the channel is configured.
+
+**Legacy two-call form** (still works, kept for reference; prefer
+`process --file` for new recoveries):
+
+```bash
+# Drop the MP4 under output_dir/everyinc/ first, then:
 python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" mindmap \
-  --file "./video-intel/everyinc/Compound Engineering Camp.mkv"
+  --file "${OUTPUT_DIR}/everyinc/Compound Engineering Camp.mkv"
 python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" transcript \
-  --file "./video-intel/everyinc/Compound Engineering Camp.mkv"
+  --file "${OUTPUT_DIR}/everyinc/Compound Engineering Camp.mkv"
 
 # Or keep the MP4 elsewhere and pass --channel explicitly:
 python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" transcript \
@@ -403,6 +440,11 @@ channels:
       - ux design
     auto_transcript: none             # mindmaps for discovery, transcript manually
     since: 30d                        # also catch recent uploads (additive)
+
+  - name: lennyspodcast            # Manual one-offs only: skipped by `scan`.
+    url: https://youtube.com/@lennyspodcast
+    auto_transcript: all
+    enabled: false                   # see "One-off creators" below
 ```
 
 **Selective scanning:** Channels with `playlists` or `keywords` target specific
@@ -410,6 +452,16 @@ content instead of scanning all uploads. Playlist names are resolved via YouTube
 (case-insensitive contains matching). Keywords search the entire channel history
 (capped at 200 results per keyword). If `since` is also set, recent uploads are
 fetched as an additional source alongside playlists/keywords.
+
+**One-off creators (`enabled: false`):** When a creator posts content you
+occasionally want a transcript or mindmap of, but you do NOT want them in
+the regular `scan` rotation, add them with `enabled: false`. The channel
+stays in config (so `mindmap --url --channel <name>`, `transcript --url
+--channel <name>`, and `concepts --channel <name>` all work) but `scan`
+skips them entirely — including when targeted explicitly via `--channel`.
+To temporarily bulk-scan such a creator, remove the flag rather than
+overriding it on the command line. The flag's purpose is durable
+manual-only routing, not advisory exclusion.
 
 ### Prompt files
 
