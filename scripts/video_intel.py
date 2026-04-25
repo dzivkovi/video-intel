@@ -12,6 +12,7 @@ Prerequisites:
 """
 
 import argparse
+import functools
 import json
 import logging
 import os
@@ -28,6 +29,7 @@ from html import unescape
 from pathlib import Path
 from typing import Any
 
+import httpx
 import yaml
 
 from gemini_common import (
@@ -986,6 +988,84 @@ def _invalidate_video_id_cache(channel_dir: Path | None = None) -> None:
         _VIDEO_ID_CACHE.clear()
     else:
         _VIDEO_ID_CACHE.pop(str(channel_dir), None)
+
+
+# ---------------------------------------------------------------------------
+# YouTube Shorts classification
+# ---------------------------------------------------------------------------
+# is_short() decides whether a video is a Short via duration < 60s OR a
+# /shorts/<id> HEAD-redirect check (covers the 60-180s "raised cap" Shorts
+# that YouTube allowed starting late 2024). Failure mode is fail-safe to
+# long-form so prune-shorts never deletes a video it cannot confidently
+# classify. See docs/plans/2026-04-24-002-feat-skip-shorts-and-prune-plan.md
+# for design rationale.
+
+_SHORT_URL_RETRY_DELAY: float = 0.5  # one retry on 5xx/timeout, then fail-safe
+
+
+def _parse_iso8601_duration(iso: str | None) -> int | None:
+    """Parse an ISO-8601 duration string from YouTube's contentDetails.duration
+    into total seconds. Returns None if the input is missing or unparseable."""
+    if not iso:
+        return None
+    match = re.match(r"^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$", iso)
+    if not match or not any(match.groups()):
+        return None
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2) or 0)
+    seconds = int(match.group(3) or 0)
+    return hours * 3600 + minutes * 60 + seconds
+
+
+@functools.cache
+def _is_youtube_short_url(video_id: str) -> bool:
+    """Return True when https://www.youtube.com/shorts/<id> renders as a Short.
+
+    YouTube serves the canonical Shorts page (HTTP 200) for actual Shorts and
+    redirects (303 with Location: /watch?v=<id>) for long-form. We treat any
+    non-200 status as long-form. One bounded retry on 5xx or timeout, then
+    fail-safe to False (per CLAUDE.md "bounded retries only").
+
+    Cached per video_id for the lifetime of the process via lru_cache. Tests
+    must call cache_clear() between cases to avoid bleed-through.
+    """
+    if not video_id:
+        return False
+    url = f"https://www.youtube.com/shorts/{video_id}"
+    for attempt in range(2):
+        try:
+            response = httpx.head(url, follow_redirects=False, timeout=5.0)
+        except httpx.HTTPError:
+            if attempt == 0:
+                if _SHORT_URL_RETRY_DELAY:
+                    time.sleep(_SHORT_URL_RETRY_DELAY)
+                continue
+            return False
+        if 500 <= response.status_code < 600 and attempt == 0:
+            if _SHORT_URL_RETRY_DELAY:
+                time.sleep(_SHORT_URL_RETRY_DELAY)
+            continue
+        return response.status_code == 200
+    return False
+
+
+def is_short(video_id: str | None, duration_iso: str | None) -> bool:
+    """Decide whether a YouTube video is a Short.
+
+    Two-signal predicate: duration < 60s OR /shorts/<id> redirect returns 200.
+    Fail-safe to long-form (False) on any classification ambiguity — false
+    negatives are recoverable (re-run prune-shorts), false positives delete
+    real videos.
+    """
+    if not video_id:
+        return False
+    duration = _parse_iso8601_duration(duration_iso)
+    if duration is not None and duration < 60:
+        return True
+    try:
+        return _is_youtube_short_url(video_id)
+    except Exception:
+        return False
 
 
 def is_processed(
