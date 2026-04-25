@@ -60,6 +60,9 @@ CURATE_TRIGGERS = [
     "find duplicate videos",
     "process this local",
     "run the full pipeline",
+    "prune shorts",
+    "remove shorts",
+    "delete youtube shorts",
 ]
 
 

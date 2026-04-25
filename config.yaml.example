@@ -28,6 +28,9 @@ channels:
     url: https://youtube.com/@example
     auto_transcript: all
     since: 90d
+    # skip_shorts is true by default — set false to opt back in for creators
+    # whose Shorts (under 60s, or vertical /shorts/ URLs) are substantive.
+    # skip_shorts: false
 
   # Selective mode: only pull specific playlists or keyword-matched videos.
   # Useful when a creator posts across many topics and you only want a slice.

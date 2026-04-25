@@ -7,6 +7,7 @@ dependencies = [
     "google-api-python-client",
     "pyyaml",
     "youtube-transcript-api",
+    "httpx",
 ]
 
 [project.optional-dependencies]
