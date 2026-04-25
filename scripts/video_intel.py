@@ -54,13 +54,123 @@ KEYWORD_MAX_PAGES = 4  # 200 results max per keyword, 400 quota units
 LARGE_FILE_THRESHOLD_BYTES = 500 * 1024 * 1024  # 500MB - segment required above this
 
 
-def load_config():
-    config_path = SKILL_DIR / "config.yaml"
-    if not config_path.exists():
-        log.error("Config not found at %s. Copy config.yaml.example to config.yaml and edit it.", config_path)
+def _user_config_path() -> Path:
+    """User-level config override location.
+
+    Extracted as a function so tests can monkeypatch the path without touching
+    `Path.home()` globally.
+    """
+    return Path.home() / ".video-intel" / "config.yaml"
+
+
+_USER_CONFIG_SUPPORTED_KEYS = frozenset({"output_dir", "vector_db_dir"})
+_LAST_RESOLVED_SOURCE: str | None = None
+
+
+def load_config() -> dict[str, Any]:
+    """Resolve the video-intel config via a four-step precedence chain.
+
+    1. ``SKILL_DIR/config.yaml`` - plugin-local config (gitignored; authored
+       by the developer running curate workflows).
+    2. ``$VIDEO_INTEL_OUTPUT_DIR`` - env-var override for installed users
+       pointing a cached plugin at a non-default corpus. Must be absolute.
+    3. ``~/.video-intel/config.yaml`` - user-level minimal config accepting
+       ``output_dir`` (required) and ``vector_db_dir`` (optional). Extra
+       keys are ignored with one INFO log.
+    4. Hard error with an actionable message naming both overrides.
+
+    KD1: plugin-local config wins over env var to prevent a stale shell
+    variable from silently redirecting a curate scan away from the author's
+    canonical corpus. Env var and user config only apply when the plugin
+    file is absent.
+
+    KD7: emits one INFO log naming the winning source; the source string is
+    stored in module-level :data:`_LAST_RESOLVED_SOURCE` for downstream
+    helpers (e.g. ``require_channels_config``) that surface diagnostics.
+    """
+    global _LAST_RESOLVED_SOURCE
+
+    # Step 1: plugin-local config
+    skill_config = SKILL_DIR / "config.yaml"
+    if skill_config.exists():
+        with open(skill_config) as f:
+            config = yaml.safe_load(f) or {}
+        _LAST_RESOLVED_SOURCE = f"SKILL_DIR/config.yaml ({skill_config})"
+        log.info("Config resolved from %s", _LAST_RESOLVED_SOURCE)
+        return config
+
+    # Step 2: env var
+    env_value = (os.environ.get("VIDEO_INTEL_OUTPUT_DIR") or "").strip()
+    if env_value:
+        if not Path(env_value).is_absolute():
+            log.error(
+                "VIDEO_INTEL_OUTPUT_DIR must be an absolute path, got: %s",
+                env_value,
+            )
+            sys.exit(1)
+        _LAST_RESOLVED_SOURCE = f"VIDEO_INTEL_OUTPUT_DIR={env_value}"
+        log.info("Config resolved from %s", _LAST_RESOLVED_SOURCE)
+        return {"output_dir": env_value}
+
+    # Step 3: user-level config
+    user_config = _user_config_path()
+    if user_config.exists():
+        try:
+            raw = yaml.safe_load(user_config.read_text(encoding="utf-8")) or {}
+        except yaml.YAMLError as exc:
+            log.error("Failed to parse %s: %s", user_config, exc)
+            sys.exit(1)
+        if "output_dir" not in raw:
+            log.error(
+                "%s is missing required key 'output_dir'. Add 'output_dir: <path>' and retry.",
+                user_config,
+            )
+            sys.exit(1)
+        supported = {k: v for k, v in raw.items() if k in _USER_CONFIG_SUPPORTED_KEYS}
+        extras = sorted(k for k in raw if k not in _USER_CONFIG_SUPPORTED_KEYS)
+        if extras:
+            log.info(
+                "Ignoring unsupported keys in ~/.video-intel/config.yaml: %s",
+                ", ".join(extras),
+            )
+        _LAST_RESOLVED_SOURCE = "~/.video-intel/config.yaml"
+        log.info("Config resolved from %s", _LAST_RESOLVED_SOURCE)
+        return supported
+
+    # Step 4: all absent
+    log.error(
+        "No config found. Set VIDEO_INTEL_OUTPUT_DIR=<corpus-path> (absolute) or "
+        "create ~/.video-intel/config.yaml with 'output_dir: <corpus-path>'. "
+        "See CLAUDE.md for the user-level install procedure."
+    )
+    sys.exit(1)
+
+
+def require_channels_config(config: dict[str, Any]) -> None:
+    """Fail fast when a curate command runs without ``channels:`` configured.
+
+    Curate commands (scan, concepts, dedupe, and the ``--channel`` branch of
+    mindmap/transcript/process) require ``channels:`` in the resolved config.
+    The user-level fallback config (step 3 of :func:`load_config`) intentionally
+    omits ``channels:``; reaching a curate command with that config means the
+    user is trying to drive scan behavior from outside the plugin repo - not
+    a supported workflow.
+
+    Search-side commands (search, nugget, status, index, taxonomy-build) and
+    the loose-file branch of mindmap/transcript/process do not call this
+    helper; they read ``output_dir`` only.
+
+    The error message steers users toward the two supported workflows: run
+    from the plugin repo (step 1 of the precedence), or point the env var at
+    a checkout that has ``channels:`` populated.
+    """
+    if not config.get("channels"):
+        log.error(
+            "This command requires 'channels:' in config.yaml. Run from the "
+            "plugin repo, or set VIDEO_INTEL_OUTPUT_DIR to point at a checkout "
+            "that has channels configured."
+        )
         sys.exit(1)
-    with open(config_path) as f:
-        return yaml.safe_load(f)
 
 
 def resolve_output_dir(config):
@@ -1786,6 +1896,7 @@ def build_taxonomy(output_dir: Path) -> dict:
 
 def cmd_scan(args, config):
     """Scan channels for new videos and generate mind maps."""
+    require_channels_config(config)
     errors = []
     _, types = require_gemini()
     yt_build = require_youtube()
@@ -2064,6 +2175,7 @@ def cmd_mindmap(args, config):
         channel_name = args.channel or infer_channel_from_file_path(input_path, output_dir, config)
 
         if args.channel:
+            require_channels_config(config)
             configured = {c["name"] for c in config.get("channels", [])}
             if args.channel not in configured:
                 log.error("Channel '%s' not found in config.yaml", args.channel)
@@ -2232,6 +2344,7 @@ def cmd_transcript(args, config):
         channel_name = args.channel or infer_channel_from_file_path(input_path, output_dir, config)
 
         if args.channel:
+            require_channels_config(config)
             configured = {c["name"] for c in config.get("channels", [])}
             if args.channel not in configured:
                 log.error("Channel '%s' not found in config.yaml", args.channel)
@@ -2450,6 +2563,7 @@ def cmd_process(args, config):
     # Channel resolution mirrors cmd_transcript's --file path.
     channel_name = args.channel or infer_channel_from_file_path(input_path, output_dir, config)
     if args.channel:
+        require_channels_config(config)
         configured = {c["name"] for c in config.get("channels", [])}
         if args.channel not in configured:
             log.error("Channel '%s' not found in config.yaml", args.channel)
@@ -2664,6 +2778,7 @@ def cmd_process(args, config):
 
 def cmd_concepts(args, config):
     """Extract and normalize concepts from existing mindmaps."""
+    require_channels_config(config)
     _, types = require_gemini()
 
     gemini_key = os.environ.get("GEMINI_API_KEY")
@@ -3551,6 +3666,7 @@ def cmd_dedupe(args, config):
     taxonomy or the LanceDB index - surface the user-facing next-step
     reminder instead so the operator can decide when to pay that cost.
     """
+    require_channels_config(config)
     output_dir = resolve_output_dir(config)
     channel_filter = getattr(args, "channel", None)
     apply = bool(getattr(args, "apply", False))

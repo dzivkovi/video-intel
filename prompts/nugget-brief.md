@@ -11,7 +11,7 @@ Do not summarize each creator individually. **Extract value across them.** Produ
 ## Critical Constraints
 
 1. **Insight Fidelity.** No generic language. If a creator uses a specific metaphor (e.g., "study guide vs filing cabinet"), a concrete case study (e.g., "41,000 bookmarks"), or a specific clever workaround (e.g., "SQL as source of truth, wiki as regenerable presentation"), you **MUST** include that exact detail with attribution.
-2. **Attribution is non-negotiable.** Every claim must cite the creator by handle/name, the video title or date, and the timestamp. Format: `[creator @ HH:MM]`. If a claim appears in a transcript excerpt, the citation is available in the input context.
+2. **Attribution is non-negotiable and must be verbatim.** Every claim must cite the creator by handle/name and the timestamp. Format: `[creator @ HH:MM]`. When you include the video title in a citation (required in Section 5 "Noteworthy Nuggets" per its format spec), **copy the title verbatim from the excerpt's `[video title]` header field**. Do NOT paraphrase, abbreviate, invent, or "improve" titles. If you cannot find the exact title in an excerpt header, cite only creator + timestamp and omit the title — never fabricate a plausible-sounding title.
 3. **Bold the "So What."** Use **bolding** to highlight the strategic implication or the conclusion, not the topic header.
 4. **No fluff.** If a section has no concrete decision or insight, omit it.
 5. **Traceable.** All insights must be directly traceable to specific statements in the input excerpts. Extract and interpret, never invent.
