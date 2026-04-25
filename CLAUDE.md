@@ -237,6 +237,11 @@ Session plans are stored in `plans/` (configured via `.claude/settings.json`). P
 
 Solved problems are recorded in `docs/solutions/` following the three-bucket rule (living / historical / decision records).
 
+## Parallel Sessions
+
+- **Suspect parallel workers when the working tree is unfamiliar.** If you find untracked files you did not create, your branch differs from session-start, or `git status` shows changes you did not make, another Claude session is likely operating on the same checkout. Do **not** stash, checkout, or reset to "clean up" — that overwrites the other worker's in-progress changes. Instead, isolate via `git worktree add ../<repo>-<feature> <your-branch>` and continue from the worktree. The shared `.git` dir is safe; only the working tree needs isolation. *Why:* parallel Claude sessions are not coordinated by Compound Engineering or any hook, so without a worktree they fight over a single index/HEAD and one will silently lose work. Burned once on 2026-04-25 when issue #36 work and `feat/skip-shorts-and-prune` raced and the other worker had to WIP-stash the in-flight changes onto a branch.
+- **CE has `ce-worktree` but does not auto-invoke it.** Phrasings like "create a worktree" trigger the skill explicitly; otherwise sessions share the working tree. If you anticipate parallel work (multiple open issues, side-by-side feature branches), kick off with `ce-worktree` rather than waiting to discover the conflict.
+
 ## Code Review Guardrails
 
 Rules for review agents (auto-selected by `/ce-code-review`) and for anyone cutting a PR. These are the non-obvious checks — the general "does it work, does it have tests" bar is assumed.
