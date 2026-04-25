@@ -507,6 +507,29 @@ def fetch_channel_videos(youtube, channel_id, since_dt):
     return videos
 
 
+def enrich_with_durations(youtube, video_ids: list[str]) -> dict[str, str | None]:
+    """Fetch ISO-8601 contentDetails.duration for each video_id.
+
+    Batches into chunks of 50 (YouTube videos.list API limit). For each
+    video_id that does not appear in the response — deleted, members-only,
+    region-restricted, etc. — the key is present with value None so callers
+    can apply their own fail-safe logic. No retry per CLAUDE.md "bounded
+    retries only"; transient batch failures bubble up to the caller.
+
+    Quota cost: 1 unit per batch (50 ids), independent of how many parts are
+    requested. So a 200-video channel costs 4 units.
+    """
+    durations: dict[str, str | None] = dict.fromkeys(video_ids)
+    if not video_ids:
+        return durations
+    for i in range(0, len(video_ids), 50):
+        batch = video_ids[i : i + 50]
+        resp = youtube.videos().list(id=",".join(batch), part="contentDetails").execute()
+        for item in resp.get("items", []):
+            durations[item["id"]] = item.get("contentDetails", {}).get("duration")
+    return durations
+
+
 # ---------------------------------------------------------------------------
 # Selective scanning: playlists and keywords
 # ---------------------------------------------------------------------------

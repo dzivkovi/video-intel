@@ -239,3 +239,88 @@ class TestIsShort:
         monkeypatch.setattr(vi, "_is_youtube_short_url", boom)
         assert vi.is_short("", "PT5M") is False
         assert vi.is_short(None, "PT5M") is False
+
+
+# ---------------------------------------------------------------------------
+# Unit 2: enrich_with_durations (batched videos.list lookup)
+# ---------------------------------------------------------------------------
+
+
+class _FakeYoutube:
+    """Minimal fake mirroring youtube.videos().list(id=..., part=...).execute()."""
+
+    def __init__(self, response_items: list[dict]):
+        self._items = response_items
+        self.calls: list[str] = []  # list of comma-joined id strings per call
+
+    def videos(self):
+        return self
+
+    def list(self, *, id: str, part: str):
+        self.calls.append(id)
+        self._next_part = part
+        self._next_ids = id.split(",")
+        return self
+
+    def execute(self):
+        items = [item for item in self._items if item["id"] in self._next_ids]
+        return {"items": items}
+
+
+class TestEnrichWithDurations:
+    def test_returns_dict_for_three_video_ids(self):
+        items = [
+            {"id": "abc", "contentDetails": {"duration": "PT47S"}},
+            {"id": "def", "contentDetails": {"duration": "PT5M"}},
+            {"id": "ghi", "contentDetails": {"duration": "PT1H"}},
+        ]
+        yt = _FakeYoutube(items)
+        result = vi.enrich_with_durations(yt, ["abc", "def", "ghi"])
+        assert result == {"abc": "PT47S", "def": "PT5M", "ghi": "PT1H"}
+        assert len(yt.calls) == 1
+
+    def test_batches_into_groups_of_fifty(self):
+        ids = [f"v{i:03d}" for i in range(51)]
+        items = [{"id": vid, "contentDetails": {"duration": "PT5M"}} for vid in ids]
+        yt = _FakeYoutube(items)
+        result = vi.enrich_with_durations(yt, ids)
+        assert len(result) == 51
+        assert all(result[vid] == "PT5M" for vid in ids)
+        assert len(yt.calls) == 2
+        # First call should have 50 ids, second should have 1
+        assert len(yt.calls[0].split(",")) == 50
+        assert len(yt.calls[1].split(",")) == 1
+
+    def test_exactly_fifty_ids_one_call(self):
+        ids = [f"v{i:03d}" for i in range(50)]
+        items = [{"id": vid, "contentDetails": {"duration": "PT5M"}} for vid in ids]
+        yt = _FakeYoutube(items)
+        result = vi.enrich_with_durations(yt, ids)
+        assert len(result) == 50
+        assert len(yt.calls) == 1
+
+    def test_empty_input_returns_empty_dict_no_api_call(self):
+        yt = _FakeYoutube([])
+        result = vi.enrich_with_durations(yt, [])
+        assert result == {}
+        assert yt.calls == []
+
+    def test_video_id_not_in_response_maps_to_none(self):
+        # Only "abc" is in the response; "missing" requested but not returned
+        # (deleted, members-only, or other access-denied case)
+        items = [{"id": "abc", "contentDetails": {"duration": "PT47S"}}]
+        yt = _FakeYoutube(items)
+        result = vi.enrich_with_durations(yt, ["abc", "missing"])
+        assert result == {"abc": "PT47S", "missing": None}
+
+    def test_response_item_missing_content_details_maps_to_none(self):
+        items = [{"id": "abc"}]  # No contentDetails key at all
+        yt = _FakeYoutube(items)
+        result = vi.enrich_with_durations(yt, ["abc"])
+        assert result == {"abc": None}
+
+    def test_response_item_missing_duration_maps_to_none(self):
+        items = [{"id": "abc", "contentDetails": {}}]  # contentDetails present but no duration
+        yt = _FakeYoutube(items)
+        result = vi.enrich_with_durations(yt, ["abc"])
+        assert result == {"abc": None}
