@@ -160,6 +160,7 @@ python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" status
 | Scan YouTube channels for new videos | **video-intel** (curate) |
 | Transcribe a video or local MP4 | **video-intel** (curate) |
 | Rebuild the index, taxonomy, or run dedupe | **video-intel** (curate) |
+| Prune shorts, remove shorts, delete YouTube Shorts from corpus | **video-intel** (curate) |
 | Process a local MP4 through the full pipeline | **video-intel** (curate) |
 
 If the user asks "summarize this [URL]" and the video is not in the corpus,

@@ -7,7 +7,8 @@ description: >
   local MP4); run the full mindmap+transcript+concepts pipeline on a local
   video; extract and normalize concepts into the taxonomy; rebuild the
   LanceDB hybrid-search index from existing transcripts; clean up
-  title-rotation duplicates; manage channel configuration. Trigger phrases:
+  title-rotation duplicates; prune YouTube Shorts that polluted the corpus;
+  manage channel configuration. Trigger phrases:
   "scan channel", "scan all channels", "what's new from [creator]" (with
   scan intent), "last N days of [creator]", "transcribe this video",
   "transcribe [creator]'s backlog", "videos I am missing from [creator]",
@@ -15,6 +16,8 @@ description: >
   "add [channel] to my watchlist", "find duplicate videos", "clean up
   duplicates", "dedupe my corpus", "the same video got scanned twice",
   "why do I have two mindmaps for [video]", "creator rotated the title",
+  "prune shorts", "remove shorts from corpus", "delete YouTube Shorts",
+  "clean up shorts", "too many shorts in my corpus",
   "process this local video", "run the full pipeline on [file]", "mindmap
   plus transcript plus concepts on one upload", "do everything on this
   MP4", "extract concepts", "rebuild the taxonomy", "rebuild the index",
@@ -113,6 +116,7 @@ table is the canonical mapping — read it before picking a command.
 | "fully scan [creator]", "everything from [creator]" | `scan --channel X --since 2005-01-01` | **Always `--dry-run` first** — implies entire channel history |
 | Backlog of N videos to transcribe | `scan` with `auto_transcript: all` configured | NOT N separate `transcript --url` calls |
 | "rebuild the index", "reindex after dedupe" | `index --force` | Write-path rebuild of LanceDB; query uses `video-intel-search` |
+| "prune shorts", "remove shorts", "too many shorts in my corpus" | `prune-shorts [--apply]` | **Always `--dry-run` first** — destructive on `--apply`; deletes mindmap/transcript/concepts/meta per Short |
 | "rebuild taxonomy", "update master vocabulary" | `taxonomy-build` | Derived artifact; rebuildable anytime |
 | "find videos about X", "search for Y", "nugget brief on Z", "corpus status" | — | **Wrong skill.** These are read-only queries; use the **video-intel-search** skill. |
 
@@ -409,6 +413,37 @@ python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" index --force
 
 Dedupe is dry-run by default because it mutates shared state (disk).
 Only pass `--apply` after reviewing the dry-run report.
+
+### Prune YouTube Shorts
+
+Shorts polluted the corpus before the scan-time `skip_shorts` filter
+existed (default-on as of plugin v1.11.0). The `prune-shorts` subcommand
+removes them retroactively. Detection: `duration < 60s OR /shorts/<id>
+HEAD redirect returns 200`. Sidecars from `translate_video.py` (`.en.srt`,
+`.translate-bcs.txt`) are preserved.
+
+```bash
+# Dry-run: report all Shorts with title, duration, URL, artifact count
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" prune-shorts
+
+# Restrict to one channel
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" prune-shorts --channel chase_h_ai
+
+# Apply: deletes mindmap.md, transcript.md (+ raw forensics), concepts.json,
+# meta.json, and any mindmap.<variant>.md files for each detected Short.
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" prune-shorts --channel chase_h_ai --apply
+```
+
+After `prune-shorts --apply`, derived artifacts may be stale. Re-run:
+
+```bash
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" taxonomy-build
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" index --force
+```
+
+Like dedupe, prune-shorts is dry-run by default. Always review the dry-run
+output before passing `--apply` — eyeball the 60-90s edge-case rows to make
+sure nothing substantive is in the deletion list.
 
 ### Manage channels
 
