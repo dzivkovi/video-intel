@@ -87,6 +87,7 @@ If prerequisites are missing, tell the user what's needed and where to get it.
 Gemini API calls read video frames and audio — they take **1-5 minutes per video**. A scan of 10 videos can take 10-30 minutes. This is normal.
 
 - **Default log level is `info`** - progress is visible without extra flags.
+- **`--log-level` goes BEFORE the subcommand.** `python video_intel.py --log-level info scan` works; `python video_intel.py scan --log-level info` errors with argparse. Applies to every subcommand.
 - **`--dry-run` is preview only** - shows what would be processed but creates no files and makes no Gemini calls. Use it to verify config before committing to a real scan.
 - **Use a long bash timeout** (at least 600000ms / 10 minutes) for scan and transcript commands. The default 2-minute timeout WILL kill multi-video scans prematurely.
 - **Silence between log lines is normal.** Gemini is processing video - don't diagnose or interrupt.

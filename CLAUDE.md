@@ -93,42 +93,24 @@ One INFO log line per invocation names the winning source (e.g. `"Config resolve
 
 ### User-level install (`video-intel-search` skill anywhere)
 
-To make the read-only search skill available from any project (not just the plugin repo):
+The read-only search skill can be made available from any project via a
+user-level marketplace entry in `~/.claude/settings.json`. See
+[INSTALLATION.md](INSTALLATION.md#claude-code-user-level-access-the-search-skill-from-any-project)
+for the step-by-step procedure (JSON to paste, OS-specific absolute paths,
+env-var vs user-config choice).
 
-1. **Add user-level marketplace entry.** Edit `~/.claude/settings.json` (Windows: `C:\Users\<you>\.claude\settings.json`; macOS/Linux: `~/.claude/settings.json`) and add:
+> **Critical:** the marketplace key under `extraKnownMarketplaces` and the
+> suffix after `@` in `enabledPlugins` MUST both be exactly `video-intel`
+> (matching `.claude-plugin/plugin.json`'s `name` field). Claude Code
+> normalizes the key silently - any suffix like `-local` is stripped, the
+> `enabledPlugins` entry points at a marketplace name that does not exist,
+> and skills never appear in other projects. If you hit "skills not
+> appearing after Claude Code restart", this is the first thing to check.
 
-   ```json
-   {
-     "extraKnownMarketplaces": {
-       "video-intel-local": {
-         "source": { "source": "directory", "path": "C:/Users/<you>/ws/Skills/video-intel" }
-       }
-     },
-     "enabledPlugins": { "video-intel@video-intel-local": true }
-   }
-   ```
-
-   Use an **absolute path** to your plugin checkout. On macOS: `/Users/<you>/...`; on Linux: `/home/<you>/...`.
-
-2. **Point at the corpus** via one of:
-
-   - Env var in your shell profile: `export VIDEO_INTEL_OUTPUT_DIR="/absolute/path/to/your/corpus"`
-   - Or create `~/.video-intel/config.yaml` with:
-
-     ```yaml
-     output_dir: /absolute/path/to/your/corpus
-     # vector_db_dir: /local/cache/lancedb   # optional; see ADR-0016
-     ```
-
-3. **Verify** from any non-plugin directory:
-
-   ```bash
-   python /abs/path/to/plugin/scripts/video_intel.py status
-   ```
-
-   Should report corpus stats without errors.
-
-**Curate operations still require the plugin repo.** `scan`, `process`, `concepts`, `dedupe` all read `channels:` from the plugin-local `config.yaml`. Run them from CWD inside the plugin checkout; they will not work from a user-level install alone.
+Curate operations (`scan`, `process`, `concepts`, `dedupe`, and the
+`--channel` branch of `mindmap` / `transcript` / `process`) still require
+the plugin repo as CWD - they read `channels:` from the plugin-local
+`config.yaml` which the user-level fallback does not provide.
 
 **Shared utilities:** `scripts/gemini_common.py` — Gemini retry logic (`get_retry_delay`), client factory with httpx timeouts (`create_client`), lazy imports (`require_gemini`, `require_youtube`). Used by both scripts; kept minimal.
 

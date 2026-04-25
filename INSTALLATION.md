@@ -71,6 +71,90 @@ instead of system environment variables (this file is never committed):
 }
 ```
 
+### Claude Code user-level (access the search skill from any project)
+
+After the project-scoped install above works, you can make the **read-only**
+`video-intel-search` skill available globally so queries like "find videos
+about MCP" or "nugget brief on prompt caching" work from any Claude Code
+session, not only the plugin repo. Curate operations (scan, index, concepts,
+dedupe, process) still require the plugin repo as CWD - that split is
+intentional, see `skills/video-intel-search/SKILL.md` for the rationale.
+
+> **Critical:** The marketplace key under `extraKnownMarketplaces` and the
+> suffix after `@` in `enabledPlugins` MUST both be exactly `video-intel`
+> (matching `.claude-plugin/plugin.json`'s `name` field). Do NOT add a
+> suffix like `-local` or any variant. Claude Code's internal plugin
+> registry normalizes the key to match `plugin.json`, so any suffix you add
+> gets stripped silently. The result: `enabledPlugins` points at a
+> marketplace name that does not exist, the plugin never installs, and no
+> skills appear in other projects. **Symptom if you get this wrong: skills
+> not appearing after Claude Code restart.** The fix below uses the correct
+> names - copy it verbatim.
+
+**Step 1 - edit `~/.claude/settings.json`.** Add these two entries (merge
+with any existing content; do not replace the whole file):
+
+```json
+{
+  "extraKnownMarketplaces": {
+    "video-intel": {
+      "source": {
+        "source": "directory",
+        "path": "ABSOLUTE_PATH_TO_PLUGIN_CHECKOUT"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "video-intel@video-intel": true
+  }
+}
+```
+
+Replace `ABSOLUTE_PATH_TO_PLUGIN_CHECKOUT` with the absolute path where you
+cloned this repo:
+
+| OS | Example path |
+|----|---------|
+| Windows | `C:/Users/YOURNAME/ws/Skills/video-intel` (forward slashes work fine in JSON) |
+| macOS | `/Users/YOURNAME/ws/Skills/video-intel` |
+| Linux | `/home/YOURNAME/ws/Skills/video-intel` |
+
+**Step 2 - point the skill at your corpus.** Pick one:
+
+- Env var in your shell profile:
+  ```bash
+  export VIDEO_INTEL_OUTPUT_DIR="/absolute/path/to/your/corpus"
+  ```
+
+- Or create `~/.video-intel/config.yaml` (works across shell restarts):
+  ```yaml
+  output_dir: /absolute/path/to/your/corpus
+  # vector_db_dir: /local/cache/lancedb   # optional; see docs/adr/ADR-0016
+  ```
+
+The plugin's own `config.yaml` at `SKILL_DIR/config.yaml` still wins when
+present, so you do not need step 2 if you have a local `config.yaml` in
+the plugin repo. Step 2 only matters for users who want a cache-resident
+install or a shared corpus pointer across machines.
+
+**Step 3 - verify.** Close and reopen Claude Code (plugin registration
+happens at session start). From any non-plugin directory, ask Claude:
+
+```
+which skills do i have access to
+```
+
+You should see `video-intel`, `video-intel-search`, and `translate-bcs` in
+the list. Then try:
+
+```
+find videos about MCP
+```
+
+The `video-intel-search` skill should fire, return concept matches, and
+list relevant videos. If skills do not appear, re-read the critical note
+above - the most common cause is a typo in the marketplace key.
+
 ### Other platforms
 
 The two `SKILL.md` files follow the open [Agent Skills](https://agentskills.io/specification)

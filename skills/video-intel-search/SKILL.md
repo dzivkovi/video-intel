@@ -75,6 +75,7 @@ See the plugin repo's `CLAUDE.md` for the full install procedure.
 - `search --vector`: Voyage embedding call + LanceDB hybrid query, ~1-3 seconds.
 - `nugget`: hybrid search + Gemini synthesis call, 30-90 seconds. Use a
   long bash timeout (600000ms / 10 min) and `--log-level info` for progress.
+- **`--log-level` goes BEFORE the subcommand.** `python video_intel.py --log-level info nugget "query"` works; `python video_intel.py nugget "query" --log-level info` errors with argparse. Applies to every subcommand.
 
 ## How to Use
 

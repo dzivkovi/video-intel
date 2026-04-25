@@ -5,10 +5,10 @@
     ]
   },
   "enabledPlugins": {
-    "video-intel@video-intel-local": true
+    "video-intel@video-intel": true
   },
   "extraKnownMarketplaces": {
-    "video-intel-local": {
+    "video-intel": {
       "source": {
         "source": "directory",
         "path": "."
