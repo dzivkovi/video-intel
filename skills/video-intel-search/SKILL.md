@@ -99,8 +99,9 @@ python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" search "recent takeawa
 
 | User intent | Command | Notes |
 |-------------|---------|-------|
-| "which videos cover X?" | `search "X"` | Concept match. Fast, no API calls. Video list + paths. |
+| "which videos cover X?" (topic only, no creator) | `search "X"` | Concept match. Fast, no API calls. Video list + paths. |
 | "what did they say about Y?" | `search "Y" --vector` | Hybrid search. Returns transcript passages (up to 3000 chars) with timestamps and speaker turns. |
+| **"find videos about [creator] [topic]"** / **"[creator] on [topic]"** | **`search "topic" --vector --channel C`** | **Creator + topic = evidence query. Go to `--vector` from the start.** Concept search returns topic matches ranked by relevance across all creators and usually crowds out the specific creator's videos. |
 | "recent X from [creator]" | `search "X" --vector --channel C --since Nd` | Pre-filtered date window, no recency bias. |
 | "is this [URL] worth watching" | `search "<title or topic>" --vector` | If indexed, returns evidence; if not, tell the user to run the curate skill to process it. |
 | "summarize this video" | `search "<video title>"` | If indexed, open the mindmap path from the result. If not, route to curate. |
@@ -108,6 +109,11 @@ python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" search "recent takeawa
 Hybrid results include evidence directly - follow-up transcript reads are
 usually unnecessary. Timestamps in result URLs (`&t=<seconds>`) jump to the
 exact moment.
+
+> **Routing tip:** when a query combines a creator name and a topic (e.g.
+> "Simon Scrapes on memory systems"), prefer `--vector --channel <name>`
+> from the start. Concept search is fast but returns topic-dominant
+> results that can drown out a specific creator's contribution.
 
 ### Synthesize a cross-creator brief
 

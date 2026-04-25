@@ -253,9 +253,34 @@ These platforms are great for **triaging results after a scan** — upload
 mind map files and ask "which videos are worth watching?" since that step
 needs no API calls.
 
-## Upgrading from v1.4.x
+## Upgrading
 
-The repo changed from "single skill at the root" to "plugin with two skills
-under `skills/`." If you previously copied the repo to `~/.claude/skills/video-intel/`,
-remove that directory. Then clone the repo fresh and open Claude Code inside it —
-the plugin auto-registers via the project settings that ship with the repo.
+### From v1.9.x to v1.10.x (April 2026)
+
+Two structural changes you should know about:
+
+1. **`config.yaml` is now gitignored.** If you have local edits in `config.yaml`,
+   they will not be overwritten by `git pull`. New cloners copy
+   `config.yaml.example` to `config.yaml` and edit — the committed template
+   replaces the previously-tracked real config. No action needed if you
+   already have a working `config.yaml` on disk.
+
+2. **Skill split into three.** The single `video-intel` skill is now two:
+   `video-intel` (ingest / curate — scan, transcribe, index, dedupe) and
+   `video-intel-search` (read-only query — search, nugget, status).
+   `translate-bcs` is unchanged. After `git pull`, close and reopen Claude
+   Code to pick up the new skill registration; both skills auto-discover
+   from `.claude/settings.json` as before.
+
+3. **User-level install now supported.** The `video-intel-search` skill can
+   be made available from any Claude Code project via `~/.claude/settings.json`.
+   See the "Claude Code user-level" section above. **Read the marketplace-key
+   callout before editing** — a common typo breaks the install silently.
+
+### From v1.4.x
+
+The repo changed from "single skill at the root" to "plugin with skills
+under `skills/`." If you previously copied the repo to
+`~/.claude/skills/video-intel/`, remove that directory. Then clone the repo
+fresh and open Claude Code inside it — the plugin auto-registers via the
+project settings that ship with the repo.
