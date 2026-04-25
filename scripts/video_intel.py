@@ -1927,6 +1927,17 @@ def cmd_scan(args, config):
             log.error("Channel '%s' not found in config.yaml", args.channel)
             sys.exit(1)
 
+    # Skip channels with enabled:false. Lets a creator stay in config for
+    # one-off mindmap/transcript --url --channel routing (and concepts
+    # extraction) without being pulled into every regular scan.
+    for ch in [c for c in channels if not c.get("enabled", True)]:
+        log.info(
+            "[%s] Skipping (enabled: false). Use mindmap/transcript --url --channel %s for one-offs.",
+            ch["name"],
+            ch["name"],
+        )
+    channels = [c for c in channels if c.get("enabled", True)]
+
     for ch in channels:
         ch_name = ch["name"]
         ch_url = ch["url"]
