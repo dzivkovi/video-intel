@@ -424,17 +424,102 @@ class TestCmdScanSkipShorts:
         assert "long1" in ids
 
     def test_quota_exceeded_skips_channel_continues_to_next(self, tmp_path, monkeypatch):
-        videos = [{"video_id": "v1", "title": "a", "published": "2026-04-15"}]
-        captured = _scan_setup(
-            monkeypatch,
-            videos,
-            raise_on_enrich=RuntimeError("<HttpError 403 ... reason: quotaExceeded ...>"),
-        )
+        """Multi-channel: when channel A's enrich raises quotaExceeded, the
+        scan must abort that channel cleanly (continue, not return) and still
+        process channel B's videos. A single-channel test would pass even if
+        the bug were `return` instead of `continue` — this one wouldn't."""
+        from unittest.mock import MagicMock
 
-        config = {"output_dir": str(tmp_path), "channels": [{"name": "ch", "url": "https://example.com/ch"}]}
+        # Two channels, each gets its own video. fetch_channel_videos returns
+        # the video matching the channel_id (uses channel_id from get_channel_id).
+        ch_a_video = {"video_id": "vA", "title": "from A", "published": "2026-04-15"}
+        ch_b_video = {"video_id": "vB", "title": "from B", "published": "2026-04-15"}
+
+        # Each call to fetch_channel_videos returns a per-channel list. Use
+        # a counter that flips on call.
+        call_state = {"channel_idx": 0}
+        per_channel_videos = [[ch_a_video], [ch_b_video]]
+
+        def fake_fetch(_yt, _cid, _since):
+            idx = call_state["channel_idx"]
+            call_state["channel_idx"] += 1
+            return list(per_channel_videos[idx])
+
+        monkeypatch.setenv("GEMINI_API_KEY", "test")
+        monkeypatch.setenv("YOUTUBE_API_KEY", "test")
+        monkeypatch.setattr(vi, "require_gemini", lambda: (None, None))
+        monkeypatch.setattr(vi, "require_youtube", lambda: lambda *a, **kw: None)
+        monkeypatch.setattr(vi, "create_client", lambda *a, **kw: None)
+        monkeypatch.setattr(vi, "get_channel_id", lambda yt, url: ("chid", "ChTitle"))
+        monkeypatch.setattr(vi, "fetch_channel_videos", fake_fetch)
+        monkeypatch.setattr(vi, "_is_youtube_short_url", lambda video_id: False)
+
+        # First enrich call raises quota HttpError; second succeeds.
+        enrich_state = {"n": 0}
+
+        def flaky_enrich(_yt, video_ids):
+            enrich_state["n"] += 1
+            if enrich_state["n"] == 1:
+                resp = MagicMock(status=403)
+                content = (
+                    b'{"error": {"errors": [{"reason": "quotaExceeded"}], "code": 403, "message": "quota exceeded"}}'
+                )
+                raise vi.HttpError(resp=resp, content=content)
+            return dict.fromkeys(video_ids)
+
+        monkeypatch.setattr(vi, "enrich_with_durations", flaky_enrich)
+
+        captured = {"processed": []}
+
+        def fake_process_mindmap(*args, **kwargs):
+            video = args[2] if len(args) > 2 else kwargs.get("video")
+            captured["processed"].append(video)
+            return (video.get("video_id", "prefix"), "done")
+
+        monkeypatch.setattr(vi, "process_mindmap", fake_process_mindmap)
+
+        config = {
+            "output_dir": str(tmp_path),
+            "channels": [
+                {"name": "ch_a", "url": "https://example.com/a"},
+                {"name": "ch_b", "url": "https://example.com/b"},
+            ],
+        }
         vi.cmd_scan(_scan_args(), config)
 
-        # No video reached process_mindmap because the channel was aborted
+        ids = [v["video_id"] for v in captured["processed"]]
+        # Channel A aborted on quota, so vA must NOT have processed.
+        assert "vA" not in ids, "vA from quota-exhausted channel A must not process"
+        # Channel B succeeded after quota error on A — proves continue (not return).
+        assert "vB" in ids, "vB from channel B must still process — bug is `return` instead of `continue`"
+        # Sanity: enrich was called twice (both channels got their candidate-list pass).
+        assert enrich_state["n"] == 2
+
+    def test_quota_exceeded_uses_canonical_reason_field_not_substring(self, tmp_path, monkeypatch):
+        """The quota detection reads `error.errors[*].reason` from the response
+        body, not a substring of str(e). A misleading message that mentions
+        'quotaExceeded' but with a non-quota reason must NOT trigger abort."""
+        from unittest.mock import MagicMock
+
+        videos = [{"video_id": "vA", "title": "a", "published": "2026-04-15"}]
+
+        def red_herring_enrich(_yt, video_ids):
+            resp = MagicMock(status=403)
+            # 403 with a NON-quota reason; message contains the word "quotaExceeded"
+            # only as part of unrelated debug context.
+            content = (
+                b'{"error": {"errors": [{"reason": "forbidden"}], '
+                b'"code": 403, "message": "see also quotaExceeded for related errors"}}'
+            )
+            raise vi.HttpError(resp=resp, content=content)
+
+        captured = _scan_setup(monkeypatch, videos)
+        monkeypatch.setattr(vi, "enrich_with_durations", red_herring_enrich)
+
+        config = {"output_dir": str(tmp_path), "channels": [{"name": "ch", "url": "https://example.com/ch"}]}
+        # Non-quota 403 must propagate, NOT be silently swallowed by the quota-abort path.
+        with pytest.raises(vi.HttpError):
+            vi.cmd_scan(_scan_args(), config)
         assert captured["processed"] == []
 
     def test_empty_video_list_skips_enrich_call(self, tmp_path, monkeypatch):

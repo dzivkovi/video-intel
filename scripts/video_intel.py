@@ -31,6 +31,7 @@ from typing import Any
 
 import httpx
 import yaml
+from googleapiclient.errors import HttpError
 
 from gemini_common import (
     build_permissive_safety_settings,
@@ -505,6 +506,28 @@ def fetch_channel_videos(youtube, channel_id, since_dt):
             break
 
     return videos
+
+
+_QUOTA_EXCEEDED_REASONS = frozenset(
+    {"quotaExceeded", "dailyLimitExceeded", "userRateLimitExceeded", "rateLimitExceeded"}
+)
+
+
+def _is_quota_exceeded(error: HttpError) -> bool:
+    """Decide whether an HttpError represents a YouTube Data API quota error.
+
+    Reads the canonical ``error.errors[*].reason`` field from the response
+    body rather than substring-matching on str(error), because googleapiclient
+    formats messages differently across versions and a substring match on
+    "quotaExceeded" can both miss adjacent quota reasons (dailyLimitExceeded,
+    userRateLimitExceeded) and false-positive on unrelated debug strings.
+    """
+    try:
+        body = json.loads(error.content.decode("utf-8"))
+    except (json.JSONDecodeError, AttributeError, UnicodeDecodeError):
+        return False
+    reasons = {item.get("reason") for item in body.get("error", {}).get("errors", []) if isinstance(item, dict)}
+    return bool(reasons & _QUOTA_EXCEEDED_REASONS)
 
 
 def enrich_with_durations(youtube, video_ids: list[str]) -> dict[str, str | None]:
@@ -2113,8 +2136,8 @@ def cmd_scan(args, config):
         skip_shorts = ch.get("skip_shorts", config.get("skip_shorts", True))
         try:
             durations = enrich_with_durations(youtube, [v["video_id"] for v in videos])
-        except Exception as e:
-            if "quotaExceeded" in str(e):
+        except HttpError as e:
+            if e.resp.status == 403 and _is_quota_exceeded(e):
                 log.error(
                     "[%s] YouTube quota exhausted while classifying Shorts; aborting this channel.",
                     ch_name,
