@@ -21,6 +21,12 @@ model: gemini-3-flash-preview
 max_parallel: 10
 auto_concepts: true
 
+# Issue #42: ceiling on transcript duration. Above this, the structured-JSON
+# response truncates beyond what salvage can recover. Mindmap loop is
+# unaffected. Default 7200 = 2 hours leaves headroom for typical technical
+# talks; raise to 10800 for podcast creators who routinely go to 3h.
+transcript_max_duration_seconds: 7200
+
 # Channels to scan. Each channel is a YouTube handle; curate commands (scan, index,
 # concepts, etc.) require this list to be populated. Search commands do not.
 channels:
@@ -31,6 +37,12 @@ channels:
     # skip_shorts is true by default — set false to opt back in for creators
     # whose Shorts (under 60s, or vertical /shorts/ URLs) are substantive.
     # skip_shorts: false
+    # Issue #42: declarative pre-fetch blocklist. List YouTube video IDs that
+    # scan should never touch (e.g. workshops, conference recordings the user
+    # has decided are not worth Gemini cost). Filter applies before any API
+    # call. Override = remove the ID from this list.
+    # skip_video_ids:
+    #   - ABCDEFGHIJK
 
   # Selective mode: only pull specific playlists or keyword-matched videos.
   # Useful when a creator posts across many topics and you only want a slice.

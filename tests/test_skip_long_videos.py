@@ -189,7 +189,7 @@ class TestLongVideoTranscriptGuard:
                 "url": "https://www.youtube.com/watch?v=long95",
             },
         ]
-        durations = {"long95": "PT1H35M"}  # 5700 seconds, > 5400 default
+        durations = {"long95": "PT2H15M"}  # 8100 seconds, > 7200 default
         captured = _scan_setup_with_transcript(monkeypatch, videos, durations=durations)
 
         config = {
@@ -215,7 +215,7 @@ class TestLongVideoTranscriptGuard:
                 "url": "https://www.youtube.com/watch?v=short70",
             },
         ]
-        durations = {"short70": "PT1H10M"}  # 4200 sec, under 5400 default
+        durations = {"short70": "PT1H10M"}  # 4200 sec, under 7200 default
         captured = _scan_setup_with_transcript(monkeypatch, videos, durations=durations)
 
         config = {
@@ -257,14 +257,14 @@ class TestLongVideoTranscriptGuard:
         assert "transcript --url" in warnings, "Recovery recipe must be present"
         assert "https://www.youtube.com/watch?v=long95" in warnings
         assert "--start 0" in warnings
-        assert "--end 5400" in warnings
+        assert "--end 7200" in warnings
         # Reviewer P2: warn that the recipe captures only the first segment.
         assert "first" in warnings and "later segments" in warnings, (
             "Warning must tell the user that --end clips the rest of the video"
         )
 
-    def test_default_threshold_5400_seconds(self):
-        assert vi.TRANSCRIPT_MAX_DURATION_DEFAULT == 5400
+    def test_default_threshold_7200_seconds(self):
+        assert vi.TRANSCRIPT_MAX_DURATION_DEFAULT == 7200
 
     def test_custom_threshold_in_config_respected(self, tmp_path, monkeypatch):
         """Setting transcript_max_duration_seconds=3600 lowers the cutoff to 60 min."""
@@ -276,7 +276,7 @@ class TestLongVideoTranscriptGuard:
                 "url": "https://www.youtube.com/watch?v=v75",
             },
         ]
-        durations = {"v75": "PT1H15M"}  # 4500 sec, < 5400 default but > 3600 override
+        durations = {"v75": "PT1H15M"}  # 4500 sec, < 7200 default but > 3600 override
         captured = _scan_setup_with_transcript(monkeypatch, videos, durations=durations)
 
         config = {
@@ -848,11 +848,11 @@ class TestSkipVideoIdsConfig:
 
         assert [v["video_id"] for v in captured["mindmaps"]] == ["v1"]
 
-    def test_blocklist_log_message_includes_count(self, tmp_path, monkeypatch, caplog):
+    def test_blocklist_log_message_includes_count_and_per_video_lines(self, tmp_path, monkeypatch, caplog):
         videos = [
-            {"video_id": "skipA12345X", "title": "t1", "published": "2026-04-15"},
-            {"video_id": "skipB67890Y", "title": "t2", "published": "2026-04-15"},
-            {"video_id": "keep1234567", "title": "t3", "published": "2026-04-15"},
+            {"video_id": "skipA12345X", "title": "Workshop A", "published": "2026-04-15"},
+            {"video_id": "skipB67890Y", "title": "Workshop B", "published": "2026-04-15"},
+            {"video_id": "keep1234567", "title": "Regular talk", "published": "2026-04-15"},
         ]
         _scan_setup_with_transcript(monkeypatch, videos, durations={"keep1234567": "PT10M"})
 
@@ -870,7 +870,34 @@ class TestSkipVideoIdsConfig:
             vi.cmd_scan(_scan_args(), config)
 
         info_lines = "\n".join(r.message for r in caplog.records if r.levelname == "INFO")
+        # Per-video log lines so silent-typo failures are visible.
+        assert 'skip_video_ids: skipA12345X "Workshop A"' in info_lines
+        assert 'skip_video_ids: skipB67890Y "Workshop B"' in info_lines
         assert "Filtered 2 video(s) per skip_video_ids" in info_lines
+
+    def test_blocklist_warns_when_listed_id_does_not_match_any_fetched_video(self, tmp_path, monkeypatch, caplog):
+        """User's typo / stale-config detection: if an ID is listed in
+        skip_video_ids but never appears in fetched results, emit a WARNING
+        so the user notices the entry is doing nothing."""
+        videos = [{"video_id": "real1234567", "title": "Real video", "published": "2026-04-15"}]
+        _scan_setup_with_transcript(monkeypatch, videos, durations={"real1234567": "PT10M"})
+
+        config = {
+            "output_dir": str(tmp_path),
+            "channels": [
+                {
+                    "name": "ch",
+                    "url": "https://example.com/ch",
+                    "skip_video_ids": ["staleZZZ123"],  # not in fetched results
+                },
+            ],
+        }
+        with caplog.at_level("WARNING"):
+            vi.cmd_scan(_scan_args(), config)
+
+        warnings_text = "\n".join(r.message for r in caplog.records if r.levelname == "WARNING")
+        assert "staleZZZ123" in warnings_text
+        assert "NOT in fetched videos" in warnings_text or "deleted" in warnings_text
 
     def test_blocklist_skips_enrich_for_listed_ids(self, tmp_path, monkeypatch):
         """The filter runs BEFORE enrich_with_durations, so listed IDs never reach
