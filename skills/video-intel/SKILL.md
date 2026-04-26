@@ -475,7 +475,7 @@ sees the array and skips just that loop. Repeating the same `--mode` is
 idempotent. The optional `--reason` lands as a `skip_reason` field for
 your own bookkeeping.
 
-The default 90-minute filter (`transcript_max_duration_seconds` in
+The default 2-hour filter (`transcript_max_duration_seconds` in
 config.yaml) handles the long-video case automatically — `mark-skip` is
 for cases where the duration is under threshold but transcript fails for
 other reasons (poor audio, region-locked transcript fetch, etc.).
@@ -500,9 +500,10 @@ default_since: 10d                 # Default lookback window
 default_prompt: mindmap-knowledge  # Which prompt to use by default
 auto_concepts: true                # Extract concepts after mindmap generation
 model: gemini-3-flash-preview     # Gemini model (overridable via --model)
-transcript_max_duration_seconds: 5400   # Skip transcripts on videos longer than this
-                                        # (issue #42). Default 90 minutes. Mindmap
-                                        # phase is unaffected. Override per workload.
+transcript_max_duration_seconds: 7200   # Skip transcripts on videos longer than this
+                                        # (issue #42). Default 2 hours - leaves headroom
+                                        # for technical talks. Mindmap phase is
+                                        # unaffected. Override per workload.
 
 channels:
   - name: natebjones               # Folder name for output

@@ -1066,7 +1066,7 @@ def _parse_iso8601_duration(iso: str | None) -> int | None:
 # Issue #42: ceiling on transcript duration. Above this, the structured-JSON
 # response truncates and the bounded retry / salvage cannot recover. Log the
 # manual-clipping recipe instead and let the mindmap path proceed.
-TRANSCRIPT_MAX_DURATION_DEFAULT = 5400  # 90 minutes
+TRANSCRIPT_MAX_DURATION_DEFAULT = 7200  # 2 hours - leaves headroom for technical talks
 
 
 def _fmt_hms(seconds: int) -> str:
@@ -2171,13 +2171,23 @@ def cmd_scan(args, config):
         # Issue #42 follow-up: declarative video-id blocklist. Filter pre-Gemini and
         # pre-enrich so listed IDs never trigger meta writes, duration lookups, or
         # processing. Override path is removing the ID from config.yaml.
+        # Per-video log lines so silent-typo failures are visible: a listed ID that
+        # never matches a fetched video produces no log line, which is the user's
+        # signal that the entry is stale.
         skip_ids = set(ch.get("skip_video_ids") or [])
         if skip_ids:
-            before = len(videos)
+            matched = [v for v in videos if v.get("video_id") in skip_ids]
             videos = [v for v in videos if v.get("video_id") not in skip_ids]
-            n_filtered = before - len(videos)
-            if n_filtered:
-                log.info("  Filtered %d video(s) per skip_video_ids config.", n_filtered)
+            for m in matched:
+                log.info('    skip_video_ids: %s "%s"', m.get("video_id"), m.get("title", ""))
+            if matched:
+                log.info("  Filtered %d video(s) per skip_video_ids config.", len(matched))
+            unmatched = skip_ids - {m.get("video_id") for m in matched}
+            for missing in sorted(unmatched):
+                log.warning(
+                    '  skip_video_ids: "%s" listed but NOT in fetched videos (deleted, typo, or wrong channel?)',
+                    missing,
+                )
 
         if not videos:
             # With auto_concepts enabled we still want to enumerate local-recovery

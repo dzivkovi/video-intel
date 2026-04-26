@@ -1,0 +1,32 @@
+19:56:23 INFO    Config resolved from SKILL_DIR/config.yaml (C:\Users\danie\ws\Skills\video-intel-issue42\config.yaml)
+19:56:26 WARNING Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+19:56:28 INFO    [seankochel] Sean Kochel
+19:56:28 INFO      Selective mode: playlists=['Agent Skills'], keywords=['ux', 'design', 'claude code', 'mcp', 'coding', 'agents', 'skills']
+19:56:28 INFO        Resolved playlist: "Agent Skills" -> PLqq3-KsIOgJodBoySb1W6tA32ncKtZasd (Agent Skills)
+19:56:28 INFO        Playlist "Agent Skills": 7 videos
+19:56:28 INFO        Keyword search: "ux" (~400 quota units)
+19:56:28 INFO        Keyword "ux": 35 results
+19:56:28 INFO        Keyword search: "design" (~400 quota units)
+19:56:29 INFO        Keyword "design": 61 results
+19:56:29 INFO        Keyword search: "claude code" (~400 quota units)
+19:56:30 INFO        Keyword "claude code": 67 results
+19:56:30 INFO        Keyword search: "mcp" (~400 quota units)
+19:56:30 INFO        Keyword "mcp": 30 results
+19:56:30 INFO        Keyword search: "coding" (~400 quota units)
+19:56:31 INFO        Keyword "coding": 175 results
+19:56:31 INFO        Keyword search: "agents" (~400 quota units)
+19:56:32 INFO        Keyword "agents": 70 results
+19:56:32 INFO        Keyword search: "skills" (~400 quota units)
+19:56:33 INFO        Keyword "skills": 59 results
+19:56:34 INFO        Recent uploads (since 2025-04-26): 159 videos, 10 new
+19:56:34 INFO      Total: 198 unique videos after dedup
+19:56:34 INFO        skip_video_ids: X5UN2LrRK48 "Build Your First SaaS App - Complete Solo Founder Blueprint (Part 1)"
+19:56:34 INFO      Filtered 1 video(s) per skip_video_ids config.
+19:56:34 WARNING   skip_video_ids: "notarealABC1" listed but NOT in fetched videos (deleted, typo, or wrong channel?)
+19:58:24 INFO      Skipped 72 Shorts (skip_shorts=true).
+19:58:28 INFO      Found 125 videos, 4 new.
+19:58:28 INFO        2026-02-02 - The Clawdbot Hype Is Lying to You
+19:58:28 INFO        2026-01-14 - I used these 5 books to go from zero customers to $20K/month
+19:58:28 INFO        2025-10-28 - How Solo AI Builders Hit $20K MRR (The 6 Things They All Do)
+19:58:28 INFO        2025-08-30 - 7-Steps To Getting More Users (Vibe Coder's Guide)
+19:58:28 INFO    Done.

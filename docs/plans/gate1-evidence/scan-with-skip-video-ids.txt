@@ -1,0 +1,30 @@
+19:49:29 INFO    Config resolved from SKILL_DIR/config.yaml (C:\Users\danie\ws\Skills\video-intel-issue42\config.yaml)
+19:49:33 WARNING Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+19:49:35 INFO    [seankochel] Sean Kochel
+19:49:35 INFO      Selective mode: playlists=['Agent Skills'], keywords=['ux', 'design', 'claude code', 'mcp', 'coding', 'agents', 'skills']
+19:49:35 INFO        Resolved playlist: "Agent Skills" -> PLqq3-KsIOgJodBoySb1W6tA32ncKtZasd (Agent Skills)
+19:49:35 INFO        Playlist "Agent Skills": 7 videos
+19:49:35 INFO        Keyword search: "ux" (~400 quota units)
+19:49:35 INFO        Keyword "ux": 35 results
+19:49:35 INFO        Keyword search: "design" (~400 quota units)
+19:49:36 INFO        Keyword "design": 61 results
+19:49:36 INFO        Keyword search: "claude code" (~400 quota units)
+19:49:36 INFO        Keyword "claude code": 67 results
+19:49:36 INFO        Keyword search: "mcp" (~400 quota units)
+19:49:37 INFO        Keyword "mcp": 30 results
+19:49:37 INFO        Keyword search: "coding" (~400 quota units)
+19:49:38 INFO        Keyword "coding": 175 results
+19:49:38 INFO        Keyword search: "agents" (~400 quota units)
+19:49:39 INFO        Keyword "agents": 70 results
+19:49:39 INFO        Keyword search: "skills" (~400 quota units)
+19:49:40 INFO        Keyword "skills": 59 results
+19:49:41 INFO        Recent uploads (since 2025-04-26): 159 videos, 10 new
+19:49:41 INFO      Total: 198 unique videos after dedup
+19:49:41 INFO      Filtered 1 video(s) per skip_video_ids config.
+19:51:42 INFO      Skipped 72 Shorts (skip_shorts=true).
+19:51:46 INFO      Found 125 videos, 4 new.
+19:51:46 INFO        2026-02-02 - The Clawdbot Hype Is Lying to You
+19:51:46 INFO        2026-01-14 - I used these 5 books to go from zero customers to $20K/month
+19:51:46 INFO        2025-10-28 - How Solo AI Builders Hit $20K MRR (The 6 Things They All Do)
+19:51:46 INFO        2025-08-30 - 7-Steps To Getting More Users (Vibe Coder's Guide)
+19:51:46 INFO    Done.
