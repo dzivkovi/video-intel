@@ -1641,24 +1641,91 @@ def isolate_json(text: str) -> str:
 
 
 def try_parse_transcript_json(text: str) -> tuple[dict | list | None, str | None]:
-    """Attempt to parse transcript JSON: direct first, then after isolation."""
+    """Attempt to parse transcript JSON: direct first, then after isolation.
+    If the parsed value is the Pro task-wrapper shape, normalize to a flat
+    envelope so downstream `merge_transcript_json` sees a valid dict (issue #45).
+    """
     # Try direct parse
     try:
-        return json.loads(text), None
+        parsed = json.loads(text)
+        return _wrapper_to_envelope_dict(parsed) or parsed, None
     except (json.JSONDecodeError, ValueError):
         pass
     # Try after isolation
     isolated = isolate_json(text)
     if isolated != text:
         try:
-            return json.loads(isolated), None
+            parsed = json.loads(isolated)
+            return _wrapper_to_envelope_dict(parsed) or parsed, None
         except (json.JSONDecodeError, ValueError) as e:
             return None, str(e)
     return None, "No valid JSON found"
 
 
+_KNOWN_TASK_KEYS = ("transcripts", "screen_content", "speakers")
+_CYRILLIC_BEFORE_TEXT_KEY = re.compile(r"\s*[Ѐ-ӿ]+\s*(\"text\"\s*:)")
+_CYRILLIC_BEFORE_VALUE = re.compile(r"\s*[Ѐ-ӿ]+\s+(\"[^\"]+\")")
+
+
+def _strip_cyrillic_for_structure(text: str) -> str:
+    """Strip Cyrillic-token intrusions that block JSON.loads of a wrapper.
+
+    Scoped helper for `_normalize_task_wrapper` only - issue #45 rejects a
+    global pre-strip because verbatim foreign content can be legitimate.
+    """
+    fixed, _ = _CYRILLIC_BEFORE_TEXT_KEY.subn(r" \1", text)
+    fixed, _ = _CYRILLIC_BEFORE_VALUE.subn(r' "text": \1', fixed)
+    return fixed
+
+
+def _wrapper_to_envelope_dict(parsed) -> dict | None:
+    """If `parsed` matches Pro's `[{"task": ..., "output": [...]}, ...]` shape
+    with at least one task in `_KNOWN_TASK_KEYS`, rebuild a flat envelope dict.
+    Otherwise return None so callers can pass the original parsed value through.
+
+    Used by both `try_parse_transcript_json` (full-parse path) and
+    `_normalize_task_wrapper` (text-level salvage path), so a wrapper response
+    is normalized whether or not it also has a Cyrillic intrusion that breaks
+    the full parse. See issue #45.
+    """
+    if not (isinstance(parsed, list) and parsed):
+        return None
+    known_items = [it for it in parsed if isinstance(it, dict) and it.get("task") in _KNOWN_TASK_KEYS]
+    if not known_items:
+        return None
+    envelope: dict[str, list] = {k: [] for k in _KNOWN_TASK_KEYS}
+    for item in known_items:
+        task = item["task"]
+        output = item.get("output", [])
+        if isinstance(output, list):
+            envelope[task] = output
+    return envelope
+
+
+def _normalize_task_wrapper(text: str) -> str:
+    """Detect Pro's task-wrapper shape in a raw text response and rewrite it
+    into the flat envelope salvage's regex scan expects.
+
+    Returns the input unchanged when the wrapper shape is absent or the
+    rebuild fails. Composition with downstream salvage is monotone: a
+    wrapper-free input is unchanged (no rewrite); a wrapper input is at
+    least as recoverable as today (which is zero). See issue #45.
+    """
+    for candidate in (text, _strip_cyrillic_for_structure(text)):
+        try:
+            parsed = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        envelope = _wrapper_to_envelope_dict(parsed)
+        if envelope is None:
+            return text
+        return json.dumps(envelope)
+    return text
+
+
 def salvage_transcript_sections(text: str) -> tuple[dict, str | None]:
     """Try to recover valid JSON arrays for transcripts/screen_content/speakers."""
+    text = _normalize_task_wrapper(text)
     result: dict[str, list] = {"transcripts": [], "screen_content": [], "speakers": []}
     warning = None
 
