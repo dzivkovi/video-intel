@@ -118,6 +118,7 @@ table is the canonical mapping — read it before picking a command.
 | "rebuild the index", "reindex after dedupe" | `index --force` | Write-path rebuild of LanceDB; query uses `video-intel-search` |
 | "prune shorts", "remove shorts", "too many shorts in my corpus" | `prune-shorts [--apply]` | **Always `--dry-run` first** — destructive on `--apply`; deletes mindmap/transcript/concepts/meta per Short |
 | "rebuild taxonomy", "update master vocabulary" | `taxonomy-build` | Derived artifact; rebuildable anytime |
+| "skip transcript on this video", "stop trying to transcribe [URL]", "this video keeps failing transcript", "block transcript only" | `mark-skip --url URL --mode transcript [--reason TEXT]` | Per-mode skip (issue #42). Mindmap and concepts continue to run. Repeatable: `--mode transcript --mode concepts`. |
 | "find videos about X", "search for Y", "nugget brief on Z", "corpus status", "verify quote", "fact-check claim against [creator]" | — | **Wrong skill.** These are read-only queries; use the **video-intel-search** skill. |
 
 ### Channel name resolution
@@ -445,6 +446,44 @@ Like dedupe, prune-shorts is dry-run by default. Always review the dry-run
 output before passing `--apply` — eyeball the 60-90s edge-case rows to make
 sure nothing substantive is in the deletion list.
 
+### Skip a single mode on one video (per-mode skip)
+
+Issue #42: a 2h 24m video kept truncating its transcript and hung scan for
+hours. Marking the whole video `skip: true` worked but also blocked the
+concepts pass that the existing mindmap could have fed. Use `mark-skip`
+when you want to silence one mode (commonly `transcript`) and let the
+others keep running.
+
+```bash
+# Stop trying to transcribe a single video. Mindmap and concepts keep going.
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" mark-skip \
+  --url "https://www.youtube.com/watch?v=X5UN2LrRK48" \
+  --mode transcript \
+  --reason "JSON truncation on 2h24m video, structured output exceeds MAX_OUTPUT_TOKENS"
+
+# Block both transcript AND concepts but keep mindmap
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" mark-skip \
+  --url "https://www.youtube.com/watch?v=X5UN2LrRK48" \
+  --mode transcript \
+  --mode concepts
+```
+
+Writes `skip_modes: ["transcript"]` (or whatever modes you passed) into
+the video's `.meta.json`. On subsequent scans, `is_skipped(..., mode="transcript")`
+sees the array and skips just that loop. Repeating the same `--mode` is
+idempotent. The optional `--reason` lands as a `skip_reason` field for
+your own bookkeeping.
+
+The default 90-minute filter (`transcript_max_duration_seconds` in
+config.yaml) handles the long-video case automatically — `mark-skip` is
+for cases where the duration is under threshold but transcript fails for
+other reasons (poor audio, region-locked transcript fetch, etc.).
+
+Backward compat: existing meta.json files with the old `skip: true`
+keep behaving as full-skip on every mode. To migrate to per-mode, just
+re-run `mark-skip` with the new flags — `skip_modes` wins outright when
+both keys exist.
+
 ### Manage channels
 
 Edit config.yaml directly or ask Claude Code to add/remove channels.
@@ -460,6 +499,9 @@ default_since: 10d                 # Default lookback window
 default_prompt: mindmap-knowledge  # Which prompt to use by default
 auto_concepts: true                # Extract concepts after mindmap generation
 model: gemini-3-flash-preview     # Gemini model (overridable via --model)
+transcript_max_duration_seconds: 5400   # Skip transcripts on videos longer than this
+                                        # (issue #42). Default 90 minutes. Mindmap
+                                        # phase is unaffected. Override per workload.
 
 channels:
   - name: natebjones               # Folder name for output

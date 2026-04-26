@@ -1063,6 +1063,35 @@ def _parse_iso8601_duration(iso: str | None) -> int | None:
     return hours * 3600 + minutes * 60 + seconds
 
 
+# Issue #42: ceiling on transcript duration. Above this, the structured-JSON
+# response truncates and the bounded retry / salvage cannot recover. Log the
+# manual-clipping recipe instead and let the mindmap path proceed.
+TRANSCRIPT_MAX_DURATION_DEFAULT = 5400  # 90 minutes
+
+
+def _fmt_hms(seconds: int) -> str:
+    """Format an integer second count as compact h/m/s (e.g. 8682 -> '2h24m42s').
+
+    Drops leading zero components so a 12-minute video reads '12m', not '0h12m0s'.
+    Trailing zero seconds are dropped too unless that would leave the entire
+    string empty (only '0' input keeps '0s' for readability).
+    """
+    if seconds <= 0:
+        return "0s"
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    parts: list[str] = []
+    if h:
+        parts.append(f"{h}h")
+    if m or (h and s):
+        # Keep the minutes slot when hours+seconds are present so '1h0m1s' reads
+        # right; otherwise drop a zero-minute middle component.
+        parts.append(f"{m}m")
+    if s:
+        parts.append(f"{s}s")
+    return "".join(parts)
+
+
 @functools.cache
 def _is_youtube_short_url(video_id: str) -> bool:
     """Return True when https://www.youtube.com/shorts/<id> renders as a Short.
@@ -1210,14 +1239,46 @@ def record_alt_title_if_rotated(
     return True
 
 
-def is_skipped(output_dir, channel_name, video):
-    """Check if a video is marked to skip permanently."""
+SKIP_MODES_VALID = ("mindmap", "transcript", "concepts")
+
+
+def is_skipped_meta(meta: dict, mode: str | None = None) -> bool:
+    """Decide whether a video should be skipped for a given processing mode.
+
+    Resolution order (issue #42):
+      1. If meta has a `skip_modes` list, check membership against `mode`.
+         skip_modes wins outright; legacy `skip` is ignored when both exist.
+      2. Else if `skip == True` (legacy boolean), treat as full-skip
+         (every mode is skipped).
+      3. Else False.
+
+    Passing mode=None preserves the pre-issue-42 "any skip" semantics so
+    existing call sites that do not care about a specific mode (e.g. dry-run
+    listing, dedupe candidates) keep behaving the same.
+    """
+    skip_modes = meta.get("skip_modes")
+    if isinstance(skip_modes, list):
+        if mode is None:
+            return len(skip_modes) > 0
+        return mode in skip_modes
+    return meta.get("skip") is True
+
+
+def is_skipped(output_dir, channel_name, video, mode: str | None = None) -> bool:
+    """Disk-backed wrapper: read meta.json then delegate to is_skipped_meta.
+
+    Backward compatible: callers without `mode=` get "any skip" semantics
+    (the pre-issue-42 behavior).
+    """
     prefix = video_file_prefix(video)
     meta_path = output_dir / channel_name / f"{prefix}.meta.json"
-    if meta_path.exists():
+    if not meta_path.exists():
+        return False
+    try:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        return meta.get("skip", False)
-    return False
+    except json.JSONDecodeError:
+        return False
+    return is_skipped_meta(meta, mode=mode)
 
 
 # ---------------------------------------------------------------------------
@@ -2154,15 +2215,17 @@ def cmd_scan(args, config):
                 log.info("  Skipped %d Shorts (skip_shorts=true).", n_skipped)
             videos = kept
 
-        # Filter already processed or skipped (any_variant=True prevents backfill)
+        # Filter already processed or skipped (any_variant=True prevents backfill).
+        # mode="mindmap" so per-mode skip_modes=["transcript"] does NOT block the
+        # mindmap loop. See is_skipped_meta() and issue #42.
         if args.force:
-            new_videos = [v for v in videos if not is_skipped(output_dir, ch_name, v)]
+            new_videos = [v for v in videos if not is_skipped(output_dir, ch_name, v, mode="mindmap")]
         else:
             new_videos = [
                 v
                 for v in videos
                 if not is_processed(output_dir, ch_name, v, "scan", any_variant=True)
-                and not is_skipped(output_dir, ch_name, v)
+                and not is_skipped(output_dir, ch_name, v, mode="mindmap")
             ]
         label = "to regenerate" if args.force else "new"
         log.info("  Found %d videos, %d %s.", len(videos), len(new_videos), label)
@@ -2224,11 +2287,37 @@ def cmd_scan(args, config):
         auto = ch.get("auto_transcript", "none")
         if auto == "all":
             transcript_prompt = load_prompt("transcript")
-            transcript_videos = [
-                v
-                for v in videos
-                if not is_processed(output_dir, ch_name, v, "transcript") and not is_skipped(output_dir, ch_name, v)
-            ]
+            # Long-video guard (issue #42): videos longer than the threshold
+            # truncate the structured-JSON transcript response. Filter them out
+            # of the transcript loop and log the manual-clipping recipe.
+            # Mindmap loop is upstream and unaffected (mindmap output is small).
+            threshold = config.get("transcript_max_duration_seconds", TRANSCRIPT_MAX_DURATION_DEFAULT)
+            transcript_videos: list[dict] = []
+            for v in videos:
+                if is_processed(output_dir, ch_name, v, "transcript"):
+                    continue
+                if is_skipped(output_dir, ch_name, v, mode="transcript"):
+                    continue
+                duration_s = _parse_iso8601_duration(v.get("duration_iso"))
+                if duration_s is not None and duration_s > threshold:
+                    log.warning(
+                        '[%s] Skipping transcript for "%s" (%s > %dm).',
+                        ch_name,
+                        v["title"],
+                        _fmt_hms(duration_s),
+                        threshold // 60,
+                    )
+                    log.warning(
+                        "  To process manually with clipping: transcript --url %s --start 0 --end %d",
+                        v.get("url", ""),
+                        threshold,
+                    )
+                    log.warning(
+                        "  Note: that command captures only the first %dm; pass --start/--end to cover later segments.",
+                        threshold // 60,
+                    )
+                    continue
+                transcript_videos.append(v)
             if transcript_videos:
                 log.info("  Generating transcripts (%d videos)...", len(transcript_videos))
                 with ThreadPoolExecutor(max_workers=max_parallel) as executor:
@@ -2276,7 +2365,7 @@ def cmd_scan(args, config):
                     except json.JSONDecodeError:
                         log.warning("Skipping malformed meta.json: %s", meta_file)
                         continue
-                    if meta.get("skip"):
+                    if is_skipped_meta(meta, mode="concepts"):
                         continue
                     synthetic_video = {
                         "video_id": meta.get("video_id", ""),
@@ -2362,8 +2451,8 @@ def cmd_mindmap(args, config):
                     existing = json.loads(identity["meta_path"].read_text(encoding="utf-8"))
                 except json.JSONDecodeError:
                     existing = {}
-                if existing.get("skip"):
-                    log.info("Skipping %s (skip=true in meta.json)", identity["prefix"])
+                if is_skipped_meta(existing, mode="mindmap"):
+                    log.info("Skipping %s (skip flag in meta.json blocks mindmap)", identity["prefix"])
                     return
 
             video = {
@@ -2541,8 +2630,8 @@ def cmd_transcript(args, config):
                     existing = json.loads(identity["meta_path"].read_text(encoding="utf-8"))
                 except json.JSONDecodeError:
                     existing = {}
-                if existing.get("skip"):
-                    log.info("Skipping %s (skip=true in meta.json)", prefix)
+                if is_skipped_meta(existing, mode="transcript"):
+                    log.info("Skipping %s (skip flag in meta.json blocks transcript)", prefix)
                     return
 
             # Two-step meta write: identity block lands BEFORE Gemini call so
@@ -2763,7 +2852,9 @@ def cmd_process(args, config):
                 existing_meta = json.loads(meta_path.read_text(encoding="utf-8"))
             except json.JSONDecodeError:
                 existing_meta = {}
-            if existing_meta.get("skip"):
+            # Issue #42: legacy `skip: true` still hard-exits; `skip_modes` is
+            # honored per-mode below by gating needs_mindmap / needs_transcript.
+            if existing_meta.get("skip") is True and "skip_modes" not in existing_meta:
                 log.info("Skipping %s (skip=true in meta.json)", prefix)
                 return
         else:
@@ -2793,8 +2884,12 @@ def cmd_process(args, config):
     transcript_path = channel_dir / f"{prefix}.transcript.md"
     raw_sidecar = channel_dir / f"{prefix}.transcript.raw.txt"
 
-    needs_mindmap = args.force or "scan" not in modes_done or not mindmap_path.exists()
-    needs_transcript = (
+    # Issue #42: per-mode skip from meta.skip_modes silences the corresponding
+    # step. Legacy `skip: true` was hard-exited above and never reaches here.
+    skip_mindmap = is_skipped_meta(existing_meta, mode="mindmap")
+    skip_transcript = is_skipped_meta(existing_meta, mode="transcript")
+    needs_mindmap = not skip_mindmap and (args.force or "scan" not in modes_done or not mindmap_path.exists())
+    needs_transcript = not skip_transcript and (
         args.force or "transcript" not in modes_done or not transcript_path.exists() or raw_sidecar.exists()
     )
     # When the orchestrator has decided a step needs work (missing artifact, stale
@@ -2882,15 +2977,24 @@ def cmd_process(args, config):
             media_uri=uri,
         )
 
-    _, mindmap_status = _call_with_file_expiry_retry("mindmap", _mindmap_call)
-    log.info("  mindmap [%s]: %s", prefix, mindmap_status)
-    # Loose prefix: process_mindmap / process_transcript surface errors as
-    # `error: <exception>` AND (for the JSON-parse-fail path) `error parsing JSON:`,
-    # so starts-with("error") catches both. Anything else ("done", "skipped (exists)")
-    # passes through.
-    if mindmap_status.startswith("error"):
-        log.error("Mindmap failed; aborting before transcript.")
-        sys.exit(1)
+    # Issue #42: per-mode skip MUST gate the helper call here, not just the
+    # upload upstream. process_mindmap/process_transcript only short-circuit on
+    # `path.exists() and not force` -- when an artifact is missing, they fall
+    # through to a Gemini call. Without this gate, skip_modes would be silently
+    # ignored on a fresh-prefix run.
+    if skip_mindmap:
+        mindmap_status = "skipped (skip_modes)"
+        log.info("  mindmap [%s]: %s", prefix, mindmap_status)
+    else:
+        _, mindmap_status = _call_with_file_expiry_retry("mindmap", _mindmap_call)
+        log.info("  mindmap [%s]: %s", prefix, mindmap_status)
+        # Loose prefix: process_mindmap / process_transcript surface errors as
+        # `error: <exception>` AND (for the JSON-parse-fail path) `error parsing JSON:`,
+        # so starts-with("error") catches both. Anything else ("done",
+        # "skipped (exists)") passes through.
+        if mindmap_status.startswith("error"):
+            log.error("Mindmap failed; aborting before transcript.")
+            sys.exit(1)
 
     # Step 2: transcript
     def _transcript_call(uri):
@@ -2908,11 +3012,15 @@ def cmd_process(args, config):
             media_uri=uri,
         )
 
-    _, transcript_status = _call_with_file_expiry_retry("transcript", _transcript_call)
-    log.info("  transcript [%s]: %s", prefix, transcript_status)
-    if transcript_status.startswith("error"):
-        log.warning("Transcript failed; skipping concepts. Mindmap artifact preserved.")
-        return
+    if skip_transcript:
+        transcript_status = "skipped (skip_modes)"
+        log.info("  transcript [%s]: %s", prefix, transcript_status)
+    else:
+        _, transcript_status = _call_with_file_expiry_retry("transcript", _transcript_call)
+        log.info("  transcript [%s]: %s", prefix, transcript_status)
+        if transcript_status.startswith("error"):
+            log.warning("Transcript failed; skipping concepts. Mindmap artifact preserved.")
+            return
 
     # Step 3: concepts (text-only; channel must be configured).
     if not channel_name:
@@ -3044,6 +3152,62 @@ def cmd_concepts(args, config):
     log.info(
         "Done. %d videos in %dm %ds. Run 'taxonomy-build' to rebuild the master taxonomy.", total, minutes, seconds
     )
+
+
+def cmd_mark_skip(args, config) -> None:
+    """Set ``skip_modes`` (and optional ``skip_reason``) on a video's meta.json.
+
+    Issue #42: instead of hand-editing JSON to silence transcript-only on a
+    long-form video, the user runs:
+
+        mark-skip --url URL --mode transcript [--mode concepts] [--reason TEXT]
+
+    Resolution: extract video_id from --url, walk every configured channel's
+    output folder for any meta.json carrying that video_id, then update.
+    Errors clearly when nothing matches. Validation is positive (argparse
+    `choices`); unknown modes never reach this function.
+    """
+    output_dir = resolve_output_dir(config)
+
+    video_id_match = re.search(r"(?:v=|/)([a-zA-Z0-9_-]{11})", args.url or "")
+    if not video_id_match:
+        log.error("Could not extract a YouTube video ID from --url: %s", args.url)
+        sys.exit(1)
+    video_id = video_id_match.group(1)
+
+    found: list[Path] = []
+    if output_dir.exists():
+        for meta_path in output_dir.glob("*/*.meta.json"):
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                continue
+            if meta.get("video_id") == video_id:
+                found.append(meta_path)
+
+    if not found:
+        log.error(
+            "No meta.json found for video_id %s under %s. "
+            "Run scan or transcript --url first so the meta exists, then re-run mark-skip.",
+            video_id,
+            output_dir,
+        )
+        sys.exit(1)
+
+    new_modes = list(args.mode or [])
+    for meta_path in found:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        existing = meta.get("skip_modes")
+        existing_list = list(existing) if isinstance(existing, list) else []
+        merged = list(existing_list)
+        for mode in new_modes:
+            if mode not in merged:
+                merged.append(mode)
+        update_fields: dict = {"skip_modes": merged}
+        if args.reason:
+            update_fields["skip_reason"] = args.reason
+        update_meta(meta_path, update_fields, mode="identity")
+        log.info("[%s] skip_modes=%s -> %s", meta_path.parent.name, existing_list, merged)
 
 
 def cmd_status(args, config):
@@ -4510,6 +4674,24 @@ Examples:
         help="Actually mutate disk. Default is dry-run (report only).",
     )
 
+    # mark-skip command (issue #42): set skip_modes on a video's meta.json
+    mark_skip_parser = subparsers.add_parser(
+        "mark-skip",
+        help="Mark a video to skip one or more processing modes (writes skip_modes to meta.json)",
+    )
+    mark_skip_parser.add_argument("--url", required=True, help="YouTube URL of the video to mark")
+    mark_skip_parser.add_argument(
+        "--mode",
+        action="append",
+        required=True,
+        choices=SKIP_MODES_VALID,
+        help="Processing mode to skip. Repeat for multiple modes (e.g. --mode transcript --mode concepts).",
+    )
+    mark_skip_parser.add_argument(
+        "--reason",
+        help="Optional human-readable reason persisted as skip_reason in meta.json",
+    )
+
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.WARNING,
@@ -4549,6 +4731,8 @@ Examples:
         cmd_dedupe(args, config)
     elif args.command == "prune-shorts":
         cmd_prune_shorts(args, config)
+    elif args.command == "mark-skip":
+        cmd_mark_skip(args, config)
 
 
 if __name__ == "__main__":
