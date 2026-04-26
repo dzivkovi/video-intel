@@ -136,9 +136,15 @@ gap a plugin developer needs to internalize.
 
 ## Prevention
 
-1. **Document the global-checkout behavior** in `CLAUDE.md`'s
-   "User-level install" section so future installers (or a fresh
-   future-self after months away) understand it without rediscovery.
+1. **Document the global-checkout behavior** in `INSTALLATION.md`'s
+   user-level section so future installers (or a fresh future-self
+   after months away) understand it without rediscovery. Done in this
+   PR's commit alongside the solution doc — see the second "Critical:"
+   blockquote in `INSTALLATION.md` after the marketplace-key callout.
+   Chose `INSTALLATION.md` over `CLAUDE.md` because the caveat helps a
+   narrow audience (plugin developers iterating on skills) and would
+   bloat `CLAUDE.md`'s every-session context cost for the much broader
+   curate/search audience that doesn't need it.
 2. **When troubleshooting "why isn't my new skill triggering?"**, first
    verify the marketplace path's checked-out branch matches the branch
    you THINK is being read. `git -C <marketplace-path> branch
@@ -153,23 +159,28 @@ gap a plugin developer needs to internalize.
    Distinguish the two install modes in any plugin's
    `INSTALLATION.md`.
 
-### Concrete CLAUDE.md addition (suggested for the plugin itself)
+### What landed in INSTALLATION.md (concrete shipped text)
+
+A second `> **Critical:**` blockquote was added immediately after the
+existing marketplace-key callout in the user-level install section:
 
 ```markdown
-### User-level install behavior — important caveat
-
-The user-level install at `~/.claude/settings.json` registers a marketplace
-at the **repo path on disk**. The plugin is read fresh from that path on
-every `claude` session start — there is no install-time cache for this
-mode. Implications:
-
-- **Pre-merge testing works.** Whatever branch is checked out in the
-  marketplace path is what every `claude` session sees, globally.
-- **Branch-switching has global side effects.** If you switch branches
-  in one terminal, every other open `claude` session loses access to
-  the previous branch's SKILL.md content on its next prompt.
-- **Use worktrees for parallel work** when any session is iterating on
-  plugin internals.
+> **Critical:** The user-level marketplace path is read **fresh from the
+> working tree on every session start** - there is no install-time cache.
+> Whatever branch is checked out at that path is what every `claude`
+> session sees globally, regardless of CWD. Three implications:
+> (1) **Pre-merge testing is valid** - iterating on `SKILL.md` /
+> `CLAUDE.md` / `specs/agent-rules.md`? Check out your branch in the
+> marketplace path; any `claude` session reads the live files, no need
+> to merge to test.
+> (2) **Branch-switching has global side effects** - `git checkout main`
+> in one terminal silently changes what every other open `claude`
+> session sees on its next prompt.
+> (3) **Use worktrees for parallel work** when any session is iterating
+> on plugin internals - `git worktree add` to a separate path does NOT
+> affect the marketplace-registered path's plugin state.
+> See `docs/solutions/integration-issues/plugin-install-reads-from-working-tree-not-frozen-cache-20260425.md`
+> for the original incident that surfaced this behavior.
 ```
 
 ## Related Issues

@@ -91,6 +91,23 @@ intentional, see `skills/video-intel-search/SKILL.md` for the rationale.
 > not appearing after Claude Code restart.** The fix below uses the correct
 > names - copy it verbatim.
 
+> **Critical:** The user-level marketplace path is read **fresh from the
+> working tree on every session start** - there is no install-time cache.
+> Whatever branch is checked out at that path is what every `claude`
+> session sees globally, regardless of CWD. Three implications:
+> (1) **Pre-merge testing is valid** - iterating on `SKILL.md` /
+> `CLAUDE.md` / `specs/agent-rules.md`? Check out your branch in the
+> marketplace path; any `claude` session reads the live files, no need
+> to merge to test.
+> (2) **Branch-switching has global side effects** - `git checkout main`
+> in one terminal silently changes what every other open `claude`
+> session sees on its next prompt.
+> (3) **Use worktrees for parallel work** when any session is iterating
+> on plugin internals - `git worktree add` to a separate path does NOT
+> affect the marketplace-registered path's plugin state.
+> See `docs/solutions/integration-issues/plugin-install-reads-from-working-tree-not-frozen-cache-20260425.md`
+> for the original incident that surfaced this behavior.
+
 **Step 1 - edit `~/.claude/settings.json`.** Add these two entries (merge
 with any existing content; do not replace the whole file):
 
