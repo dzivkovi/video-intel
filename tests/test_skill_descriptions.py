@@ -33,6 +33,15 @@ def _load_description(path: Path) -> str:
     return data["description"]
 
 
+def _load_body(path: Path) -> str:
+    """Return SKILL.md body (post-frontmatter) — mirrors _load_description split."""
+    text = path.read_text(encoding="utf-8")
+    assert text.startswith("---\n"), f"{path} does not start with YAML frontmatter"
+    _, rest = text.split("---\n", 1)
+    _, body = rest.split("\n---\n", 1)
+    return body
+
+
 # Phrases that belong to video-intel-search (read-only query intent).
 # Matching is case-insensitive substring.
 SEARCH_TRIGGERS = [
@@ -47,6 +56,12 @@ SEARCH_TRIGGERS = [
     "corpus status",
     "summarize this video",
     "is this worth watching",
+    # Verification / fact-check triggers (added 2026-04-25, KD3/KD4):
+    "verify whether",
+    "fact-check",
+    "really say",
+    "quote real",
+    "find the source",
 ]
 
 # Phrases that belong to video-intel (ingest/curate intent).
@@ -127,3 +142,41 @@ class TestSkillMetadataSanity:
         frontmatter_yaml, _ = rest.split("\n---\n", 1)
         data = yaml.safe_load(frontmatter_yaml)
         assert data["name"] == "video-intel"
+
+    def test_curate_skill_routes_verify_intent_to_search_skill(self):
+        """KD6: curate-skill 'Wrong skill' row bounces verification queries.
+
+        AND-style assertion: 'verify quote' AND 'fact-check' AND
+        'video-intel-search' must all appear in the body so a silent
+        half-rollback (someone removing one phrase while leaving the other)
+        breaks the test. Body-only check; the description-substring mutex
+        already verifies these phrases are NOT in the curate description.
+        """
+        body = _load_body(CURATE_SKILL).lower()
+        assert "verify quote" in body, (
+            "curate skill body missing 'verify quote' bounce phrase - "
+            "verification queries will not route to video-intel-search"
+        )
+        assert "fact-check" in body, (
+            "curate skill body missing 'fact-check' bounce phrase - "
+            "fact-check queries will not route to video-intel-search"
+        )
+        assert "video-intel-search" in body, (
+            "curate skill body missing 'video-intel-search' pointer - "
+            "the bounce row no longer names the destination skill"
+        )
+
+    def test_anti_grep_callout_present_in_search_skill_body(self):
+        """KD5: anti-grep callout in video-intel-search body names the why.
+
+        Guards the specific regression most likely to bite — someone "tightening"
+        the body and accidentally removing the callout. Three substring assertions
+        on a single, named callout lock the lesson's "why" (vocabulary mismatch)
+        along with the "what" (no grep).
+        """
+        body = _load_body(SEARCH_SKILL).lower()
+        assert "do not" in body, "anti-grep callout missing 'Do not' phrasing in video-intel-search body"
+        assert "`grep`" in body, "anti-grep callout missing literal `grep` in backticks in video-intel-search body"
+        assert "vocabulary" in body, (
+            "anti-grep callout missing 'vocabulary' (the why-it-fails reason) in video-intel-search body"
+        )
