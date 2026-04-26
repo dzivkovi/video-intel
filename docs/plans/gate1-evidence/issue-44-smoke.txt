@@ -1,0 +1,24 @@
+[2026-04-26T04:51:18Z WARN  lance::dataset::write::insert] No existing dataset at C:\Windows\TEMP\vi-smoke-uk7t881s\_lancedb\_probe_08b4790f2a15\probe.lance, it will be created
+00:51:18 INFO    [kieranklaassen] Found 1 transcripts
+00:51:18 INFO    Embedding 121 chunks with voyage-4-large...
+00:51:18 WARNING Voyage batch too large (121 chunks); splitting into 60 + 61
+00:51:18 INFO    [1/~2] Embedded 60 chunks
+00:51:19 INFO    [2/~2] Embedded 61 chunks
+[2026-04-26T04:51:19Z WARN  lance::dataset::write::insert] No existing dataset at C:\Windows\TEMP\vi-smoke-uk7t881s\_lancedb\transcript_chunks.lance, it will be created
+00:51:19 INFO    Indexed 121 chunks into C:\Windows\TEMP\vi-smoke-uk7t881s\_lancedb
+
+=== Gate 1 smoke for issue #44 ===
+corpus    : C:\Windows\TEMP\vi-smoke-uk7t881s
+vector_db : C:\Windows\TEMP\vi-smoke-uk7t881s\_lancedb
+channel   : kieranklaassen
+voyage    : stubbed (no real API calls)
+
+
+--- Results ---
+chunks indexed         : 121
+voyage stub call count : 3
+voyage batch sizes     : [121, 60, 61]
+lancedb rows           : 121
+channels in index      : ['kieranklaassen']
+
+=== Gate 1 PASS ===
