@@ -3082,6 +3082,10 @@ VOYAGE_DOC_MODEL = "voyage-4-large"
 VOYAGE_QUERY_MODEL = "voyage-4-lite"
 VOYAGE_DIMS = 1024
 VOYAGE_BATCH_SIZE = 128
+# Floor for adaptive batch-halving on Voyage token-cap errors. When a batch
+# at this size still trips the cap, the chunk content itself is pathological
+# and we raise rather than recurse further. See issue #44.
+MIN_BATCH_SIZE = 4
 
 
 def require_lancedb():
@@ -3192,33 +3196,89 @@ def _extract_video_metadata(prefix: str, channel_dir: Path, channel_name: str) -
 
 
 def _embed_batch(vo_client, texts: list[str], model: str, input_type: str) -> list[list[float]]:
-    """Embed a list of texts with Voyage AI, handling batch size and rate limits."""
-    all_embeddings = []
-    total_batches = (len(texts) + VOYAGE_BATCH_SIZE - 1) // VOYAGE_BATCH_SIZE
+    """Embed a list of texts with Voyage AI, with adaptive batch-halving on
+    per-batch token-cap errors plus exponential backoff on rate-limit and
+    connection errors.
 
-    for batch_num, i in enumerate(range(0, len(texts), VOYAGE_BATCH_SIZE)):
-        batch = texts[i : i + VOYAGE_BATCH_SIZE]
-        max_retries = 5
-        for attempt in range(max_retries + 1):
-            try:
-                result = vo_client.embed(batch, model=model, input_type=input_type)
-                all_embeddings.extend(result.embeddings)
-                log.info("[%d/%d] Embedded %d chunks", batch_num + 1, total_batches, len(batch))
-                # Pace requests to stay under rate limits (3 RPM on free tier)
-                if batch_num < total_batches - 1:
-                    time.sleep(1)
-                break
-            except Exception as e:
-                error_str = str(e).lower()
-                is_rate_limit = "rate" in error_str and "limit" in error_str
-                is_connection = "connection" in error_str or "resolve" in error_str or "timeout" in error_str
-                if (is_rate_limit or is_connection) and attempt < max_retries:
-                    wait = 25 * (2**attempt) + random.uniform(0, 5)
-                    reason = "rate limited" if is_rate_limit else "connection error"
-                    log.warning("Voyage %s, waiting %ds (attempt %d/%d)...", reason, wait, attempt + 1, max_retries)
-                    time.sleep(wait)
-                else:
+    Token-cap recovery (issue #44): Voyage rejects batches whose total token
+    count exceeds the model's per-batch cap (120,000 for voyage-4-large) with
+    an InvalidRequestError. The match is substring-based against two stable
+    phrases ("max allowed tokens" and "tokens per submitted batch") so a minor
+    SDK rewording does not silently regress the recovery path. Token-cap
+    detection takes precedence over rate-limit detection: a message that
+    happens to contain both substrings means split, not backoff -- the
+    underlying problem is sizing, not pacing.
+
+    Halving stops at MIN_BATCH_SIZE: below that, a single chunk is genuinely
+    pathological and we raise. On any raise from this helper, no LanceDB
+    write occurs and the previous index (if any) is preserved -- recovery is
+    to re-run `index --force` from scratch; there is no resume.
+    """
+    all_embeddings: list[list[float]] = []
+    pending: list[list[str]] = [texts[i : i + VOYAGE_BATCH_SIZE] for i in range(0, len(texts), VOYAGE_BATCH_SIZE)]
+    done = 0
+
+    try:
+        while pending:
+            batch = pending.pop(0)
+            max_retries = 5
+            attempt = 0
+            while True:
+                try:
+                    result = vo_client.embed(batch, model=model, input_type=input_type)
+                    all_embeddings.extend(result.embeddings)
+                    done += 1
+                    # ~total grows as splits happen; the tilde signals an estimate.
+                    log.info("[%d/~%d] Embedded %d chunks", done, done + len(pending), len(batch))
+                    if pending:
+                        time.sleep(1)
+                    break
+                except Exception as e:
+                    error_str = str(e).lower()
+                    is_token_cap = "max allowed tokens" in error_str or "tokens per submitted batch" in error_str
+                    is_rate_limit = "rate" in error_str and "limit" in error_str
+                    is_connection = "connection" in error_str or "resolve" in error_str or "timeout" in error_str
+
+                    # Token-cap precedence: split rather than retry.
+                    if is_token_cap and len(batch) > MIN_BATCH_SIZE:
+                        mid = len(batch) // 2
+                        log.warning(
+                            "Voyage batch too large (%d chunks); splitting into %d + %d",
+                            len(batch),
+                            mid,
+                            len(batch) - mid,
+                        )
+                        pending = [batch[:mid], batch[mid:], *pending]
+                        break  # exit inner retry loop, dequeue next batch
+
+                    if is_token_cap:
+                        # At MIN_BATCH_SIZE floor: a single chunk is too large.
+                        log.error(
+                            "Voyage batch at floor size %d still exceeds token cap; raising",
+                            len(batch),
+                        )
+                        raise
+
+                    if (is_rate_limit or is_connection) and attempt < max_retries:
+                        wait = 25 * (2**attempt) + random.uniform(0, 5)
+                        reason = "rate limited" if is_rate_limit else "connection error"
+                        log.warning("Voyage %s, waiting %ds (attempt %d/%d)...", reason, wait, attempt + 1, max_retries)
+                        time.sleep(wait)
+                        attempt += 1
+                        continue
+
                     raise
+    except Exception:
+        # Mid-run failure: caller's `db.create_table(... mode="overwrite")` is
+        # downstream of us, so the previous index survives. Surface the sunk
+        # Voyage spend so the user can see it before re-running.
+        if done > 0:
+            log.warning(
+                "Voyage spend before failure: %d batches embedded (%d chunks); results discarded; LanceDB not written",
+                done,
+                len(all_embeddings),
+            )
+        raise
 
     return all_embeddings
 

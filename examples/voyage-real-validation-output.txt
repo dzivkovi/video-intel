@@ -1,0 +1,32 @@
+11:03:03 INFO    Calling build_search_index against real Voyage...
+[2026-04-26T15:03:06Z WARN  lance::dataset::write::insert] No existing dataset at C:\Users\danie\ws\Skills\video-intel\.claude\worktrees\issue-44-voyage-batch-halving\examples\.lancedb-validation\_probe_8c24929a9234\probe.lance, it will be created
+11:03:06 INFO    [kieranklaassen] Found 1 transcripts
+11:03:06 INFO    [lennyspodcast] Found 2 transcripts
+11:03:06 INFO    Embedding 181 chunks with voyage-4-large...
+11:03:08 INFO    [1/~2] Embedded 128 chunks
+11:03:09 INFO    [2/~2] Embedded 53 chunks
+[2026-04-26T15:03:09Z WARN  lance::dataset::write::insert] No existing dataset at C:\Users\danie\ws\Skills\video-intel\.claude\worktrees\issue-44-voyage-batch-halving\examples\.lancedb-validation\transcript_chunks.lance, it will be created
+11:03:10 INFO    Indexed 181 chunks into C:\Users\danie\ws\Skills\video-intel\.claude\worktrees\issue-44-voyage-batch-halving\examples\.lancedb-validation
+=== Issue #44 real-Voyage validation ===
+corpus    : C:\Windows\TEMP\vi-real-validation-e7mr248i  (TEMP, copied from G:\My Drive\video-intel)
+vector_db : C:\Users\danie\ws\Skills\video-intel\.claude\worktrees\issue-44-voyage-batch-halving\examples\.lancedb-validation  (ISOLATED -- production NOT touched)
+voyage    : real SDK, real API spend (~$0.05 estimated)
+
+Per-file chunk counts:
+  #1 Chip Huyen - AI Engineering 101            chunks=20  (lennyspodcast/2025-10-23-al-engineering-101-with-chip-huyen-nvidia-stanford-netflix)
+  #2 Cat Wu - Anthropic Head of Product         chunks=40  (lennyspodcast/2026-04-23-how-anthropics-product-team-moves-faster-than-anyone-else-cat-wu-head-of-product)
+  #3 Kieran X - GPT 5.5 thinking                chunks=121  (kieranklaassen/Kieran Klaassen on X GPT 5.5 is capable. You can see it thinking)
+  TOTAL                                         chunks=181
+
+
+--- Results ---
+chunks indexed         : 181
+lancedb rows           : 181
+channels in index      : ['kieranklaassen', 'lennyspodcast']
+per-channel row counts : {'kieranklaassen': 121, 'lennyspodcast': 60}
+sample chunk text      : '[00:00] Kieran Klaassen (General Manager): "whole notes from different people across the organization. Uh like we\'re we\''...
+
+=== Real-Voyage validation PASS ===
+  - 3 suspect transcripts processed cleanly through patched _embed_batch
+  - Production index at C:/Users/danie/video-intel-cache/lancedb UNCHANGED
+  - LanceDB output landed at C:\Users\danie\ws\Skills\video-intel\.claude\worktrees\issue-44-voyage-batch-halving\examples\.lancedb-validation

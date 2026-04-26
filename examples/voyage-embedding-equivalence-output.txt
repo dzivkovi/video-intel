@@ -1,0 +1,24 @@
+=== Embedding equivalence check ===
+Production : C:\Users\danie\video-intel-cache\lancedb  (built without halving)
+Test       : C:\Users\danie\ws\Skills\video-intel\.claude\worktrees\issue-44-voyage-batch-halving\examples\.lancedb-validation  (built via halving recovery)
+
+Production rows in scope (['lennyspodcast']): 206
+Test rows                                   : 206
+Matched on (channel, video_id, timestamp_seconds): 206
+
+--- Vector comparison ---
+chunks compared             : 206
+bit-identical vectors       : 164 / 206
+chunks with differing text  : 0 (production text != test text)
+cosine similarity min       : 0.999273
+cosine similarity max       : 1.000000
+cosine similarity mean      : 0.999977
+cosine similarity median    : 1.000000
+chunks with cosine == 1.0   : 77
+chunks with cosine >= 0.9999: 198
+chunks with cosine < 0.99   : 0
+
+--- Verdict ---
+CLOSE: All vectors agree to >= 0.99 cosine similarity. Likely
+halving is transparent and Voyage's model has minor server-side
+drift between the production build and this test run.
