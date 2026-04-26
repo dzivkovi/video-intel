@@ -1,0 +1,42 @@
+16:14:15 INFO    Calling build_search_index against real Voyage...
+[2026-04-26T20:14:17Z WARN  lance::dataset::write::insert] No existing dataset at C:\Users\danie\ws\Skills\video-intel\.claude\worktrees\issue-44-voyage-batch-halving\examples\.lancedb-validation\_probe_b820e96b2d10\probe.lance, it will be created
+16:14:17 INFO    [lennyspodcast] Found 7 transcripts
+16:14:17 INFO    Embedding 206 chunks with voyage-4-large...
+16:14:18 INFO    error_message="Request to model 'voyage-4-large' failed. The max allowed tokens per submitted batch is 120000. Your batch has 155083 tokens after truncation. Please lower the number of tokens in the batch." message='Voyage API error received'
+16:14:18 WARNING Voyage batch too large (206 chunks); splitting into 103 + 103
+16:14:20 INFO    [1/~2] Embedded 103 chunks
+16:14:23 INFO    [2/~2] Embedded 103 chunks
+[2026-04-26T20:14:23Z WARN  lance::dataset::write::insert] No existing dataset at C:\Users\danie\ws\Skills\video-intel\.claude\worktrees\issue-44-voyage-batch-halving\examples\.lancedb-validation\transcript_chunks.lance, it will be created
+16:14:23 INFO    Indexed 206 chunks into C:\Users\danie\ws\Skills\video-intel\.claude\worktrees\issue-44-voyage-batch-halving\examples\.lancedb-validation
+VOYAGE_BATCH_SIZE overridden: 128 -> 256 (this run only; module constant restored on exit)
+
+=== Issue #44 real-Voyage validation -- mode=halving-trigger ===
+corpus    : C:\Windows\TEMP\vi-real-validation-tknbd9wm  (TEMP, copied from G:\My Drive\video-intel)
+vector_db : C:\Users\danie\ws\Skills\video-intel\.claude\worktrees\issue-44-voyage-batch-halving\examples\.lancedb-validation  (ISOLATED -- production NOT touched)
+voyage    : real SDK, real API spend
+
+Per-file chunk counts:
+  lp/the-ai-native-startup                                chunks=26  (lennyspodcast/2025-07-17-the-ai-native-startup-5-products-7-)
+  lp/anthropic-co-founder-agi                             chunks=24  (lennyspodcast/2025-07-20-anthropic-co-founder-agi-prediction)
+  lp/why-ai-evals-are                                     chunks=56  (lennyspodcast/2025-09-25-why-ai-evals-are-the-hottest-new-sk)
+  lp/al-engineering-101-with                              chunks=20  (lennyspodcast/2025-10-23-al-engineering-101-with-chip-huyen-)
+  lp/why-most-ai-products                                 chunks=3  (lennyspodcast/2026-01-11-why-most-ai-products-fail-lessons-f)
+  lp/head-of-claude-code                                  chunks=37  (lennyspodcast/2026-02-19-head-of-claude-code-what-happens-af)
+  lp/how-anthropics-product-team                          chunks=40  (lennyspodcast/2026-04-23-how-anthropics-product-team-moves-f)
+  TOTAL                                                   chunks=206
+
+
+--- Results ---
+chunks indexed         : 206
+halving events fired   : 1
+  -> Voyage batch too large (206 chunks); splitting into 103 + 103
+lancedb rows           : 206
+channels in index      : ['lennyspodcast']
+per-channel row counts : {'lennyspodcast': 206}
+sample chunk text      : '[00:00] Lenny Rachitsky (Host): "The business you\'re building, the team you\'re building, the way you\'re operating is the'...
+
+=== Real-Voyage validation PASS ===
+  - mode=halving-trigger, files=7, total chunks indexed=206
+  - HALVING FIRED on real Voyage: 1 split event(s)
+  - Production index at C:/Users/danie/video-intel-cache/lancedb UNCHANGED
+  - LanceDB output landed at C:\Users\danie\ws\Skills\video-intel\.claude\worktrees\issue-44-voyage-batch-halving\examples\.lancedb-validation
