@@ -47,3 +47,6 @@ skill-eval-workspace/**
 !skill-eval-workspace/**/*-report.html
 !skill-eval-workspace/**/*-trigger-eval.json
 !skill-eval-workspace/README.md
+
+# Local smoke-test sandboxes (Gate 1 evidence is committed under docs/plans/gate1-evidence)
+/.smoke/

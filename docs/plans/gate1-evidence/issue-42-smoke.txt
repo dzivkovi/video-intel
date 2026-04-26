@@ -1,0 +1,103 @@
+Gate 1 smoke evidence - Issue #42 (per-mode skip + long-video transcript guard)
+================================================================================
+Run date: 2026-04-26
+Branch:   feat/issue-42-skip-controls
+Harness:  .smoke/smoke_run.py (sandbox copy of real Sean Kochel meta.json)
+
+Trigger video: X5UN2LrRK48
+  "Build Your First SaaS App - Complete Solo Founder Blueprint (Part 1)"
+  Duration 2h24m42s (8682s) - the issue's real-world hang trigger
+
+--------------------------------------------------------------------------------
+1. mark-skip command writes the right shape into meta.json
+--------------------------------------------------------------------------------
+
+BEFORE (sandbox copy, with original skip:true / skip_reason removed to simulate
+a fresh case):
+
+  "transcript_parse_error": "Expecting 'delimiter at line 7 (smoke-test fixture)"
+
+AFTER `mark-skip --url ...X5UN2LrRK48 --mode transcript --reason '...'`:
+
+  "transcript_parse_error": "Expecting 'delimiter at line 7 (smoke-test fixture)",
+  "skip_modes": [
+    "transcript"
+  ],
+  "skip_reason": "Issue #42 smoke: 2h24m42s exceeds Gemini transcript reliability threshold"
+
+modes_completed array preserved unchanged ("scan", "concepts"). No other
+fields perturbed.
+
+--------------------------------------------------------------------------------
+2. Per-mode gating decisions on the resulting meta
+--------------------------------------------------------------------------------
+
+  is_skipped(mode='mindmap'   ) -> ALLOW   <-- mindmap loop runs
+  is_skipped(mode='transcript') -> BLOCK   <-- transcript loop skips
+  is_skipped(mode='concepts'  ) -> ALLOW   <-- concepts loop runs
+
+Issue's acceptance criterion #3 satisfied.
+
+--------------------------------------------------------------------------------
+3. Long-video threshold filter classifies the trigger video correctly
+--------------------------------------------------------------------------------
+
+  Sub-threshold 30-min talk            PT30M        -> 30m        -> KEEP
+  Just under 90-min limit              PT1H29M      -> 1h29m      -> KEEP
+  Exactly 90-min limit                 PT1H30M      -> 1h30m      -> KEEP
+  1 second over - first to drop        PT1H30M1S    -> 1h30m1s    -> DROP
+  Sean Kochel trigger video            PT2H24M42S   -> 2h24m42s   -> DROP
+
+Boundary correct: > threshold (strict greater-than). Off-by-one safe.
+Issue's acceptance criterion #1 satisfied.
+
+--------------------------------------------------------------------------------
+4. Backward compat - legacy skip:true still blocks all modes
+--------------------------------------------------------------------------------
+
+  legacy skip:true is_skipped(mode='mindmap'   ) -> BLOCK
+  legacy skip:true is_skipped(mode='transcript') -> BLOCK
+  legacy skip:true is_skipped(mode='concepts'  ) -> BLOCK
+
+Issue's acceptance criterion #4 satisfied.
+
+--------------------------------------------------------------------------------
+5. skip_modes wins outright when both keys are present
+--------------------------------------------------------------------------------
+
+  meta = { skip: true, skip_modes: ["transcript"] }
+
+  mode='mindmap'    -> ALLOW   <-- skip_modes overrides legacy boolean
+  mode='transcript' -> BLOCK
+  mode='concepts'   -> ALLOW
+
+Documented in CLAUDE.md guardrail and is_skipped_meta() docstring.
+
+--------------------------------------------------------------------------------
+6. CLI surface
+--------------------------------------------------------------------------------
+
+  $ python scripts/video_intel.py mark-skip --help
+  usage: video_intel.py mark-skip [-h] --url URL --mode
+                                  {mindmap,transcript,concepts}
+                                  [--reason REASON]
+  options:
+    -h, --help            show this help message and exit
+    --url URL             YouTube URL of the video to mark
+    --mode {mindmap,transcript,concepts}
+                          Processing mode to skip. Repeat for multiple modes
+                          (e.g. --mode transcript --mode concepts).
+    --reason REASON       Optional human-readable reason persisted as
+                          skip_reason in meta.json
+
+Argparse choices= rejects unknown modes. Required: --url and --mode.
+
+--------------------------------------------------------------------------------
+Test suite snapshot
+--------------------------------------------------------------------------------
+
+701 passed in 15.56s
+  (665 pre-existing + 36 new in tests/test_skip_long_videos.py)
+
+ruff format .             # 29 files left unchanged
+ruff check scripts/ tests/ # All checks passed!
