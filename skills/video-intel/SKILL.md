@@ -118,7 +118,7 @@ table is the canonical mapping — read it before picking a command.
 | "rebuild the index", "reindex after dedupe" | `index --force` | Write-path rebuild of LanceDB; query uses `video-intel-search` |
 | "prune shorts", "remove shorts", "too many shorts in my corpus" | `prune-shorts [--apply]` | **Always `--dry-run` first** — destructive on `--apply`; deletes mindmap/transcript/concepts/meta per Short |
 | "rebuild taxonomy", "update master vocabulary" | `taxonomy-build` | Derived artifact; rebuildable anytime |
-| "find videos about X", "search for Y", "nugget brief on Z", "corpus status" | — | **Wrong skill.** These are read-only queries; use the **video-intel-search** skill. |
+| "find videos about X", "search for Y", "nugget brief on Z", "corpus status", "verify quote", "fact-check claim against [creator]" | — | **Wrong skill.** These are read-only queries; use the **video-intel-search** skill. |
 
 ### Channel name resolution
 

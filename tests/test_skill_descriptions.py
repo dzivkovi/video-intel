@@ -143,6 +143,29 @@ class TestSkillMetadataSanity:
         data = yaml.safe_load(frontmatter_yaml)
         assert data["name"] == "video-intel"
 
+    def test_curate_skill_routes_verify_intent_to_search_skill(self):
+        """KD6: curate-skill 'Wrong skill' row bounces verification queries.
+
+        AND-style assertion: 'verify quote' AND 'fact-check' AND
+        'video-intel-search' must all appear in the body so a silent
+        half-rollback (someone removing one phrase while leaving the other)
+        breaks the test. Body-only check; the description-substring mutex
+        already verifies these phrases are NOT in the curate description.
+        """
+        body = _load_body(CURATE_SKILL).lower()
+        assert "verify quote" in body, (
+            "curate skill body missing 'verify quote' bounce phrase - "
+            "verification queries will not route to video-intel-search"
+        )
+        assert "fact-check" in body, (
+            "curate skill body missing 'fact-check' bounce phrase - "
+            "fact-check queries will not route to video-intel-search"
+        )
+        assert "video-intel-search" in body, (
+            "curate skill body missing 'video-intel-search' pointer - "
+            "the bounce row no longer names the destination skill"
+        )
+
     def test_anti_grep_callout_present_in_search_skill_body(self):
         """KD5: anti-grep callout in video-intel-search body names the why.
 
