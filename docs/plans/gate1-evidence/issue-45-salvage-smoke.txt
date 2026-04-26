@@ -1,0 +1,24 @@
+======================================================================
+GATE 1 SMOKE TEST v2 - issue #45 (post-rebase on main)
+======================================================================
+
+== robotics raw (task-wrapper + Cyrillic, salvage path) ==
+   salvaged: speech=93  screen=14  speakers=5
+   acceptance: speech>=80 -> PASS
+
+== BCI raw (simple format + Cyrillic, salvage path) ==
+   salvaged: speech=405  screen=5  speakers=2
+   acceptance: speech>=400 -> PASS
+
+== CLEAN task-wrapper (P0 case, full-parse path) ==
+   try_parse: err=None  type=dict
+   normalized has transcripts key: True
+   merge: fused length=45  contains "Hello": True
+   acceptance: non-empty fused with content -> PASS
+
+== Classic flat envelope (regression guard) ==
+   try_parse: err=None  unchanged: True
+   acceptance: byte-identical pass-through -> PASS
+
+======================================================================
+Done.

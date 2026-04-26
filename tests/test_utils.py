@@ -1218,6 +1218,175 @@ class TestSalvageTranscriptSections:
         assert result.get("screen_content", []) == []
         assert result.get("speakers", []) == []
 
+    def test_recovers_from_pro_task_wrapper_format(self):
+        """Pro sometimes wraps each section in {task, output}. Salvage must
+        normalize that shape into the flat envelope before recovering entries.
+        See issue #45."""
+        speech = [{"start": f"00:{i:02d}", "voice": 1, "text": f"Line {i}"} for i in range(10)]
+        screens = [{"start": "01:00", "end": "01:10", "type": "slide", "description": "Title"}]
+        speakers = [{"voice": 1, "name": "Host"}]
+        wrapped = json.dumps(
+            [
+                {"task": "transcripts", "output": speech},
+                {"task": "screen_content", "output": screens},
+                {"task": "speakers", "output": speakers},
+            ]
+        )
+        result, warning = salvage_transcript_sections(wrapped)
+        assert len(result.get("transcripts", [])) >= SALVAGE_MIN_SPEECH_ENTRIES
+        assert len(result.get("screen_content", [])) == 1
+        assert len(result.get("speakers", [])) == 1
+        assert warning is not None
+
+    def test_recovers_from_task_wrapper_with_cyrillic_intrusion(self):
+        """Wrapper + a Cyrillic token injected before a `text` key. Per-entry
+        salvage drops the corrupted entry, but the rest must come through."""
+        wrapped = """[
+  {
+    "task": "transcripts",
+    "output": [
+      {
+        "start": "00:00",
+        "voice": 1,
+ минерал"text": "first line corrupted by a cyrillic intrusion"
+      },
+      {"start": "00:10", "voice": 1, "text": "second line clean"},
+      {"start": "00:20", "voice": 1, "text": "third line clean"},
+      {"start": "00:30", "voice": 1, "text": "fourth line clean"},
+      {"start": "00:40", "voice": 1, "text": "fifth line clean"},
+      {"start": "00:50", "voice": 1, "text": "sixth line clean"}
+    ]
+  }
+]"""
+        result, _warning = salvage_transcript_sections(wrapped)
+        assert len(result.get("transcripts", [])) >= 1
+
+    def test_task_wrapper_recovery_does_not_break_simple_format(self):
+        """Regression guard: classic flat envelope must still salvage as before."""
+        entries = [{"start": f"00:{i:02d}", "voice": 1, "text": f"Line {i}"} for i in range(10)]
+        raw = '{"transcripts": ' + json.dumps(entries) + ', "screen_content": [{"start": "01:00"'
+        result, warning = salvage_transcript_sections(raw)
+        assert len(result.get("transcripts", [])) >= SALVAGE_MIN_SPEECH_ENTRIES
+        assert warning is not None
+
+    def test_malformed_wrapper_does_not_raise(self):
+        """A truncated wrapper that does not full-parse must degrade gracefully:
+        salvage returns a well-shaped result without raising, even if all lists
+        are empty. This locks the no-raise contract; the recovery-strength
+        contract is covered by the synthetic and real-fixture tests above."""
+        truncated = '[{"task": "transcripts", "output": [{"start": "00:00", "voice": 1, "text"'
+        result, _ = salvage_transcript_sections(truncated)
+        assert isinstance(result, dict)
+        assert set(result.keys()) >= {"transcripts", "screen_content", "speakers"}
+        for key in ("transcripts", "screen_content", "speakers"):
+            assert isinstance(result[key], list)
+
+    def test_wrapper_with_unknown_task_does_not_overwrite_with_empty(self):
+        """Defensive guard: if Pro emits the wrapper shape with an unknown task
+        name (not in {transcripts, screen_content, speakers}), salvage must
+        not silently rewrite the input to an empty envelope. Either recover
+        nothing OR fall through to the legacy regex - never claim success."""
+        unknown = json.dumps(
+            [
+                {
+                    "task": "speech",
+                    "output": [{"start": f"00:{i:02d}", "voice": 1, "text": f"Line {i}"} for i in range(10)],
+                },
+            ]
+        )
+        # Whether or not legacy salvage finds anything, we must not have
+        # OVERWRITTEN the original text with an empty envelope and lost the
+        # bytes the per-object walker could have reached.
+        result, _ = salvage_transcript_sections(unknown)
+        assert isinstance(result.get("transcripts"), list)
+
+    def test_robotics_raw_sidecar_recovers_at_least_80_speech_entries(self):
+        """Acceptance criterion 1 from issue #45: the real sidecar that hit
+        zero entries today must recover at least 80 once the fix lands.
+        Skips on a fresh clone where the file is not present."""
+        raw_path = Path(
+            r"G:\My Drive\video-intel\ycombinator\2026-04-16-the-gpt-moment-for-robotics-is-here.transcript.raw.txt"
+        )
+        if not raw_path.exists():
+            pytest.skip(f"Real fixture not on disk: {raw_path}")
+        text = raw_path.read_text(encoding="utf-8")
+        result, _ = salvage_transcript_sections(text)
+        assert len(result.get("transcripts", [])) >= 80
+
+    def test_bci_raw_sidecar_still_recovers_at_least_400_speech_entries(self):
+        """Acceptance criterion 2 from issue #45: regression check on the
+        sidecar that already salvages well today (~405 entries)."""
+        raw_path = Path(
+            r"G:\My Drive\video-intel\ycombinator\2026-03-09-the-future-of-brain-computer-interfaces.transcript.raw.txt"
+        )
+        if not raw_path.exists():
+            pytest.skip(f"Real fixture not on disk: {raw_path}")
+        text = raw_path.read_text(encoding="utf-8")
+        result, _ = salvage_transcript_sections(text)
+        assert len(result.get("transcripts", [])) >= 400
+
+
+class TestTryParseTranscriptJsonWrapperHandling:
+    """Issue #45 P0: clean task-wrapper responses must not bypass normalization.
+    `try_parse_transcript_json` must return a flat-envelope dict for wrapper
+    inputs so the downstream `merge_transcript_json` produces a non-empty
+    transcript on the full-parse path (not just the salvage path)."""
+
+    def test_clean_wrapper_returns_flat_envelope_dict(self):
+        wrapper = json.dumps(
+            [
+                {
+                    "task": "transcripts",
+                    "output": [
+                        {"start": "00:10", "voice": 1, "text": "Hello"},
+                        {"start": "00:20", "voice": 1, "text": "World"},
+                    ],
+                },
+                {"task": "screen_content", "output": []},
+                {"task": "speakers", "output": [{"voice": 1, "name": "Host"}]},
+            ]
+        )
+        parsed, err = try_parse_transcript_json(wrapper)
+        assert err is None
+        assert isinstance(parsed, dict), "wrapper must be normalized to flat dict"
+        assert len(parsed.get("transcripts", [])) == 2
+        assert len(parsed.get("speakers", [])) == 1
+
+    def test_clean_wrapper_produces_nonempty_fused_transcript(self):
+        """End-to-end: clean wrapper -> parse -> merge -> non-empty markdown."""
+        from video_intel import merge_transcript_json
+
+        wrapper = json.dumps(
+            [
+                {
+                    "task": "transcripts",
+                    "output": [
+                        {"start": "00:10", "voice": 1, "text": "Hello there"},
+                        {"start": "00:20", "voice": 1, "text": "Welcome to the show"},
+                    ],
+                },
+                {"task": "screen_content", "output": []},
+                {"task": "speakers", "output": [{"voice": 1, "name": "Host"}]},
+            ]
+        )
+        parsed, err = try_parse_transcript_json(wrapper)
+        assert err is None
+        fused = merge_transcript_json(parsed, {})
+        assert "Hello there" in fused
+        assert "Welcome to the show" in fused
+
+    def test_flat_envelope_passes_through_unchanged(self):
+        """Regression guard: the normal flat-envelope response must NOT be
+        accidentally rewritten by wrapper detection."""
+        flat = {
+            "transcripts": [{"start": "00:10", "voice": 1, "text": "Hello"}],
+            "screen_content": [],
+            "speakers": [{"voice": 1, "name": "Host"}],
+        }
+        parsed, err = try_parse_transcript_json(json.dumps(flat))
+        assert err is None
+        assert parsed == flat
+
 
 # ---------------------------------------------------------------------------
 # process_transcript resilience
