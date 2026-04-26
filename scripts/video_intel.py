@@ -2167,6 +2167,18 @@ def cmd_scan(args, config):
             since_dt = parse_since(since_str)
             log.info("  Looking back to %s", since_dt.strftime("%Y-%m-%d"))
             videos = fetch_channel_videos(youtube, channel_id, since_dt)
+
+        # Issue #42 follow-up: declarative video-id blocklist. Filter pre-Gemini and
+        # pre-enrich so listed IDs never trigger meta writes, duration lookups, or
+        # processing. Override path is removing the ID from config.yaml.
+        skip_ids = set(ch.get("skip_video_ids") or [])
+        if skip_ids:
+            before = len(videos)
+            videos = [v for v in videos if v.get("video_id") not in skip_ids]
+            n_filtered = before - len(videos)
+            if n_filtered:
+                log.info("  Filtered %d video(s) per skip_video_ids config.", n_filtered)
+
         if not videos:
             # With auto_concepts enabled we still want to enumerate local-recovery
             # artifacts via the *.meta.json glob below, even when YouTube has no

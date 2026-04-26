@@ -119,6 +119,7 @@ table is the canonical mapping — read it before picking a command.
 | "prune shorts", "remove shorts", "too many shorts in my corpus" | `prune-shorts [--apply]` | **Always `--dry-run` first** — destructive on `--apply`; deletes mindmap/transcript/concepts/meta per Short |
 | "rebuild taxonomy", "update master vocabulary" | `taxonomy-build` | Derived artifact; rebuildable anytime |
 | "skip transcript on this video", "stop trying to transcribe [URL]", "this video keeps failing transcript", "block transcript only" | `mark-skip --url URL --mode transcript [--reason TEXT]` | Per-mode skip (issue #42). Mindmap and concepts continue to run. Repeatable: `--mode transcript --mode concepts`. |
+| "permanently ignore this video", "never re-process [video_id]", "skip these IDs on backfill", "stop touching this URL on every scan" | edit `skip_video_ids` under the channel in `config.yaml` | Declarative pre-fetch blocklist. Listed IDs never reach Gemini, never get a meta.json, no cost. Override = remove the ID from config. Cheaper than `mark-skip` since no meta.json roundtrip needed. |
 | "find videos about X", "search for Y", "nugget brief on Z", "corpus status", "verify quote", "fact-check claim against [creator]" | — | **Wrong skill.** These are read-only queries; use the **video-intel-search** skill. |
 
 ### Channel name resolution
@@ -522,6 +523,15 @@ channels:
     url: https://youtube.com/@lennyspodcast
     auto_transcript: all
     enabled: false                   # see "One-off creators" below
+
+  - name: seankochel
+    url: https://youtube.com/@iamseankochel
+    auto_transcript: all
+    skip_video_ids:                  # Issue #42: declarative pre-fetch blocklist.
+      - X5UN2LrRK48                  # 2h24m SaaS workshop - transcript truncates,
+                                     # mindmap + concepts already done by hand.
+      - SOMEOTHERID                  # add IDs here as you see them fail. The scan
+                                     # never touches these on subsequent runs.
 ```
 
 **Selective scanning:** Channels with `playlists` or `keywords` target specific
