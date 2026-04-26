@@ -787,3 +787,126 @@ class TestCmdProcessPerModeSkip:
         assert len(uploads) == 0
         assert len(mm_calls) == 0
         assert len(tx_calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# Issue #42 follow-up: declarative skip_video_ids blocklist in config.yaml.
+# Verified pre-fetch filter so listed IDs never trigger any side effect.
+# ---------------------------------------------------------------------------
+
+
+class TestSkipVideoIdsConfig:
+    def test_listed_ids_filtered_before_processing(self, tmp_path, monkeypatch):
+        videos = [
+            {"video_id": "skipMe1234", "title": "long workshop", "published": "2026-04-15"},
+            {"video_id": "keepMe5678", "title": "regular talk", "published": "2026-04-15"},
+        ]
+        captured = _scan_setup_with_transcript(monkeypatch, videos, durations={"keepMe5678": "PT10M"})
+
+        config = {
+            "output_dir": str(tmp_path),
+            "channels": [
+                {
+                    "name": "ch",
+                    "url": "https://example.com/ch",
+                    "skip_video_ids": ["skipMe1234"],
+                },
+            ],
+        }
+        vi.cmd_scan(_scan_args(), config)
+
+        mm_ids = [v["video_id"] for v in captured["mindmaps"]]
+        assert "skipMe1234" not in mm_ids, "Blocklisted ID must not reach process_mindmap"
+        assert "keepMe5678" in mm_ids, "Non-blocklisted ID must still process"
+
+    def test_empty_blocklist_is_no_op(self, tmp_path, monkeypatch):
+        videos = [
+            {"video_id": "v1", "title": "t1", "published": "2026-04-15"},
+            {"video_id": "v2", "title": "t2", "published": "2026-04-15"},
+        ]
+        captured = _scan_setup_with_transcript(monkeypatch, videos, durations={"v1": "PT10M", "v2": "PT10M"})
+
+        config = {
+            "output_dir": str(tmp_path),
+            "channels": [{"name": "ch", "url": "https://example.com/ch", "skip_video_ids": []}],
+        }
+        vi.cmd_scan(_scan_args(), config)
+
+        mm_ids = [v["video_id"] for v in captured["mindmaps"]]
+        assert sorted(mm_ids) == ["v1", "v2"]
+
+    def test_missing_key_is_no_op(self, tmp_path, monkeypatch):
+        """Channels without skip_video_ids set must keep current behavior."""
+        videos = [{"video_id": "v1", "title": "t1", "published": "2026-04-15"}]
+        captured = _scan_setup_with_transcript(monkeypatch, videos, durations={"v1": "PT10M"})
+
+        config = {
+            "output_dir": str(tmp_path),
+            "channels": [{"name": "ch", "url": "https://example.com/ch"}],
+        }
+        vi.cmd_scan(_scan_args(), config)
+
+        assert [v["video_id"] for v in captured["mindmaps"]] == ["v1"]
+
+    def test_blocklist_log_message_includes_count(self, tmp_path, monkeypatch, caplog):
+        videos = [
+            {"video_id": "skipA12345X", "title": "t1", "published": "2026-04-15"},
+            {"video_id": "skipB67890Y", "title": "t2", "published": "2026-04-15"},
+            {"video_id": "keep1234567", "title": "t3", "published": "2026-04-15"},
+        ]
+        _scan_setup_with_transcript(monkeypatch, videos, durations={"keep1234567": "PT10M"})
+
+        config = {
+            "output_dir": str(tmp_path),
+            "channels": [
+                {
+                    "name": "ch",
+                    "url": "https://example.com/ch",
+                    "skip_video_ids": ["skipA12345X", "skipB67890Y"],
+                },
+            ],
+        }
+        with caplog.at_level("INFO"):
+            vi.cmd_scan(_scan_args(), config)
+
+        info_lines = "\n".join(r.message for r in caplog.records if r.levelname == "INFO")
+        assert "Filtered 2 video(s) per skip_video_ids" in info_lines
+
+    def test_blocklist_skips_enrich_for_listed_ids(self, tmp_path, monkeypatch):
+        """The filter runs BEFORE enrich_with_durations, so listed IDs never reach
+        the YouTube duration API call. Verifies cost-saving intent."""
+        videos = [
+            {"video_id": "skipMe1234", "title": "long workshop", "published": "2026-04-15"},
+            {"video_id": "keepMe5678", "title": "regular talk", "published": "2026-04-15"},
+        ]
+
+        monkeypatch.setenv("GEMINI_API_KEY", "test")
+        monkeypatch.setenv("YOUTUBE_API_KEY", "test")
+        monkeypatch.setattr(vi, "require_gemini", lambda: (None, None))
+        monkeypatch.setattr(vi, "require_youtube", lambda: lambda *a, **kw: None)
+        monkeypatch.setattr(vi, "create_client", lambda *a, **kw: None)
+        monkeypatch.setattr(vi, "get_channel_id", lambda yt, url: ("chid", "ChTitle"))
+        monkeypatch.setattr(vi, "fetch_channel_videos", lambda yt, cid, since: list(videos))
+        monkeypatch.setattr(vi, "_is_youtube_short_url", lambda video_id: False)
+
+        enrich_calls: list = []
+
+        def recording_enrich(_yt, video_ids):
+            enrich_calls.append(list(video_ids))
+            return dict.fromkeys(video_ids, "PT10M")
+
+        monkeypatch.setattr(vi, "enrich_with_durations", recording_enrich)
+        monkeypatch.setattr(vi, "process_mindmap", lambda *a, **kw: ("p", "done"))
+
+        config = {
+            "output_dir": str(tmp_path),
+            "channels": [
+                {"name": "ch", "url": "https://example.com/ch", "skip_video_ids": ["skipMe1234"]},
+            ],
+        }
+        vi.cmd_scan(_scan_args(), config)
+
+        assert enrich_calls, "enrich_with_durations should have been called"
+        flattened = [vid for batch in enrich_calls for vid in batch]
+        assert "skipMe1234" not in flattened, "Blocklisted ID must NOT reach enrich (cost-saving invariant)"
+        assert "keepMe5678" in flattened
