@@ -1,0 +1,111 @@
+# Route newly-opened PRs to "Status: Review" on the Video-Intel project board.
+#
+# WHY THIS EXISTS
+# ---------------
+# GitHub Projects v2 has built-in "Pull request linked to issue" workflow that
+# auto-routes PRs to Review only when the PR body contains `Closes #N`. For
+# plan-only PRs (no underlying issue, like PR #43), there is no built-in
+# trigger that routes them — they land in Inbox by default. This workflow
+# closes that gap so every PR auto-routes to Review on open, regardless of
+# whether it links an issue.
+#
+# Pattern adapted from GitHub's official documentation:
+#   https://docs.github.com/en/issues/planning-and-tracking-with-projects/automating-your-project/automating-projects-using-actions
+# Adapted for user projects (the docs example uses `organization()`; this uses
+# `user()` because https://github.com/users/dzivkovi/projects/8 is a user-owned
+# project, not an org-owned one).
+#
+# REQUIRED SETUP (one-time)
+# -------------------------
+# The auto-generated `GITHUB_TOKEN` that GitHub Actions provides per workflow
+# run does NOT have `project` scope — it is scoped to the repository only.
+# This workflow needs a Personal Access Token (PAT) with `project` scope.
+#
+# 1. Create a classic PAT at https://github.com/settings/tokens with
+#    `project` scope (and `repo` if your projects span private repos).
+#    If you already have a PAT with `project` scope (e.g. the one you use
+#    for `gh` CLI locally), reuse it — no need to create a second one.
+# 2. Add it as a repo secret at
+#    https://github.com/dzivkovi/video-intel/settings/secrets/actions/new
+#    Secret name: PROJECTS_PAT
+#    Value: your PAT
+# 3. Push a new PR. It should auto-route to Review.
+#
+# Until step 2 is done, this workflow will fail visibly on every new PR. That
+# is intentional — silent fallback would mean PRs continue to land in Inbox
+# without you noticing.
+
+name: Route new PRs to project Review
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - ready_for_review
+
+permissions:
+  contents: read
+
+jobs:
+  route-to-review:
+    name: Set Status=Review on Video-Intel project
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
+    steps:
+      - name: Look up project, Status field, and Review option IDs
+        env:
+          GH_TOKEN: ${{ secrets.PROJECTS_PAT }}
+          PROJECT_OWNER: dzivkovi
+          PROJECT_NUMBER: 8
+        run: |
+          gh api graphql -f query='
+            query($user: String!, $number: Int!) {
+              user(login: $user) {
+                projectV2(number: $number) {
+                  id
+                  fields(first: 20) {
+                    nodes {
+                      ... on ProjectV2SingleSelectField {
+                        id
+                        name
+                        options { id name }
+                      }
+                    }
+                  }
+                }
+              }
+            }' -f user=$PROJECT_OWNER -F number=$PROJECT_NUMBER > project_data.json
+
+          echo 'PROJECT_ID='$(jq -r '.data.user.projectV2.id' project_data.json) >> "$GITHUB_ENV"
+          echo 'STATUS_FIELD_ID='$(jq -r '.data.user.projectV2.fields.nodes[] | select(.name=="Status") | .id' project_data.json) >> "$GITHUB_ENV"
+          echo 'REVIEW_OPTION_ID='$(jq -r '.data.user.projectV2.fields.nodes[] | select(.name=="Status") | .options[] | select(.name=="Review") | .id' project_data.json) >> "$GITHUB_ENV"
+
+      - name: Add PR to project (idempotent — returns existing item if already added)
+        env:
+          GH_TOKEN: ${{ secrets.PROJECTS_PAT }}
+          PR_NODE_ID: ${{ github.event.pull_request.node_id }}
+        run: |
+          item_id="$(gh api graphql -f query='
+            mutation($project: ID!, $pr: ID!) {
+              addProjectV2ItemById(input: {projectId: $project, contentId: $pr}) {
+                item { id }
+              }
+            }' -f project=$PROJECT_ID -f pr=$PR_NODE_ID --jq '.data.addProjectV2ItemById.item.id')"
+          echo 'ITEM_ID='$item_id >> "$GITHUB_ENV"
+
+      - name: Set Status to Review
+        env:
+          GH_TOKEN: ${{ secrets.PROJECTS_PAT }}
+        run: |
+          gh api graphql -f query='
+            mutation($project: ID!, $item: ID!, $field: ID!, $value: String!) {
+              updateProjectV2ItemFieldValue(input: {
+                projectId: $project
+                itemId: $item
+                fieldId: $field
+                value: { singleSelectOptionId: $value }
+              }) {
+                projectV2Item { id }
+              }
+            }' -f project=$PROJECT_ID -f item=$ITEM_ID -f field=$STATUS_FIELD_ID -f value=$REVIEW_OPTION_ID --silent
