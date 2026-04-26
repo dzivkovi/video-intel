@@ -19,12 +19,16 @@ description: >
   "mental models across creators", "find the nuggets about [X]", "show
   corpus status", "when was this last scanned", "what concepts are in my
   library", "what topics recur across channels", "summarize this video",
-  "is this worth watching", "what should I watch", any YouTube URL
-  followed by a question about its content. For scanning new videos,
-  transcribing, generating mindmaps, rebuilding the index, or any write
-  operation on the corpus, use the video-intel skill from the plugin
-  repo instead - those operations require channels configured and API
-  keys the search skill does not need.
+  "is this worth watching", "what should I watch",
+  "verify whether [creator] said [paraphrase]", "fact-check this
+  quote against [creator]'s videos", "did [creator] really say [X]",
+  "is this [creator] quote real", "find the source for this [creator]
+  claim", "check the corpus for the quote [paraphrase]", any YouTube
+  URL followed by a question about its content. For scanning new
+  videos, transcribing, generating mindmaps, rebuilding the index,
+  or any write operation on the corpus, use the video-intel skill
+  from the plugin repo instead - those operations require channels
+  configured and API keys the search skill does not need.
 ---
 
 # Video Intel Search
@@ -79,6 +83,13 @@ See the plugin repo's `CLAUDE.md` for the full install procedure.
 
 ## How to Use
 
+> **Do not `grep` / `Grep` / `rg` the `output_dir` directory directly when
+> verifying a paraphrase.** The speaker's vocabulary almost never matches a
+> paraphrase verbatim, so keyword search returns false negatives. Always
+> start with `search --vector`, which uses semantic similarity to overcome
+> that vocabulary mismatch. Direct file search is only appropriate when the
+> user has already given you an exact phrase known to appear in transcripts.
+
 ### Find videos about a topic (start here)
 
 ```bash
@@ -102,6 +113,7 @@ python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" search "recent takeawa
 | "which videos cover X?" (topic only, no creator) | `search "X"` | Concept match. Fast, no API calls. Video list + paths. |
 | "what did they say about Y?" | `search "Y" --vector` | Hybrid search. Returns transcript passages (up to 3000 chars) with timestamps and speaker turns. |
 | **"find videos about [creator] [topic]"** / **"[creator] on [topic]"** | **`search "topic" --vector --channel C`** | **Creator + topic = evidence query. Go to `--vector` from the start.** Concept search returns topic matches ranked by relevance across all creators and usually crowds out the specific creator's videos. |
+| **"verify [creator] said [paraphrase]"** / **"fact-check this quote"** / **"did [creator] really say [X]"** | **`search "<key noun phrase>" --vector --channel C`** then **`nugget`** if multiple chunks help | **Paraphrase verification is a semantic question, not a keyword question. The speaker's vocabulary likely differs from the paraphrase - vector match catches it where keyword grep misses. Try 2-3 noun-phrase variants if the first returns nothing.** |
 | "recent X from [creator]" | `search "X" --vector --channel C --since Nd` | Pre-filtered date window, no recency bias. |
 | "is this [URL] worth watching" | `search "<title or topic>" --vector` | If indexed, returns evidence; if not, tell the user to run the curate skill to process it. |
 | "summarize this video" | `search "<video title>"` | If indexed, open the mindmap path from the result. If not, route to curate. |
