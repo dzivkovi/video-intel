@@ -3165,18 +3165,161 @@ def _is_file_expiry_error_status(status: str) -> bool:
     return any(pos in lowered for pos in _FILE_EXPIRY_POSITIVE_MARKERS)
 
 
-def cmd_process(args, config):
-    """Run the full local-file pipeline (mindmap + transcript + concepts) on one upload.
+def _cmd_process_url(args, config):
+    """`process --url` orchestrator: mindmap, then transcript with chunking,
+    then concepts. Mirrors process --file's exit-code contract: 0 if mindmap
+    succeeded, regardless of downstream step outcome."""
+    _, types = require_gemini()
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    if not gemini_key:
+        log.error("GEMINI_API_KEY not set.")
+        sys.exit(1)
+    client = create_client(gemini_key)
+    output_dir = resolve_output_dir(config)
+    model = resolve_model(args, config)
 
-    Wraps ``process_mindmap`` / ``process_transcript`` / ``process_concepts`` with a
-    single ``upload_local_video`` call and threads the returned ``file_uri`` to the
-    video-bearing helpers. The upload is skipped entirely when meta.json already
-    records the completed modes on disk (and ``--force`` is not set).
+    video_id_match = re.search(r"(?:v=|/)([a-zA-Z0-9_-]{11})", args.url)
+    if not video_id_match:
+        log.error("Could not extract video ID from: %s", args.url)
+        sys.exit(1)
+    video_id = video_id_match.group(1)
+
+    channel_name = args.channel
+    title = args.title
+    date = args.date
+    if not channel_name or not title or not date:
+        yt_key = os.environ.get("YOUTUBE_API_KEY")
+        if yt_key:
+            yt_build = require_youtube()
+            yt = yt_build("youtube", "v3", developerKey=yt_key)
+            resp = yt.videos().list(part="snippet", id=video_id).execute()
+            if resp.get("items"):
+                snippet = resp["items"][0]["snippet"]
+                title = title or unescape(snippet["title"])
+                date = date or snippet["publishedAt"][:10]
+                if not channel_name:
+                    yt_channel_id = snippet["channelId"]
+                    for ch in config.get("channels", []):
+                        ch_id, _ = get_channel_id(yt, ch["url"])
+                        if ch_id == yt_channel_id:
+                            channel_name = ch["name"]
+                            break
+                    if not channel_name:
+                        channel_name = slugify(snippet["channelTitle"])
+    channel_name = channel_name or "_standalone"
+    video = {
+        "video_id": video_id,
+        "url": f"https://www.youtube.com/watch?v={video_id}",
+        "title": title or video_id,
+        "published": date or datetime.now().strftime("%Y-%m-%d"),
+    }
+    channel_dir = output_dir / channel_name
+    prefix = video_file_prefix(video)
+
+    prompt_name = normalize_prompt_name(
+        getattr(args, "prompt", None) or config.get("default_prompt", "mindmap-knowledge")
+    )
+    mindmap_prompt = load_prompt(prompt_name)
+    transcript_prompt = load_prompt("transcript")
+
+    log.info("[process --url] %s", video["url"])
+    log.info("  Step 1/3: mindmap")
+    mindmap_prefix, mindmap_status = process_mindmap(
+        client,
+        types,
+        video,
+        mindmap_prompt,
+        model,
+        output_dir,
+        channel_name,
+        prompt_name=prompt_name,
+        force=args.force,
+    )
+    log.info("    mindmap [%s]: %s", mindmap_prefix, mindmap_status)
+    if mindmap_status.startswith("error"):
+        log.error("Mindmap failed; aborting.")
+        sys.exit(1)
+
+    log.info("  Step 2/3: transcript")
+    chunk_minutes = getattr(args, "chunk_minutes", None) or TRANSCRIPT_CHUNK_MINUTES_DEFAULT
+    duration_seconds = _lookup_video_duration_seconds(video_id)
+    if duration_seconds and duration_seconds > chunk_minutes * 60:
+        chunks = _build_transcript_chunks(duration_seconds, chunk_minutes)
+        log.info(
+            "    %s is %s; running %d chunks of %d min each.",
+            video_id,
+            _fmt_hms(duration_seconds),
+            len(chunks),
+            chunk_minutes,
+        )
+        transcript_status = _run_chunked_transcript_url(
+            client=client,
+            types=types,
+            video=video,
+            prompt_text=transcript_prompt,
+            model=model,
+            channel_dir=channel_dir,
+            prefix=prefix,
+            chunks=chunks,
+            duration_seconds=duration_seconds,
+            chunk_minutes=chunk_minutes,
+            force=args.force,
+        )
+    else:
+        _, transcript_status = process_transcript(
+            client,
+            types,
+            video,
+            transcript_prompt,
+            model,
+            channel_dir,
+            prefix,
+            force=args.force,
+            media_uri=None,
+        )
+    log.info("    transcript [%s]: %s", prefix, transcript_status)
+
+    log.info("  Step 3/3: concepts")
+    if channel_name == "_standalone":
+        log.warning("    No configured channel for %s; skipping concepts.", video_id)
+        return
+    mindmap_path = find_mindmap_source(channel_dir, prefix)
+    if not mindmap_path or not mindmap_path.exists():
+        log.warning("    Mindmap not on disk; skipping concepts.")
+        return
+    mindmap_text = mindmap_path.read_text(encoding="utf-8")
+    taxonomy = load_taxonomy(output_dir)
+    concepts_prefix, concepts_status = process_concepts(
+        client,
+        types,
+        video,
+        mindmap_text,
+        taxonomy,
+        model,
+        output_dir,
+        channel_name,
+        source_file=mindmap_path.name,
+        source_prompt=prompt_name,
+        prefix=prefix,
+    )
+    log.info("    concepts [%s]: %s", concepts_prefix, concepts_status)
+
+
+def cmd_process(args, config):
+    """Run the full pipeline (mindmap + transcript + concepts) on a single video.
+
+    Two input modes:
+      --file PATH: local MP4 - one Gemini upload, lazy-skipped when meta records
+        all modes complete and artifacts exist (legacy local-file path).
+      --url URL: YouTube URL - chunked transcript via _run_chunked_transcript_url
+        when duration exceeds chunk_minutes; otherwise single call (issue #50).
 
     Exit-code contract: 0 if mindmap succeeded (regardless of transcript/concepts
     outcome), non-zero if mindmap itself failed. Automation callers inspect
     ``modes_completed`` in meta.json for finer-grained detection.
     """
+    if getattr(args, "url", None):
+        return _cmd_process_url(args, config)
     _, types = require_gemini()
 
     gemini_key = os.environ.get("GEMINI_API_KEY")
@@ -4930,12 +5073,16 @@ Examples:
     # process command: one-upload full pipeline for local MP4s
     process_parser = subparsers.add_parser(
         "process",
-        help="Full pipeline (mindmap + transcript + concepts) on one Gemini upload for a local video",
+        help="Full pipeline (mindmap + transcript + concepts) on a video. --file uploads a local MP4 once; --url chunks a YouTube URL when long.",
     )
-    process_parser.add_argument(
+    process_source = process_parser.add_mutually_exclusive_group(required=True)
+    process_source.add_argument(
         "--file",
-        required=True,
         help="Path to local video file. The channel is inferred from the parent folder (output_dir/<channel>/X.mp4) or passed explicitly via --channel.",
+    )
+    process_source.add_argument(
+        "--url",
+        help="YouTube video URL (issue #50). Auto-chunks transcripts on long videos via --chunk-minutes.",
     )
     process_parser.add_argument(
         "--channel",
@@ -4948,16 +5095,23 @@ Examples:
     )
     process_parser.add_argument(
         "--title",
-        help="Video title. Falls back to filename stem.",
+        help="Video title. Falls back to filename stem (--file) or YouTube snippet (--url).",
     )
     process_parser.add_argument(
         "--date",
-        help="Publish date YYYY-MM-DD. Falls back to the file's mtime.",
+        help="Publish date YYYY-MM-DD. Falls back to the file's mtime (--file) or YouTube publishedAt (--url).",
     )
     process_parser.add_argument("--start", help="Segment start time (MM:SS, HH:MM:SS, or raw seconds)")
     process_parser.add_argument("--end", help="Segment end time (MM:SS, HH:MM:SS, or raw seconds)")
     process_parser.add_argument("--force", action="store_true", help="Regenerate all artifacts from scratch")
     process_parser.add_argument("--prompt", help="Mindmap prompt name (overrides config default)")
+    process_parser.add_argument(
+        "--chunk-minutes",
+        type=int,
+        default=TRANSCRIPT_CHUNK_MINUTES_DEFAULT,
+        dest="chunk_minutes",
+        help=f"Chunk size for long-video transcripts via --url (default: {TRANSCRIPT_CHUNK_MINUTES_DEFAULT}). Ignored with --file.",
+    )
 
     # concepts command
     concepts_parser = subparsers.add_parser("concepts", help="Extract concepts from existing mindmaps")

@@ -339,3 +339,123 @@ class TestCmdTranscriptUrlChunking:
         assert "chunked transcript" in body.lower() or "Coverage" in body
         # Chunk-2's offset-applied timestamp is 1:00:30, not 00:30
         assert "1:00:30" in body
+
+
+# ---------------------------------------------------------------------------
+# Unit 4: process --url orchestrator (mindmap + transcript + concepts)
+# ---------------------------------------------------------------------------
+
+
+def _process_url_args(url, **overrides):
+    base = {
+        "url": url,
+        "file": None,
+        "channel": "ch",
+        "video_id": None,
+        "title": "Test Video",
+        "date": "2026-04-15",
+        "start": None,
+        "end": None,
+        "force": False,
+        "model": None,
+        "prompt": None,
+        "chunk_minutes": 50,
+    }
+    base.update(overrides)
+    return Namespace(**base)
+
+
+class TestCmdProcessUrl:
+    def test_url_orchestrates_mindmap_transcript_concepts(self, tmp_path, monkeypatch):
+        """process --url runs mindmap, then transcript (single-call here, under
+        threshold), then concepts. All three steps fire on one invocation."""
+        from unittest.mock import MagicMock
+
+        monkeypatch.setenv("GEMINI_API_KEY", "test")
+        monkeypatch.setenv("YOUTUBE_API_KEY", "test")
+        monkeypatch.setattr(vi, "require_gemini", lambda: (MagicMock(), MagicMock()))
+        monkeypatch.setattr(vi, "create_client", lambda *_a, **_kw: MagicMock())
+        monkeypatch.setattr(vi, "resolve_model", lambda *_a, **_kw: "stub-model")
+        monkeypatch.setattr(vi, "resolve_output_dir", lambda _cfg: tmp_path)
+        monkeypatch.setattr(vi, "load_prompt", lambda *_a, **_kw: "prompt")
+        monkeypatch.setattr(vi, "load_taxonomy", lambda *_a, **_kw: {"concepts": {}})
+        monkeypatch.setattr(vi, "_lookup_video_duration_seconds", lambda *_a, **_kw: 1800)
+
+        calls = {"mindmap": 0, "transcript": 0, "concepts": 0}
+
+        def fake_mindmap(*args, **kwargs):
+            calls["mindmap"] += 1
+            video = args[2]
+            ch = args[6] if len(args) > 6 else kwargs.get("channel_name")
+            prefix = video_file_prefix_for_test(video)
+            (tmp_path / ch).mkdir(parents=True, exist_ok=True)
+            (tmp_path / ch / f"{prefix}.mindmap.md").write_text("# stub mindmap", encoding="utf-8")
+            return prefix, "done"
+
+        def video_file_prefix_for_test(video):
+            return vi.video_file_prefix(video)
+
+        def fake_transcript(*args, **kwargs):
+            calls["transcript"] += 1
+            return args[6] if len(args) > 6 else kwargs.get("prefix"), "done"
+
+        def fake_concepts(*args, **kwargs):
+            calls["concepts"] += 1
+            return kwargs.get("prefix") or "p", "done"
+
+        monkeypatch.setattr(vi, "process_mindmap", fake_mindmap)
+        monkeypatch.setattr(vi, "process_transcript", fake_transcript)
+        monkeypatch.setattr(vi, "process_concepts", fake_concepts)
+
+        config = {
+            "output_dir": str(tmp_path),
+            "channels": [{"name": "ch", "url": "https://example.com/ch"}],
+        }
+        vi.cmd_process(_process_url_args("https://www.youtube.com/watch?v=ZZZ12345678"), config)
+
+        assert calls["mindmap"] == 1
+        assert calls["transcript"] == 1
+        assert calls["concepts"] == 1
+
+    def test_url_with_long_video_uses_chunked_transcript(self, tmp_path, monkeypatch):
+        """process --url on a 3h video calls process_mindmap once (mindmap is
+        always single-call) and call_gemini multiple times for chunked
+        transcript."""
+        from unittest.mock import MagicMock
+
+        monkeypatch.setenv("GEMINI_API_KEY", "test")
+        monkeypatch.setenv("YOUTUBE_API_KEY", "test")
+        monkeypatch.setattr(vi, "require_gemini", lambda: (MagicMock(), MagicMock()))
+        monkeypatch.setattr(vi, "create_client", lambda *_a, **_kw: MagicMock())
+        monkeypatch.setattr(vi, "resolve_model", lambda *_a, **_kw: "stub-model")
+        monkeypatch.setattr(vi, "resolve_output_dir", lambda _cfg: tmp_path)
+        monkeypatch.setattr(vi, "load_prompt", lambda *_a, **_kw: "prompt")
+        monkeypatch.setattr(vi, "load_taxonomy", lambda *_a, **_kw: {"concepts": {}})
+        monkeypatch.setattr(vi, "_lookup_video_duration_seconds", lambda *_a, **_kw: 11752)
+
+        # Mindmap stub - writes a fake artifact so concepts step finds something
+        def fake_mindmap(*args, **kwargs):
+            video = args[2]
+            ch = args[6] if len(args) > 6 else kwargs.get("channel_name")
+            prefix = vi.video_file_prefix(video)
+            (tmp_path / ch).mkdir(parents=True, exist_ok=True)
+            (tmp_path / ch / f"{prefix}.mindmap.md").write_text("# stub", encoding="utf-8")
+            return prefix, "done"
+
+        monkeypatch.setattr(vi, "process_mindmap", fake_mindmap)
+        monkeypatch.setattr(vi, "process_concepts", lambda *a, **kw: ("p", "done"))
+
+        chunk_response = {"transcripts": [], "speakers": [{"voice": 1, "name": "S"}], "screen_content": []}
+        chunk_calls = _stub_gemini_calls(monkeypatch, [chunk_response] * 4)
+
+        config = {
+            "output_dir": str(tmp_path),
+            "channels": [{"name": "lex", "url": "https://example.com/lex"}],
+        }
+        args = _process_url_args("https://www.youtube.com/watch?v=YFjfBk8HI5o", channel="lex")
+        vi.cmd_process(args, config)
+
+        # 4 chunks invoked for transcript (mindmap goes through process_mindmap stub, not call_gemini)
+        assert len(chunk_calls) == 4
+        starts = [c["start"] for c in chunk_calls]
+        assert starts == [0, 3000, 6000, 9000]
