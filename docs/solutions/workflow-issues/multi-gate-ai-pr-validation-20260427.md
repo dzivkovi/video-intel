@@ -141,6 +141,14 @@ The Dark Factories framing collapses these two phases for narrative clarity. The
 
 The two phases are independent. Compressing the validate phase to match the write phase produces silent corruption. Not visible breakage that a smoke would catch, but plausibly-wrong outputs that downstream systems consume as truth. For a knowledge-graph use case (this repo), wrong-but-plausible mindmap timestamps are more dangerous than mindmap generation failures, because the failure is invisible until a downstream layer surfaces it.
 
+### Systems Engineering frame
+
+The shape of this overnight pattern felt familiar before I had a frame for it. For a couple of years through COVID I subcontracted for Quantiphi: prep specs in Toronto by midnight, hand off to the dev team in India, review the build at breakfast. Same rhythm as the AI overnight chain. I noticed the asymmetry then (write was fast, review was slow) but treated it as a quirk of distributed teams. I did not have a name for what filled the gap.
+
+The name was V&V (verification and validation), the systems-engineering practice I had run formally as a Systems Engineering Team Lead at Derivion in the early 2000s before the term left my daily vocabulary. The asymmetry was not a quirk. It was the structural property of any pipeline that compresses authoring while leaving the integration surface unchanged: validation costs are owed to the change, not to the labor that produced the change. The breakfast reviews worked because I was running V&V intuitively. I just had not invoked the name.
+
+Running Dark Factories daily across multiple GitHub issues, the association lands back where it started. The team is silicon, the cadence is the same, the discipline that closes the validation gap has a decades-long lineage. The framework above is what V&V looks like applied to AI-generated PRs.
+
 The systems-engineering frame (probability-based sign-off, real-input verification, adversarial cross-examination, evidence preservation) exists because billing systems, telecom carrier-grade systems, and now knowledge-graph systems share a property: the cost of a wrong-but-plausible output is far higher than the cost of a visible failure. The discipline is codified in IEEE/ISO 15288 (international standard for system life-cycle processes) and elaborated in publicly accessible bodies of work such as INCOSE's Systems Engineering Body of Knowledge and the published research of practitioners like Prof. Joseph E. Kasser. It has been mainstream practice for decades in financial systems engineering (where the V-model and pre-release V&V have been standard for billing systems, payment processors, and global-deployment products since the 1990s) and in telecom carrier-grade engineering (often under names like "System Test" or "Integration & Verification" rather than "Systems Engineering"). Both industries share the failure profile that motivated the discipline's formalization.
 
 Modern web and SaaS culture (~2010 to 2024) moved the validation phase rightward, into CI tests and production observability, because the cost-benefit favored fast iteration over pre-release sign-off. Cheap rollback and observability replaced pre-release V&V for non-critical bugs. AI-generated PRs flip the cost-benefit back. The failure profile (wrong-but-plausible outputs flowing into downstream automated systems with hard-to-revert blast radius) is exactly what systems engineering V&V originally won on. The methodology in this doc is not new. It is a re-application of decades-old discipline to a newly-acute failure profile.
@@ -215,6 +223,11 @@ The third smoke produced 100% grounding on verbose vs 95.2% on legacy and confir
 - `specs/agent-rules.md` §4 (Git Hygiene), §7 (Priority & Stopping Conditions): the destructive-action rules that shape the Gate 2 boundary.
 
 ### Systems engineering lineage references
+
+A few terms first, because they appear above and are not self-evident to engineers trained in modern web / Agile environments:
+
+- **V (verification)**: "Are we building the thing right?" Does the implementation match the spec.
+- **V&V (verification and validation)**: verification plus "Are we building the right thing?" Does the spec match what the user actually needs. V&V is the discipline; the V-model below is a structure for it.
 
 For readers researching the formal discipline this doc applies to AI-generated PRs:
 
