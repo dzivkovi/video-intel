@@ -1,0 +1,15 @@
+20:10:22 INFO    Config resolved from SKILL_DIR/config.yaml (C:\Users\danie\ws\Skills\video-intel-issue42\config.yaml)
+20:10:26 WARNING Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+20:10:27 INFO    [lexfridman] Lex Fridman
+20:10:27 INFO      Looking back to 2026-01-27
+20:10:33 INFO      Skipped 1 Shorts (skip_shorts=true).
+20:10:33 INFO        min_duration_seconds: dropped KGVpKPNUdzA (22m9s < 30m) "Khabib vs Lex: Training with Khabib | FULL EXCLUSIVE FOOTAGE"
+20:10:33 INFO      Filtered 1 video(s) under 30m (min_duration_seconds).
+20:10:33 INFO      Found 6 videos, 6 new.
+20:10:33 INFO        2026-04-09 - Vikings, Ragnar, Berserkers, Valhalla & the Warriors of the Viking Age | Lex Fridman Podcast #495
+20:10:33 INFO        2026-03-23 - Jensen Huang: NVIDIA - The $4 Trillion Company & the AI Revolution | Lex Fridman Podcast #494
+20:10:33 INFO        2026-03-11 - Jeff Kaplan: World of Warcraft, Overwatch, Blizzard, and Future of Gaming | Lex Fridman Podcast #493
+20:10:33 INFO        2026-03-01 - Rick Beato: Greatest Guitarists of All Time, History & Future of Music | Lex Fridman Podcast #492
+20:10:33 INFO        2026-02-12 - OpenClaw: The Viral AI Agent that Broke the Internet - Peter Steinberger | Lex Fridman Podcast #491
+20:10:33 INFO        2026-01-31 - State of AI in 2026: LLMs, Coding, Scaling Laws, China, Agents, GPUs, AGI | Lex Fridman Podcast #490
+20:10:33 INFO    Done.

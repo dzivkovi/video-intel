@@ -2237,6 +2237,37 @@ def cmd_scan(args, config):
                 log.info("  Skipped %d Shorts (skip_shorts=true).", n_skipped)
             videos = kept
 
+        # Issue #42 follow-up: per-channel min_duration_seconds. Drops anything
+        # shorter than the threshold. Useful for long-form podcasters (Lex
+        # Fridman) where the user's mental model of "too short to bother" is
+        # higher than the standard 60s YouTube Shorts cutoff. Unparseable
+        # durations fail-safe to KEEP (matches transcript_max_duration_seconds
+        # invariant - silent drops are worse than visible truncation).
+        min_duration = ch.get("min_duration_seconds")
+        if min_duration:
+            kept = []
+            n_dropped = 0
+            for v in videos:
+                secs = _parse_iso8601_duration(v.get("duration_iso"))
+                if secs is None or secs >= min_duration:
+                    kept.append(v)
+                else:
+                    n_dropped += 1
+                    log.info(
+                        '    min_duration_seconds: dropped %s (%s < %s) "%s"',
+                        v.get("video_id", "?"),
+                        _fmt_hms(secs),
+                        _fmt_hms(min_duration),
+                        v.get("title", "")[:60],
+                    )
+            if n_dropped:
+                log.info(
+                    "  Filtered %d video(s) under %s (min_duration_seconds).",
+                    n_dropped,
+                    _fmt_hms(min_duration),
+                )
+            videos = kept
+
         # Filter already processed or skipped (any_variant=True prevents backfill).
         # mode="mindmap" so per-mode skip_modes=["transcript"] does NOT block the
         # mindmap loop. See is_skipped_meta() and issue #42.
@@ -2260,7 +2291,23 @@ def cmd_scan(args, config):
         prompt_name = ch.get("prompt") or config.get("default_prompt", "mindmap-light")
         prompt_text = load_prompt(prompt_name)
 
-        if not new_videos:
+        # Issue #42 follow-up (notify-only mode): per-channel auto_mindmap=none
+        # discovers and logs new videos without paying the mindmap Gemini call.
+        # Combined with auto_transcript=none, the channel becomes pure
+        # notification - useful for long-form podcasters (Lex Fridman) where
+        # the user wants to cherry-pick episodes manually.
+        auto_mindmap = ch.get("auto_mindmap", "all")
+        if auto_mindmap == "none":
+            if new_videos:
+                log.info(
+                    "  auto_mindmap=none: %d new video(s) listed below, NOT processed.",
+                    len(new_videos),
+                )
+                for v in new_videos:
+                    log.info("    %s - %s", v["published"], v["title"])
+            else:
+                log.info("  auto_mindmap=none: no new videos.")
+        elif not new_videos:
             log.info("  All mind maps up to date.")
         else:
             # Process mind maps in parallel

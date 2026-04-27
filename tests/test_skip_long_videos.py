@@ -899,6 +899,30 @@ class TestSkipVideoIdsConfig:
         assert "staleZZZ123" in warnings_text
         assert "NOT in fetched videos" in warnings_text or "deleted" in warnings_text
 
+    def test_listed_id_filter_pre_enrich_for_lex_use_case(self, tmp_path, monkeypatch):
+        """Same as test_blocklist_skips_enrich_for_listed_ids but with the actual
+        Lex use case shape: long-form podcast channel, one episode blocklisted,
+        rest pass through normally."""
+        videos = [
+            {"video_id": "lexEp001", "title": "Lex Ep 1 (3h)", "published": "2026-01-15"},
+            {"video_id": "skipMe1234", "title": "Lex one we hate", "published": "2026-02-01"},
+        ]
+        captured = _scan_setup_with_transcript(
+            monkeypatch, videos, durations={"lexEp001": "PT3H", "skipMe1234": "PT3H"}
+        )
+
+        config = {
+            "output_dir": str(tmp_path),
+            "channels": [
+                {"name": "ch", "url": "https://example.com/ch", "skip_video_ids": ["skipMe1234"]},
+            ],
+        }
+        vi.cmd_scan(_scan_args(), config)
+
+        mm_ids = [v["video_id"] for v in captured["mindmaps"]]
+        assert "lexEp001" in mm_ids
+        assert "skipMe1234" not in mm_ids
+
     def test_blocklist_skips_enrich_for_listed_ids(self, tmp_path, monkeypatch):
         """The filter runs BEFORE enrich_with_durations, so listed IDs never reach
         the YouTube duration API call. Verifies cost-saving intent."""
@@ -937,3 +961,120 @@ class TestSkipVideoIdsConfig:
         flattened = [vid for batch in enrich_calls for vid in batch]
         assert "skipMe1234" not in flattened, "Blocklisted ID must NOT reach enrich (cost-saving invariant)"
         assert "keepMe5678" in flattened
+
+
+# ---------------------------------------------------------------------------
+# Phase 2A: auto_mindmap=none for notify-only channels (Lex Fridman use case).
+# ---------------------------------------------------------------------------
+
+
+class TestAutoMindmapNone:
+    def test_auto_mindmap_none_skips_mindmap_loop(self, tmp_path, monkeypatch, caplog):
+        videos = [
+            {"video_id": "lex001", "title": "Lex Episode 1", "published": "2026-04-15"},
+            {"video_id": "lex002", "title": "Lex Episode 2", "published": "2026-04-16"},
+        ]
+        captured = _scan_setup_with_transcript(monkeypatch, videos, durations={"lex001": "PT3H", "lex002": "PT3H"})
+
+        config = {
+            "output_dir": str(tmp_path),
+            "channels": [
+                {
+                    "name": "lex",
+                    "url": "https://example.com/lex",
+                    "auto_mindmap": "none",
+                    "auto_transcript": "none",
+                },
+            ],
+        }
+        with caplog.at_level("INFO"):
+            vi.cmd_scan(_scan_args(), config)
+
+        assert captured["mindmaps"] == [], "Mindmap loop must NOT fire when auto_mindmap=none"
+        assert captured["transcripts"] == [], "Transcript loop respects its own none flag"
+        info_lines = "\n".join(r.message for r in caplog.records if r.levelname == "INFO")
+        assert "auto_mindmap=none" in info_lines
+        assert "Lex Episode 1" in info_lines
+        assert "Lex Episode 2" in info_lines
+
+    def test_auto_mindmap_default_all_keeps_existing_behavior(self, tmp_path, monkeypatch):
+        videos = [{"video_id": "v1", "title": "t1", "published": "2026-04-15"}]
+        captured = _scan_setup_with_transcript(monkeypatch, videos, durations={"v1": "PT10M"})
+
+        config = {
+            "output_dir": str(tmp_path),
+            "channels": [{"name": "ch", "url": "https://example.com/ch"}],
+        }
+        vi.cmd_scan(_scan_args(), config)
+
+        assert captured["mindmaps"] == [
+            {"video_id": "v1", "title": "t1", "published": "2026-04-15", "duration_iso": "PT10M"}
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Phase 2B: per-channel min_duration_seconds filter (Lex's "shorts < 30 min").
+# ---------------------------------------------------------------------------
+
+
+class TestMinDurationSeconds:
+    def test_drops_videos_under_threshold(self, tmp_path, monkeypatch, caplog):
+        videos = [
+            {"video_id": "vshort1", "title": "Khabib clip", "published": "2026-04-15"},
+            {"video_id": "vlong1", "title": "Full episode", "published": "2026-04-15"},
+        ]
+        captured = _scan_setup_with_transcript(
+            monkeypatch, videos, durations={"vshort1": "PT22M9S", "vlong1": "PT2H30M"}
+        )
+
+        config = {
+            "output_dir": str(tmp_path),
+            "channels": [
+                {
+                    "name": "lex",
+                    "url": "https://example.com/lex",
+                    "min_duration_seconds": 1800,  # 30 min
+                },
+            ],
+        }
+        with caplog.at_level("INFO"):
+            vi.cmd_scan(_scan_args(), config)
+
+        mm_ids = [v["video_id"] for v in captured["mindmaps"]]
+        assert "vshort1" not in mm_ids, "22-min video must be dropped under 30-min threshold"
+        assert "vlong1" in mm_ids, "Long episode must pass through"
+        info_lines = "\n".join(r.message for r in caplog.records if r.levelname == "INFO")
+        assert "min_duration_seconds: dropped vshort1" in info_lines
+        assert "Filtered 1 video(s) under 30m" in info_lines
+
+    def test_unparseable_duration_kept_fail_safe(self, tmp_path, monkeypatch):
+        """Unparseable duration must NOT cause a silent drop. Mirrors the
+        invariant for transcript_max_duration_seconds."""
+        videos = [{"video_id": "vNone", "title": "Mystery", "published": "2026-04-15"}]
+        captured = _scan_setup_with_transcript(monkeypatch, videos, durations={})
+
+        config = {
+            "output_dir": str(tmp_path),
+            "channels": [
+                {
+                    "name": "lex",
+                    "url": "https://example.com/lex",
+                    "min_duration_seconds": 1800,
+                },
+            ],
+        }
+        vi.cmd_scan(_scan_args(), config)
+
+        assert "vNone" in [v["video_id"] for v in captured["mindmaps"]]
+
+    def test_missing_key_is_no_op(self, tmp_path, monkeypatch):
+        videos = [{"video_id": "vshort", "title": "30s talk", "published": "2026-04-15"}]
+        captured = _scan_setup_with_transcript(monkeypatch, videos, durations={"vshort": "PT5M"})
+
+        config = {
+            "output_dir": str(tmp_path),
+            "channels": [{"name": "ch", "url": "https://example.com/ch"}],
+        }
+        vi.cmd_scan(_scan_args(), config)
+
+        assert "vshort" in [v["video_id"] for v in captured["mindmaps"]]
