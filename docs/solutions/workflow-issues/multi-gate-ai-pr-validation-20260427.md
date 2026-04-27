@@ -19,6 +19,8 @@ tags: [pr-validation, gate-framework, systems-engineering, adversarial-review, r
 
 ## Context
 
+This doc is the long-form companion to a [LinkedIn post on "Dark Factories"](https://www.linkedin.com/posts/magmainc_github-everyinccompound-engineering-plugin-share-7453892607862259712-Nf1q) that compressed the human-validation phase to "ten minutes of human review." The compression was honest for that specific case (a small PR with a clear smoke and a short blast radius) but understated the discipline that architectural diffs into automated downstream systems actually require. The discipline is the subject below.
+
 The "Dark Factories" pattern (Compound Engineering plugin running brainstorm → plan → work → commit → review → resolve overnight) reliably produces merge-shape PRs: green tests, ruff clean, multi-agent code review applied, smoke evidence captured. The agent does that part well. This doc covers what comes after: how the human at the merge button decides whether the merge-shape PR is actually merge-ready.
 
 The receipt is [PR #55](https://github.com/dzivkovi/video-intel/pull/55) (issue #54: invert the mindmap pipeline to read from on-disk transcripts instead of re-watching the video). Five hours of human validation surfaced two real bugs that 791 passing tests plus a multi-persona code review had not:
