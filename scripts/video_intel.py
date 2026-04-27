@@ -1092,6 +1092,421 @@ def _fmt_hms(seconds: int) -> str:
     return "".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# Issue #50: chunked transcript helpers (port of translate_video.py pattern,
+# adapted for the structured-JSON merge that transcript needs).
+# ---------------------------------------------------------------------------
+
+
+TRANSCRIPT_CHUNK_MINUTES_DEFAULT = 50
+
+
+def _build_transcript_chunks(
+    duration_seconds: int,
+    chunk_minutes: int,
+) -> list[tuple[int, int]]:
+    """Return [(start_sec, end_sec), ...] chunks for a transcript run.
+
+    Convention (matches translate_video.build_chunk_list):
+      - duration <= chunk threshold -> single (0, 0) marker = no clipping.
+      - over threshold -> uniform chunk_minutes segments from 0 to duration.
+
+    The (0, 0) sentinel lets the caller skip the chunking branch entirely
+    and run a single Gemini call without VideoMetadata offsets.
+    """
+    if chunk_minutes <= 0:
+        raise ValueError(f"chunk_minutes must be positive, got {chunk_minutes}")
+    if duration_seconds <= 0:
+        return [(0, 0)]
+    chunk_seconds = chunk_minutes * 60
+    if duration_seconds <= chunk_seconds:
+        return [(0, 0)]
+    chunks: list[tuple[int, int]] = []
+    pos = 0
+    while pos < duration_seconds:
+        end = min(pos + chunk_seconds, duration_seconds)
+        chunks.append((pos, end))
+        pos = end
+    return chunks
+
+
+def _offset_timestamp(ts: str, offset_seconds: int) -> str:
+    """Add offset_seconds to a 'MM:SS' or 'HH:MM:SS' timestamp string.
+
+    Unconditional offset addition - the caller has already decided this
+    timestamp needs the offset applied. For per-timestamp absolute-vs-
+    relative classification (Gemini's chunk inconsistency), use
+    _classify_and_offset_timestamp instead.
+    """
+    parts = ts.split(":")
+    try:
+        if len(parts) == 2:
+            total = int(parts[0]) * 60 + int(parts[1])
+        elif len(parts) == 3:
+            total = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+        else:
+            return ts
+    except ValueError:
+        return ts
+    total += offset_seconds
+    if total < 0:
+        return ts
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def _timestamp_chunk_tolerance(chunk_duration_seconds: int) -> int:
+    """Slack for absolute-vs-relative classification (ported from translate_video.py).
+
+    Long clips can drift by minutes; short clips should stay much tighter.
+    """
+    return min(300, max(30, chunk_duration_seconds // 10))
+
+
+def _classify_and_offset_timestamp(
+    ts: str,
+    chunk_start_secs: int,
+    chunk_duration_secs: int,
+) -> str:
+    """Per-timestamp classifier handling Gemini's inconsistent absolute-vs-
+    relative timestamp behavior across chunks. Ported from translate_video.py's
+    apply_timestamp_offset (proven empirically on BCS translation runs).
+
+    Three branches per timestamp:
+      1. total <= chunk_duration + tolerance -> relative, add chunk_start offset
+      2. chunk_start <= total <= chunk_start + chunk_duration + tolerance ->
+         already absolute, leave as-is
+      3. otherwise -> implausible, log warning and pass through unchanged
+
+    Returns the offset-applied (or unchanged) timestamp in the most compact
+    form: under one hour stays MM:SS; one hour or more becomes H:MM:SS to
+    match merge_transcript_json's rendering convention.
+    """
+    parts = ts.split(":")
+    try:
+        if len(parts) == 2:
+            total = int(parts[0]) * 60 + int(parts[1])
+        elif len(parts) == 3:
+            total = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+        else:
+            return ts
+    except ValueError:
+        return ts
+
+    tolerance = _timestamp_chunk_tolerance(chunk_duration_secs)
+    max_relative = chunk_duration_secs + tolerance
+
+    # Branch order: prefer ABSOLUTE when both interpretations are plausible
+    # (e.g. value exactly at chunk_start = chunk_duration boundary). The
+    # transcript prompt explicitly tells Gemini to use absolute timestamps,
+    # so absolute is the expected case; relative is the defensive fallback.
+    # This ordering differs from translate_video.py's apply_timestamp_offset
+    # (which prefers relative-first) because translate's video-translation
+    # prompt does not carry the same instruction.
+    if chunk_start_secs > 0 and chunk_start_secs <= total <= chunk_start_secs + max_relative:
+        # Absolute: in [chunk_start, chunk_start + chunk_duration + tolerance]
+        # range. Leave alone. Skipped for chunk_start=0 since absolute and
+        # relative coincide there.
+        pass
+    elif total <= max_relative:
+        # Chunk-relative: add the chunk's start offset.
+        total += chunk_start_secs
+    else:
+        # Implausible (probably a Gemini hallucination or stale prefix).
+        log.warning(
+            "Implausible timestamp [%s] in chunk (start=%ds, duration=%ds); passing through.",
+            ts,
+            chunk_start_secs,
+            chunk_duration_secs,
+        )
+        return ts
+
+    if total < 0:
+        return ts
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def _lookup_video_duration_seconds(video_id: str) -> int | None:
+    """Resolve a YouTube video's duration via contentDetails.duration.
+
+    Returns parsed seconds, or None when the lookup fails (no API key, video
+    not found, network error). Caller decides how to react to None - the
+    chunking decision must fail-safe to single-call when duration is unknown
+    rather than blindly chunk the wrong shape.
+    """
+    yt_key = os.environ.get("YOUTUBE_API_KEY")
+    if not yt_key:
+        return None
+    try:
+        yt_build = require_youtube()
+        yt = yt_build("youtube", "v3", developerKey=yt_key)
+        resp = yt.videos().list(part="contentDetails", id=video_id).execute()
+        if not resp.get("items"):
+            return None
+        return _parse_iso8601_duration(resp["items"][0]["contentDetails"]["duration"])
+    except Exception as e:
+        log.warning("Could not look up duration for %s: %s", video_id, e)
+        return None
+
+
+def _format_chunk_range_label(start_secs: int, end_secs: int) -> str:
+    """'0:00 - 50:00' style label for the coverage table."""
+
+    def fmt(s: int) -> str:
+        h, rem = divmod(s, 3600)
+        m, sec = divmod(rem, 60)
+        if h:
+            return f"{h}:{m:02d}:{sec:02d}"
+        return f"{m:02d}:{sec:02d}"
+
+    return f"{fmt(start_secs)} - {fmt(end_secs)}"
+
+
+def _build_chunked_transcript_coverage_block(
+    duration_seconds: int,
+    chunk_minutes: int,
+    segment_results: list[dict],
+) -> str:
+    """Markdown block prepended to the stitched transcript so a reader can see
+    coverage at a glance. Mirrors the translate_video.py pattern but for
+    transcript-shaped output."""
+    lines = [
+        "**Source:** chunked transcript",
+        f"**Total duration:** {_fmt_hms(duration_seconds)}",
+        f"**Chunk size:** {chunk_minutes} minutes",
+        f"**Segments:** {len(segment_results)}",
+        "",
+        "| Segment | Range | Status | Speakers |",
+        "|---|---|---|---|",
+    ]
+    for i, seg in enumerate(segment_results, start=1):
+        speakers = ", ".join(seg.get("speakers", [])) or "—"
+        lines.append(f"| {i} | {seg['range']} | {seg['status']} | {speakers} |")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def merge_chunked_transcripts(
+    chunks: list[tuple[int, dict]],
+    chunk_duration_seconds: int = 3000,
+) -> dict:
+    """Merge per-chunk transcript JSONs into a single transcript JSON.
+
+    Input: [(chunk_start_seconds, chunk_json), ...] in chronological order.
+    chunk_duration_seconds: nominal length of each chunk in seconds (default
+    3000 = 50 min, the typical chunk_minutes default). Used by the per-
+    timestamp classifier for absolute-vs-relative detection. Last chunk may
+    be shorter; the tolerance in _timestamp_chunk_tolerance handles the
+    slack.
+
+    Output: dict with the same shape as a single Gemini transcript response
+    (transcripts, screen_content, speakers) with speakers deduplicated by
+    name with globally-unique voice ids and timestamps classified per-entry
+    via _classify_and_offset_timestamp.
+
+    **Hard-won finding (Gate-1 smoke on YFjfBk8HI5o, 2026-04-26):** Gemini's
+    timestamp behavior is INCONSISTENT across chunks of the same video.
+    Some chunks return absolute timestamps (relative to full video start),
+    others return chunk-relative. There's no prompt incantation that
+    guarantees consistency. The fix is per-timestamp classification:
+    decide for each timestamp whether it falls in [0, chunk_duration] (=
+    relative) or [chunk_start, chunk_start + chunk_duration] (= absolute),
+    apply offset only in the relative case. This is the same pattern
+    translate_video.py's apply_timestamp_offset uses, proven on long-form
+    BCS translation runs.
+
+    Speaker dedup is by exact name match. If Gemini renumbers a speaker
+    mid-stream (chunk 1's voice=1 = "Lex"; chunk 2's voice=1 = "Peter"),
+    the merger correctly maps them to different global voice ids because
+    the lookup keys on (chunk_idx, original_voice) -> name -> global_voice.
+    """
+    merged: dict = {"transcripts": [], "screen_content": [], "speakers": []}
+    name_to_global: dict[str, int] = {}
+    next_global = 1
+
+    for _chunk_idx, (start_secs, chunk_json) in enumerate(chunks):
+        if not isinstance(chunk_json, dict):
+            continue
+        # Per-chunk (original_voice -> global_voice) map.
+        voice_remap: dict[int, int] = {}
+        for s in chunk_json.get("speakers", []):
+            voice = s.get("voice")
+            name = s.get("name") or f"Speaker {voice}"
+            if name not in name_to_global:
+                name_to_global[name] = next_global
+                next_global += 1
+                merged["speakers"].append({**s, "voice": name_to_global[name]})
+            if voice is not None:
+                voice_remap[voice] = name_to_global[name]
+
+        # Per-timestamp absolute-vs-relative classification.
+        for t in chunk_json.get("transcripts", []):
+            new_t = dict(t)
+            if "start" in new_t:
+                new_t["start"] = _classify_and_offset_timestamp(new_t["start"], start_secs, chunk_duration_seconds)
+            if t.get("voice") in voice_remap:
+                new_t["voice"] = voice_remap[t["voice"]]
+            merged["transcripts"].append(new_t)
+
+        for sc in chunk_json.get("screen_content", []):
+            new_sc = dict(sc)
+            if "start" in new_sc:
+                new_sc["start"] = _classify_and_offset_timestamp(new_sc["start"], start_secs, chunk_duration_seconds)
+            if new_sc.get("end"):
+                new_sc["end"] = _classify_and_offset_timestamp(new_sc["end"], start_secs, chunk_duration_seconds)
+            merged["screen_content"].append(new_sc)
+
+    return merged
+
+
+def _run_chunked_transcript_url(
+    *,
+    client,
+    types,
+    video: dict,
+    prompt_text: str,
+    model: str,
+    channel_dir: Path,
+    prefix: str,
+    chunks: list[tuple[int, int]],
+    duration_seconds: int,
+    chunk_minutes: int,
+    force: bool,
+) -> str:
+    """Run transcript in N chunks against a YouTube URL, merge, write artifact.
+
+    Skipped (exists, not forced) -> "skipped (exists)".
+    All chunks succeeded -> "done".
+    Some chunks failed -> "partial" with raw sidecars for failed chunks.
+    """
+    channel_dir.mkdir(parents=True, exist_ok=True)
+    transcript_path = channel_dir / f"{prefix}.transcript.md"
+    if transcript_path.exists() and not force:
+        return "skipped (exists)"
+
+    media_uri = video["url"]
+    chunk_results: list[tuple[int, dict]] = []
+    segment_rows: list[dict] = []
+    failed_chunks: list[tuple[int, int, str]] = []
+
+    for chunk_idx, (start_secs, end_secs) in enumerate(chunks, start=1):
+        gemini_start: int | None = None if (start_secs == 0 and end_secs == 0) else start_secs
+        gemini_end: int | None = None if (start_secs == 0 and end_secs == 0) else end_secs
+        chunk_label_for_log = _format_chunk_range_label(start_secs, end_secs or duration_seconds)
+        log.info("    chunk %s -> Gemini", chunk_label_for_log)
+        # log_usage_metadata emits 'usage transcript-chunkN prompt=N cached=N
+        # candidates=N total=N' so the user can audit per-chunk implicit cache
+        # hits. cached>0 across later chunks means Gemini's implicit cache
+        # deduplicated the URL prefix; cached=0 means each chunk paid full
+        # input tokens. The label includes chunk index so multiple-call
+        # observability stays readable.
+        raw = call_gemini(
+            client,
+            types,
+            media_uri,
+            prompt_text,
+            model,
+            response_json=True,
+            start_offset=gemini_start,
+            end_offset=gemini_end,
+            on_response=lambda r, _idx=chunk_idx: log_usage_metadata(r, f"transcript-chunk{_idx}"),
+        )
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            try:
+                parsed = json.loads(isolate_json(raw or ""))
+            except (json.JSONDecodeError, TypeError):
+                salvaged, _ = salvage_transcript_sections(raw or "")
+                parsed = salvaged or None
+
+        # Real-input gotcha: Gemini sometimes wraps the JSON response in [...]
+        # instead of {...}. merge_transcript_json() handles this for the single-
+        # call path; mirror the same defensive unwrap here so per-chunk logic
+        # downstream can rely on dict shape.
+        if isinstance(parsed, list):
+            parsed = parsed[0] if parsed else None
+
+        chunk_label = _format_chunk_range_label(start_secs, end_secs or duration_seconds)
+        if not parsed or not isinstance(parsed, dict):
+            failed_chunks.append((start_secs, end_secs, raw or ""))
+            segment_rows.append({"range": chunk_label, "status": "FAILED (parse)", "speakers": []})
+            continue
+
+        chunk_results.append((start_secs, parsed))
+        speaker_names = [s.get("name", f"Speaker {s.get('voice')}") for s in parsed.get("speakers", [])]
+        segment_rows.append({"range": chunk_label, "status": "ok", "speakers": speaker_names})
+
+    if not chunk_results:
+        # All chunks failed - persist concatenated raw responses for forensics
+        for i, (sstart, send, raw) in enumerate(failed_chunks, start=1):
+            sidecar = channel_dir / f"{prefix}.transcript.raw.chunk{i}-{sstart}-{send}.txt"
+            sidecar.write_text(raw, encoding="utf-8")
+        return "error: all chunks failed parsing (raw sidecars saved)"
+
+    chunk_duration = chunk_minutes * 60
+    merged = merge_chunked_transcripts(chunk_results, chunk_duration_seconds=chunk_duration)
+
+    # Sort transcripts by classified timestamp before monotonicity check.
+    # merge_transcript_json's downstream rendering also sorts; mirror that
+    # here so the check operates on the same order as the final output.
+    # Without this sort, the check fires false alarms on per-chunk insert
+    # order (chunks emit entries in chronological-within-chunk order, but
+    # the merged list interleaves chunks).
+    merged["transcripts"].sort(key=lambda t: timestamp_to_seconds(t.get("start", "")))
+
+    # Post-merge monotonicity check (Gate-1 finding 2026-04-26): even with
+    # the per-timestamp classifier, Gemini hallucinations or edge cases can
+    # produce backward jumps. Log them so the user knows which sections to
+    # eyeball, and mark transcript_status: "partial" so downstream automation
+    # can detect quality issues.
+    monotonicity_warnings: list[tuple[str, str]] = []
+    last_secs: int | None = None
+    for t in merged["transcripts"]:
+        ts = t.get("start", "")
+        secs = timestamp_to_seconds(ts)
+        if last_secs is not None and secs < last_secs:
+            prev_label = _format_chunk_range_label(last_secs, last_secs).split(" - ")[0]
+            curr_label = _format_chunk_range_label(secs, secs).split(" - ")[0]
+            monotonicity_warnings.append((prev_label, curr_label))
+        last_secs = secs
+    if monotonicity_warnings:
+        log.warning(
+            "  Stitched transcript has %d non-monotonic timestamp jumps (transcript_status=partial). First 5: %s",
+            len(monotonicity_warnings),
+            ", ".join(f"{a}->{b}" for a, b in monotonicity_warnings[:5]),
+        )
+    body = merge_transcript_json(merged, speakers_map={})
+    coverage = _build_chunked_transcript_coverage_block(duration_seconds, chunk_minutes, segment_rows)
+    transcript_path.write_text(coverage + "\n" + body, encoding="utf-8")
+
+    # Persist raw sidecars only for failed chunks so the user can retry.
+    for i, (sstart, send, raw) in enumerate(failed_chunks, start=1):
+        sidecar = channel_dir / f"{prefix}.transcript.raw.chunk{i}-{sstart}-{send}.txt"
+        sidecar.write_text(raw, encoding="utf-8")
+
+    meta_fields = {
+        "video_url": video["url"],
+        "video_id": video["video_id"],
+        "channel": channel_dir.name,
+        "title": video["title"],
+        "published": video["published"],
+        "model": model,
+        "transcript_status": "partial" if failed_chunks else "ok",
+        "transcript_chunks": len(chunks),
+        "transcript_chunk_minutes": chunk_minutes,
+    }
+    update_meta(channel_dir / f"{prefix}.meta.json", meta_fields, mode="transcript")
+    return "partial" if failed_chunks else "done"
+
+
 @functools.cache
 def _is_youtube_short_url(video_id: str) -> bool:
     """Return True when https://www.youtube.com/shorts/<id> renders as a Short.
@@ -1296,6 +1711,7 @@ def call_gemini(
     *,
     start_offset: int | None = None,
     end_offset: int | None = None,
+    fps: float | None = None,
     on_response: Callable[[object], None] | None = None,
 ):
     """Send a video to Gemini for multimodal analysis with retry on rate limits.
@@ -1309,6 +1725,12 @@ def call_gemini(
 
     Optional start_offset/end_offset (in seconds) clip the video to a segment
     via Gemini's VideoMetadata.
+
+    Optional fps (frames per second) reduces Gemini's frame extraction rate.
+    Default is 1.0 (one frame per second). At 1fps, the model caps requests
+    at 10800 frames (= 3 hours of video). Pass fps=0.5 to halve the frame
+    count for videos longer than 3h - this is what `process --url` uses for
+    its mindmap step on long-form podcasts (issue #50 Gate-1 finding).
 
     Optional on_response callback receives the raw response object before
     ``response.text`` is returned. Used for usage-token observability without
@@ -1325,12 +1747,14 @@ def call_gemini(
         config_kwargs["response_mime_type"] = "application/json"
 
     part_kwargs = {"file_data": types.FileData(file_uri=media_uri)}
-    if start_offset is not None or end_offset is not None:
+    if start_offset is not None or end_offset is not None or fps is not None:
         meta_kwargs = {}
         if start_offset is not None:
             meta_kwargs["start_offset"] = f"{start_offset}s"
         if end_offset is not None:
             meta_kwargs["end_offset"] = f"{end_offset}s"
+        if fps is not None:
+            meta_kwargs["fps"] = fps
         part_kwargs["video_metadata"] = types.VideoMetadata(**meta_kwargs)
 
     contents = types.Content(
@@ -1388,6 +1812,7 @@ def process_mindmap(
     prefix: str | None = None,
     channel_dir_override: Path | None = None,
     media_uri: str | None = None,
+    fps: float | None = None,
 ):
     """Generate a mind map for a single video.
 
@@ -1417,6 +1842,7 @@ def process_mindmap(
             effective_media_uri,
             prompt_text,
             model,
+            fps=fps,
             on_response=lambda r: log_usage_metadata(r, "mindmap"),
         )
 
@@ -2692,9 +3118,31 @@ def cmd_mindmap(args, config):
         "published": date or datetime.now().strftime("%Y-%m-%d"),
     }
 
+    # Issue #50 Gate-1 finding: Gemini caps at 10800 frames per request.
+    # For 3h+ videos at default 1fps, drop fps to 0.5 so the full duration
+    # still fits in one mindmap call. Same threshold as _cmd_process_url.
+    duration_seconds = _lookup_video_duration_seconds(video_id)
+    mindmap_fps: float | None = None
+    if duration_seconds and duration_seconds > 10000:
+        mindmap_fps = 0.5
+        log.info(
+            "Long video (%s); reducing mindmap fps to %.1f to fit Gemini's 10800-frame cap.",
+            _fmt_hms(duration_seconds),
+            mindmap_fps,
+        )
+
     log.info("Generating mind map (%s): %s", prompt_name, video["url"])
     prefix, status = process_mindmap(
-        client, types, video, prompt_text, model, output_dir, channel_name, prompt_name=prompt_name, force=args.force
+        client,
+        types,
+        video,
+        prompt_text,
+        model,
+        output_dir,
+        channel_name,
+        prompt_name=prompt_name,
+        force=args.force,
+        fps=mindmap_fps,
     )
     log.info("  %s: %s", prefix, status)
 
@@ -2855,6 +3303,44 @@ def cmd_transcript(args, config):
         media_uri = None  # YouTube URL path: video["url"] is the media source
         log.info("Transcribing: %s", video["url"])
 
+    # Issue #50: chunked transcript path. Auto-trigger when (a) caller is the
+    # YouTube URL path, (b) no manual --start/--end is set, (c) duration lookup
+    # succeeds and exceeds chunk_minutes. Otherwise fall through to the
+    # single-call process_transcript path that has existed since PR #48.
+    chunk_minutes = getattr(args, "chunk_minutes", None) or TRANSCRIPT_CHUNK_MINUTES_DEFAULT
+    manual_segment = start_offset is not None or end_offset is not None
+    use_chunking = args.url and not manual_segment
+
+    if use_chunking:
+        duration_seconds = _lookup_video_duration_seconds(video["video_id"])
+        if duration_seconds and duration_seconds > chunk_minutes * 60:
+            chunks = _build_transcript_chunks(duration_seconds, chunk_minutes)
+            log.info(
+                "  %s is %s; running %d chunks of %d min each.",
+                video["video_id"],
+                _fmt_hms(duration_seconds),
+                len(chunks),
+                chunk_minutes,
+            )
+            status = _run_chunked_transcript_url(
+                client=client,
+                types=types,
+                video=video,
+                prompt_text=prompt_text,
+                model=model,
+                channel_dir=channel_dir,
+                prefix=prefix,
+                chunks=chunks,
+                duration_seconds=duration_seconds,
+                chunk_minutes=chunk_minutes,
+                force=args.force,
+            )
+            out_path = channel_dir / f"{prefix}.transcript.md"
+            log.info("  %s: %s", prefix, status)
+            if status == "done":
+                log.info("  Saved: %s", out_path)
+            return
+
     prefix, status = process_transcript(
         client,
         types,
@@ -2918,18 +3404,177 @@ def _is_file_expiry_error_status(status: str) -> bool:
     return any(pos in lowered for pos in _FILE_EXPIRY_POSITIVE_MARKERS)
 
 
-def cmd_process(args, config):
-    """Run the full local-file pipeline (mindmap + transcript + concepts) on one upload.
+def _cmd_process_url(args, config):
+    """`process --url` orchestrator: mindmap, then transcript with chunking,
+    then concepts. Mirrors process --file's exit-code contract: 0 if mindmap
+    succeeded, regardless of downstream step outcome."""
+    _, types = require_gemini()
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    if not gemini_key:
+        log.error("GEMINI_API_KEY not set.")
+        sys.exit(1)
+    client = create_client(gemini_key)
+    output_dir = resolve_output_dir(config)
+    model = resolve_model(args, config)
 
-    Wraps ``process_mindmap`` / ``process_transcript`` / ``process_concepts`` with a
-    single ``upload_local_video`` call and threads the returned ``file_uri`` to the
-    video-bearing helpers. The upload is skipped entirely when meta.json already
-    records the completed modes on disk (and ``--force`` is not set).
+    video_id_match = re.search(r"(?:v=|/)([a-zA-Z0-9_-]{11})", args.url)
+    if not video_id_match:
+        log.error("Could not extract video ID from: %s", args.url)
+        sys.exit(1)
+    video_id = video_id_match.group(1)
+
+    channel_name = args.channel
+    title = args.title
+    date = args.date
+    if not channel_name or not title or not date:
+        yt_key = os.environ.get("YOUTUBE_API_KEY")
+        if yt_key:
+            yt_build = require_youtube()
+            yt = yt_build("youtube", "v3", developerKey=yt_key)
+            resp = yt.videos().list(part="snippet", id=video_id).execute()
+            if resp.get("items"):
+                snippet = resp["items"][0]["snippet"]
+                title = title or unescape(snippet["title"])
+                date = date or snippet["publishedAt"][:10]
+                if not channel_name:
+                    yt_channel_id = snippet["channelId"]
+                    for ch in config.get("channels", []):
+                        ch_id, _ = get_channel_id(yt, ch["url"])
+                        if ch_id == yt_channel_id:
+                            channel_name = ch["name"]
+                            break
+                    if not channel_name:
+                        channel_name = slugify(snippet["channelTitle"])
+    channel_name = channel_name or "_standalone"
+    video = {
+        "video_id": video_id,
+        "url": f"https://www.youtube.com/watch?v={video_id}",
+        "title": title or video_id,
+        "published": date or datetime.now().strftime("%Y-%m-%d"),
+    }
+    channel_dir = output_dir / channel_name
+    prefix = video_file_prefix(video)
+
+    prompt_name = normalize_prompt_name(
+        getattr(args, "prompt", None) or config.get("default_prompt", "mindmap-knowledge")
+    )
+    mindmap_prompt = load_prompt(prompt_name)
+    transcript_prompt = load_prompt("transcript")
+
+    log.info("[process --url] %s", video["url"])
+
+    # Issue #50 Gate-1 finding: Gemini caps video requests at 10800 frames.
+    # At default 1fps that's 3h. For longer videos, drop fps so the full
+    # duration still fits in one mindmap call. Threshold of 10000s leaves
+    # 800-frame headroom for SDK rounding. fps=0.5 covers up to 6h.
+    duration_seconds = _lookup_video_duration_seconds(video_id)
+    mindmap_fps: float | None = None
+    if duration_seconds and duration_seconds > 10000:
+        mindmap_fps = 0.5
+        log.info(
+            "  Long video (%s); reducing mindmap fps to %.1f to fit Gemini's 10800-frame cap.",
+            _fmt_hms(duration_seconds),
+            mindmap_fps,
+        )
+
+    log.info("  Step 1/3: mindmap")
+    mindmap_prefix, mindmap_status = process_mindmap(
+        client,
+        types,
+        video,
+        mindmap_prompt,
+        model,
+        output_dir,
+        channel_name,
+        prompt_name=prompt_name,
+        force=args.force,
+        fps=mindmap_fps,
+    )
+    log.info("    mindmap [%s]: %s", mindmap_prefix, mindmap_status)
+    if mindmap_status.startswith("error"):
+        log.error("Mindmap failed; aborting.")
+        sys.exit(1)
+
+    log.info("  Step 2/3: transcript")
+    chunk_minutes = getattr(args, "chunk_minutes", None) or TRANSCRIPT_CHUNK_MINUTES_DEFAULT
+    # duration_seconds was looked up above for the mindmap-fps decision.
+    if duration_seconds and duration_seconds > chunk_minutes * 60:
+        chunks = _build_transcript_chunks(duration_seconds, chunk_minutes)
+        log.info(
+            "    %s is %s; running %d chunks of %d min each.",
+            video_id,
+            _fmt_hms(duration_seconds),
+            len(chunks),
+            chunk_minutes,
+        )
+        transcript_status = _run_chunked_transcript_url(
+            client=client,
+            types=types,
+            video=video,
+            prompt_text=transcript_prompt,
+            model=model,
+            channel_dir=channel_dir,
+            prefix=prefix,
+            chunks=chunks,
+            duration_seconds=duration_seconds,
+            chunk_minutes=chunk_minutes,
+            force=args.force,
+        )
+    else:
+        _, transcript_status = process_transcript(
+            client,
+            types,
+            video,
+            transcript_prompt,
+            model,
+            channel_dir,
+            prefix,
+            force=args.force,
+            media_uri=None,
+        )
+    log.info("    transcript [%s]: %s", prefix, transcript_status)
+
+    log.info("  Step 3/3: concepts")
+    if channel_name == "_standalone":
+        log.warning("    No configured channel for %s; skipping concepts.", video_id)
+        return
+    mindmap_path = find_mindmap_source(channel_dir, prefix)
+    if not mindmap_path or not mindmap_path.exists():
+        log.warning("    Mindmap not on disk; skipping concepts.")
+        return
+    mindmap_text = mindmap_path.read_text(encoding="utf-8")
+    taxonomy = load_taxonomy(output_dir)
+    concepts_prefix, concepts_status = process_concepts(
+        client,
+        types,
+        video,
+        mindmap_text,
+        taxonomy,
+        model,
+        output_dir,
+        channel_name,
+        source_file=mindmap_path.name,
+        source_prompt=prompt_name,
+        prefix=prefix,
+    )
+    log.info("    concepts [%s]: %s", concepts_prefix, concepts_status)
+
+
+def cmd_process(args, config):
+    """Run the full pipeline (mindmap + transcript + concepts) on a single video.
+
+    Two input modes:
+      --file PATH: local MP4 - one Gemini upload, lazy-skipped when meta records
+        all modes complete and artifacts exist (legacy local-file path).
+      --url URL: YouTube URL - chunked transcript via _run_chunked_transcript_url
+        when duration exceeds chunk_minutes; otherwise single call (issue #50).
 
     Exit-code contract: 0 if mindmap succeeded (regardless of transcript/concepts
     outcome), non-zero if mindmap itself failed. Automation callers inspect
     ``modes_completed`` in meta.json for finer-grained detection.
     """
+    if getattr(args, "url", None):
+        return _cmd_process_url(args, config)
     _, types = require_gemini()
 
     gemini_key = os.environ.get("GEMINI_API_KEY")
@@ -4669,16 +5314,30 @@ Examples:
         ),
     )
     tx_parser.add_argument("--force", action="store_true", help="Regenerate even if transcript exists")
+    tx_parser.add_argument(
+        "--chunk-minutes",
+        type=int,
+        default=TRANSCRIPT_CHUNK_MINUTES_DEFAULT,
+        dest="chunk_minutes",
+        help=(
+            f"Chunk size in minutes for auto-splitting long videos via the YouTube URL path "
+            f"(default: {TRANSCRIPT_CHUNK_MINUTES_DEFAULT}). Manual --start/--end disables chunking."
+        ),
+    )
 
     # process command: one-upload full pipeline for local MP4s
     process_parser = subparsers.add_parser(
         "process",
-        help="Full pipeline (mindmap + transcript + concepts) on one Gemini upload for a local video",
+        help="Full pipeline (mindmap + transcript + concepts) on a video. --file uploads a local MP4 once; --url chunks a YouTube URL when long.",
     )
-    process_parser.add_argument(
+    process_source = process_parser.add_mutually_exclusive_group(required=True)
+    process_source.add_argument(
         "--file",
-        required=True,
         help="Path to local video file. The channel is inferred from the parent folder (output_dir/<channel>/X.mp4) or passed explicitly via --channel.",
+    )
+    process_source.add_argument(
+        "--url",
+        help="YouTube video URL (issue #50). Auto-chunks transcripts on long videos via --chunk-minutes.",
     )
     process_parser.add_argument(
         "--channel",
@@ -4691,16 +5350,23 @@ Examples:
     )
     process_parser.add_argument(
         "--title",
-        help="Video title. Falls back to filename stem.",
+        help="Video title. Falls back to filename stem (--file) or YouTube snippet (--url).",
     )
     process_parser.add_argument(
         "--date",
-        help="Publish date YYYY-MM-DD. Falls back to the file's mtime.",
+        help="Publish date YYYY-MM-DD. Falls back to the file's mtime (--file) or YouTube publishedAt (--url).",
     )
     process_parser.add_argument("--start", help="Segment start time (MM:SS, HH:MM:SS, or raw seconds)")
     process_parser.add_argument("--end", help="Segment end time (MM:SS, HH:MM:SS, or raw seconds)")
     process_parser.add_argument("--force", action="store_true", help="Regenerate all artifacts from scratch")
     process_parser.add_argument("--prompt", help="Mindmap prompt name (overrides config default)")
+    process_parser.add_argument(
+        "--chunk-minutes",
+        type=int,
+        default=TRANSCRIPT_CHUNK_MINUTES_DEFAULT,
+        dest="chunk_minutes",
+        help=f"Chunk size for long-video transcripts via --url (default: {TRANSCRIPT_CHUNK_MINUTES_DEFAULT}). Ignored with --file.",
+    )
 
     # concepts command
     concepts_parser = subparsers.add_parser("concepts", help="Extract concepts from existing mindmaps")

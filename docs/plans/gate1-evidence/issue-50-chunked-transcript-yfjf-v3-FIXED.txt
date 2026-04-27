@@ -1,0 +1,19 @@
+23:30:35 INFO    Config resolved from SKILL_DIR/config.yaml (C:\Users\danie\ws\Skills\video-intel-issue50\config.yaml)
+23:30:36 WARNING Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+23:30:40 INFO    Transcribing: https://www.youtube.com/watch?v=YFjfBk8HI5o
+23:30:40 INFO      YFjfBk8HI5o is 3h15m52s; running 4 chunks of 50 min each.
+23:30:40 INFO        chunk 00:00 - 50:00 -> Gemini
+23:31:44 INFO    usage transcript-chunk1 prompt=273699 cached=0 thoughts=0 candidates=14542 total=288241
+23:31:44 INFO        chunk 50:00 - 1:40:00 -> Gemini
+23:35:13 INFO    usage transcript-chunk2 prompt=273699 cached=0 thoughts=0 candidates=65522 total=339221
+23:35:13 INFO        chunk 1:40:00 - 2:30:00 -> Gemini
+23:36:13 INFO    usage transcript-chunk3 prompt=273699 cached=0 thoughts=0 candidates=12537 total=286236
+23:36:13 INFO        chunk 2:30:00 - 3:15:52 -> Gemini
+23:37:11 INFO    usage transcript-chunk4 prompt=251122 cached=0 thoughts=0 candidates=12771 total=263893
+23:37:11 WARNING Implausible timestamp [1:45:47] in chunk (start=3000s, duration=3000s); passing through.
+23:37:11 WARNING Implausible timestamp [1:46:25] in chunk (start=3000s, duration=3000s); passing through.
+23:37:11 WARNING Implausible timestamp [1:48:53] in chunk (start=3000s, duration=3000s); passing through.
+23:37:11 WARNING Implausible timestamp [1:49:30] in chunk (start=3000s, duration=3000s); passing through.
+23:37:11 WARNING   Stitched transcript has 3 non-monotonic timestamp jumps (transcript_status=partial). First 5: 21:08->12:28, 43:21->31:21, 1:49:30->1:40:00
+23:37:12 INFO      2026-02-12-openclaw-the-viral-ai-agent-that-broke-the-internet-peter-steinberger-lex-fridma: done
+23:37:12 INFO      Saved: G:\My Drive\video-intel\lexfridman\2026-02-12-openclaw-the-viral-ai-agent-that-broke-the-internet-peter-steinberger-lex-fridma.transcript.md

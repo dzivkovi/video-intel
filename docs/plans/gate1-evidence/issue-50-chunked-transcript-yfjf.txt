@@ -1,0 +1,14 @@
+22:19:31 INFO    Config resolved from SKILL_DIR/config.yaml (C:\Users\danie\ws\Skills\video-intel-issue50\config.yaml)
+22:19:32 WARNING Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+22:19:36 INFO    Transcribing: https://www.youtube.com/watch?v=YFjfBk8HI5o
+22:19:36 INFO      YFjfBk8HI5o is 3h15m52s; running 4 chunks of 50 min each.
+22:19:36 INFO        chunk 00:00 - 50:00 -> Gemini
+22:21:27 INFO    usage transcript-chunk1 prompt=273542 cached=269784 thoughts=0 candidates=20875 total=294417
+22:21:27 INFO        chunk 50:00 - 1:40:00 -> Gemini
+22:23:41 INFO    usage transcript-chunk2 prompt=273542 cached=0 thoughts=12011 candidates=14460 total=300013
+22:23:41 INFO        chunk 1:40:00 - 2:30:00 -> Gemini
+22:25:51 INFO    usage transcript-chunk3 prompt=273542 cached=0 thoughts=2717 candidates=12558 total=288817
+22:25:51 INFO        chunk 2:30:00 - 3:15:52 -> Gemini
+22:27:31 INFO    usage transcript-chunk4 prompt=250965 cached=0 thoughts=0 candidates=11500 total=262465
+22:27:32 INFO      2026-02-12-openclaw-the-viral-ai-agent-that-broke-the-internet-peter-steinberger-lex-fridma: done
+22:27:32 INFO      Saved: G:\My Drive\video-intel\lexfridman\2026-02-12-openclaw-the-viral-ai-agent-that-broke-the-internet-peter-steinberger-lex-fridma.transcript.md
