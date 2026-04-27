@@ -174,6 +174,76 @@ After the fix, on the same two real raw sidecars:
   syntactically valid JSON in the wrong shape — a tolerant parser
   would not have helped. The current regex-first approach is right
   for the actual failure modes seen.
+- **No proactive defense against other intrusion scripts.** The
+  Cyrillic strip is hardcoded to `U+0400-U+04FF`. Greek, Arabic,
+  Chinese, Hebrew, etc. would not be caught by the same regex. We
+  did not add them speculatively because guessing at Gemini's next
+  language leak has no signal; the recovery loop below keeps the
+  cost of a new variant low.
+
+## If this happens again with a different intrusion pattern
+
+The fix shipped here covers Cyrillic intrusions and the specific
+`[{"task": ..., "output": [...]}, ...]` wrapper shape. Gemini may
+emit something different in the future — a Greek / Arabic / Chinese
+single-token leak, a new wrapper variant like
+`{"results": [{"section": ..., "data": [...]}]}`, or both. This
+section captures the recovery loop so the next instance is cheap to
+fix instead of cheap-to-rediscover-and-then-fix.
+
+### What still works regardless of the new pattern
+
+- **The raw sidecar is always preserved.** `process_transcript`
+  writes `.transcript.raw.txt` (with `.raw.2.txt` etc. on retries)
+  whenever the parse path does not fully succeed. The original Gemini
+  bytes are never deleted, so any new failure mode lands on disk for
+  inspection within the same scan run.
+- **`meta.json` flags partial outcomes.** `transcript_status: "partial"`
+  is the user-visible signal. To enumerate every video flagged this
+  way in the canonical corpus:
+  `grep -l '"transcript_status": "partial"' "G:\My Drive\video-intel"\*\*.meta.json`.
+- **`_wrapper_to_envelope_dict` is open-extension.** Adding a new
+  detector for a new wrapper shape is a single new branch in the
+  helper, not a redesign.
+- **Per-object salvage works for any script.** A Greek / Arabic /
+  Chinese single-token intrusion in the simple flat envelope still
+  loses ~1 entry per occurrence, same as Cyrillic. The
+  script-specific code path is `_strip_cyrillic_for_structure`,
+  which fires only inside `_normalize_task_wrapper` (wrapper-shape
+  recovery).
+
+### Recovery loop
+
+1. **Notice.** A scan summary shows zero or surprisingly low entries
+   on a video, or the partial-status grep finds new entries.
+2. **Inspect the sidecar.** `head -20 <prefix>.transcript.raw.txt`
+   reveals the new shape in seconds. Look for: a different wrapper
+   key (`section`, `data`, `results`), a new outer-object envelope,
+   or a non-Cyrillic intrusion at a structural position.
+3. **Capture as test fixture.** The robotics raw and BCI raw under
+   `tests/test_utils.py::TestSalvageTranscriptSections` (gated on
+   the on-disk path so they skip in fresh clones) are the model: the
+   captured bytes ARE the test, no synthesis required.
+4. **Extend the helper.** For a new wrapper variant, add a branch
+   in `_wrapper_to_envelope_dict`. For a non-Cyrillic intrusion, add
+   a sibling regex to `_strip_cyrillic_for_structure` and rename the
+   helper to `_strip_intrusion_for_structure` (single cross-file
+   rename) so the name keeps describing what it does.
+5. **Verify with the same Gate 1 pattern.** Run a small Python
+   harness against the new sidecar and confirm non-zero recovery
+   before merging the fix; commit the harness output to
+   `docs/plans/gate1-evidence/` like `issue-45-salvage-smoke.txt`.
+
+### What this means for confidence in the existing fix
+
+The two specific cases observed in the 2026-04-25 incident (wrapper
++ Cyrillic, simple + Cyrillic) are locked by real-fixture tests
+against the same bytes. A clean wrapper case (P0 from review) is
+locked by a synthetic test. Future intrusion patterns are not
+proactively defended against — the cost would be guessing what
+Gemini might do next — but the recovery loop above keeps the
+worst-case to "one new sidecar, one new branch, one new test"
+rather than "manual repair script + lost evening."
 
 ## Reviewer guardrail
 
