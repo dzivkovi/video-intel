@@ -141,6 +141,8 @@ The Dark Factories framing collapses these two phases for narrative clarity. The
 
 The two phases are independent. Compressing the validate phase to match the write phase produces silent corruption: not visible breakage that a smoke would catch, but plausibly-wrong outputs that downstream systems consume as truth. For a knowledge-graph use case (this repo), wrong-but-plausible mindmap timestamps are more dangerous than mindmap generation failures, because the failure is invisible until a downstream layer surfaces it.
 
+### Systems Engineering frame
+
 The discipline this doc applies (probability-based sign-off, real-input verification, adversarial cross-examination, evidence preservation) is codified in IEEE/ISO 15288 (international standard for system life-cycle processes) and elaborated in publicly accessible bodies of work such as INCOSE's Systems Engineering Body of Knowledge and the published research of practitioners like Prof. Joseph E. Kasser. It has been mainstream practice for decades in financial systems engineering (where the V-model and pre-release V&V have been standard for billing systems, payment processors, and global-deployment products since the 1990s) and in telecom carrier-grade engineering (often under names like "System Test" or "Integration & Verification" rather than "Systems Engineering"). Both industries share the failure profile that motivated the discipline's formalization: the cost of a wrong-but-plausible output is far higher than the cost of a visible failure.
 
 Modern web and SaaS culture (~2010 to 2024) moved the validation phase rightward, into CI tests and production observability, because the cost-benefit favored fast iteration over pre-release sign-off. Cheap rollback and observability replaced pre-release V&V for non-critical bugs. AI-generated PRs flip the cost-benefit back. The failure profile (wrong-but-plausible outputs flowing into downstream automated systems with hard-to-revert blast radius) is exactly what systems engineering V&V originally won on. The methodology in this doc is not new. It is a re-application of decades-old discipline to a newly-acute failure profile, run at compressed cadence: evenings on a single architectural diff, days across a project's worth of diffs.
@@ -214,9 +216,9 @@ The third smoke produced 100% grounding on verbose vs 95.2% on legacy and confir
 - [PR #55](https://github.com/dzivkovi/video-intel/pull/55): the concrete execution this learning documents (issue #54: invert the mindmap pipeline).
 - `specs/agent-rules.md` §4 (Git Hygiene), §7 (Priority & Stopping Conditions): the destructive-action rules that shape the Gate 2 boundary.
 
-### Systems engineering lineage references
+### Useful Systems Engineering resources
 
-For readers researching the formal discipline this doc applies to AI-generated PRs:
+For readers exploring the discipline this doc applies to AI-generated PRs:
 
 - **IEEE/ISO/IEC 15288**: *Systems and software engineering. System life cycle processes*. Current international standard for the life-cycle and V&V processes the gate framework above re-applies.
 - **INCOSE Systems Engineering Body of Knowledge (SEBoK)**: [sebokwiki.org](https://sebokwiki.org/). Open reference for systems engineering practice; readable without membership.
