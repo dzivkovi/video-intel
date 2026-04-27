@@ -2360,7 +2360,12 @@ def cmd_scan(args, config):
             # truncate the structured-JSON transcript response. Filter them out
             # of the transcript loop and log the manual-clipping recipe.
             # Mindmap loop is upstream and unaffected (mindmap output is small).
-            threshold = config.get("transcript_max_duration_seconds", TRANSCRIPT_MAX_DURATION_DEFAULT)
+            # Per-channel override wins over top-level over default - matches
+            # every other knob in this config (skip_shorts, since, prompt, etc).
+            threshold = ch.get(
+                "transcript_max_duration_seconds",
+                config.get("transcript_max_duration_seconds", TRANSCRIPT_MAX_DURATION_DEFAULT),
+            )
             transcript_videos: list[dict] = []
             for v in videos:
                 if is_processed(output_dir, ch_name, v, "transcript"):
