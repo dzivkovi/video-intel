@@ -27,6 +27,20 @@ auto_concepts: true
 # talks; raise to 10800 for podcast creators who routinely go to 3h.
 transcript_max_duration_seconds: 7200
 
+# Issue #54: per-channel `mindmap_source: auto|transcript|video|none` controls
+# what the mindmap step reads. Default `auto` (no opt-in needed):
+#   - `auto`        use transcript when one is on disk; else watch the video.
+#                   This is the new (cheaper, faster) default whenever
+#                   auto_transcript is also configured to run.
+#   - `transcript`  MUST use transcript; ERROR when none is available.
+#                   Surfaces the explicit-knob conflict (e.g. with
+#                   skip_modes['transcript']) instead of silently falling back.
+#   - `video`       legacy path: mindmap watches the video directly
+#                   (~10x more expensive, hits Gemini's 10800-frame cap on
+#                   3h+ videos).
+#   - `none`        no mindmap at all (independent of `auto_mindmap`).
+# Configure per-channel under the channels list below.
+
 # Channels to scan. Each channel is a YouTube handle; curate commands (scan, index,
 # concepts, etc.) require this list to be populated. Search commands do not.
 channels:
@@ -34,6 +48,11 @@ channels:
     url: https://youtube.com/@example
     auto_transcript: all
     since: 90d
+    # mindmap_source defaults to "auto" -- transcript-first when available,
+    # video fallback when not. Override only when needed:
+    # mindmap_source: video       # force legacy mindmap-from-video path
+    # mindmap_source: transcript  # error when no transcript exists
+    # mindmap_source: none        # skip mindmap entirely
     # skip_shorts is true by default — set false to opt back in for creators
     # whose Shorts (under 60s, or vertical /shorts/ URLs) are substantive.
     # skip_shorts: false

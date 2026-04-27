@@ -398,6 +398,61 @@ def expand_query_via_taxonomy(
     return expanded, match_records
 
 
+_VALID_MINDMAP_SOURCE_VALUES = {"auto", "video", "transcript", "none"}
+
+# Issue #54 / review C1: transcript writers populate `transcript_status` with
+# different healthy literals depending on path: chunked merge writes "ok"
+# (scripts/video_intel.py:1542), single-call success writes "complete"
+# (:2419), salvage writes "partial" (:2449). Any non-healthy value triggers
+# the partial-source mindmap marker. Keep this set in sync with the writers.
+_HEALTHY_TRANSCRIPT_STATUSES = {"ok", "complete"}
+
+
+def resolve_mindmap_source(channel_config: dict, *, transcript_available: bool) -> str:
+    """Decide which input the mindmap step should consume.
+
+    Returns one of ``"video" | "transcript" | "skip"`` (issue #54).
+
+    The ``transcript_available`` flag is a pure file-presence signal — the
+    caller is responsible for deciding whether a transcript artifact exists
+    on disk for this video. This function does NOT inspect ``skip_modes``;
+    the upstream transcript loop is what honors that knob, and a stale
+    on-disk transcript still flips ``transcript_available`` to True (which
+    is the right behavior — use what we have).
+
+    Channel config knob ``mindmap_source`` accepts:
+    - ``"auto"`` (default): transcript when available, else fall back to video.
+      The auto path makes the inversion safe to ship as the new default — a
+      missing transcript silently routes back to the legacy video code.
+    - ``"transcript"``: must use transcript. Raises ``ValueError`` when none
+      is available. Common cause: the user set
+      ``skip_modes['transcript']`` (issue #42) AND ``mindmap_source: transcript``
+      on the same channel; the conflict surfaces here so callers can either
+      remove the skip or change the source.
+    - ``"video"``: explicit legacy path, always watches the video.
+    - ``"none"``: no mindmap at all, matches existing notify-only intent.
+
+    Unknown values raise ``ValueError`` to surface typos at scan time.
+    """
+    raw = channel_config.get("mindmap_source", "auto")
+    if raw not in _VALID_MINDMAP_SOURCE_VALUES:
+        raise ValueError(f"Invalid mindmap_source={raw!r}. Expected one of: {sorted(_VALID_MINDMAP_SOURCE_VALUES)}")
+    if raw == "none":
+        return "skip"
+    if raw == "video":
+        return "video"
+    if raw == "transcript":
+        if not transcript_available:
+            raise ValueError(
+                "mindmap_source='transcript' but no transcript is available. "
+                "Either remove skip_modes['transcript'] (so transcript runs) "
+                "or change mindmap_source to 'video' or 'auto'."
+            )
+        return "transcript"
+    # auto
+    return "transcript" if transcript_available else "video"
+
+
 def find_mindmap_source(channel_dir: Path, prefix: str) -> Path | None:
     """Find the best mindmap file for concept extraction.
 
@@ -1813,17 +1868,35 @@ def process_mindmap(
     channel_dir_override: Path | None = None,
     media_uri: str | None = None,
     fps: float | None = None,
+    source: str = "video",
+    transcript_path: Path | None = None,
 ):
     """Generate a mind map for a single video.
 
-    When called without keyword overrides, artifacts land at
-    ``output_dir/channel_name/{video_file_prefix(video)}.mindmap.md`` and Gemini
-    receives ``video["url"]`` as the media source. The three keyword overrides
-    (``prefix``, ``channel_dir_override``, ``media_uri``) exist for the local-file
-    recovery path (plan rev 4): the caller can route artifacts to a different
-    folder/prefix (e.g. a canonical scan-generated prefix when G2 dedup fires)
-    and feed Gemini a Files API URI while keeping ``video["url"]`` canonical.
+    When ``source="video"`` (default, legacy path), Gemini watches the media at
+    ``video["url"]`` (or ``media_uri`` override). When ``source="transcript"``
+    (issue #54), the function reads the on-disk
+    ``<channel_dir>/<prefix>.transcript.md`` (or the explicit ``transcript_path``)
+    and sends the text to Gemini via ``call_gemini_text`` with
+    ``response_mime_type="text/plain"``. This is roughly 10x cheaper and side-steps
+    Gemini's 10800-frame video cap on long content.
+
+    Artifact shape is identical between both paths: same `<!-- video: -->`
+    header, same `.mindmap.md` filename, same downstream concepts contract. The
+    transcript path additionally writes ``mindmap_source="transcript"`` to
+    meta.json, and when the source transcript was partial it adds
+    ``mindmap_source_status="partial"`` plus a ``<!-- source: partial transcript -->``
+    HTML comment line in the markdown output so readers know.
+
+    The three keyword overrides ``prefix`` / ``channel_dir_override`` / ``media_uri``
+    exist for the local-file recovery path (plan rev 4): the caller can route
+    artifacts to a different folder/prefix (e.g. a canonical scan-generated prefix
+    when G2 dedup fires) and feed Gemini a Files API URI while keeping
+    ``video["url"]`` canonical.
     """
+    if source not in ("video", "transcript"):
+        raise ValueError(f"Invalid source={source!r}. Expected 'video' or 'transcript'.")
+
     resolved_prefix = prefix if prefix is not None else video_file_prefix(video)
     resolved_channel_dir = channel_dir_override if channel_dir_override is not None else output_dir / channel_name
     resolved_channel_dir.mkdir(parents=True, exist_ok=True)
@@ -1834,24 +1907,68 @@ def process_mindmap(
     if mindmap_path.exists() and not force:
         return resolved_prefix, "skipped (exists)"
 
-    effective_media_uri = media_uri if media_uri is not None else video["url"]
     try:
-        result = call_gemini(
-            client,
-            types,
-            effective_media_uri,
-            prompt_text,
-            model,
-            fps=fps,
-            on_response=lambda r: log_usage_metadata(r, "mindmap"),
-        )
+        if source == "transcript":
+            resolved_transcript = (
+                transcript_path
+                if transcript_path is not None
+                else resolved_channel_dir / f"{resolved_prefix}.transcript.md"
+            )
+            if not resolved_transcript.exists():
+                raise FileNotFoundError(f"transcript not found at {resolved_transcript}")
+            transcript_text = resolved_transcript.read_text(encoding="utf-8")
 
-        # Save mind map
-        header = (
-            f"<!-- video: {video['url']} -->\n"
-            f"<!-- title: {video['title']} -->\n"
-            f"<!-- published: {video['published']} -->\n\n"
-        )
+            # Detect partial-source state from the sibling meta.json (best effort:
+            # a missing meta or missing field is treated as healthy). The marker
+            # is additive — readers who don't care can ignore the comment, but
+            # anyone auditing mindmap quality has a clear breadcrumb back to the
+            # source. Healthy values are 'ok' (chunked + scan single-shot
+            # writers, line 1542) and 'complete' (single-call success writer,
+            # line 2419) — both populated by paths that produced a full
+            # transcript. Anything else (notably 'partial' from salvage) signals
+            # the upstream had to recover and the mindmap inherits the gap.
+            transcript_status = "ok"
+            if meta_path.exists():
+                try:
+                    src_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    transcript_status = src_meta.get("transcript_status", "ok")
+                except json.JSONDecodeError:
+                    pass
+
+            result = call_gemini_text(
+                client,
+                types,
+                prompt_text + "\n\n# TRANSCRIPT TO PROCESS\n\n" + transcript_text,
+                model,
+                response_mime_type="text/plain",
+                on_response=lambda r: log_usage_metadata(r, "mindmap"),
+            )
+
+            header_lines = [
+                f"<!-- video: {video['url']} -->",
+                f"<!-- title: {video['title']} -->",
+                f"<!-- published: {video['published']} -->",
+            ]
+            if transcript_status not in _HEALTHY_TRANSCRIPT_STATUSES:
+                header_lines.append(f"<!-- source: partial transcript ({transcript_status}) -->")
+            header = "\n".join(header_lines) + "\n\n"
+        else:
+            effective_media_uri = media_uri if media_uri is not None else video["url"]
+            result = call_gemini(
+                client,
+                types,
+                effective_media_uri,
+                prompt_text,
+                model,
+                fps=fps,
+                on_response=lambda r: log_usage_metadata(r, "mindmap"),
+            )
+            header = (
+                f"<!-- video: {video['url']} -->\n"
+                f"<!-- title: {video['title']} -->\n"
+                f"<!-- published: {video['published']} -->\n\n"
+            )
+
         tmp_path = mindmap_path.with_suffix(".md.tmp")
         tmp_path.write_text(header + result, encoding="utf-8")
         tmp_path.replace(mindmap_path)
@@ -1865,7 +1982,10 @@ def process_mindmap(
             "published": video["published"],
             "processed": datetime.now(UTC).isoformat(),
             "model": model,
+            "mindmap_source": source,
         }
+        if source == "transcript" and transcript_status not in _HEALTHY_TRANSCRIPT_STATUSES:
+            meta_fields["mindmap_source_status"] = "partial"
         if prompt_name:
             meta_fields["prompt"] = prompt_name
         # Forward-fix: persist duration_seconds when scan-time enrichment supplied it,
@@ -2382,8 +2502,14 @@ def call_gemini_text(
     model,
     *,
     on_response: Callable[[object], None] | None = None,
+    response_mime_type: str = "application/json",
 ):
-    """Send text-only content to Gemini and get a JSON response.
+    """Send text-only content to Gemini and get the raw response text.
+
+    The default ``response_mime_type`` is ``"application/json"`` for back-compat
+    with the concepts caller. Callers that need markdown (issue #54
+    mindmap-from-transcript) should pass ``response_mime_type="text/plain"`` so
+    Gemini does not wrap the markdown in a JSON envelope.
 
     Optional on_response callback mirrors ``call_gemini``'s behavior: the raw
     response object is passed to the callback before ``.text`` is returned.
@@ -2391,7 +2517,7 @@ def call_gemini_text(
     """
     config_kwargs = {
         "temperature": 0.3,
-        "response_mime_type": "application/json",
+        "response_mime_type": response_mime_type,
         "safety_settings": build_permissive_safety_settings(types),
     }
     contents = types.Content(parts=[types.Part(text=text_content)])
@@ -2784,75 +2910,24 @@ def cmd_scan(args, config):
         prompt_name = ch.get("prompt") or config.get("default_prompt", "mindmap-light")
         prompt_text = load_prompt(prompt_name)
 
-        # Issue #42 follow-up (notify-only mode): per-channel auto_mindmap=none
-        # discovers and logs new videos without paying the mindmap Gemini call.
-        # Combined with auto_transcript=none, the channel becomes pure
-        # notification - useful for long-form podcasters (Lex Fridman) where
-        # the user wants to cherry-pick episodes manually.
-        auto_mindmap = ch.get("auto_mindmap", "all")
-        if auto_mindmap == "none":
-            if new_videos:
-                log.info(
-                    "  auto_mindmap=none: %d new video(s) listed below, NOT processed.",
-                    len(new_videos),
-                )
-                for v in new_videos:
-                    log.info("    %s - %s", v["published"], v["title"])
-            else:
-                log.info("  auto_mindmap=none: no new videos.")
-        elif not new_videos:
-            log.info("  All mind maps up to date.")
-        else:
-            # Process mind maps in parallel
-            log.info("  Generating mind maps (%s)...", prompt_name)
-            with ThreadPoolExecutor(max_workers=max_parallel) as executor:
-                futures = {
-                    executor.submit(
-                        process_mindmap,
-                        client,
-                        types,
-                        v,
-                        prompt_text,
-                        model,
-                        output_dir,
-                        ch_name,
-                        prompt_name=prompt_name,
-                        force=args.force,
-                    ): v
-                    for v in new_videos
-                }
-                for future in as_completed(futures):
-                    v = futures[future]
-                    prefix, status = future.result()
-                    log.info("    %s: %s", prefix, status)
-                    if status.startswith("error"):
-                        errors.append((ch_name, prefix, status))
-                        # Plan rev 4: on 403 PERMISSION_DENIED, print a recovery
-                        # recipe so the user can fix a members-only gated video
-                        # without having to read documentation mid-scan.
-                        if "PERMISSION_DENIED" in status:
-                            log.info(
-                                "      -> Likely members-only. To recover: save the MP4 as %s.mp4 "
-                                "in any folder, then run:",
-                                v["video_id"],
-                            )
-                            log.info(
-                                "        python scripts/video_intel.py mindmap    --file <PATH> --channel %s",
-                                ch_name,
-                            )
-                            log.info(
-                                "        python scripts/video_intel.py transcript --file <PATH> --channel %s",
-                                ch_name,
-                            )
+        # ----------------------------------------------------------------------
+        # Issue #54: scan order is now transcript -> mindmap -> concepts. The
+        # transcript loop runs first so the mindmap loop below can read on-disk
+        # transcripts via the new mindmap-from-transcript path. The legacy
+        # mindmap-from-video path stays available via the resolver's auto/video
+        # branches and powers users who keep auto_transcript=none.
+        # ----------------------------------------------------------------------
 
-        # Auto-transcript if configured
+        # Auto-transcript if configured (Step 1/2 of the inverted ordering).
         auto = ch.get("auto_transcript", "none")
         if auto == "all":
             transcript_prompt = load_prompt("transcript")
             # Long-video guard (issue #42): videos longer than the threshold
             # truncate the structured-JSON transcript response. Filter them out
             # of the transcript loop and log the manual-clipping recipe.
-            # Mindmap loop is upstream and unaffected (mindmap output is small).
+            # Mindmap loop is downstream and unaffected for filtered videos:
+            # the resolver falls back to "video" source when no transcript
+            # is on disk (with the existing fps fallback for long videos).
             # Per-channel override wins over top-level over default - matches
             # every other knob in this config (skip_shorts, since, prompt, etc).
             threshold = ch.get(
@@ -2907,6 +2982,105 @@ def cmd_scan(args, config):
                         log.info("    %s: %s", prefix, status)
                         if status.startswith("error"):
                             errors.append((ch_name, prefix, status))
+
+        # Issue #42 follow-up (notify-only mode): per-channel auto_mindmap=none
+        # discovers and logs new videos without paying the mindmap Gemini call.
+        # Combined with auto_transcript=none, the channel becomes pure
+        # notification - useful for long-form podcasters (Lex Fridman) where
+        # the user wants to cherry-pick episodes manually.
+        auto_mindmap = ch.get("auto_mindmap", "all")
+        if auto_mindmap == "none":
+            if new_videos:
+                log.info(
+                    "  auto_mindmap=none: %d new video(s) listed below, NOT processed.",
+                    len(new_videos),
+                )
+                for v in new_videos:
+                    log.info("    %s - %s", v["published"], v["title"])
+            else:
+                log.info("  auto_mindmap=none: no new videos.")
+        elif not new_videos:
+            log.info("  All mind maps up to date.")
+        else:
+            # Issue #54: per-video source resolution. Transcripts from Step 1
+            # are now on disk (or absent if the threshold/skip filter rejected
+            # them); resolve_mindmap_source() picks transcript vs video accordingly.
+            channel_dir_for_mindmap = output_dir / ch_name
+            mindmap_from_transcript_prompt = load_prompt("mindmap-from-transcript")
+
+            # Bind loop-scope variables as defaults to avoid B023 closure-over-loop-var.
+            def _build_mindmap_call(
+                v,
+                _ch=ch,
+                _ch_name=ch_name,
+                _channel_dir=channel_dir_for_mindmap,
+                _video_prompt_text=prompt_text,
+                _video_prompt_name=prompt_name,
+                _transcript_prompt_text=mindmap_from_transcript_prompt,
+            ):
+                v_prefix = video_file_prefix(v)
+                v_transcript_path = _channel_dir / f"{v_prefix}.transcript.md"
+                transcript_available = v_transcript_path.exists()
+                try:
+                    src = resolve_mindmap_source(_ch, transcript_available=transcript_available)
+                except ValueError as exc:
+                    return v_prefix, f"error: {exc}"
+                if src == "skip":
+                    return v_prefix, "skipped (mindmap_source=none)"
+                if src == "transcript":
+                    return process_mindmap(
+                        client,
+                        types,
+                        v,
+                        _transcript_prompt_text,
+                        model,
+                        output_dir,
+                        _ch_name,
+                        prompt_name="mindmap-from-transcript",
+                        force=args.force,
+                        source="transcript",
+                        transcript_path=v_transcript_path,
+                    )
+                # Legacy video path
+                return process_mindmap(
+                    client,
+                    types,
+                    v,
+                    _video_prompt_text,
+                    model,
+                    output_dir,
+                    _ch_name,
+                    prompt_name=_video_prompt_name,
+                    force=args.force,
+                    source="video",
+                )
+
+            log.info("  Generating mind maps (%s)...", prompt_name)
+            with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+                futures = {executor.submit(_build_mindmap_call, v): v for v in new_videos}
+                for future in as_completed(futures):
+                    v = futures[future]
+                    prefix, status = future.result()
+                    log.info("    %s: %s", prefix, status)
+                    if status.startswith("error"):
+                        errors.append((ch_name, prefix, status))
+                        # Plan rev 4: on 403 PERMISSION_DENIED, print a recovery
+                        # recipe so the user can fix a members-only gated video
+                        # without having to read documentation mid-scan.
+                        if "PERMISSION_DENIED" in status:
+                            log.info(
+                                "      -> Likely members-only. To recover: save the MP4 as %s.mp4 "
+                                "in any folder, then run:",
+                                v["video_id"],
+                            )
+                            log.info(
+                                "        python scripts/video_intel.py mindmap    --file <PATH> --channel %s",
+                                ch_name,
+                            )
+                            log.info(
+                                "        python scripts/video_intel.py transcript --file <PATH> --channel %s",
+                                ch_name,
+                            )
 
         # Auto-concepts if configured.
         # Plan rev 4 F12: enumerate via *.meta.json glob so both scan-generated
@@ -3118,32 +3292,91 @@ def cmd_mindmap(args, config):
         "published": date or datetime.now().strftime("%Y-%m-%d"),
     }
 
-    # Issue #50 Gate-1 finding: Gemini caps at 10800 frames per request.
-    # For 3h+ videos at default 1fps, drop fps to 0.5 so the full duration
-    # still fits in one mindmap call. Same threshold as _cmd_process_url.
-    duration_seconds = _lookup_video_duration_seconds(video_id)
-    mindmap_fps: float | None = None
-    if duration_seconds and duration_seconds > 10000:
-        mindmap_fps = 0.5
+    # Issue #54: route through resolver. When a transcript is already on disk
+    # for this URL, this command becomes a fast text-only call. Otherwise it
+    # falls back to the legacy mindmap-from-video path with the same fps
+    # fallback for the 10800-frame cap.
+    #
+    # Title-rotation safety net (PR #31 follow-up): consult the channel's
+    # video_id index BEFORE computing the lookup prefix. When YouTube creators
+    # A/B-test titles, the API returns the current title, but the on-disk
+    # transcript is named after the title at write-time. Without this check,
+    # rotated-title videos would miss their existing transcript and fall back
+    # to source=video — failing on the 1M-token cap on long content.
+    # Reproducer: simonscrapes / Master Claude Code retitled to "How the 1%...".
+    channel_dir = output_dir / channel_name
+    computed_prefix = video_file_prefix(video)
+    indexed_prefix = _load_video_id_index(channel_dir).get(video["video_id"])
+    prefix_for_lookup = indexed_prefix if indexed_prefix else computed_prefix
+    if indexed_prefix and indexed_prefix != computed_prefix:
         log.info(
-            "Long video (%s); reducing mindmap fps to %.1f to fit Gemini's 10800-frame cap.",
-            _fmt_hms(duration_seconds),
-            mindmap_fps,
+            "Title-rotation detected for %s; using existing prefix %r (computed would have been %r)",
+            video["video_id"],
+            indexed_prefix,
+            computed_prefix,
         )
-
-    log.info("Generating mind map (%s): %s", prompt_name, video["url"])
-    prefix, status = process_mindmap(
-        client,
-        types,
-        video,
-        prompt_text,
-        model,
-        output_dir,
-        channel_name,
-        prompt_name=prompt_name,
-        force=args.force,
-        fps=mindmap_fps,
+    transcript_path = channel_dir / f"{prefix_for_lookup}.transcript.md"
+    transcript_available = transcript_path.exists()
+    channel_cfg: dict = next(
+        (c for c in config.get("channels", []) if c.get("name") == channel_name),
+        {},
     )
+    try:
+        resolved_source = resolve_mindmap_source(channel_cfg, transcript_available=transcript_available)
+    except ValueError as exc:
+        log.error("Mindmap source unresolvable for %s: %s", video_id, exc)
+        sys.exit(1)
+    if resolved_source == "skip":
+        log.info("mindmap_source=none for channel %s; nothing to do.", channel_name)
+        return
+
+    log.info(
+        "Generating mind map (source=%s, %s): %s",
+        resolved_source,
+        prompt_name if resolved_source == "video" else "mindmap-from-transcript",
+        video["url"],
+    )
+    if resolved_source == "transcript":
+        prefix, status = process_mindmap(
+            client,
+            types,
+            video,
+            load_prompt("mindmap-from-transcript"),
+            model,
+            output_dir,
+            channel_name,
+            prompt_name="mindmap-from-transcript",
+            force=args.force,
+            prefix=prefix_for_lookup,
+            source="transcript",
+            transcript_path=transcript_path,
+        )
+    else:
+        # Issue #50 Gate-1 finding: Gemini caps at 10800 frames per request.
+        # Preserved here only - text input has no frame cap.
+        duration_seconds = _lookup_video_duration_seconds(video_id)
+        mindmap_fps: float | None = None
+        if duration_seconds and duration_seconds > 10000:
+            mindmap_fps = 0.5
+            log.info(
+                "Long video (%s); reducing mindmap fps to %.1f to fit Gemini's 10800-frame cap.",
+                _fmt_hms(duration_seconds),
+                mindmap_fps,
+            )
+        prefix, status = process_mindmap(
+            client,
+            types,
+            video,
+            prompt_text,
+            model,
+            output_dir,
+            channel_name,
+            prompt_name=prompt_name,
+            force=args.force,
+            prefix=prefix_for_lookup,
+            fps=mindmap_fps,
+            source="video",
+        )
     log.info("  %s: %s", prefix, status)
 
     if status == "done":
@@ -3405,9 +3638,18 @@ def _is_file_expiry_error_status(status: str) -> bool:
 
 
 def _cmd_process_url(args, config):
-    """`process --url` orchestrator: mindmap, then transcript with chunking,
-    then concepts. Mirrors process --file's exit-code contract: 0 if mindmap
-    succeeded, regardless of downstream step outcome."""
+    """`process --url` orchestrator (issue #54 ordering): transcript first
+    (chunked if long, per PR #51), then mindmap built from the on-disk
+    transcript text (text-only Gemini call), then concepts.
+
+    Falls back to mindmap-from-video when no transcript is available AND the
+    channel's ``mindmap_source`` resolves to ``"auto"`` or ``"video"``. The
+    legacy mindmap-fps fallback for the 10800-frame video cap is preserved
+    only on that fallback path because text input has no frame cap.
+
+    Mirrors process --file's exit-code contract: 0 if mindmap succeeded,
+    regardless of downstream step outcome.
+    """
     _, types = require_gemini()
     gemini_key = os.environ.get("GEMINI_API_KEY")
     if not gemini_key:
@@ -3453,86 +3695,147 @@ def _cmd_process_url(args, config):
         "published": date or datetime.now().strftime("%Y-%m-%d"),
     }
     channel_dir = output_dir / channel_name
-    prefix = video_file_prefix(video)
+    computed_prefix = video_file_prefix(video)
+    # Title-rotation safety net (PR #31 follow-up): consult the channel's
+    # video_id index so transcript+mindmap stay co-located under the
+    # ORIGINAL prefix when YouTube creators A/B-test titles. Otherwise
+    # transcript Step 1 would write to the new prefix while any prior
+    # transcript at the old prefix becomes orphaned, AND the mindmap
+    # resolver in Step 2 would miss the prior transcript and fall back
+    # to source=video. Reproducer: simonscrapes / Master Claude Code.
+    indexed_prefix = _load_video_id_index(channel_dir).get(video_id)
+    prefix = indexed_prefix if indexed_prefix else computed_prefix
+    if indexed_prefix and indexed_prefix != computed_prefix:
+        log.info(
+            "  Title-rotation: using existing prefix %r (computed would have been %r)",
+            indexed_prefix,
+            computed_prefix,
+        )
 
     prompt_name = normalize_prompt_name(
         getattr(args, "prompt", None) or config.get("default_prompt", "mindmap-knowledge")
     )
     mindmap_prompt = load_prompt(prompt_name)
     transcript_prompt = load_prompt("transcript")
+    mindmap_from_transcript_prompt = load_prompt("mindmap-from-transcript")
 
     log.info("[process --url] %s", video["url"])
 
-    # Issue #50 Gate-1 finding: Gemini caps video requests at 10800 frames.
-    # At default 1fps that's 3h. For longer videos, drop fps so the full
-    # duration still fits in one mindmap call. Threshold of 10000s leaves
-    # 800-frame headroom for SDK rounding. fps=0.5 covers up to 6h.
-    duration_seconds = _lookup_video_duration_seconds(video_id)
-    mindmap_fps: float | None = None
-    if duration_seconds and duration_seconds > 10000:
-        mindmap_fps = 0.5
-        log.info(
-            "  Long video (%s); reducing mindmap fps to %.1f to fit Gemini's 10800-frame cap.",
-            _fmt_hms(duration_seconds),
-            mindmap_fps,
-        )
-
-    log.info("  Step 1/3: mindmap")
-    mindmap_prefix, mindmap_status = process_mindmap(
-        client,
-        types,
-        video,
-        mindmap_prompt,
-        model,
-        output_dir,
-        channel_name,
-        prompt_name=prompt_name,
-        force=args.force,
-        fps=mindmap_fps,
+    # Resolve mindmap source from the channel config (default "auto").
+    channel_cfg: dict = next(
+        (c for c in config.get("channels", []) if c.get("name") == channel_name),
+        {},
     )
-    log.info("    mindmap [%s]: %s", mindmap_prefix, mindmap_status)
-    if mindmap_status.startswith("error"):
-        log.error("Mindmap failed; aborting.")
+
+    duration_seconds = _lookup_video_duration_seconds(video_id)
+    transcript_path = channel_dir / f"{prefix}.transcript.md"
+
+    # Step 1/3: transcript (chunked if long, per PR #51 path).
+    # Review K1: catch any uncaught exception so the mindmap step (the AI's
+    # primary discovery surface) still runs with the legacy video-source
+    # fallback. Without this guard, a single transient transcript failure
+    # would skip mindmap entirely - breaking the user's "mindmap always
+    # runs" invariant (memory: feedback_long_video_keep_mindmap).
+    log.info("  Step 1/3: transcript")
+    chunk_minutes = getattr(args, "chunk_minutes", None) or TRANSCRIPT_CHUNK_MINUTES_DEFAULT
+    try:
+        if duration_seconds and duration_seconds > chunk_minutes * 60:
+            chunks = _build_transcript_chunks(duration_seconds, chunk_minutes)
+            log.info(
+                "    %s is %s; running %d chunks of %d min each.",
+                video_id,
+                _fmt_hms(duration_seconds),
+                len(chunks),
+                chunk_minutes,
+            )
+            transcript_status = _run_chunked_transcript_url(
+                client=client,
+                types=types,
+                video=video,
+                prompt_text=transcript_prompt,
+                model=model,
+                channel_dir=channel_dir,
+                prefix=prefix,
+                chunks=chunks,
+                duration_seconds=duration_seconds,
+                chunk_minutes=chunk_minutes,
+                force=args.force,
+            )
+        else:
+            _, transcript_status = process_transcript(
+                client,
+                types,
+                video,
+                transcript_prompt,
+                model,
+                channel_dir,
+                prefix,
+                force=args.force,
+                media_uri=None,
+            )
+    except Exception as exc:
+        transcript_status = f"error: {exc}"
+        log.warning("    transcript [%s] raised: %s", prefix, exc)
+    log.info("    transcript [%s]: %s", prefix, transcript_status)
+
+    # Step 2/3: mindmap. Resolver picks source based on channel config and
+    # whether transcript exists on disk now (it may have been written by Step 1
+    # this run, or already present from a prior run).
+    transcript_available = transcript_path.exists()
+    try:
+        resolved_source = resolve_mindmap_source(channel_cfg, transcript_available=transcript_available)
+    except ValueError as exc:
+        log.error("Mindmap source unresolvable for %s: %s", video_id, exc)
         sys.exit(1)
 
-    log.info("  Step 2/3: transcript")
-    chunk_minutes = getattr(args, "chunk_minutes", None) or TRANSCRIPT_CHUNK_MINUTES_DEFAULT
-    # duration_seconds was looked up above for the mindmap-fps decision.
-    if duration_seconds and duration_seconds > chunk_minutes * 60:
-        chunks = _build_transcript_chunks(duration_seconds, chunk_minutes)
-        log.info(
-            "    %s is %s; running %d chunks of %d min each.",
-            video_id,
-            _fmt_hms(duration_seconds),
-            len(chunks),
-            chunk_minutes,
-        )
-        transcript_status = _run_chunked_transcript_url(
-            client=client,
-            types=types,
-            video=video,
-            prompt_text=transcript_prompt,
-            model=model,
-            channel_dir=channel_dir,
-            prefix=prefix,
-            chunks=chunks,
-            duration_seconds=duration_seconds,
-            chunk_minutes=chunk_minutes,
-            force=args.force,
-        )
-    else:
-        _, transcript_status = process_transcript(
+    if resolved_source == "skip":
+        log.info("  Step 2/3: mindmap [skipped (mindmap_source=none)]")
+        log.info("  Step 3/3: concepts [skipped (no mindmap)]")
+        return
+
+    log.info("  Step 2/3: mindmap (source=%s)", resolved_source)
+    if resolved_source == "transcript":
+        mindmap_prefix, mindmap_status = process_mindmap(
             client,
             types,
             video,
-            transcript_prompt,
+            mindmap_from_transcript_prompt,
             model,
-            channel_dir,
-            prefix,
+            output_dir,
+            channel_name,
+            prompt_name="mindmap-from-transcript",
             force=args.force,
-            media_uri=None,
+            source="transcript",
+            transcript_path=transcript_path,
         )
-    log.info("    transcript [%s]: %s", prefix, transcript_status)
+    else:
+        # Legacy path: mindmap watches the video. Issue #50 fps fallback for
+        # the 10800-frame cap is preserved here only - text input has no cap.
+        mindmap_fps: float | None = None
+        if duration_seconds and duration_seconds > 10000:
+            mindmap_fps = 0.5
+            log.info(
+                "  Long video (%s); reducing mindmap fps to %.1f to fit Gemini's 10800-frame cap.",
+                _fmt_hms(duration_seconds),
+                mindmap_fps,
+            )
+        mindmap_prefix, mindmap_status = process_mindmap(
+            client,
+            types,
+            video,
+            mindmap_prompt,
+            model,
+            output_dir,
+            channel_name,
+            prompt_name=prompt_name,
+            force=args.force,
+            fps=mindmap_fps,
+            source="video",
+        )
+    log.info("    mindmap [%s]: %s", mindmap_prefix, mindmap_status)
+    if mindmap_status.startswith("error"):
+        log.error("Mindmap failed; skipping concepts.")
+        sys.exit(1)
 
     log.info("  Step 3/3: concepts")
     if channel_name == "_standalone":
@@ -3544,6 +3847,7 @@ def _cmd_process_url(args, config):
         return
     mindmap_text = mindmap_path.read_text(encoding="utf-8")
     taxonomy = load_taxonomy(output_dir)
+    concepts_prompt_name = "mindmap-from-transcript" if resolved_source == "transcript" else prompt_name
     concepts_prefix, concepts_status = process_concepts(
         client,
         types,
@@ -3554,7 +3858,7 @@ def _cmd_process_url(args, config):
         output_dir,
         channel_name,
         source_file=mindmap_path.name,
-        source_prompt=prompt_name,
+        source_prompt=concepts_prompt_name,
         prefix=prefix,
     )
     log.info("    concepts [%s]: %s", concepts_prefix, concepts_status)
