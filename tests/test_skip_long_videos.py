@@ -291,6 +291,70 @@ class TestLongVideoTranscriptGuard:
         tx_ids = [v["video_id"] for v in captured["transcripts"]]
         assert "v75" not in tx_ids, "75-min video must be dropped under 60-min threshold"
 
+    def test_per_channel_threshold_override_wins_over_top_level(self, tmp_path, monkeypatch):
+        """Per-channel transcript_max_duration_seconds must override the
+        top-level value, matching the precedence pattern used by every other
+        knob in this codebase (skip_shorts, since, prompt, etc)."""
+        videos = [
+            {
+                "video_id": "lex2h30m",
+                "title": "Lex 2h30m episode",
+                "published": "2026-04-15",
+                "url": "https://www.youtube.com/watch?v=lex2h30m",
+            },
+        ]
+        durations = {"lex2h30m": "PT2H30M"}  # 9000 sec
+        captured = _scan_setup_with_transcript(monkeypatch, videos, durations=durations)
+
+        # Top-level says 7200 (would skip), but channel override says 14400 (4h, keeps it)
+        config = {
+            "output_dir": str(tmp_path),
+            "transcript_max_duration_seconds": 7200,
+            "channels": [
+                {
+                    "name": "lex",
+                    "url": "https://example.com/lex",
+                    "auto_transcript": "all",
+                    "transcript_max_duration_seconds": 14400,  # channel-specific 4h override
+                },
+            ],
+        }
+        vi.cmd_scan(_scan_args(), config)
+
+        tx_ids = [v["video_id"] for v in captured["transcripts"]]
+        assert "lex2h30m" in tx_ids, "Channel override 14400 must keep 2h30m video"
+
+    def test_per_channel_threshold_can_be_lower_than_top_level(self, tmp_path, monkeypatch):
+        """Symmetric: a tighter per-channel cap drops videos that the top-level
+        would have kept."""
+        videos = [
+            {
+                "video_id": "v90m",
+                "title": "90-min talk",
+                "published": "2026-04-15",
+                "url": "https://www.youtube.com/watch?v=v90m",
+            },
+        ]
+        durations = {"v90m": "PT1H30M"}  # 5400 sec
+        captured = _scan_setup_with_transcript(monkeypatch, videos, durations=durations)
+
+        config = {
+            "output_dir": str(tmp_path),
+            "transcript_max_duration_seconds": 7200,  # default would keep 90m
+            "channels": [
+                {
+                    "name": "shortform",
+                    "url": "https://example.com/shortform",
+                    "auto_transcript": "all",
+                    "transcript_max_duration_seconds": 3600,  # 60-min cap drops 90m
+                },
+            ],
+        }
+        vi.cmd_scan(_scan_args(), config)
+
+        tx_ids = [v["video_id"] for v in captured["transcripts"]]
+        assert "v90m" not in tx_ids
+
     def test_video_with_unparseable_duration_kept_fail_safe(self, tmp_path, monkeypatch):
         """If duration is None, do NOT silently drop. Better to attempt and fail visibly."""
         videos = [
