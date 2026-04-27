@@ -44,6 +44,17 @@ channels:
     # skip_video_ids:
     #   - ABCDEFGHIJK
 
+  # Notify-only mode: long-form podcasts where the user wants to cherry-pick
+  # episodes manually rather than auto-process. auto_mindmap=none means scan
+  # logs new videos but doesn't run Gemini. min_duration_seconds drops any
+  # short clips below the channel-specific definition of "real content".
+  - name: example_long_form_podcast
+    url: https://youtube.com/@example_podcast
+    auto_mindmap: none           # discovery only, zero Gemini cost
+    auto_transcript: none
+    min_duration_seconds: 1800   # drop anything under 30 min
+    since: 90d
+
   # Selective mode: only pull specific playlists or keyword-matched videos.
   # Useful when a creator posts across many topics and you only want a slice.
   - name: example_selective

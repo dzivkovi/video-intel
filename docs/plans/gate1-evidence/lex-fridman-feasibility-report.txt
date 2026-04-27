@@ -1,0 +1,45 @@
+================================================================================================
+PHASE 1 REPORT - Lex Fridman channel feasibility
+================================================================================================
+Channel id: UCSHZKyawb77ixDdsGog4iWA
+Uploads playlist: UUSHZKyawb77ixDdsGog4iWA
+
+Date           Duration   Std-Short   Lex-Short    >2h?  video_id      Title
+----------------------------------------------------------------------------------------------------------------------------------
+2026-04-09      2h3m24s                             YES  iKx3gAODybU   Vikings, Ragnar, Berserkers, Valhalla & the Warriors of
+2026-03-23     2h25m59s                             YES  vif8NQcjVf0   Jensen Huang: NVIDIA - The $4 Trillion Company & the AI
+2026-03-11     5h10m12s                             YES  H9rF1CSSh-w   Jeff Kaplan: World of Warcraft, Overwatch, Blizzard, an
+2026-03-03        2m57s                     YES          SHlrUAkkWI0   Lex trains w/ Khabib Nurmagomedov | Exclusive Footage a
+2026-03-01     2h33m48s                             YES  1SJiTwbSI58   Rick Beato: Greatest Guitarists of All Time, History & 
+2026-02-25        22m9s                     YES          KGVpKPNUdzA   Khabib vs Lex: Training with Khabib | FULL EXCLUSIVE FO
+2026-02-12     3h15m52s                             YES  YFjfBk8HI5o   OpenClaw: The Viral AI Agent that Broke the Internet - 
+2026-01-31     4h25m13s                             YES  EV7WhVT270Q   State of AI in 2026: LLMs, Coding, Scaling Laws, China,
+2026-01-13      3h6m19s                             YES  Z-FRe5AKmCU   Paul Rosolie: Uncontacted Tribes in the Amazon Jungle |
+2025-12-31     3h52m18s                             YES  14OPT6CcsH4   Infinity, Paradoxes, Gödel Incompleteness & the Mathema
+2025-12-12      2h5m13s                             YES  _bBRVNkAfkQ   Deciphering Secrets of Ancient Civilizations, Noah's Ar
+2025-11-30      3h18m9s                             YES  Qp0rCU49lMs   Michael Levin: Hidden Reality of Alien Intelligence & B
+2025-11-17     2h36m55s                             YES  m_CFCyc2Shs   David Kirtley: Nuclear Fusion, Plasma Physics, and the 
+2025-10-31     2h45m26s                             YES  o3gbXDjNWyI   Dan Houser: GTA, Red Dead Redemption, Rockstar, Absurd 
+2025-10-14      2h42m7s                             YES  7OLVwZeMCfY   Julia Shaw: Criminal Psychology of Murder, Serial Kille
+2025-09-30     4h34m10s                             YES  qjPH9njnaVU   Pavel Durov: Telegram, Freedom, Censorship, Money, Powe
+2025-09-19     4h25m45s                             YES  SvKv7D4pBjE   Norman Ohler: Hitler, Nazis, Drugs, WW2, Blitzkrieg, LS
+2025-09-04     3h36m26s                             YES  -Qm1_On71Oo   Dave Hone: T-Rex, Dinosaurs, Extinction, Evolution, and
+2025-08-29     1h50m29s                                  HsLgZzgpz9Y   Dave Plummer: Programming, Autism, and Old-School Micro
+2025-08-24    10h26m31s                             YES  jdCKiEJpwf4   Scott Horton: The Case Against War and the Military Ind
+----------------------------------------------------------------------------------------------------------------------------------
+
+Last 20 uploads (covers > 90d for Lex):
+  Standard Shorts (<60s): 0
+  Lex-shorts (<30 min, user's mental model): 2
+  Over 2h (transcript would be auto-skipped per PR #48): 17
+  Total runtime: 65h39m22s
+  Average length: 3h16m58s
+
+--- Phase 3 target: YFjfBk8HI5o ---
+  Title: OpenClaw: The Viral AI Agent that Broke the Internet - Peter Steinberger | Lex Fridman Podcast #491
+  Channel: Lex Fridman
+  Published: 2026-02-12
+  Duration: 3h15m52s (11752s)
+  Over 2h threshold? YES (would be auto-skipped)
+  Chunks needed at 50min/chunk: 4
+  Chunks needed at 100min/chunk: 2
