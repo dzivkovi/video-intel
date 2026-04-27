@@ -1,10 +1,12 @@
 Generate a JSON object with keys `transcripts`, `screen_content`, and `speakers` for the following three tasks.
 
+**Critical timestamp instruction (applies to all tasks):** if this video has been clipped to a segment via VideoMetadata start/end offsets, ALL timestamps you emit must be ABSOLUTE relative to the start of the full original video, NOT relative to the clip start. For example, if you receive a clip covering 50:00 to 1:40:00 of the full video, content one minute into the clip should be timestamped `[51:00]`, not `[01:00]`. Use `HH:MM:SS` for timestamps at or above one hour, `MM:SS` otherwise. This invariant is enforced downstream; chunk-relative timestamps will be detected and rejected.
+
 **Task 1 - Transcripts**
 - Listen carefully to the audio.
 - Identify distinct voices using a `voice` integer ID (1, 2, 3...).
 - Transcribe the audio verbatim with voice diarization.
-- Include the `start` timecode (MM:SS) for each speech segment.
+- Include the `start` timecode for each speech segment using ABSOLUTE timestamps per the rule above.
 - Preserve filler words, false starts, and self-corrections.
 - Do NOT paraphrase or summarize. Transcribe exactly what is said.
 - Output: array of objects with fields: `start`, `voice`, `text`

@@ -90,40 +90,81 @@ def _chunk(speakers, transcripts, screen_content=None):
 
 
 class TestMergeChunkedTranscripts:
-    def test_timestamps_pass_through_unchanged(self):
-        """Gate-1 finding (2026-04-26 YFjfBk8HI5o smoke): Gemini returns
-        ABSOLUTE timestamps when given VideoMetadata.start_offset, not
-        chunk-relative. So the merger must NOT add offsets - that would
-        double-apply and shift chunk-2's timestamps into chunk-3 territory."""
+    def test_relative_timestamps_get_offset_applied(self):
+        """When Gemini returns chunk-relative timestamps (e.g. '12:34' for
+        content 12 min into chunk 2), the classifier detects the value is
+        within chunk_duration tolerance of zero and adds the offset."""
         c1 = _chunk(
             speakers=[{"voice": 1, "name": "Lex"}],
-            transcripts=[{"start": "00:30", "voice": 1, "text": "Hello."}],
+            transcripts=[{"start": "00:30", "voice": 1, "text": "first chunk"}],
         )
-        # Chunk 2 covers 50:00-1:40:00 absolute. Gemini returns absolute
-        # timestamps (e.g. "1:02:34" not "12:34"). Merger preserves them.
+        # Chunk 2 (start=3000) Gemini returned relative "12:34"
         c2 = _chunk(
             speakers=[{"voice": 1, "name": "Lex"}],
-            transcripts=[{"start": "1:02:34", "voice": 1, "text": "Goodbye."}],
+            transcripts=[{"start": "12:34", "voice": 1, "text": "second chunk"}],
         )
         merged = vi.merge_chunked_transcripts([(0, c1), (3000, c2)])
         starts = [t["start"] for t in merged["transcripts"]]
-        # No offset applied - timestamps come through untouched.
+        # 12:34 in chunk 2 (offset=3000s) classified as relative, becomes
+        # "1:02:34" (3000s + 754s = 3754s = 1h2m34s).
         assert starts == ["00:30", "1:02:34"]
-        assert merged["transcripts"][1]["text"] == "Goodbye."
 
-    def test_screen_content_timestamps_pass_through_unchanged(self):
-        c1 = _chunk(speakers=[], transcripts=[], screen_content=[])
-        # Chunk 2 starts at 50:00 absolute. Gemini's screen_content uses
-        # absolute "55:00 - 56:00", not chunk-relative "05:00 - 06:00".
+    def test_absolute_timestamps_not_double_offset(self):
+        """When Gemini returns ABSOLUTE timestamps (e.g. '1:02:34' already
+        meaning 1h2m34s of full video for chunk 2), the classifier detects
+        the value falls in [chunk_start, chunk_start + chunk_duration]
+        and leaves it alone."""
+        c1 = _chunk(
+            speakers=[{"voice": 1, "name": "Lex"}],
+            transcripts=[{"start": "00:30", "voice": 1, "text": "first chunk"}],
+        )
+        # Chunk 2 (start=3000) Gemini returned absolute "1:02:34" already.
         c2 = _chunk(
+            speakers=[{"voice": 1, "name": "Lex"}],
+            transcripts=[{"start": "1:02:34", "voice": 1, "text": "second chunk"}],
+        )
+        merged = vi.merge_chunked_transcripts([(0, c1), (3000, c2)])
+        starts = [t["start"] for t in merged["transcripts"]]
+        # Absolute already - no double-offset. 1:02:34 stays 1:02:34.
+        assert starts == ["00:30", "1:02:34"]
+
+    def test_implausible_timestamps_pass_through_with_warning(self, caplog):
+        """Timestamps that fit neither classification (e.g. '5:30:00' for
+        chunk 2 covering 50:00-1:40:00) get logged and passed through."""
+        c1 = _chunk(speakers=[], transcripts=[])
+        c2 = _chunk(
+            speakers=[{"voice": 1, "name": "X"}],
+            transcripts=[{"start": "5:30:00", "voice": 1, "text": "way past chunk 2"}],
+        )
+        with caplog.at_level("WARNING"):
+            merged = vi.merge_chunked_transcripts([(0, c1), (3000, c2)])
+        assert merged["transcripts"][0]["start"] == "5:30:00"
+        assert "Implausible timestamp" in "\n".join(r.message for r in caplog.records)
+
+    def test_screen_content_classifier_handles_both_modes(self):
+        c1 = _chunk(speakers=[], transcripts=[], screen_content=[])
+        # Chunk 2 covers 50:00-1:40:00 absolute. SCREEN content emitted
+        # absolute "55:00-56:00".
+        c2_absolute = _chunk(
             speakers=[],
             transcripts=[],
             screen_content=[{"start": "55:00", "end": "56:00", "type": "slide", "description": "Title"}],
         )
-        merged = vi.merge_chunked_transcripts([(0, c1), (3000, c2)])
+        merged = vi.merge_chunked_transcripts([(0, c1), (3000, c2_absolute)])
         sc = merged["screen_content"][0]
         assert sc["start"] == "55:00"
         assert sc["end"] == "56:00"
+        # Same chunk if Gemini emitted relative "05:00-06:00" instead -
+        # classifier should also produce "55:00-56:00".
+        c2_relative = _chunk(
+            speakers=[],
+            transcripts=[],
+            screen_content=[{"start": "05:00", "end": "06:00", "type": "slide", "description": "Title"}],
+        )
+        merged2 = vi.merge_chunked_transcripts([(0, c1), (3000, c2_relative)])
+        sc2 = merged2["screen_content"][0]
+        assert sc2["start"] == "55:00"
+        assert sc2["end"] == "56:00"
 
     def test_speakers_dedup_by_name_across_chunks(self):
         """Lex appears in both chunks; merged should have exactly one Lex record

@@ -1133,11 +1133,10 @@ def _build_transcript_chunks(
 def _offset_timestamp(ts: str, offset_seconds: int) -> str:
     """Add offset_seconds to a 'MM:SS' or 'HH:MM:SS' timestamp string.
 
-    Returns the input unchanged if it does not match either expected shape -
-    the caller decides whether to log this. Output uses the most compact
-    representation that fits: under one hour stays MM:SS; one hour or more
-    becomes H:MM:SS (no zero-padding on hour to match merge_transcript_json's
-    rendering convention).
+    Unconditional offset addition - the caller has already decided this
+    timestamp needs the offset applied. For per-timestamp absolute-vs-
+    relative classification (Gemini's chunk inconsistency), use
+    _classify_and_offset_timestamp instead.
     """
     parts = ts.split(":")
     try:
@@ -1150,6 +1149,81 @@ def _offset_timestamp(ts: str, offset_seconds: int) -> str:
     except ValueError:
         return ts
     total += offset_seconds
+    if total < 0:
+        return ts
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def _timestamp_chunk_tolerance(chunk_duration_seconds: int) -> int:
+    """Slack for absolute-vs-relative classification (ported from translate_video.py).
+
+    Long clips can drift by minutes; short clips should stay much tighter.
+    """
+    return min(300, max(30, chunk_duration_seconds // 10))
+
+
+def _classify_and_offset_timestamp(
+    ts: str,
+    chunk_start_secs: int,
+    chunk_duration_secs: int,
+) -> str:
+    """Per-timestamp classifier handling Gemini's inconsistent absolute-vs-
+    relative timestamp behavior across chunks. Ported from translate_video.py's
+    apply_timestamp_offset (proven empirically on BCS translation runs).
+
+    Three branches per timestamp:
+      1. total <= chunk_duration + tolerance -> relative, add chunk_start offset
+      2. chunk_start <= total <= chunk_start + chunk_duration + tolerance ->
+         already absolute, leave as-is
+      3. otherwise -> implausible, log warning and pass through unchanged
+
+    Returns the offset-applied (or unchanged) timestamp in the most compact
+    form: under one hour stays MM:SS; one hour or more becomes H:MM:SS to
+    match merge_transcript_json's rendering convention.
+    """
+    parts = ts.split(":")
+    try:
+        if len(parts) == 2:
+            total = int(parts[0]) * 60 + int(parts[1])
+        elif len(parts) == 3:
+            total = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+        else:
+            return ts
+    except ValueError:
+        return ts
+
+    tolerance = _timestamp_chunk_tolerance(chunk_duration_secs)
+    max_relative = chunk_duration_secs + tolerance
+
+    # Branch order: prefer ABSOLUTE when both interpretations are plausible
+    # (e.g. value exactly at chunk_start = chunk_duration boundary). The
+    # transcript prompt explicitly tells Gemini to use absolute timestamps,
+    # so absolute is the expected case; relative is the defensive fallback.
+    # This ordering differs from translate_video.py's apply_timestamp_offset
+    # (which prefers relative-first) because translate's video-translation
+    # prompt does not carry the same instruction.
+    if chunk_start_secs > 0 and chunk_start_secs <= total <= chunk_start_secs + max_relative:
+        # Absolute: in [chunk_start, chunk_start + chunk_duration + tolerance]
+        # range. Leave alone. Skipped for chunk_start=0 since absolute and
+        # relative coincide there.
+        pass
+    elif total <= max_relative:
+        # Chunk-relative: add the chunk's start offset.
+        total += chunk_start_secs
+    else:
+        # Implausible (probably a Gemini hallucination or stale prefix).
+        log.warning(
+            "Implausible timestamp [%s] in chunk (start=%ds, duration=%ds); passing through.",
+            ts,
+            chunk_start_secs,
+            chunk_duration_secs,
+        )
+        return ts
+
     if total < 0:
         return ts
     h, rem = divmod(total, 3600)
@@ -1221,37 +1295,43 @@ def _build_chunked_transcript_coverage_block(
 
 def merge_chunked_transcripts(
     chunks: list[tuple[int, dict]],
+    chunk_duration_seconds: int = 3000,
 ) -> dict:
     """Merge per-chunk transcript JSONs into a single transcript JSON.
 
     Input: [(chunk_start_seconds, chunk_json), ...] in chronological order.
+    chunk_duration_seconds: nominal length of each chunk in seconds (default
+    3000 = 50 min, the typical chunk_minutes default). Used by the per-
+    timestamp classifier for absolute-vs-relative detection. Last chunk may
+    be shorter; the tolerance in _timestamp_chunk_tolerance handles the
+    slack.
+
     Output: dict with the same shape as a single Gemini transcript response
     (transcripts, screen_content, speakers) with speakers deduplicated by
-    name with globally-unique voice ids.
+    name with globally-unique voice ids and timestamps classified per-entry
+    via _classify_and_offset_timestamp.
 
-    **Critical empirical finding (Gate-1 smoke on YFjfBk8HI5o, 2026-04-26):**
-    when Gemini receives a video with VideoMetadata.start_offset clipping,
-    its returned timestamps are ABSOLUTE (relative to the full video), not
-    relative to the clip start. So this merger does NOT add any offset to
-    the timestamps - it just concatenates and dedupes. Adding an offset
-    here results in cumulative double-application across chunks; the bug
-    surfaced as a 3h15m video producing timestamps up to 5:45:18 (= real
-    end + 3 chunks * 50min wrongly-added offset).
+    **Hard-won finding (Gate-1 smoke on YFjfBk8HI5o, 2026-04-26):** Gemini's
+    timestamp behavior is INCONSISTENT across chunks of the same video.
+    Some chunks return absolute timestamps (relative to full video start),
+    others return chunk-relative. There's no prompt incantation that
+    guarantees consistency. The fix is per-timestamp classification:
+    decide for each timestamp whether it falls in [0, chunk_duration] (=
+    relative) or [chunk_start, chunk_start + chunk_duration] (= absolute),
+    apply offset only in the relative case. This is the same pattern
+    translate_video.py's apply_timestamp_offset uses, proven on long-form
+    BCS translation runs.
 
     Speaker dedup is by exact name match. If Gemini renumbers a speaker
     mid-stream (chunk 1's voice=1 = "Lex"; chunk 2's voice=1 = "Peter"),
     the merger correctly maps them to different global voice ids because
     the lookup keys on (chunk_idx, original_voice) -> name -> global_voice.
-
-    The chunk_start_seconds parameter is preserved in the function signature
-    for two reasons: (a) future-proof if Gemini changes behavior, and (b)
-    callers can still inspect chunk boundaries via the input tuple shape.
     """
     merged: dict = {"transcripts": [], "screen_content": [], "speakers": []}
     name_to_global: dict[str, int] = {}
     next_global = 1
 
-    for _chunk_idx, (_start_secs, chunk_json) in enumerate(chunks):
+    for _chunk_idx, (start_secs, chunk_json) in enumerate(chunks):
         if not isinstance(chunk_json, dict):
             continue
         # Per-chunk (original_voice -> global_voice) map.
@@ -1266,16 +1346,22 @@ def merge_chunked_transcripts(
             if voice is not None:
                 voice_remap[voice] = name_to_global[name]
 
-        # Timestamps pass through unchanged - Gemini already returns absolute
-        # values when given VideoMetadata.start_offset (see docstring above).
+        # Per-timestamp absolute-vs-relative classification.
         for t in chunk_json.get("transcripts", []):
             new_t = dict(t)
+            if "start" in new_t:
+                new_t["start"] = _classify_and_offset_timestamp(new_t["start"], start_secs, chunk_duration_seconds)
             if t.get("voice") in voice_remap:
                 new_t["voice"] = voice_remap[t["voice"]]
             merged["transcripts"].append(new_t)
 
         for sc in chunk_json.get("screen_content", []):
-            merged["screen_content"].append(dict(sc))
+            new_sc = dict(sc)
+            if "start" in new_sc:
+                new_sc["start"] = _classify_and_offset_timestamp(new_sc["start"], start_secs, chunk_duration_seconds)
+            if new_sc.get("end"):
+                new_sc["end"] = _classify_and_offset_timestamp(new_sc["end"], start_secs, chunk_duration_seconds)
+            merged["screen_content"].append(new_sc)
 
     return merged
 
@@ -1365,7 +1451,38 @@ def _run_chunked_transcript_url(
             sidecar.write_text(raw, encoding="utf-8")
         return "error: all chunks failed parsing (raw sidecars saved)"
 
-    merged = merge_chunked_transcripts(chunk_results)
+    chunk_duration = chunk_minutes * 60
+    merged = merge_chunked_transcripts(chunk_results, chunk_duration_seconds=chunk_duration)
+
+    # Sort transcripts by classified timestamp before monotonicity check.
+    # merge_transcript_json's downstream rendering also sorts; mirror that
+    # here so the check operates on the same order as the final output.
+    # Without this sort, the check fires false alarms on per-chunk insert
+    # order (chunks emit entries in chronological-within-chunk order, but
+    # the merged list interleaves chunks).
+    merged["transcripts"].sort(key=lambda t: timestamp_to_seconds(t.get("start", "")))
+
+    # Post-merge monotonicity check (Gate-1 finding 2026-04-26): even with
+    # the per-timestamp classifier, Gemini hallucinations or edge cases can
+    # produce backward jumps. Log them so the user knows which sections to
+    # eyeball, and mark transcript_status: "partial" so downstream automation
+    # can detect quality issues.
+    monotonicity_warnings: list[tuple[str, str]] = []
+    last_secs: int | None = None
+    for t in merged["transcripts"]:
+        ts = t.get("start", "")
+        secs = timestamp_to_seconds(ts)
+        if last_secs is not None and secs < last_secs:
+            prev_label = _format_chunk_range_label(last_secs, last_secs).split(" - ")[0]
+            curr_label = _format_chunk_range_label(secs, secs).split(" - ")[0]
+            monotonicity_warnings.append((prev_label, curr_label))
+        last_secs = secs
+    if monotonicity_warnings:
+        log.warning(
+            "  Stitched transcript has %d non-monotonic timestamp jumps (transcript_status=partial). First 5: %s",
+            len(monotonicity_warnings),
+            ", ".join(f"{a}->{b}" for a, b in monotonicity_warnings[:5]),
+        )
     body = merge_transcript_json(merged, speakers_map={})
     coverage = _build_chunked_transcript_coverage_block(duration_seconds, chunk_minutes, segment_rows)
     transcript_path.write_text(coverage + "\n" + body, encoding="utf-8")
