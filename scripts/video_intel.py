@@ -1303,10 +1303,17 @@ def _run_chunked_transcript_url(
     segment_rows: list[dict] = []
     failed_chunks: list[tuple[int, int, str]] = []
 
-    for start_secs, end_secs in chunks:
+    for chunk_idx, (start_secs, end_secs) in enumerate(chunks, start=1):
         gemini_start: int | None = None if (start_secs == 0 and end_secs == 0) else start_secs
         gemini_end: int | None = None if (start_secs == 0 and end_secs == 0) else end_secs
-        log.info("    chunk %s -> Gemini", _format_chunk_range_label(start_secs, end_secs or duration_seconds))
+        chunk_label_for_log = _format_chunk_range_label(start_secs, end_secs or duration_seconds)
+        log.info("    chunk %s -> Gemini", chunk_label_for_log)
+        # log_usage_metadata emits 'usage transcript-chunkN prompt=N cached=N
+        # candidates=N total=N' so the user can audit per-chunk implicit cache
+        # hits. cached>0 across later chunks means Gemini's implicit cache
+        # deduplicated the URL prefix; cached=0 means each chunk paid full
+        # input tokens. The label includes chunk index so multiple-call
+        # observability stays readable.
         raw = call_gemini(
             client,
             types,
@@ -1316,6 +1323,7 @@ def _run_chunked_transcript_url(
             response_json=True,
             start_offset=gemini_start,
             end_offset=gemini_end,
+            on_response=lambda r, _idx=chunk_idx: log_usage_metadata(r, f"transcript-chunk{_idx}"),
         )
         try:
             parsed = json.loads(raw)
@@ -1326,8 +1334,15 @@ def _run_chunked_transcript_url(
                 salvaged, _ = salvage_transcript_sections(raw or "")
                 parsed = salvaged or None
 
+        # Real-input gotcha: Gemini sometimes wraps the JSON response in [...]
+        # instead of {...}. merge_transcript_json() handles this for the single-
+        # call path; mirror the same defensive unwrap here so per-chunk logic
+        # downstream can rely on dict shape.
+        if isinstance(parsed, list):
+            parsed = parsed[0] if parsed else None
+
         chunk_label = _format_chunk_range_label(start_secs, end_secs or duration_seconds)
-        if not parsed:
+        if not parsed or not isinstance(parsed, dict):
             failed_chunks.append((start_secs, end_secs, raw or ""))
             segment_rows.append({"range": chunk_label, "status": "FAILED (parse)", "speakers": []})
             continue
@@ -1572,6 +1587,7 @@ def call_gemini(
     *,
     start_offset: int | None = None,
     end_offset: int | None = None,
+    fps: float | None = None,
     on_response: Callable[[object], None] | None = None,
 ):
     """Send a video to Gemini for multimodal analysis with retry on rate limits.
@@ -1585,6 +1601,12 @@ def call_gemini(
 
     Optional start_offset/end_offset (in seconds) clip the video to a segment
     via Gemini's VideoMetadata.
+
+    Optional fps (frames per second) reduces Gemini's frame extraction rate.
+    Default is 1.0 (one frame per second). At 1fps, the model caps requests
+    at 10800 frames (= 3 hours of video). Pass fps=0.5 to halve the frame
+    count for videos longer than 3h - this is what `process --url` uses for
+    its mindmap step on long-form podcasts (issue #50 Gate-1 finding).
 
     Optional on_response callback receives the raw response object before
     ``response.text`` is returned. Used for usage-token observability without
@@ -1601,12 +1623,14 @@ def call_gemini(
         config_kwargs["response_mime_type"] = "application/json"
 
     part_kwargs = {"file_data": types.FileData(file_uri=media_uri)}
-    if start_offset is not None or end_offset is not None:
+    if start_offset is not None or end_offset is not None or fps is not None:
         meta_kwargs = {}
         if start_offset is not None:
             meta_kwargs["start_offset"] = f"{start_offset}s"
         if end_offset is not None:
             meta_kwargs["end_offset"] = f"{end_offset}s"
+        if fps is not None:
+            meta_kwargs["fps"] = fps
         part_kwargs["video_metadata"] = types.VideoMetadata(**meta_kwargs)
 
     contents = types.Content(
@@ -1664,6 +1688,7 @@ def process_mindmap(
     prefix: str | None = None,
     channel_dir_override: Path | None = None,
     media_uri: str | None = None,
+    fps: float | None = None,
 ):
     """Generate a mind map for a single video.
 
@@ -1693,6 +1718,7 @@ def process_mindmap(
             effective_media_uri,
             prompt_text,
             model,
+            fps=fps,
             on_response=lambda r: log_usage_metadata(r, "mindmap"),
         )
 
@@ -2901,9 +2927,31 @@ def cmd_mindmap(args, config):
         "published": date or datetime.now().strftime("%Y-%m-%d"),
     }
 
+    # Issue #50 Gate-1 finding: Gemini caps at 10800 frames per request.
+    # For 3h+ videos at default 1fps, drop fps to 0.5 so the full duration
+    # still fits in one mindmap call. Same threshold as _cmd_process_url.
+    duration_seconds = _lookup_video_duration_seconds(video_id)
+    mindmap_fps: float | None = None
+    if duration_seconds and duration_seconds > 10000:
+        mindmap_fps = 0.5
+        log.info(
+            "Long video (%s); reducing mindmap fps to %.1f to fit Gemini's 10800-frame cap.",
+            _fmt_hms(duration_seconds),
+            mindmap_fps,
+        )
+
     log.info("Generating mind map (%s): %s", prompt_name, video["url"])
     prefix, status = process_mindmap(
-        client, types, video, prompt_text, model, output_dir, channel_name, prompt_name=prompt_name, force=args.force
+        client,
+        types,
+        video,
+        prompt_text,
+        model,
+        output_dir,
+        channel_name,
+        prompt_name=prompt_name,
+        force=args.force,
+        fps=mindmap_fps,
     )
     log.info("  %s: %s", prefix, status)
 
@@ -3223,6 +3271,21 @@ def _cmd_process_url(args, config):
     transcript_prompt = load_prompt("transcript")
 
     log.info("[process --url] %s", video["url"])
+
+    # Issue #50 Gate-1 finding: Gemini caps video requests at 10800 frames.
+    # At default 1fps that's 3h. For longer videos, drop fps so the full
+    # duration still fits in one mindmap call. Threshold of 10000s leaves
+    # 800-frame headroom for SDK rounding. fps=0.5 covers up to 6h.
+    duration_seconds = _lookup_video_duration_seconds(video_id)
+    mindmap_fps: float | None = None
+    if duration_seconds and duration_seconds > 10000:
+        mindmap_fps = 0.5
+        log.info(
+            "  Long video (%s); reducing mindmap fps to %.1f to fit Gemini's 10800-frame cap.",
+            _fmt_hms(duration_seconds),
+            mindmap_fps,
+        )
+
     log.info("  Step 1/3: mindmap")
     mindmap_prefix, mindmap_status = process_mindmap(
         client,
@@ -3234,6 +3297,7 @@ def _cmd_process_url(args, config):
         channel_name,
         prompt_name=prompt_name,
         force=args.force,
+        fps=mindmap_fps,
     )
     log.info("    mindmap [%s]: %s", mindmap_prefix, mindmap_status)
     if mindmap_status.startswith("error"):
@@ -3242,7 +3306,7 @@ def _cmd_process_url(args, config):
 
     log.info("  Step 2/3: transcript")
     chunk_minutes = getattr(args, "chunk_minutes", None) or TRANSCRIPT_CHUNK_MINUTES_DEFAULT
-    duration_seconds = _lookup_video_duration_seconds(video_id)
+    # duration_seconds was looked up above for the mindmap-fps decision.
     if duration_seconds and duration_seconds > chunk_minutes * 60:
         chunks = _build_transcript_chunks(duration_seconds, chunk_minutes)
         log.info(
