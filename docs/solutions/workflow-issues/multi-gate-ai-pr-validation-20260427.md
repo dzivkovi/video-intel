@@ -96,7 +96,7 @@ The convention `docs/plans/gate1-evidence/{topic}-{shape}.md` works because it's
 
 ### 5. Confidence-based language over binary go/no-go
 
-Systems engineering — formalized by INCOSE and IEEE/ISO 15288, practiced for 30+ years across aerospace, telecom carrier-grade, and financial systems — signs off in probability bands, not binary verdicts. The trained habit:
+Systems engineering — the discipline codified in IEEE/ISO 15288 and elaborated by published practitioners such as Prof. Joseph E. Kasser — signs off in probability bands, not binary verdicts. The trained habit:
 
 | Bad | Better |
 |---|---|
@@ -139,7 +139,7 @@ The Dark Factories framing collapses these two phases for narrative clarity. The
 
 The two phases are independent. Compressing the validate phase to match the write phase produces silent corruption — not visible breakage that a smoke would catch, but plausibly-wrong outputs that downstream systems consume as truth. For a knowledge-graph use case (this repo), wrong-but-plausible mindmap timestamps are more dangerous than mindmap generation failures, because the failure is invisible until a downstream layer surfaces it.
 
-The systems-engineering frame — probability-based sign-off, real-input verification, adversarial cross-examination, evidence preservation — exists because billing systems, safety-critical systems, and now knowledge-graph systems share a property: the cost of a wrong-but-plausible output is far higher than the cost of a visible failure. The discipline is codified in IEEE/ISO 15288, INCOSE's Systems Engineering Body of Knowledge (SEBoK), the NASA Systems Engineering Handbook, and aerospace standards such as DO-178C. It is mainstream practice in telecom carrier-grade engineering, financial systems engineering (where the V-model and pre-release V&V have been standard since the 1990s), FDA Class II/III medical devices, autonomous-vehicle safety engineering, and defense / mission systems.
+The systems-engineering frame — probability-based sign-off, real-input verification, adversarial cross-examination, evidence preservation — exists because billing systems, telecom carrier-grade systems, and now knowledge-graph systems share a property: the cost of a wrong-but-plausible output is far higher than the cost of a visible failure. The discipline is codified in IEEE/ISO 15288 (international standard for system life-cycle processes) and elaborated in publicly accessible bodies of work such as INCOSE's Systems Engineering Body of Knowledge and the published research of practitioners like Prof. Joseph E. Kasser. It has been mainstream practice for decades in financial systems engineering (where the V-model and pre-release V&V have been standard for billing systems, payment processors, and global-deployment products since the 1990s) and in telecom carrier-grade engineering (often under names like "System Test" and "Integration & Verification" rather than "Systems Engineering"). Both industries share the failure profile that motivated the discipline's formalization.
 
 Modern web and SaaS culture (~2010–2024) moved the validation phase rightward — into CI tests and production observability — because the cost-benefit favored fast iteration over pre-release sign-off. Cheap rollback and observability replaced pre-release V&V for non-critical bugs. AI-generated PRs flip the cost-benefit back. The failure profile (wrong-but-plausible outputs flowing into downstream automated systems with hard-to-revert blast radius) is exactly what systems engineering V&V originally won on. The methodology in this doc is not new; it is a re-application of decades-old discipline to a newly-acute failure profile.
 
@@ -214,10 +214,9 @@ The third smoke produced 100% grounding on verbose vs 95.2% on legacy and confir
 
 ### Systems engineering lineage references
 
-For readers unfamiliar with the formal discipline this doc applies to AI-generated PRs:
+For readers researching the formal discipline this doc applies to AI-generated PRs:
 
-- **INCOSE Systems Engineering Body of Knowledge (SEBoK)** — https://sebokwiki.org/ — the canonical reference for systems engineering practice
-- **IEEE/ISO/IEC 15288** — *Systems and software engineering — System life cycle processes* — current international standard, most recent revision 2023
-- **NASA Systems Engineering Handbook (NASA/SP-2016-6105 Rev 2)** — https://www.nasa.gov/reference/systems-engineering-handbook/ — public-domain reference with worked V-model and V&V examples
-- **DO-178C** — *Software Considerations in Airborne Systems and Equipment Certification* — aerospace V&V standard; the discipline at its strictest
-- **The V-model** — visual representation of "every level of design has a corresponding level of verification" (requirements ↔ acceptance test, architecture ↔ system test, detailed design ↔ unit test). Pre-dates Agile by decades and is the structural ancestor of the gate framework above.
+- **IEEE/ISO/IEC 15288** — *Systems and software engineering — System life cycle processes* — current international standard for the life-cycle and V&V processes the gate framework above re-applies
+- **INCOSE Systems Engineering Body of Knowledge (SEBoK)** — [sebokwiki.org](https://sebokwiki.org/) — open reference for systems engineering practice; readable without membership
+- **The V-model** — visual representation of "every level of design has a corresponding level of verification" (requirements ↔ acceptance test, architecture ↔ system test, detailed design ↔ unit test). Predates Agile by decades; structural ancestor of the gate framework above
+- **Prof. Joseph E. Kasser's published work on systems engineering** — accessible academic-and-consulting writing (multiple books available via standard channels) for readers who want the discipline framed for practitioners rather than as standards documents
