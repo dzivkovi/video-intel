@@ -634,3 +634,210 @@ class TestCmdScanInversion:
         first_mindmap = call_order.index("mindmap")
         last_transcript = max(i for i, x in enumerate(call_order) if x == "transcript")
         assert last_transcript < first_mindmap, f"loop ordering inverted from issue #54 spec: {call_order}"
+
+
+# ---------------------------------------------------------------------------
+# Title-rotation fix (PR #31 follow-up; issue #54 reviewer's C2/C3 finding)
+# ---------------------------------------------------------------------------
+
+
+class TestTitleRotationFix:
+    """When YouTube creators A/B-test titles, the API returns the current
+    title but the on-disk transcript was named with the title at write-time.
+    cmd_mindmap and _cmd_process_url must consult _load_video_id_index to
+    find the existing transcript at the ORIGINAL prefix instead of computing
+    a fresh prefix from the rotated title (which would miss the existing
+    transcript and fall back to source=video, then fail on long videos)."""
+
+    def _setup_rotated_video(self, tmp_path, monkeypatch):
+        """Create a channel dir where video_id 'TESTID' has an existing
+        transcript at prefix 'old-prefix' but YouTube would now return a
+        title that slugifies to 'new-prefix'."""
+        from unittest.mock import MagicMock
+
+        channel_dir = tmp_path / "demo"
+        channel_dir.mkdir(parents=True)
+
+        # The OLD prefix (when the original transcript was written)
+        old_prefix = "2025-01-01-original-title-here"
+        # Existing transcript + meta at the old prefix
+        (channel_dir / f"{old_prefix}.transcript.md").write_text(
+            "[00:00] Speaker: existing transcript content\n", encoding="utf-8"
+        )
+        (channel_dir / f"{old_prefix}.meta.json").write_text(
+            json.dumps(
+                {
+                    "video_id": "TESTID12345",
+                    "video_url": "https://www.youtube.com/watch?v=TESTID12345",
+                    "title": "Original Title Here",
+                    "published": "2025-01-01",
+                    "channel": "demo",
+                    "modes_completed": ["transcript"],
+                    "transcript_status": "ok",
+                }
+            ),
+            encoding="utf-8",
+        )
+        # Stubs common to both cmd_mindmap and cmd_process tests
+        monkeypatch.setenv("GEMINI_API_KEY", "test")
+        monkeypatch.setattr(video_intel, "require_gemini", lambda: (MagicMock(), MagicMock()))
+        monkeypatch.setattr(video_intel, "create_client", lambda *_a, **_kw: MagicMock())
+        monkeypatch.setattr(video_intel, "resolve_model", lambda *_a, **_kw: "stub-model")
+        monkeypatch.setattr(video_intel, "resolve_output_dir", lambda _cfg: tmp_path)
+        monkeypatch.setattr(video_intel, "load_prompt", lambda name: f"prompt-for-{name}")
+        return channel_dir, old_prefix
+
+    def test_cmd_mindmap_uses_indexed_prefix_for_rotated_title(self, tmp_path, monkeypatch):
+        """cmd_mindmap --url with a video whose title rotated (API returns
+        'New Title' that would slugify to 'new-prefix', but on-disk
+        transcript is at 'old-prefix') must consult _load_video_id_index
+        and use the OLD prefix so the resolver finds the transcript."""
+        from argparse import Namespace
+        from unittest.mock import MagicMock
+
+        _, old_prefix = self._setup_rotated_video(tmp_path, monkeypatch)
+
+        # Stub YouTube API to return the new (rotated) title.
+        fake_youtube = MagicMock()
+        fake_youtube.videos.return_value.list.return_value.execute.return_value = {
+            "items": [
+                {
+                    "snippet": {
+                        "title": "New Rotated Title For Same Video",
+                        "publishedAt": "2025-01-01T00:00:00Z",
+                        "channelId": "UC_TEST",
+                        "channelTitle": "Demo",
+                    }
+                }
+            ]
+        }
+        monkeypatch.setattr(
+            video_intel,
+            "require_youtube",
+            lambda: lambda *_a, **_kw: fake_youtube,
+        )
+        monkeypatch.setattr(
+            video_intel,
+            "get_channel_id",
+            lambda *_a, **_kw: ("UC_TEST", "Demo"),
+        )
+        monkeypatch.setenv("YOUTUBE_API_KEY", "test")
+
+        captured: dict = {}
+
+        def fake_process_mindmap(*args, **kwargs):
+            captured.update(kwargs)
+            captured["video"] = args[2]
+            return kwargs.get("prefix") or "computed", "done"
+
+        monkeypatch.setattr(video_intel, "process_mindmap", fake_process_mindmap)
+
+        args = Namespace(
+            url="https://www.youtube.com/watch?v=TESTID12345",
+            file=None,
+            channel="demo",
+            video_id=None,
+            title=None,
+            date=None,
+            force=False,
+            model=None,
+            prompt=None,
+        )
+        config = {
+            "output_dir": str(tmp_path),
+            "channels": [{"name": "demo", "url": "https://youtube.com/@demo"}],
+        }
+        video_intel.cmd_mindmap(args, config)
+
+        # The indexed prefix (from existing meta.json) wins over the prefix
+        # the new title would have computed.
+        assert captured.get("prefix") == old_prefix, (
+            f"expected indexed prefix {old_prefix!r}, got {captured.get('prefix')!r}"
+        )
+        # Resolver should pick transcript (because the existing transcript is
+        # at the indexed prefix).
+        assert captured.get("source") == "transcript", (
+            f"expected source='transcript' after rotation fix, got {captured.get('source')!r}"
+        )
+
+    def test_cmd_mindmap_falls_through_when_no_index_entry(self, tmp_path, monkeypatch):
+        """When no meta.json exists in the channel dir for this video_id,
+        the resolver falls through to the computed prefix (current behavior).
+        Empty channel dir, brand-new video."""
+        from argparse import Namespace
+        from unittest.mock import MagicMock
+
+        # Empty channel dir — no prior meta.json
+        channel_dir = tmp_path / "demo"
+        channel_dir.mkdir(parents=True)
+        monkeypatch.setenv("GEMINI_API_KEY", "test")
+        monkeypatch.setenv("YOUTUBE_API_KEY", "test")
+        monkeypatch.setattr(video_intel, "require_gemini", lambda: (MagicMock(), MagicMock()))
+        monkeypatch.setattr(video_intel, "create_client", lambda *_a, **_kw: MagicMock())
+        monkeypatch.setattr(video_intel, "resolve_model", lambda *_a, **_kw: "stub-model")
+        monkeypatch.setattr(video_intel, "resolve_output_dir", lambda _cfg: tmp_path)
+        monkeypatch.setattr(video_intel, "load_prompt", lambda name: f"prompt-for-{name}")
+        monkeypatch.setattr(
+            video_intel,
+            "_lookup_video_duration_seconds",
+            lambda *_a, **_kw: 600,
+        )
+
+        fake_youtube = MagicMock()
+        fake_youtube.videos.return_value.list.return_value.execute.return_value = {
+            "items": [
+                {
+                    "snippet": {
+                        "title": "Brand New Video",
+                        "publishedAt": "2026-01-15T00:00:00Z",
+                        "channelId": "UC_TEST",
+                        "channelTitle": "Demo",
+                    }
+                }
+            ]
+        }
+        monkeypatch.setattr(
+            video_intel,
+            "require_youtube",
+            lambda: lambda *_a, **_kw: fake_youtube,
+        )
+        monkeypatch.setattr(
+            video_intel,
+            "get_channel_id",
+            lambda *_a, **_kw: ("UC_TEST", "Demo"),
+        )
+
+        captured: dict = {}
+
+        def fake_process_mindmap(*args, **kwargs):
+            captured.update(kwargs)
+            captured["video"] = args[2]
+            return kwargs.get("prefix") or "computed", "done"
+
+        monkeypatch.setattr(video_intel, "process_mindmap", fake_process_mindmap)
+
+        args = Namespace(
+            url="https://www.youtube.com/watch?v=NEWVIDEOID1",
+            file=None,
+            channel="demo",
+            video_id=None,
+            title=None,
+            date=None,
+            force=False,
+            model=None,
+            prompt=None,
+        )
+        config = {
+            "output_dir": str(tmp_path),
+            "channels": [{"name": "demo", "url": "https://youtube.com/@demo"}],
+        }
+        video_intel.cmd_mindmap(args, config)
+
+        # Falls through to computed prefix (slug of "Brand New Video").
+        # Note: video_file_prefix uses date+slug, so the prefix should start
+        # with the published date and contain the slug.
+        prefix = captured.get("prefix")
+        assert prefix is not None, "expected prefix to be passed to process_mindmap"
+        assert "brand-new-video" in prefix, f"expected slugified title in computed prefix, got {prefix!r}"
+        # No transcript exists, so resolver routes to video.
+        assert captured.get("source") == "video", f"expected source='video' fallback, got {captured.get('source')!r}"

@@ -3296,8 +3296,25 @@ def cmd_mindmap(args, config):
     # for this URL, this command becomes a fast text-only call. Otherwise it
     # falls back to the legacy mindmap-from-video path with the same fps
     # fallback for the 10800-frame cap.
+    #
+    # Title-rotation safety net (PR #31 follow-up): consult the channel's
+    # video_id index BEFORE computing the lookup prefix. When YouTube creators
+    # A/B-test titles, the API returns the current title, but the on-disk
+    # transcript is named after the title at write-time. Without this check,
+    # rotated-title videos would miss their existing transcript and fall back
+    # to source=video — failing on the 1M-token cap on long content.
+    # Reproducer: simonscrapes / Master Claude Code retitled to "How the 1%...".
     channel_dir = output_dir / channel_name
-    prefix_for_lookup = video_file_prefix(video)
+    computed_prefix = video_file_prefix(video)
+    indexed_prefix = _load_video_id_index(channel_dir).get(video["video_id"])
+    prefix_for_lookup = indexed_prefix if indexed_prefix else computed_prefix
+    if indexed_prefix and indexed_prefix != computed_prefix:
+        log.info(
+            "Title-rotation detected for %s; using existing prefix %r (computed would have been %r)",
+            video["video_id"],
+            indexed_prefix,
+            computed_prefix,
+        )
     transcript_path = channel_dir / f"{prefix_for_lookup}.transcript.md"
     transcript_available = transcript_path.exists()
     channel_cfg: dict = next(
@@ -3330,6 +3347,7 @@ def cmd_mindmap(args, config):
             channel_name,
             prompt_name="mindmap-from-transcript",
             force=args.force,
+            prefix=prefix_for_lookup,
             source="transcript",
             transcript_path=transcript_path,
         )
@@ -3355,6 +3373,7 @@ def cmd_mindmap(args, config):
             channel_name,
             prompt_name=prompt_name,
             force=args.force,
+            prefix=prefix_for_lookup,
             fps=mindmap_fps,
             source="video",
         )
@@ -3676,7 +3695,22 @@ def _cmd_process_url(args, config):
         "published": date or datetime.now().strftime("%Y-%m-%d"),
     }
     channel_dir = output_dir / channel_name
-    prefix = video_file_prefix(video)
+    computed_prefix = video_file_prefix(video)
+    # Title-rotation safety net (PR #31 follow-up): consult the channel's
+    # video_id index so transcript+mindmap stay co-located under the
+    # ORIGINAL prefix when YouTube creators A/B-test titles. Otherwise
+    # transcript Step 1 would write to the new prefix while any prior
+    # transcript at the old prefix becomes orphaned, AND the mindmap
+    # resolver in Step 2 would miss the prior transcript and fall back
+    # to source=video. Reproducer: simonscrapes / Master Claude Code.
+    indexed_prefix = _load_video_id_index(channel_dir).get(video_id)
+    prefix = indexed_prefix if indexed_prefix else computed_prefix
+    if indexed_prefix and indexed_prefix != computed_prefix:
+        log.info(
+            "  Title-rotation: using existing prefix %r (computed would have been %r)",
+            indexed_prefix,
+            computed_prefix,
+        )
 
     prompt_name = normalize_prompt_name(
         getattr(args, "prompt", None) or config.get("default_prompt", "mindmap-knowledge")
