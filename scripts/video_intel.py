@@ -1092,6 +1092,127 @@ def _fmt_hms(seconds: int) -> str:
     return "".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# Issue #50: chunked transcript helpers (port of translate_video.py pattern,
+# adapted for the structured-JSON merge that transcript needs).
+# ---------------------------------------------------------------------------
+
+
+TRANSCRIPT_CHUNK_MINUTES_DEFAULT = 50
+
+
+def _build_transcript_chunks(
+    duration_seconds: int,
+    chunk_minutes: int,
+) -> list[tuple[int, int]]:
+    """Return [(start_sec, end_sec), ...] chunks for a transcript run.
+
+    Convention (matches translate_video.build_chunk_list):
+      - duration <= chunk threshold -> single (0, 0) marker = no clipping.
+      - over threshold -> uniform chunk_minutes segments from 0 to duration.
+
+    The (0, 0) sentinel lets the caller skip the chunking branch entirely
+    and run a single Gemini call without VideoMetadata offsets.
+    """
+    if chunk_minutes <= 0:
+        raise ValueError(f"chunk_minutes must be positive, got {chunk_minutes}")
+    if duration_seconds <= 0:
+        return [(0, 0)]
+    chunk_seconds = chunk_minutes * 60
+    if duration_seconds <= chunk_seconds:
+        return [(0, 0)]
+    chunks: list[tuple[int, int]] = []
+    pos = 0
+    while pos < duration_seconds:
+        end = min(pos + chunk_seconds, duration_seconds)
+        chunks.append((pos, end))
+        pos = end
+    return chunks
+
+
+def _offset_timestamp(ts: str, offset_seconds: int) -> str:
+    """Add offset_seconds to a 'MM:SS' or 'HH:MM:SS' timestamp string.
+
+    Returns the input unchanged if it does not match either expected shape -
+    the caller decides whether to log this. Output uses the most compact
+    representation that fits: under one hour stays MM:SS; one hour or more
+    becomes H:MM:SS (no zero-padding on hour to match merge_transcript_json's
+    rendering convention).
+    """
+    parts = ts.split(":")
+    try:
+        if len(parts) == 2:
+            total = int(parts[0]) * 60 + int(parts[1])
+        elif len(parts) == 3:
+            total = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+        else:
+            return ts
+    except ValueError:
+        return ts
+    total += offset_seconds
+    if total < 0:
+        return ts
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def merge_chunked_transcripts(
+    chunks: list[tuple[int, dict]],
+) -> dict:
+    """Merge per-chunk transcript JSONs into a single transcript JSON.
+
+    Input: [(chunk_start_seconds, chunk_json), ...] in chronological order.
+    Output: dict with the same shape as a single Gemini transcript response
+    (transcripts, screen_content, speakers) but with timestamps offset by
+    each chunk's start and speakers deduplicated by name with globally-
+    unique voice ids.
+
+    Speaker dedup is by exact name match. If Gemini renumbers a speaker
+    mid-stream (chunk 1's voice=1 = "Lex"; chunk 2's voice=1 = "Peter"),
+    the merger correctly maps them to different global voice ids because
+    the lookup keys on (chunk_idx, original_voice) -> name -> global_voice.
+    """
+    merged: dict = {"transcripts": [], "screen_content": [], "speakers": []}
+    name_to_global: dict[str, int] = {}
+    next_global = 1
+
+    for chunk_idx, (start_secs, chunk_json) in enumerate(chunks):
+        if not isinstance(chunk_json, dict):
+            continue
+        # Per-chunk (original_voice -> global_voice) map.
+        voice_remap: dict[int, int] = {}
+        for s in chunk_json.get("speakers", []):
+            voice = s.get("voice")
+            name = s.get("name") or f"Speaker {voice}"
+            if name not in name_to_global:
+                name_to_global[name] = next_global
+                next_global += 1
+                merged["speakers"].append({**s, "voice": name_to_global[name]})
+            if voice is not None:
+                voice_remap[voice] = name_to_global[name]
+
+        for t in chunk_json.get("transcripts", []):
+            new_t = dict(t)
+            if "start" in new_t:
+                new_t["start"] = _offset_timestamp(new_t["start"], start_secs)
+            if t.get("voice") in voice_remap:
+                new_t["voice"] = voice_remap[t["voice"]]
+            merged["transcripts"].append(new_t)
+
+        for sc in chunk_json.get("screen_content", []):
+            new_sc = dict(sc)
+            if "start" in new_sc:
+                new_sc["start"] = _offset_timestamp(new_sc["start"], start_secs)
+            if "end" in new_sc and new_sc["end"]:
+                new_sc["end"] = _offset_timestamp(new_sc["end"], start_secs)
+            merged["screen_content"].append(new_sc)
+
+    return merged
+
+
 @functools.cache
 def _is_youtube_short_url(video_id: str) -> bool:
     """Return True when https://www.youtube.com/shorts/<id> renders as a Short.
