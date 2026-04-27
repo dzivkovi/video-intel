@@ -90,26 +90,35 @@ def _chunk(speakers, transcripts, screen_content=None):
 
 
 class TestMergeChunkedTranscripts:
-    def test_offsets_applied_to_all_transcripts(self):
+    def test_timestamps_pass_through_unchanged(self):
+        """Gate-1 finding (2026-04-26 YFjfBk8HI5o smoke): Gemini returns
+        ABSOLUTE timestamps when given VideoMetadata.start_offset, not
+        chunk-relative. So the merger must NOT add offsets - that would
+        double-apply and shift chunk-2's timestamps into chunk-3 territory."""
         c1 = _chunk(
             speakers=[{"voice": 1, "name": "Lex"}],
             transcripts=[{"start": "00:30", "voice": 1, "text": "Hello."}],
         )
+        # Chunk 2 covers 50:00-1:40:00 absolute. Gemini returns absolute
+        # timestamps (e.g. "1:02:34" not "12:34"). Merger preserves them.
         c2 = _chunk(
             speakers=[{"voice": 1, "name": "Lex"}],
-            transcripts=[{"start": "12:34", "voice": 1, "text": "Goodbye."}],
+            transcripts=[{"start": "1:02:34", "voice": 1, "text": "Goodbye."}],
         )
         merged = vi.merge_chunked_transcripts([(0, c1), (3000, c2)])
         starts = [t["start"] for t in merged["transcripts"]]
+        # No offset applied - timestamps come through untouched.
         assert starts == ["00:30", "1:02:34"]
         assert merged["transcripts"][1]["text"] == "Goodbye."
 
-    def test_offsets_applied_to_screen_content_start_and_end(self):
+    def test_screen_content_timestamps_pass_through_unchanged(self):
         c1 = _chunk(speakers=[], transcripts=[], screen_content=[])
+        # Chunk 2 starts at 50:00 absolute. Gemini's screen_content uses
+        # absolute "55:00 - 56:00", not chunk-relative "05:00 - 06:00".
         c2 = _chunk(
             speakers=[],
             transcripts=[],
-            screen_content=[{"start": "05:00", "end": "06:00", "type": "slide", "description": "Title"}],
+            screen_content=[{"start": "55:00", "end": "56:00", "type": "slide", "description": "Title"}],
         )
         merged = vi.merge_chunked_transcripts([(0, c1), (3000, c2)])
         sc = merged["screen_content"][0]
@@ -306,12 +315,17 @@ class TestCmdTranscriptUrlChunking:
 
         responses = [
             {
+                # Chunk 1 covers 0-1h absolute. Gemini returns absolute
+                # timestamps; for a 0-1h chunk, "00:30" is at 30s of video.
                 "transcripts": [{"start": "00:30", "voice": 1, "text": "chunk-1 hello"}],
                 "speakers": [{"voice": 1, "name": "Lex"}],
                 "screen_content": [],
             },
             {
-                "transcripts": [{"start": "00:30", "voice": 1, "text": "chunk-2 hello"}],
+                # Chunk 2 covers 1h-2h absolute. Real Gemini returns absolute
+                # timestamps (e.g. "1:00:30" not "00:30") - that's the
+                # Gate-1 finding. Merger preserves them as-is.
+                "transcripts": [{"start": "1:00:30", "voice": 1, "text": "chunk-2 hello"}],
                 "speakers": [{"voice": 1, "name": "Lex"}],
                 "screen_content": [],
             },
@@ -337,8 +351,11 @@ class TestCmdTranscriptUrlChunking:
         assert "chunk-2 hello" in body
         # Coverage table heading must be present
         assert "chunked transcript" in body.lower() or "Coverage" in body
-        # Chunk-2's offset-applied timestamp is 1:00:30, not 00:30
+        # Chunk-2's already-absolute timestamp passes through.
         assert "1:00:30" in body
+        # And critically: chunk-1's "00:30" must NOT have been doubled
+        # into "00:30 + 0" (still 00:30) - just confirms it's there.
+        assert "00:30" in body
 
 
 # ---------------------------------------------------------------------------

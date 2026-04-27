@@ -1226,20 +1226,32 @@ def merge_chunked_transcripts(
 
     Input: [(chunk_start_seconds, chunk_json), ...] in chronological order.
     Output: dict with the same shape as a single Gemini transcript response
-    (transcripts, screen_content, speakers) but with timestamps offset by
-    each chunk's start and speakers deduplicated by name with globally-
-    unique voice ids.
+    (transcripts, screen_content, speakers) with speakers deduplicated by
+    name with globally-unique voice ids.
+
+    **Critical empirical finding (Gate-1 smoke on YFjfBk8HI5o, 2026-04-26):**
+    when Gemini receives a video with VideoMetadata.start_offset clipping,
+    its returned timestamps are ABSOLUTE (relative to the full video), not
+    relative to the clip start. So this merger does NOT add any offset to
+    the timestamps - it just concatenates and dedupes. Adding an offset
+    here results in cumulative double-application across chunks; the bug
+    surfaced as a 3h15m video producing timestamps up to 5:45:18 (= real
+    end + 3 chunks * 50min wrongly-added offset).
 
     Speaker dedup is by exact name match. If Gemini renumbers a speaker
     mid-stream (chunk 1's voice=1 = "Lex"; chunk 2's voice=1 = "Peter"),
     the merger correctly maps them to different global voice ids because
     the lookup keys on (chunk_idx, original_voice) -> name -> global_voice.
+
+    The chunk_start_seconds parameter is preserved in the function signature
+    for two reasons: (a) future-proof if Gemini changes behavior, and (b)
+    callers can still inspect chunk boundaries via the input tuple shape.
     """
     merged: dict = {"transcripts": [], "screen_content": [], "speakers": []}
     name_to_global: dict[str, int] = {}
     next_global = 1
 
-    for _chunk_idx, (start_secs, chunk_json) in enumerate(chunks):
+    for _chunk_idx, (_start_secs, chunk_json) in enumerate(chunks):
         if not isinstance(chunk_json, dict):
             continue
         # Per-chunk (original_voice -> global_voice) map.
@@ -1254,21 +1266,16 @@ def merge_chunked_transcripts(
             if voice is not None:
                 voice_remap[voice] = name_to_global[name]
 
+        # Timestamps pass through unchanged - Gemini already returns absolute
+        # values when given VideoMetadata.start_offset (see docstring above).
         for t in chunk_json.get("transcripts", []):
             new_t = dict(t)
-            if "start" in new_t:
-                new_t["start"] = _offset_timestamp(new_t["start"], start_secs)
             if t.get("voice") in voice_remap:
                 new_t["voice"] = voice_remap[t["voice"]]
             merged["transcripts"].append(new_t)
 
         for sc in chunk_json.get("screen_content", []):
-            new_sc = dict(sc)
-            if "start" in new_sc:
-                new_sc["start"] = _offset_timestamp(new_sc["start"], start_secs)
-            if new_sc.get("end"):
-                new_sc["end"] = _offset_timestamp(new_sc["end"], start_secs)
-            merged["screen_content"].append(new_sc)
+            merged["screen_content"].append(dict(sc))
 
     return merged
 
