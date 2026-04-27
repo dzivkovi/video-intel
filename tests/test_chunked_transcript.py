@@ -12,12 +12,10 @@ from __future__ import annotations
 
 import json
 from argparse import Namespace
-from pathlib import Path
 
 import pytest
 
 import video_intel as vi
-
 
 # ---------------------------------------------------------------------------
 # Unit 1: chunk helpers
@@ -210,10 +208,10 @@ def _transcript_url_args(url, **overrides):
     base = {
         "url": url,
         "file": None,
-        "channel": None,
+        "channel": "ch",
         "video_id": None,
-        "title": None,
-        "date": None,
+        "title": "Test Video",
+        "date": "2026-04-15",
         "start": None,
         "end": None,
         "force": False,

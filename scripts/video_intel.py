@@ -1159,6 +1159,66 @@ def _offset_timestamp(ts: str, offset_seconds: int) -> str:
     return f"{m:02d}:{s:02d}"
 
 
+def _lookup_video_duration_seconds(video_id: str) -> int | None:
+    """Resolve a YouTube video's duration via contentDetails.duration.
+
+    Returns parsed seconds, or None when the lookup fails (no API key, video
+    not found, network error). Caller decides how to react to None - the
+    chunking decision must fail-safe to single-call when duration is unknown
+    rather than blindly chunk the wrong shape.
+    """
+    yt_key = os.environ.get("YOUTUBE_API_KEY")
+    if not yt_key:
+        return None
+    try:
+        yt_build = require_youtube()
+        yt = yt_build("youtube", "v3", developerKey=yt_key)
+        resp = yt.videos().list(part="contentDetails", id=video_id).execute()
+        if not resp.get("items"):
+            return None
+        return _parse_iso8601_duration(resp["items"][0]["contentDetails"]["duration"])
+    except Exception as e:
+        log.warning("Could not look up duration for %s: %s", video_id, e)
+        return None
+
+
+def _format_chunk_range_label(start_secs: int, end_secs: int) -> str:
+    """'0:00 - 50:00' style label for the coverage table."""
+
+    def fmt(s: int) -> str:
+        h, rem = divmod(s, 3600)
+        m, sec = divmod(rem, 60)
+        if h:
+            return f"{h}:{m:02d}:{sec:02d}"
+        return f"{m:02d}:{sec:02d}"
+
+    return f"{fmt(start_secs)} - {fmt(end_secs)}"
+
+
+def _build_chunked_transcript_coverage_block(
+    duration_seconds: int,
+    chunk_minutes: int,
+    segment_results: list[dict],
+) -> str:
+    """Markdown block prepended to the stitched transcript so a reader can see
+    coverage at a glance. Mirrors the translate_video.py pattern but for
+    transcript-shaped output."""
+    lines = [
+        "**Source:** chunked transcript",
+        f"**Total duration:** {_fmt_hms(duration_seconds)}",
+        f"**Chunk size:** {chunk_minutes} minutes",
+        f"**Segments:** {len(segment_results)}",
+        "",
+        "| Segment | Range | Status | Speakers |",
+        "|---|---|---|---|",
+    ]
+    for i, seg in enumerate(segment_results, start=1):
+        speakers = ", ".join(seg.get("speakers", [])) or "—"
+        lines.append(f"| {i} | {seg['range']} | {seg['status']} | {speakers} |")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def merge_chunked_transcripts(
     chunks: list[tuple[int, dict]],
 ) -> dict:
@@ -1179,7 +1239,7 @@ def merge_chunked_transcripts(
     name_to_global: dict[str, int] = {}
     next_global = 1
 
-    for chunk_idx, (start_secs, chunk_json) in enumerate(chunks):
+    for _chunk_idx, (start_secs, chunk_json) in enumerate(chunks):
         if not isinstance(chunk_json, dict):
             continue
         # Per-chunk (original_voice -> global_voice) map.
@@ -1206,11 +1266,106 @@ def merge_chunked_transcripts(
             new_sc = dict(sc)
             if "start" in new_sc:
                 new_sc["start"] = _offset_timestamp(new_sc["start"], start_secs)
-            if "end" in new_sc and new_sc["end"]:
+            if new_sc.get("end"):
                 new_sc["end"] = _offset_timestamp(new_sc["end"], start_secs)
             merged["screen_content"].append(new_sc)
 
     return merged
+
+
+def _run_chunked_transcript_url(
+    *,
+    client,
+    types,
+    video: dict,
+    prompt_text: str,
+    model: str,
+    channel_dir: Path,
+    prefix: str,
+    chunks: list[tuple[int, int]],
+    duration_seconds: int,
+    chunk_minutes: int,
+    force: bool,
+) -> str:
+    """Run transcript in N chunks against a YouTube URL, merge, write artifact.
+
+    Skipped (exists, not forced) -> "skipped (exists)".
+    All chunks succeeded -> "done".
+    Some chunks failed -> "partial" with raw sidecars for failed chunks.
+    """
+    channel_dir.mkdir(parents=True, exist_ok=True)
+    transcript_path = channel_dir / f"{prefix}.transcript.md"
+    if transcript_path.exists() and not force:
+        return "skipped (exists)"
+
+    media_uri = video["url"]
+    chunk_results: list[tuple[int, dict]] = []
+    segment_rows: list[dict] = []
+    failed_chunks: list[tuple[int, int, str]] = []
+
+    for start_secs, end_secs in chunks:
+        gemini_start: int | None = None if (start_secs == 0 and end_secs == 0) else start_secs
+        gemini_end: int | None = None if (start_secs == 0 and end_secs == 0) else end_secs
+        log.info("    chunk %s -> Gemini", _format_chunk_range_label(start_secs, end_secs or duration_seconds))
+        raw = call_gemini(
+            client,
+            types,
+            media_uri,
+            prompt_text,
+            model,
+            response_json=True,
+            start_offset=gemini_start,
+            end_offset=gemini_end,
+        )
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            try:
+                parsed = json.loads(isolate_json(raw or ""))
+            except (json.JSONDecodeError, TypeError):
+                salvaged, _ = salvage_transcript_sections(raw or "")
+                parsed = salvaged or None
+
+        chunk_label = _format_chunk_range_label(start_secs, end_secs or duration_seconds)
+        if not parsed:
+            failed_chunks.append((start_secs, end_secs, raw or ""))
+            segment_rows.append({"range": chunk_label, "status": "FAILED (parse)", "speakers": []})
+            continue
+
+        chunk_results.append((start_secs, parsed))
+        speaker_names = [s.get("name", f"Speaker {s.get('voice')}") for s in parsed.get("speakers", [])]
+        segment_rows.append({"range": chunk_label, "status": "ok", "speakers": speaker_names})
+
+    if not chunk_results:
+        # All chunks failed - persist concatenated raw responses for forensics
+        for i, (sstart, send, raw) in enumerate(failed_chunks, start=1):
+            sidecar = channel_dir / f"{prefix}.transcript.raw.chunk{i}-{sstart}-{send}.txt"
+            sidecar.write_text(raw, encoding="utf-8")
+        return "error: all chunks failed parsing (raw sidecars saved)"
+
+    merged = merge_chunked_transcripts(chunk_results)
+    body = merge_transcript_json(merged, speakers_map={})
+    coverage = _build_chunked_transcript_coverage_block(duration_seconds, chunk_minutes, segment_rows)
+    transcript_path.write_text(coverage + "\n" + body, encoding="utf-8")
+
+    # Persist raw sidecars only for failed chunks so the user can retry.
+    for i, (sstart, send, raw) in enumerate(failed_chunks, start=1):
+        sidecar = channel_dir / f"{prefix}.transcript.raw.chunk{i}-{sstart}-{send}.txt"
+        sidecar.write_text(raw, encoding="utf-8")
+
+    meta_fields = {
+        "video_url": video["url"],
+        "video_id": video["video_id"],
+        "channel": channel_dir.name,
+        "title": video["title"],
+        "published": video["published"],
+        "model": model,
+        "transcript_status": "partial" if failed_chunks else "ok",
+        "transcript_chunks": len(chunks),
+        "transcript_chunk_minutes": chunk_minutes,
+    }
+    update_meta(channel_dir / f"{prefix}.meta.json", meta_fields, mode="transcript")
+    return "partial" if failed_chunks else "done"
 
 
 @functools.cache
@@ -2908,6 +3063,44 @@ def cmd_transcript(args, config):
         prefix = video_file_prefix(video)
         media_uri = None  # YouTube URL path: video["url"] is the media source
         log.info("Transcribing: %s", video["url"])
+
+    # Issue #50: chunked transcript path. Auto-trigger when (a) caller is the
+    # YouTube URL path, (b) no manual --start/--end is set, (c) duration lookup
+    # succeeds and exceeds chunk_minutes. Otherwise fall through to the
+    # single-call process_transcript path that has existed since PR #48.
+    chunk_minutes = getattr(args, "chunk_minutes", None) or TRANSCRIPT_CHUNK_MINUTES_DEFAULT
+    manual_segment = start_offset is not None or end_offset is not None
+    use_chunking = args.url and not manual_segment
+
+    if use_chunking:
+        duration_seconds = _lookup_video_duration_seconds(video["video_id"])
+        if duration_seconds and duration_seconds > chunk_minutes * 60:
+            chunks = _build_transcript_chunks(duration_seconds, chunk_minutes)
+            log.info(
+                "  %s is %s; running %d chunks of %d min each.",
+                video["video_id"],
+                _fmt_hms(duration_seconds),
+                len(chunks),
+                chunk_minutes,
+            )
+            status = _run_chunked_transcript_url(
+                client=client,
+                types=types,
+                video=video,
+                prompt_text=prompt_text,
+                model=model,
+                channel_dir=channel_dir,
+                prefix=prefix,
+                chunks=chunks,
+                duration_seconds=duration_seconds,
+                chunk_minutes=chunk_minutes,
+                force=args.force,
+            )
+            out_path = channel_dir / f"{prefix}.transcript.md"
+            log.info("  %s: %s", prefix, status)
+            if status == "done":
+                log.info("  Saved: %s", out_path)
+            return
 
     prefix, status = process_transcript(
         client,
@@ -4723,6 +4916,16 @@ Examples:
         ),
     )
     tx_parser.add_argument("--force", action="store_true", help="Regenerate even if transcript exists")
+    tx_parser.add_argument(
+        "--chunk-minutes",
+        type=int,
+        default=TRANSCRIPT_CHUNK_MINUTES_DEFAULT,
+        dest="chunk_minutes",
+        help=(
+            f"Chunk size in minutes for auto-splitting long videos via the YouTube URL path "
+            f"(default: {TRANSCRIPT_CHUNK_MINUTES_DEFAULT}). Manual --start/--end disables chunking."
+        ),
+    )
 
     # process command: one-upload full pipeline for local MP4s
     process_parser = subparsers.add_parser(
