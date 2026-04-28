@@ -76,6 +76,52 @@ class TestOffsetTimestamp:
         assert vi._offset_timestamp("not-a-timestamp", 1800) == "not-a-timestamp"
 
 
+class TestClassifyAndOffsetTimestampNormalization:
+    """Regression tests for issue #58 - normalize_timestamp pre-pass.
+
+    Tucker/Sachs chunk 3 (chunk_start=6000s, chunk_duration=3000s) produced
+    [100:08:57]-style timestamps where Gemini packed total minutes into the
+    HH field. Without the normalize_timestamp pre-pass added in this issue,
+    the classifier saw 100 hours, flagged "Implausible timestamp", and passed
+    the corruption through to disk.
+    """
+
+    def test_tucker_chunk3_100_08_57_normalizes_and_classifies_as_absolute(self):
+        # 100 minutes = 1h40m chunk start + 8m = 1h48m, 57 sec.
+        # Should classify as ABSOLUTE (already inside the chunk window after
+        # normalization), no warning.
+        result = vi._classify_and_offset_timestamp("100:08:57", chunk_start_secs=6000, chunk_duration_secs=3000)
+        assert result == "1:48:57"
+
+    def test_tucker_chunk3_100_00_00_normalizes_to_chunk_start(self):
+        # 100 minutes = exactly chunk start (1h40m).
+        result = vi._classify_and_offset_timestamp("100:00:00", chunk_start_secs=6000, chunk_duration_secs=3000)
+        assert result == "1:40:00"
+
+    def test_tucker_chunk3_100_22_35_normalizes_to_chunk_end(self):
+        # 100 minutes + 22 = 2h02m, 35 sec - the actual end of Tucker chunk 3.
+        result = vi._classify_and_offset_timestamp("100:22:35", chunk_start_secs=6000, chunk_duration_secs=3000)
+        assert result == "2:02:35"
+
+    def test_already_normal_absolute_unchanged(self):
+        # Sanity: clean input with proper HH:MM:SS still classifies as absolute.
+        result = vi._classify_and_offset_timestamp("1:48:57", chunk_start_secs=6000, chunk_duration_secs=3000)
+        assert result == "1:48:57"
+
+    def test_relative_chunk_input_gets_offset_applied(self):
+        # Sanity: 8:57 (relative within chunk) gets chunk_start added.
+        result = vi._classify_and_offset_timestamp("08:57", chunk_start_secs=6000, chunk_duration_secs=3000)
+        assert result == "1:48:57"
+
+    def test_already_bracketed_input_does_not_corrupt(self):
+        # Defensive contract test (issue #58 review feedback): if a caller
+        # ever passes already-bracketed input, the wrap-and-strip pre-pass
+        # must not double-bracket and lose data. The bracket-stripping at
+        # entry guarantees the result is bracket-free regardless of branch.
+        result = vi._classify_and_offset_timestamp("[1:30:00]", chunk_start_secs=0, chunk_duration_secs=600)
+        assert "[" not in result and "]" not in result
+
+
 # ---------------------------------------------------------------------------
 # Unit 2: merge_chunked_transcripts
 # ---------------------------------------------------------------------------

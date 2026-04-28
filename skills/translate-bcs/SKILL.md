@@ -60,6 +60,7 @@ Gemini translation takes **1-15 minutes** depending on video length. The transcr
 | If the video is… | Use this command |
 | --- | --- |
 | A talking head, long interview, or single-speaker monologue — captions are enough, on-screen content does not carry meaning | **Default** `python ${CLAUDE_SKILL_DIR}/../../scripts/translate_video.py URL` |
+| **Long (over ~90 minutes)** — YouTube SRT chunking drifts on long videos ([issue #49](https://github.com/dzivkovi/video-intel/issues/49)); the rich-transcript path uses chunked transcription with normalized timestamps and is the supported route | **Transcript-first** (two-command workflow below) |
 | No English captions available but audio-only translation is fine | **Default** — it falls through to the video-understanding path automatically |
 | Heavily edited with cut-ins to other speakers; on-screen text labels who is speaking or where footage came from; news-style overlays, tickers, OCR text; burned-in captions from other outlets | **Transcript-first** (two-command workflow below) |
 | The user only wants the English SRT (no BCS translation) | `python ${CLAUDE_SKILL_DIR}/../../scripts/translate_video.py URL --srt-only` |

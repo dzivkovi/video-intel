@@ -1,0 +1,12 @@
+20:38:09 INFO    Config resolved from SKILL_DIR/config.yaml (C:\Users\danie\ws\Skills\video-intel\config.yaml)
+20:38:10 WARNING Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY.
+20:38:16 INFO    Transcribing: https://www.youtube.com/watch?v=sFow6dOMfgQ
+20:38:16 INFO      sFow6dOMfgQ is 2h2m35s; running 3 chunks of 50 min each.
+20:38:16 INFO        chunk 00:00 - 50:00 -> Gemini
+20:39:25 INFO    usage transcript-chunk1 prompt=273699 cached=0 thoughts=0 candidates=9439 total=283138
+20:39:25 INFO        chunk 50:00 - 1:40:00 -> Gemini
+20:40:52 INFO    usage transcript-chunk2 prompt=273699 cached=0 thoughts=15013 candidates=1484 total=290196
+20:40:52 INFO        chunk 1:40:00 - 2:02:35 -> Gemini
+20:41:17 INFO    usage transcript-chunk3 prompt=123918 cached=0 thoughts=0 candidates=5345 total=129263
+20:41:17 INFO      2026-04-24-jeffrey-sachs-on-the-real-origins-of-the-iran-war-and-the-coming-economic-devast: done
+20:41:17 INFO      Saved: G:\My Drive\video-intel\tuckercarlson\2026-04-24-jeffrey-sachs-on-the-real-origins-of-the-iran-war-and-the-coming-economic-devast.transcript.md

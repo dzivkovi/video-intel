@@ -41,6 +41,7 @@ from gemini_common import (
     require_gemini,
     require_youtube,
 )
+from timestamp_utils import normalize_timestamp, timestamp_tolerance
 
 log = logging.getLogger("video_intel")
 
@@ -1213,14 +1214,6 @@ def _offset_timestamp(ts: str, offset_seconds: int) -> str:
     return f"{m:02d}:{s:02d}"
 
 
-def _timestamp_chunk_tolerance(chunk_duration_seconds: int) -> int:
-    """Slack for absolute-vs-relative classification (ported from translate_video.py).
-
-    Long clips can drift by minutes; short clips should stay much tighter.
-    """
-    return min(300, max(30, chunk_duration_seconds // 10))
-
-
 def _classify_and_offset_timestamp(
     ts: str,
     chunk_start_secs: int,
@@ -1229,6 +1222,12 @@ def _classify_and_offset_timestamp(
     """Per-timestamp classifier handling Gemini's inconsistent absolute-vs-
     relative timestamp behavior across chunks. Ported from translate_video.py's
     apply_timestamp_offset (proven empirically on BCS translation runs).
+
+    Issue #58: normalize_timestamp runs first as a malformation pre-pass so
+    Gemini's minutes-in-HH-field output (e.g. "100:08:57" meaning 1h48m57s)
+    gets unscrambled before classification. Without this, the malformed input
+    looks like 100 hours and falls through as "implausible" (PR #51 ported
+    the classifier but missed the pre-pass; Tucker chunk 3 surfaced the gap).
 
     Three branches per timestamp:
       1. total <= chunk_duration + tolerance -> relative, add chunk_start offset
@@ -1240,6 +1239,17 @@ def _classify_and_offset_timestamp(
     form: under one hour stays MM:SS; one hour or more becomes H:MM:SS to
     match merge_transcript_json's rendering convention.
     """
+    # Wrap-and-strip around normalize_timestamp: classifier receives bare
+    # strings, normalize_timestamp expects bracketed input. Defensively
+    # strip any pre-existing brackets so an already-bracketed caller does
+    # not double-bracket and corrupt the result (issue #58 review feedback).
+    ts_clean = ts.strip().lstrip("[").rstrip("]")
+    normalized = normalize_timestamp(f"[{ts_clean}]")
+    if normalized.startswith("[") and "]" in normalized:
+        ts = normalized[1 : normalized.index("]")]
+    else:
+        ts = ts_clean
+
     parts = ts.split(":")
     try:
         if len(parts) == 2:
@@ -1251,7 +1261,7 @@ def _classify_and_offset_timestamp(
     except ValueError:
         return ts
 
-    tolerance = _timestamp_chunk_tolerance(chunk_duration_secs)
+    tolerance = timestamp_tolerance(chunk_duration_secs)
     max_relative = chunk_duration_secs + tolerance
 
     # Branch order: prefer ABSOLUTE when both interpretations are plausible
@@ -1358,8 +1368,7 @@ def merge_chunked_transcripts(
     chunk_duration_seconds: nominal length of each chunk in seconds (default
     3000 = 50 min, the typical chunk_minutes default). Used by the per-
     timestamp classifier for absolute-vs-relative detection. Last chunk may
-    be shorter; the tolerance in _timestamp_chunk_tolerance handles the
-    slack.
+    be shorter; the tolerance in timestamp_tolerance handles the slack.
 
     Output: dict with the same shape as a single Gemini transcript response
     (transcripts, screen_content, speakers) with speakers deduplicated by

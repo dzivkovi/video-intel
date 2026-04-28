@@ -45,7 +45,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["video_intel", "gemini_common"]
+known-first-party = ["video_intel", "gemini_common", "timestamp_utils"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
