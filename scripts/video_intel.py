@@ -41,6 +41,7 @@ from gemini_common import (
     require_gemini,
     require_youtube,
 )
+from timestamp_utils import normalize_timestamp, timestamp_tolerance
 
 log = logging.getLogger("video_intel")
 
@@ -1213,14 +1214,6 @@ def _offset_timestamp(ts: str, offset_seconds: int) -> str:
     return f"{m:02d}:{s:02d}"
 
 
-def _timestamp_chunk_tolerance(chunk_duration_seconds: int) -> int:
-    """Slack for absolute-vs-relative classification (ported from translate_video.py).
-
-    Long clips can drift by minutes; short clips should stay much tighter.
-    """
-    return min(300, max(30, chunk_duration_seconds // 10))
-
-
 def _classify_and_offset_timestamp(
     ts: str,
     chunk_start_secs: int,
@@ -1229,6 +1222,12 @@ def _classify_and_offset_timestamp(
     """Per-timestamp classifier handling Gemini's inconsistent absolute-vs-
     relative timestamp behavior across chunks. Ported from translate_video.py's
     apply_timestamp_offset (proven empirically on BCS translation runs).
+
+    Issue #58: normalize_timestamp runs first as a malformation pre-pass so
+    Gemini's minutes-in-HH-field output (e.g. "100:08:57" meaning 1h48m57s)
+    gets unscrambled before classification. Without this, the malformed input
+    looks like 100 hours and falls through as "implausible" (PR #51 ported
+    the classifier but missed the pre-pass; Tucker chunk 3 surfaced the gap).
 
     Three branches per timestamp:
       1. total <= chunk_duration + tolerance -> relative, add chunk_start offset
@@ -1240,6 +1239,17 @@ def _classify_and_offset_timestamp(
     form: under one hour stays MM:SS; one hour or more becomes H:MM:SS to
     match merge_transcript_json's rendering convention.
     """
+    # Wrap-and-strip around normalize_timestamp: classifier receives bare
+    # strings, normalize_timestamp expects bracketed input. Defensively
+    # strip any pre-existing brackets so an already-bracketed caller does
+    # not double-bracket and corrupt the result (issue #58 review feedback).
+    ts_clean = ts.strip().lstrip("[").rstrip("]")
+    normalized = normalize_timestamp(f"[{ts_clean}]")
+    if normalized.startswith("[") and "]" in normalized:
+        ts = normalized[1 : normalized.index("]")]
+    else:
+        ts = ts_clean
+
     parts = ts.split(":")
     try:
         if len(parts) == 2:
@@ -1251,7 +1261,7 @@ def _classify_and_offset_timestamp(
     except ValueError:
         return ts
 
-    tolerance = _timestamp_chunk_tolerance(chunk_duration_secs)
+    tolerance = timestamp_tolerance(chunk_duration_secs)
     max_relative = chunk_duration_secs + tolerance
 
     # Branch order: prefer ABSOLUTE when both interpretations are plausible
@@ -1358,8 +1368,7 @@ def merge_chunked_transcripts(
     chunk_duration_seconds: nominal length of each chunk in seconds (default
     3000 = 50 min, the typical chunk_minutes default). Used by the per-
     timestamp classifier for absolute-vs-relative detection. Last chunk may
-    be shorter; the tolerance in _timestamp_chunk_tolerance handles the
-    slack.
+    be shorter; the tolerance in timestamp_tolerance handles the slack.
 
     Output: dict with the same shape as a single Gemini transcript response
     (transcripts, screen_content, speakers) with speakers deduplicated by
@@ -1447,9 +1456,16 @@ def _run_chunked_transcript_url(
         return "skipped (exists)"
 
     media_uri = video["url"]
+    thinking_config = _make_thinking_config_for_transcript(types, model)
+    # Force LOW media resolution for transcription regardless of model. Tucker-
+    # class interview content (talking heads + overlay text) doesn't need HIGH
+    # frame detail; Pro 2.5 default is HIGH which 3x's the input token cost
+    # without quality benefit for our prompt's needs (issue #58 Gate 3).
+    media_resolution_low = types.MediaResolution.MEDIA_RESOLUTION_LOW
     chunk_results: list[tuple[int, dict]] = []
     segment_rows: list[dict] = []
     failed_chunks: list[tuple[int, int, str]] = []
+    thin_chunk_count = 0
 
     for chunk_idx, (start_secs, end_secs) in enumerate(chunks, start=1):
         gemini_start: int | None = None if (start_secs == 0 and end_secs == 0) else start_secs
@@ -1472,6 +1488,8 @@ def _run_chunked_transcript_url(
             start_offset=gemini_start,
             end_offset=gemini_end,
             on_response=lambda r, _idx=chunk_idx: log_usage_metadata(r, f"transcript-chunk{_idx}"),
+            thinking_config=thinking_config,
+            media_resolution=media_resolution_low,
         )
         try:
             parsed = json.loads(raw)
@@ -1483,11 +1501,15 @@ def _run_chunked_transcript_url(
                 parsed = salvaged or None
 
         # Real-input gotcha: Gemini sometimes wraps the JSON response in [...]
-        # instead of {...}. merge_transcript_json() handles this for the single-
-        # call path; mirror the same defensive unwrap here so per-chunk logic
-        # downstream can rely on dict shape.
+        # instead of {...}. Two distinct list shapes need handling:
+        # 1) Pro 2.5 task-wrapper: [{"task": "transcripts", "output": [...]}, ...]
+        #    → use _wrapper_to_envelope_dict to rebuild flat envelope (PR #46
+        #    fixed this for single-call path; mirror it here for chunked).
+        # 2) Simple list-wrap: [{...flat envelope...}] → take first element.
+        # Without (1), Pro 2.5 chunks false-positive as thin (issue #58 Gate 3).
         if isinstance(parsed, list):
-            parsed = parsed[0] if parsed else None
+            envelope = _wrapper_to_envelope_dict(parsed)
+            parsed = envelope if envelope is not None else (parsed[0] if parsed else None)
 
         chunk_label = _format_chunk_range_label(start_secs, end_secs or duration_seconds)
         if not parsed or not isinstance(parsed, dict):
@@ -1495,9 +1517,19 @@ def _run_chunked_transcript_url(
             segment_rows.append({"range": chunk_label, "status": "FAILED (parse)", "speakers": []})
             continue
 
+        # Issue #58 Gate 2: detect chunks that returned successful JSON but
+        # transcribed only a fraction of the allotted time window. Tucker
+        # chunk 2 trip: candidates=1484 thoughts=15013 -> Gemini burned its
+        # output budget on thinking and stopped after ~3 min of a 50-min
+        # window. With thinking_config now capped above this should be rare,
+        # but the sanity check makes any future stochastic dropout loud.
+        chunk_status = _assess_chunk_coverage(parsed, start_secs, end_secs, duration_seconds, chunk_idx)
+        if chunk_status == "thin":
+            thin_chunk_count += 1
+
         chunk_results.append((start_secs, parsed))
         speaker_names = [s.get("name", f"Speaker {s.get('voice')}") for s in parsed.get("speakers", [])]
-        segment_rows.append({"range": chunk_label, "status": "ok", "speakers": speaker_names})
+        segment_rows.append({"range": chunk_label, "status": chunk_status, "speakers": speaker_names})
 
     if not chunk_results:
         # All chunks failed - persist concatenated raw responses for forensics
@@ -1547,6 +1579,7 @@ def _run_chunked_transcript_url(
         sidecar = channel_dir / f"{prefix}.transcript.raw.chunk{i}-{sstart}-{send}.txt"
         sidecar.write_text(raw, encoding="utf-8")
 
+    is_partial = bool(failed_chunks) or thin_chunk_count > 0
     meta_fields = {
         "video_url": video["url"],
         "video_id": video["video_id"],
@@ -1554,12 +1587,13 @@ def _run_chunked_transcript_url(
         "title": video["title"],
         "published": video["published"],
         "model": model,
-        "transcript_status": "partial" if failed_chunks else "ok",
+        "transcript_status": "partial" if is_partial else "ok",
         "transcript_chunks": len(chunks),
         "transcript_chunk_minutes": chunk_minutes,
+        "transcript_thin_chunks": thin_chunk_count,
     }
     update_meta(channel_dir / f"{prefix}.meta.json", meta_fields, mode="transcript")
-    return "partial" if failed_chunks else "done"
+    return "partial" if is_partial else "done"
 
 
 @functools.cache
@@ -1756,6 +1790,99 @@ def is_skipped(output_dir, channel_name, video, mode: str | None = None) -> bool
 # ---------------------------------------------------------------------------
 
 
+def _make_thinking_config_for_transcript(types, model: str):
+    """Build a minimum-thinking ThinkingConfig for chunked transcription.
+
+    Transcription is mechanical (diarize + log on-screen content + return JSON),
+    not analytical. Letting Gemini's dynamic-thinking default consume output
+    tokens for thinking is a stochastic failure mode (issue #58 Gate 2:
+    Tucker chunk 2 burned 15,013 thinking tokens, produced 1,484 output tokens,
+    truncated ~47 minutes of content). Mirrors translate_video.py's
+    SRT_DEFAULT_THINKING_BUDGET=128 mitigation but model-aware: 2.5 Pro
+    minimum is 128, 2.5 Flash can disable with 0, Gemini 3.x uses
+    thinking_level. Returns None for unknown models so the SDK default
+    applies and we don't 400 on a model we don't recognize.
+    """
+    if "gemini-3-flash" in model:
+        # Flash-exclusive level: lower than LOW. Confirmed in official docs at
+        # ai.google.dev/gemini-api/docs/thinking and Firebase AI Logic guide.
+        return types.ThinkingConfig(thinking_level="minimal")
+    if "gemini-3" in model:
+        # Pro variants: LOW is the lowest available value (Pro models have
+        # no MINIMAL level). Default would be HIGH.
+        return types.ThinkingConfig(thinking_level="low")
+    if "2.5-flash" in model:
+        return types.ThinkingConfig(thinking_budget=0)
+    if "2.5-pro" in model:
+        return types.ThinkingConfig(thinking_budget=128)
+    return None
+
+
+def _assess_chunk_coverage(
+    parsed: dict,
+    start_secs: int,
+    end_secs: int,
+    duration_seconds: int,
+    chunk_idx: int,
+) -> str:
+    """Detect chunks that returned successful JSON but transcribed only a
+    fraction of the allotted time window.
+
+    Returns "ok" when the chunk's observed timestamp span covers >= 50% of
+    its allotted window, "thin" otherwise. "thin" propagates to overall
+    transcript_status as partial so downstream automation can detect the
+    quality issue without re-parsing the transcript.
+
+    Issue #58 Gate 2: Tucker chunk 2 returned candidates=1484, thoughts=15013
+    -> ~3 minutes of content for a 50-minute window. With thinking_config
+    capped via _make_thinking_config_for_transcript this should be rare,
+    but the check makes any future stochastic dropout loud rather than
+    silently shipping a 50%-empty transcript with status=ok.
+    """
+    if start_secs == 0 and end_secs == 0:
+        return "ok"
+    transcripts = parsed.get("transcripts") or []
+    if not transcripts:
+        log.warning(
+            "Chunk %d transcribed 0 entries for window %ds-%ds; flagged as thin.",
+            chunk_idx,
+            start_secs,
+            end_secs,
+        )
+        return "thin"
+    ts_seconds: list[int] = []
+    for t in transcripts:
+        ts_str = t.get("start") if isinstance(t, dict) else None
+        if not ts_str:
+            continue
+        try:
+            ts_seconds.append(timestamp_to_seconds(str(ts_str)))
+        except (ValueError, AttributeError):
+            continue
+    if len(ts_seconds) < 2:
+        log.warning(
+            "Chunk %d has fewer than 2 parseable timestamps for window %ds-%ds; flagged as thin.",
+            chunk_idx,
+            start_secs,
+            end_secs,
+        )
+        return "thin"
+    observed_span = max(ts_seconds) - min(ts_seconds)
+    allotted_span = max(1, end_secs - start_secs)
+    ratio = observed_span / allotted_span
+    if ratio < 0.5:
+        log.warning(
+            "Chunk %d transcribed %ds of %ds (%.1f%% of allotted window); flagged as thin. "
+            "Re-run may be needed to recover content.",
+            chunk_idx,
+            observed_span,
+            allotted_span,
+            ratio * 100,
+        )
+        return "thin"
+    return "ok"
+
+
 def call_gemini(
     client,
     types,
@@ -1768,6 +1895,8 @@ def call_gemini(
     end_offset: int | None = None,
     fps: float | None = None,
     on_response: Callable[[object], None] | None = None,
+    thinking_config=None,
+    media_resolution: str | None = None,
 ):
     """Send a video to Gemini for multimodal analysis with retry on rate limits.
 
@@ -1800,6 +1929,16 @@ def call_gemini(
     }
     if response_json:
         config_kwargs["response_mime_type"] = "application/json"
+    if thinking_config is not None:
+        config_kwargs["thinking_config"] = thinking_config
+    if media_resolution is not None:
+        # Per ai.google.dev/gemini-api/docs/media-resolution: video low/medium
+        # are treated identically at 70 tok/frame; HIGH (280 tok/frame) is
+        # only needed for OCR-dense or fine-detail video. For Pro 2.5
+        # transcription of interview content (talking heads, overlay text),
+        # LOW is the documented right choice and brings input cost to parity
+        # with Flash 3 (~3x reduction vs Pro 2.5 default HIGH).
+        config_kwargs["media_resolution"] = media_resolution
 
     part_kwargs = {"file_data": types.FileData(file_uri=media_uri)}
     if start_offset is not None or end_offset is not None or fps is not None:
@@ -2101,12 +2240,22 @@ def merge_transcript_json(raw_json, speakers_map):
 
 
 def timestamp_to_seconds(ts):
-    """Convert MM:SS or H:MM:SS to seconds for sorting."""
+    """Convert MM:SS or H:MM:SS to seconds for sorting.
+
+    Issue #58 Gate 3: Gemini 2.5 Pro can emit fractional seconds (e.g.
+    "00:00.040" for 40-millisecond precision) where Flash emits whole-second
+    "00:00". Use int(float(...)) on the seconds field to strip the decimal,
+    and wrap the whole parse in try/except so any future timestamp variant
+    falls through to 0 instead of crashing the merge sort.
+    """
     parts = ts.split(":")
-    if len(parts) == 2:
-        return int(parts[0]) * 60 + int(parts[1])
-    elif len(parts) == 3:
-        return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+    try:
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + int(float(parts[1]))
+        elif len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(float(parts[2]))
+    except (ValueError, TypeError):
+        return 0
     return 0
 
 

@@ -31,7 +31,6 @@ from translate_video import (
     format_captions_for_translation,
     format_elapsed,
     format_stats,
-    normalize_timestamp,
     parse_iso8601_duration,
     parse_transcript_header,
     single_request_cap_seconds,
@@ -262,33 +261,6 @@ class TestBuildChunkList:
         assert chunks[0] == (0, 600)
         assert chunks[-1] == (4800, 5400)
         assert len(chunks) == 9
-
-
-class TestNormalizeTimestamp:
-    def test_normal_timestamp_unchanged(self):
-        assert normalize_timestamp("[00:05:30] hello") == "[00:05:30] hello"
-
-    def test_boundary_23_unchanged(self):
-        assert normalize_timestamp("[23:59:59] text") == "[23:59:59] text"
-
-    def test_120_minutes_converts_to_2_hours(self):
-        assert normalize_timestamp("[120:05:30] text") == "[02:05:30] text"
-
-    def test_90_minutes_converts_with_carry(self):
-        assert normalize_timestamp("[90:15:42] text") == "[01:45:42] text"
-
-    def test_60_minutes_converts_to_1_hour(self):
-        assert normalize_timestamp("[60:00:00] text") == "[01:00:00] text"
-
-    def test_no_timestamp_passthrough(self):
-        assert normalize_timestamp("no timestamp line") == "no timestamp line"
-
-    def test_minutes_carry_over_60(self):
-        # 75 min + 50 MM = 1h15m + 50m = 2h05m
-        assert normalize_timestamp("[75:50:10] text") == "[02:05:10] text"
-
-    def test_empty_line_passthrough(self):
-        assert normalize_timestamp("") == ""
 
 
 class TestApplyTimestampOffset:

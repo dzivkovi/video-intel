@@ -31,6 +31,11 @@ tests/evals/results/
 examples/*.part-*.txt
 examples/*.txt.tmp
 
+# Manual post-processing of translate-bcs outputs (e.g. .fixed.txt) is
+# private to the author and never committed. The raw .translate-bcs.txt
+# and .en.srt outputs ARE tracked as before/after evidence.
+examples/*.fixed.txt
+
 # Isolated LanceDB output from the real-Voyage validation harness; binary
 # artifacts. Harness is reproducible from the committed source.
 examples/.lancedb-validation/

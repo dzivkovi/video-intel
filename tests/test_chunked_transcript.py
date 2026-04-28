@@ -76,6 +76,166 @@ class TestOffsetTimestamp:
         assert vi._offset_timestamp("not-a-timestamp", 1800) == "not-a-timestamp"
 
 
+class TestClassifyAndOffsetTimestampNormalization:
+    """Regression tests for issue #58 - normalize_timestamp pre-pass.
+
+    Tucker/Sachs chunk 3 (chunk_start=6000s, chunk_duration=3000s) produced
+    [100:08:57]-style timestamps where Gemini packed total minutes into the
+    HH field. Without the normalize_timestamp pre-pass added in this issue,
+    the classifier saw 100 hours, flagged "Implausible timestamp", and passed
+    the corruption through to disk.
+    """
+
+    def test_tucker_chunk3_100_08_57_normalizes_and_classifies_as_absolute(self):
+        # 100 minutes = 1h40m chunk start + 8m = 1h48m, 57 sec.
+        # Should classify as ABSOLUTE (already inside the chunk window after
+        # normalization), no warning.
+        result = vi._classify_and_offset_timestamp("100:08:57", chunk_start_secs=6000, chunk_duration_secs=3000)
+        assert result == "1:48:57"
+
+    def test_tucker_chunk3_100_00_00_normalizes_to_chunk_start(self):
+        # 100 minutes = exactly chunk start (1h40m).
+        result = vi._classify_and_offset_timestamp("100:00:00", chunk_start_secs=6000, chunk_duration_secs=3000)
+        assert result == "1:40:00"
+
+    def test_tucker_chunk3_100_22_35_normalizes_to_chunk_end(self):
+        # 100 minutes + 22 = 2h02m, 35 sec - the actual end of Tucker chunk 3.
+        result = vi._classify_and_offset_timestamp("100:22:35", chunk_start_secs=6000, chunk_duration_secs=3000)
+        assert result == "2:02:35"
+
+    def test_already_normal_absolute_unchanged(self):
+        # Sanity: clean input with proper HH:MM:SS still classifies as absolute.
+        result = vi._classify_and_offset_timestamp("1:48:57", chunk_start_secs=6000, chunk_duration_secs=3000)
+        assert result == "1:48:57"
+
+    def test_relative_chunk_input_gets_offset_applied(self):
+        # Sanity: 8:57 (relative within chunk) gets chunk_start added.
+        result = vi._classify_and_offset_timestamp("08:57", chunk_start_secs=6000, chunk_duration_secs=3000)
+        assert result == "1:48:57"
+
+    def test_already_bracketed_input_does_not_corrupt(self):
+        # Defensive contract test (issue #58 review feedback): if a caller
+        # ever passes already-bracketed input, the wrap-and-strip pre-pass
+        # must not double-bracket and lose data. The bracket-stripping at
+        # entry guarantees the result is bracket-free regardless of branch.
+        result = vi._classify_and_offset_timestamp("[1:30:00]", chunk_start_secs=0, chunk_duration_secs=600)
+        assert "[" not in result and "]" not in result
+
+
+class TestMakeThinkingConfigForTranscript:
+    """Issue #58 Gate 2 mitigation: chunked transcript path constrains the
+    Gemini thinking budget so dynamic-thinking can't stochastically consume
+    output budget. Model-aware because Gemini 2.x and 3.x have different
+    thinking-control APIs."""
+
+    def _types_stub(self):
+        # Minimal stand-in for google-genai types.ThinkingConfig — captures
+        # the kwargs so we can assert on what was constructed without a real
+        # SDK import.
+        captured: list[dict] = []
+
+        class _ThinkingConfig:
+            def __init__(self, **kwargs):
+                captured.append(kwargs)
+                self.kwargs = kwargs
+
+        types = type("Types", (), {"ThinkingConfig": _ThinkingConfig})
+        return types, captured
+
+    def test_gemini_3_flash_uses_minimal_level(self):
+        # Confirmed via ai.google.dev/gemini-api/docs/thinking and Firebase AI
+        # Logic guide: gemini-3-flash-preview supports MINIMAL/LOW/MEDIUM/HIGH.
+        # MINIMAL is Flash-exclusive and the lowest available level.
+        types, captured = self._types_stub()
+        result = vi._make_thinking_config_for_transcript(types, "gemini-3-flash-preview")
+        assert result is not None
+        assert captured[-1] == {"thinking_level": "minimal"}
+
+    def test_gemini_3_pro_uses_low_level(self):
+        # Pro variants don't have MINIMAL; LOW is the lowest available.
+        types, captured = self._types_stub()
+        result = vi._make_thinking_config_for_transcript(types, "gemini-3-pro-preview")
+        assert result is not None
+        assert captured[-1] == {"thinking_level": "low"}
+
+    def test_gemini_2_5_flash_disables_thinking_with_budget_zero(self):
+        # 2.5 Flash range is 0-24576; 0 disables thinking entirely.
+        types, captured = self._types_stub()
+        result = vi._make_thinking_config_for_transcript(types, "gemini-2.5-flash")
+        assert result is not None
+        assert captured[-1] == {"thinking_budget": 0}
+
+    def test_gemini_2_5_pro_uses_minimum_budget_128(self):
+        # 2.5 Pro cannot disable thinking; 128 is the documented minimum.
+        types, captured = self._types_stub()
+        result = vi._make_thinking_config_for_transcript(types, "gemini-2.5-pro")
+        assert result is not None
+        assert captured[-1] == {"thinking_budget": 128}
+
+    def test_unknown_model_returns_none(self):
+        # Don't 400 on a model we don't recognize - let the SDK default apply.
+        types, _captured = self._types_stub()
+        result = vi._make_thinking_config_for_transcript(types, "gemini-future-9000")
+        assert result is None
+
+
+class TestAssessChunkCoverage:
+    """Issue #58 Gate 2 sanity check: detect chunks that returned valid JSON
+    but transcribed only a fraction of their allotted time window."""
+
+    def test_full_coverage_is_ok(self):
+        # 50-minute chunk where Gemini transcribed entries spanning the full
+        # window (~50 min observed span).
+        parsed = {
+            "transcripts": [
+                {"start": "00:30"},
+                {"start": "25:00"},
+                {"start": "49:30"},
+            ]
+        }
+        result = vi._assess_chunk_coverage(parsed, start_secs=3000, end_secs=6000, duration_seconds=11752, chunk_idx=2)
+        assert result == "ok"
+
+    def test_tucker_chunk2_thin_case_flagged(self):
+        # Real-input regression: chunk 2 covered only 50:00-53:10 of its
+        # 50:00-1:40:00 (3000s) allotted window. Observed span ~190s = 6.3%.
+        parsed = {
+            "transcripts": [
+                {"start": "00:00"},
+                {"start": "01:30"},
+                {"start": "03:10"},
+            ]
+        }
+        result = vi._assess_chunk_coverage(parsed, start_secs=3000, end_secs=6000, duration_seconds=7355, chunk_idx=2)
+        assert result == "thin"
+
+    def test_empty_transcripts_list_flagged_thin(self):
+        result = vi._assess_chunk_coverage(
+            {"transcripts": []}, start_secs=3000, end_secs=6000, duration_seconds=7355, chunk_idx=2
+        )
+        assert result == "thin"
+
+    def test_single_timestamp_cannot_measure_span_flagged_thin(self):
+        # Need at least 2 timestamps to compute a span.
+        parsed = {"transcripts": [{"start": "00:30"}]}
+        result = vi._assess_chunk_coverage(parsed, start_secs=3000, end_secs=6000, duration_seconds=7355, chunk_idx=2)
+        assert result == "thin"
+
+    def test_single_chunk_video_skips_check(self):
+        # When there's no chunking (start=0, end=0), the allotted window is
+        # the whole video — coverage check would be ill-defined.
+        parsed = {"transcripts": [{"start": "00:30"}, {"start": "01:00"}]}
+        result = vi._assess_chunk_coverage(parsed, start_secs=0, end_secs=0, duration_seconds=600, chunk_idx=1)
+        assert result == "ok"
+
+    def test_50_percent_threshold_boundary(self):
+        # Boundary case: exactly 50% of allotted span = "ok".
+        parsed = {"transcripts": [{"start": "00:00"}, {"start": "25:00"}]}
+        # 1500s observed / 3000s allotted = 50% exactly — passes.
+        result = vi._assess_chunk_coverage(parsed, start_secs=3000, end_secs=6000, duration_seconds=7355, chunk_idx=2)
+        assert result == "ok"
+
+
 # ---------------------------------------------------------------------------
 # Unit 2: merge_chunked_transcripts
 # ---------------------------------------------------------------------------
