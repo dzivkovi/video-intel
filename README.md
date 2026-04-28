@@ -136,7 +136,7 @@ Both get installed together; Claude picks the right one based on what you ask.
 | Skill | What it does | Trigger phrases |
 | ----- | ------------ | --------------- |
 | **video-intel** | Scan YouTube channels, generate mind maps, produce rich transcripts with on-screen content, extract concepts, hybrid search across the library | "scan my channels", "transcribe this video", "what videos cover X", "what should I watch" |
-| **translate-bcs** | Translate YouTube videos and rich transcripts into Bosnian/Croatian/Serbian subtitles; also downloads just the English SRT on request | "translate to Bosnian/Croatian/Serbian", "BCS subtitles", "titl na bosanski", "just give me the SRT" |
+| **translate-bcs** | Translate YouTube videos and rich transcripts into Bosnian/Croatian/Serbian (BCS) subtitles. Two paths: fast captions-first via YouTube SRT for short videos, or rich-transcript-first via video-intel for long videos where the SRT path drifts. Also downloads English SRT only on request. | "translate to Bosnian/Croatian/Serbian", "BCS subtitles", "titl na bosanski", "just give me the SRT" |
 
 The two skills stay operationally independent — `translate-bcs` does not read video-intel's
 channel config, taxonomy, or meta files. The integration point is a file handoff:
@@ -544,16 +544,24 @@ A separate utility script for translating YouTube video audio into
 BCS subtitles. Not part of the video-intel
 pipeline, but shares the same Gemini API patterns and lives in this repo.
 
-**Why this exists.** Millions of people in the Balkans and the diaspora
-speak BCS languages that YouTube's auto-translate does not support.
-Gemini can translate video audio into BCS with high quality, but the web
-interface caps output at 8K tokens (~30 minutes of video). The API allows
-65K tokens, enough for 2-3 hours of content in a single pass. This script
-is a bridge: it gives non-English speakers access to long-form content
-that YouTube's own tools cannot reach yet.
+**About BCS.** Bosnian, Croatian, and Serbian — collectively "BCS" — are
+mutually-intelligible South Slavic languages spoken across the former
+Yugoslavia (Bosnia, Serbia, Croatia, Montenegro, plus Serbian-speaking
+communities in Kosovo) and the diaspora. Same grammar, same core
+vocabulary; differences are dialect, script, and a few hundred preferred
+words. This script outputs Bosnian-neutral Latin-script ijekavica —
+natural across all four countries and readable by Serbian Cyrillic users
+without conversion.
 
-Built for family, elders, and friends who live in North America but
-cannot benefit from English-language YouTube.
+**Why this matters.** Many immigrants around the world don't speak English
+at all. Most long-form journalism, podcasts, and political interviews
+that shape global discourse are in English — especially in North America.
+For BCS speakers in diaspora communities, that means missing out.
+This script gives them a path to read those videos in their own language —
+about $0.50 for short videos via the captions-first path, or ~$0.90 per
+2-hour video via the rich-transcript path. Built for family, elders, and
+friends who live in North America but cannot benefit from English-language
+YouTube.
 
 ```bash
 # Translate a video to BCS (auto-detects title, saves to file)
@@ -593,6 +601,26 @@ BCS came from: manual captions, auto-generated captions (with silent ASR
 cleanup), or direct video audio. When the captions track is auto-generated,
 the SRT prompt instructs Gemini to repair punctuation and capitalization
 as part of the translation pass.
+
+**Long videos: rich-transcript path.** For videos over ~90 minutes, or
+content where on-screen text and speaker changes carry meaning (lectures
+with slides, multi-speaker interviews, news-style overlays, OCR-heavy
+material), YouTube's SRT alone loses too much. Run two commands instead
+of one:
+
+```bash
+# Step 1 — produce a rich transcript via video-intel
+python scripts/video_intel.py transcript --url URL --channel <name>
+
+# Step 2 — translate the transcript to BCS
+python scripts/translate_video.py --from-transcript <path>
+```
+
+This path keeps speaker labels and on-screen content in the BCS output.
+Cost is roughly $0.50 (transcript) + $0.40 (translation) = ~$0.90 per
+2-hour video. The translate-bcs skill auto-routes long videos here. For
+the engineering rationale, see
+[docs/solutions/integration-issues/gemini-flash3-vs-pro25-chunked-transcription-20260427.md](docs/solutions/integration-issues/gemini-flash3-vs-pro25-chunked-transcription-20260427.md).
 
 **Video fallback (used when no captions exist):** Gemini's input limit is
 1M tokens. Translation reads audio only — the `translate-bcs` prompt never
