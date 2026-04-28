@@ -1457,6 +1457,11 @@ def _run_chunked_transcript_url(
 
     media_uri = video["url"]
     thinking_config = _make_thinking_config_for_transcript(types, model)
+    # Force LOW media resolution for transcription regardless of model. Tucker-
+    # class interview content (talking heads + overlay text) doesn't need HIGH
+    # frame detail; Pro 2.5 default is HIGH which 3x's the input token cost
+    # without quality benefit for our prompt's needs (issue #58 Gate 3).
+    media_resolution_low = types.MediaResolution.MEDIA_RESOLUTION_LOW
     chunk_results: list[tuple[int, dict]] = []
     segment_rows: list[dict] = []
     failed_chunks: list[tuple[int, int, str]] = []
@@ -1484,6 +1489,7 @@ def _run_chunked_transcript_url(
             end_offset=gemini_end,
             on_response=lambda r, _idx=chunk_idx: log_usage_metadata(r, f"transcript-chunk{_idx}"),
             thinking_config=thinking_config,
+            media_resolution=media_resolution_low,
         )
         try:
             parsed = json.loads(raw)
@@ -1495,11 +1501,15 @@ def _run_chunked_transcript_url(
                 parsed = salvaged or None
 
         # Real-input gotcha: Gemini sometimes wraps the JSON response in [...]
-        # instead of {...}. merge_transcript_json() handles this for the single-
-        # call path; mirror the same defensive unwrap here so per-chunk logic
-        # downstream can rely on dict shape.
+        # instead of {...}. Two distinct list shapes need handling:
+        # 1) Pro 2.5 task-wrapper: [{"task": "transcripts", "output": [...]}, ...]
+        #    → use _wrapper_to_envelope_dict to rebuild flat envelope (PR #46
+        #    fixed this for single-call path; mirror it here for chunked).
+        # 2) Simple list-wrap: [{...flat envelope...}] → take first element.
+        # Without (1), Pro 2.5 chunks false-positive as thin (issue #58 Gate 3).
         if isinstance(parsed, list):
-            parsed = parsed[0] if parsed else None
+            envelope = _wrapper_to_envelope_dict(parsed)
+            parsed = envelope if envelope is not None else (parsed[0] if parsed else None)
 
         chunk_label = _format_chunk_range_label(start_secs, end_secs or duration_seconds)
         if not parsed or not isinstance(parsed, dict):
@@ -1886,6 +1896,7 @@ def call_gemini(
     fps: float | None = None,
     on_response: Callable[[object], None] | None = None,
     thinking_config=None,
+    media_resolution: str | None = None,
 ):
     """Send a video to Gemini for multimodal analysis with retry on rate limits.
 
@@ -1920,6 +1931,14 @@ def call_gemini(
         config_kwargs["response_mime_type"] = "application/json"
     if thinking_config is not None:
         config_kwargs["thinking_config"] = thinking_config
+    if media_resolution is not None:
+        # Per ai.google.dev/gemini-api/docs/media-resolution: video low/medium
+        # are treated identically at 70 tok/frame; HIGH (280 tok/frame) is
+        # only needed for OCR-dense or fine-detail video. For Pro 2.5
+        # transcription of interview content (talking heads, overlay text),
+        # LOW is the documented right choice and brings input cost to parity
+        # with Flash 3 (~3x reduction vs Pro 2.5 default HIGH).
+        config_kwargs["media_resolution"] = media_resolution
 
     part_kwargs = {"file_data": types.FileData(file_uri=media_uri)}
     if start_offset is not None or end_offset is not None or fps is not None:
@@ -2221,12 +2240,22 @@ def merge_transcript_json(raw_json, speakers_map):
 
 
 def timestamp_to_seconds(ts):
-    """Convert MM:SS or H:MM:SS to seconds for sorting."""
+    """Convert MM:SS or H:MM:SS to seconds for sorting.
+
+    Issue #58 Gate 3: Gemini 2.5 Pro can emit fractional seconds (e.g.
+    "00:00.040" for 40-millisecond precision) where Flash emits whole-second
+    "00:00". Use int(float(...)) on the seconds field to strip the decimal,
+    and wrap the whole parse in try/except so any future timestamp variant
+    falls through to 0 instead of crashing the merge sort.
+    """
     parts = ts.split(":")
-    if len(parts) == 2:
-        return int(parts[0]) * 60 + int(parts[1])
-    elif len(parts) == 3:
-        return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+    try:
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + int(float(parts[1]))
+        elif len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(float(parts[2]))
+    except (ValueError, TypeError):
+        return 0
     return 0
 
 
