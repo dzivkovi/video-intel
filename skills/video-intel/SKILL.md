@@ -37,16 +37,25 @@ Multimodal video scanning and transcription powered by Gemini.
 
 ## What This Skill Does
 
-Three layers, designed as a narrowing funnel:
+Three layers, designed as a narrowing funnel.
 
-1. **scan** - Fetch new videos from configured YouTube channels, generate
-   thematic mind maps for each video in parallel via Gemini's multimodal API.
-   Optionally auto-generate transcripts and concept extraction.
+1. **scan** - Fetch new videos from configured YouTube channels. For each
+   video, in this order: (a) Gemini multimodal transcript reading frames +
+   audio + on-screen text; (b) mindmap built from that transcript via a
+   text-only Gemini call (~10× cheaper than reading video, no 10800-frame
+   cap); (c) concept extraction from the mindmap. Only step (a) touches the
+   video; (b) and (c) are text-only and read what (a) wrote to disk. The
+   `mindmap_source: auto` per-channel knob (default) routes step (b) to the
+   text-only path when a transcript exists, with a fallback to mindmap-from-
+   video when no transcript is on disk.
 
 2. **transcript** - Generate a fused document for a single video: diarized
    speech interleaved with timestamped SCREEN sections describing what was
    shown (slides, diagrams, code, demos). Uses a three-task decoupled prompt
-   for best quality.
+   for best quality. **Always Gemini multimodal in this skill** — there is
+   no YouTube captions / SRT path here. (The SRT-first path lives in
+   `translate_video.py` for BCS subtitle translation only; do not confuse
+   the two.)
 
 3. **concepts** - Extract and normalize key concepts from mind maps into a
    canonical vocabulary (taxonomy.json). Different videos use different words
@@ -147,11 +156,15 @@ any of these are true:
 - The implied scope is more than ~10 new videos
 - The channel name was fuzzy and required config-file resolution
 - `auto_transcript: all` is set on the target channel (each new video =
-  2 Gemini calls — mindmap + transcript)
+  3 Gemini calls — 1 expensive transcript reading video frames + audio,
+  plus 2 cheap text-only calls: mindmap-from-transcript and concepts)
 
-Report the count of new videos and the estimated Gemini call count
-(videos × 2 if `auto_transcript: all`, otherwise videos × 1). Wait for
-the user's go-ahead before running the real scan.
+Report the count of new videos and the estimated Gemini call count.
+Per video with `auto_transcript: all`: 1 expensive transcript call +
+2 cheap text-only calls (mindmap-from-transcript + concepts). With
+`auto_transcript: none`: 1 expensive mindmap-from-video call (legacy
+path, used when no transcript is on disk). Wait for the user's go-ahead
+before running the real scan.
 
 ## Model Selection
 
@@ -160,7 +173,7 @@ operations. Override with `--model` / `-m` when needed:
 
 | Scenario | Model | Why |
 |----------|-------|-----|
-| Default (mindmaps, concepts, scan) | `gemini-3-flash-preview` | Best deep video understanding |
+| Default (transcripts, mindmaps, concepts, scan) | `gemini-3-flash-preview` | Best deep video understanding for the transcript step; cheap text-only model for mindmap+concepts |
 | Transcripts failing with JSON errors | `gemini-2.5-pro` | More reliable structured JSON, higher output token limit |
 | Gemini 3.x backend unreliable / 503s | `gemini-2.5-pro` | Stable fallback |
 | Long videos (>60 min transcripts) | `gemini-2.5-pro` | Less likely to truncate mid-output |
@@ -192,8 +205,11 @@ python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" --log-level info scan
 ```
 
 Scans all channels in config.yaml, processes new videos since each channel's
-`since` window, saves mind maps and (optionally) transcripts to the output
-directory. **This command is slow** — multiple Gemini API calls, 1-5 min each.
+`since` window. Per video the order is: transcript (Gemini multimodal) →
+mindmap (text-only Gemini, reads the just-written transcript) → concepts
+(text-only Gemini, reads the mindmap). All three artifacts land in the
+output directory. **This command is slow** — multiple Gemini API calls,
+1-5 min each (the transcript step dominates wall-clock).
 Use a 600000ms bash timeout. `--log-level info` is mandatory so progress is
 visible; without it the command appears to produce no output.
 

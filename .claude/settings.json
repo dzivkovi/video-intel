@@ -1,7 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "mcp__exa__crawling_exa"
+      "mcp__exa__crawling_exa",
+      "Read(//g/My Drive/video-intel/**)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\danie\\.claude"
     ]
   },
   "enabledPlugins": {
