@@ -1820,6 +1820,24 @@ def _make_thinking_config_for_transcript(types, model: str):
     return None
 
 
+def _resolve_media_resolution(types, choice: str):
+    """Map a CLI string choice to the matching genai MediaResolution enum value.
+
+    Used at the cmd_process / cmd_mindmap boundary to turn the
+    --media-resolution {low,high} flag into the SDK enum that call_gemini
+    expects. Centralized so both subcommands use identical mapping.
+    """
+    mapping = {
+        "low": types.MediaResolution.MEDIA_RESOLUTION_LOW,
+        "high": types.MediaResolution.MEDIA_RESOLUTION_HIGH,
+    }
+    if choice not in mapping:
+        # Defensive — argparse `choices=` should have rejected this, but a
+        # programmatic caller could pass an invalid value.
+        raise ValueError(f"Invalid media_resolution={choice!r}. Expected 'low' or 'high'.")
+    return mapping[choice]
+
+
 def _assess_chunk_coverage(
     parsed: dict,
     start_secs: int,
@@ -2011,6 +2029,7 @@ def process_mindmap(
     fps: float | None = None,
     source: str = "video",
     transcript_path: Path | None = None,
+    media_resolution=None,
 ):
     """Generate a mind map for a single video.
 
@@ -2095,6 +2114,17 @@ def process_mindmap(
             header = "\n".join(header_lines) + "\n\n"
         else:
             effective_media_uri = media_uri if media_uri is not None else video["url"]
+            # Default to LOW media resolution: mirrors the chunked-transcript
+            # path's pattern (line 1466) and applies the same issue #58 Gate 3
+            # finding — for our prompt's needs (theme/concept extraction from
+            # talking-head + occasional slide content), LOW yields equivalent
+            # quality at 3x lower input-token cost. HIGH would re-introduce
+            # Gemini's 1M-token ceiling on hour-long videos. Override via the
+            # --media-resolution CLI flag for the rare case where the prompt
+            # depends on reading fine on-screen text.
+            effective_media_resolution = (
+                media_resolution if media_resolution is not None else types.MediaResolution.MEDIA_RESOLUTION_LOW
+            )
             result = call_gemini(
                 client,
                 types,
@@ -2102,6 +2132,7 @@ def process_mindmap(
                 prompt_text,
                 model,
                 fps=fps,
+                media_resolution=effective_media_resolution,
                 on_response=lambda r: log_usage_metadata(r, "mindmap"),
             )
             header = (
@@ -2337,11 +2368,19 @@ def isolate_json(text: str) -> str:
     return text
 
 
-def try_parse_transcript_json(text: str) -> tuple[dict | list | None, str | None]:
+def try_parse_transcript_json(text: str | None) -> tuple[dict | list | None, str | None]:
     """Attempt to parse transcript JSON: direct first, then after isolation.
     If the parsed value is the Pro task-wrapper shape, normalize to a flat
     envelope so downstream `merge_transcript_json` sees a valid dict (issue #45).
+
+    None or empty input is treated as a parse failure (returns parse_error)
+    rather than raising — Gemini's thinking-budget overflow can produce
+    `candidates=0` and `text=None`, and the caller should fall through to
+    the salvage path with a clear error rather than crash with a TypeError.
     """
+    # Defensive: empty / None / non-string input cannot be valid JSON.
+    if not text:
+        return None, "Empty response from Gemini (likely thinking-budget overflow: candidates=0)"
     # Try direct parse
     try:
         parsed = json.loads(text)
@@ -2533,6 +2572,7 @@ def process_transcript(
     start_offset: int | None = None,
     end_offset: int | None = None,
     media_uri: str | None = None,
+    media_resolution=None,
 ):
     """Generate a fused transcript for a single video with layered JSON resilience.
 
@@ -2558,6 +2598,23 @@ def process_transcript(
         return prefix, "skipped (exists)"
 
     effective_media_uri = media_uri if media_uri is not None else video["url"]
+    # Default to LOW media resolution: same justification as process_mindmap
+    # (issue #58 Gate 3 — LOW = same quality at 3x lower input-token cost for
+    # talking-head + slide content). Without this default, single-shot transcript
+    # calls hit Gemini's 1M-token cap on hour-long videos. The chunked-transcript
+    # path (line 1466) already uses LOW; this brings the single-shot path into
+    # parity. CLI override flows from the --media-resolution flag through cmd_*.
+    effective_media_resolution = (
+        media_resolution if media_resolution is not None else types.MediaResolution.MEDIA_RESOLUTION_LOW
+    )
+    # Cap thinking budget. Without this cap, Gemini 2.5 Pro can stochastically
+    # burn the entire output token budget on internal thinking, returning
+    # candidates=0 and text=None — empirically observed on a 91-min video that
+    # produced thoughts=65533, candidates=0. Mirrors the chunked-transcript path's
+    # mitigation (line 1493): same model-aware helper, same justification (issue
+    # #58 Gate 2). Transcription is mechanical (diarize + log on-screen content),
+    # not analytical — minimum thinking is the right setting.
+    transcript_thinking_config = _make_thinking_config_for_transcript(types, model)
     for attempt in range(1 + TRANSCRIPT_PARSE_RETRY_LIMIT):
         try:
             raw = call_gemini(
@@ -2569,6 +2626,8 @@ def process_transcript(
                 response_json=True,
                 start_offset=start_offset,
                 end_offset=end_offset,
+                media_resolution=effective_media_resolution,
+                thinking_config=transcript_thinking_config,
                 on_response=lambda r: log_usage_metadata(r, "transcript"),
             )
         except Exception as e:
@@ -3310,6 +3369,14 @@ def cmd_mindmap(args, config):
     client = create_client(gemini_key)
     output_dir = resolve_output_dir(config)
     model = resolve_model(args, config)
+    # Resolve --media-resolution flag once at command boundary; threaded into
+    # every process_mindmap call below that uses source="video". Only meaningful
+    # on the mindmap-from-video path; transcript-source calls ignore it.
+    # Guarded against types=None for test stubs that bypass require_gemini —
+    # process_mindmap accepts media_resolution=None and falls back to LOW.
+    media_resolution_enum = (
+        _resolve_media_resolution(types, getattr(args, "media_resolution", "low")) if types is not None else None
+    )
 
     # Resolve prompt
     prompt_name = normalize_prompt_name(getattr(args, "prompt", None) or config.get("default_prompt", "mindmap-light"))
@@ -3368,6 +3435,7 @@ def cmd_mindmap(args, config):
                 prefix=identity["prefix"],
                 channel_dir_override=identity["channel_dir"],
                 media_uri=file_uri,
+                media_resolution=media_resolution_enum,
             )
             log.info("  %s: %s", prefix, status)
             if status == "done":
@@ -3396,6 +3464,7 @@ def cmd_mindmap(args, config):
             prefix=input_path.stem,
             channel_dir_override=input_path.parent,
             media_uri=file_uri,
+            media_resolution=media_resolution_enum,
         )
         log.info("  %s: %s", prefix, status)
         if status == "done":
@@ -3527,6 +3596,7 @@ def cmd_mindmap(args, config):
             prefix=prefix_for_lookup,
             fps=mindmap_fps,
             source="video",
+            media_resolution=media_resolution_enum,
         )
     log.info("  %s: %s", prefix, status)
 
@@ -3547,6 +3617,13 @@ def cmd_transcript(args, config):
     client = create_client(gemini_key)
     model = resolve_model(args, config)
     prompt_text = load_prompt("transcript")
+    # Resolve --media-resolution flag once at command boundary; threaded into
+    # all process_transcript calls below. Defaults to LOW to match the chunked-
+    # transcript path's pattern and stay under Gemini's 1M-token cap on
+    # hour-long videos. Guarded against types=None for test stubs.
+    media_resolution_enum = (
+        _resolve_media_resolution(types, getattr(args, "media_resolution", "low")) if types is not None else None
+    )
 
     # Parse segment offsets (shared between URL and file paths)
     start_offset = parse_time_to_seconds(args.start) if args.start else None
@@ -3737,6 +3814,7 @@ def cmd_transcript(args, config):
         start_offset=start_offset,
         end_offset=end_offset,
         media_uri=media_uri,
+        media_resolution=media_resolution_enum,
     )
     out_path = channel_dir / f"{prefix}.transcript.md"
     log.info("  %s: %s", prefix, status)
@@ -3809,6 +3887,11 @@ def _cmd_process_url(args, config):
     client = create_client(gemini_key)
     output_dir = resolve_output_dir(config)
     model = resolve_model(args, config)
+    # Resolve --media-resolution flag for the legacy single-shot transcript fallback
+    # below. Default LOW; guarded against types=None for test stubs.
+    media_resolution_enum = (
+        _resolve_media_resolution(types, getattr(args, "media_resolution", "low")) if types is not None else None
+    )
 
     video_id_match = re.search(r"(?:v=|/)([a-zA-Z0-9_-]{11})", args.url)
     if not video_id_match:
@@ -3923,6 +4006,7 @@ def _cmd_process_url(args, config):
                 prefix,
                 force=args.force,
                 media_uri=None,
+                media_resolution=media_resolution_enum,
             )
     except Exception as exc:
         transcript_status = f"error: {exc}"
@@ -4040,6 +4124,14 @@ def cmd_process(args, config):
     client = create_client(gemini_key)
     output_dir = resolve_output_dir(config)
     model = resolve_model(args, config)
+    # Resolve --media-resolution flag once at command boundary; threaded into
+    # the mindmap step below. Local-file path stays on legacy mindmap-from-video,
+    # so this flag is the user's only knob to override the LOW default.
+    # Guarded against types=None for test stubs that bypass require_gemini —
+    # process_mindmap accepts media_resolution=None and falls back to LOW.
+    media_resolution_enum = (
+        _resolve_media_resolution(types, getattr(args, "media_resolution", "low")) if types is not None else None
+    )
 
     start_offset = parse_time_to_seconds(args.start) if args.start else None
     end_offset = parse_time_to_seconds(args.end) if args.end else None
@@ -4216,6 +4308,7 @@ def cmd_process(args, config):
             prefix=prefix,
             channel_dir_override=channel_dir,
             media_uri=uri,
+            media_resolution=media_resolution_enum,
         )
 
     # Issue #42: per-mode skip MUST gate the helper call here, not just the
@@ -4251,6 +4344,7 @@ def cmd_process(args, config):
             start_offset=start_offset,
             end_offset=end_offset,
             media_uri=uri,
+            media_resolution=media_resolution_enum,
         )
 
     if skip_transcript:
@@ -5727,6 +5821,19 @@ Examples:
         ),
     )
     mm_parser.add_argument("--force", action="store_true", help="Regenerate even if mindmap exists")
+    mm_parser.add_argument(
+        "--media-resolution",
+        choices=["low", "high"],
+        default="low",
+        dest="media_resolution",
+        help=(
+            "Gemini media resolution for the mindmap-from-video path "
+            "(default: low). LOW yields equivalent quality at 3x lower input-token "
+            "cost for theme/concept extraction (issue #58 Gate 3); HIGH is for the "
+            "rare case where the prompt depends on reading fine on-screen text. "
+            "Ignored on the mindmap-from-transcript path (text-only)."
+        ),
+    )
 
     # transcript command
     tx_parser = subparsers.add_parser("transcript", help="Transcribe a specific video")
@@ -5779,6 +5886,19 @@ Examples:
             f"(default: {TRANSCRIPT_CHUNK_MINUTES_DEFAULT}). Manual --start/--end disables chunking."
         ),
     )
+    tx_parser.add_argument(
+        "--media-resolution",
+        choices=["low", "high"],
+        default="low",
+        dest="media_resolution",
+        help=(
+            "Gemini media resolution for the single-shot transcript path "
+            "(default: low). LOW yields equivalent quality at 3x lower input-token "
+            "cost for talking-head + slide content (issue #58 Gate 3) and is required "
+            "to fit hour-long videos under Gemini's 1M-token cap. The chunked-transcript "
+            "path is hardcoded to LOW regardless of this flag."
+        ),
+    )
 
     # process command: one-upload full pipeline for local MP4s
     process_parser = subparsers.add_parser(
@@ -5821,6 +5941,19 @@ Examples:
         default=TRANSCRIPT_CHUNK_MINUTES_DEFAULT,
         dest="chunk_minutes",
         help=f"Chunk size for long-video transcripts via --url (default: {TRANSCRIPT_CHUNK_MINUTES_DEFAULT}). Ignored with --file.",
+    )
+    process_parser.add_argument(
+        "--media-resolution",
+        choices=["low", "high"],
+        default="low",
+        dest="media_resolution",
+        help=(
+            "Gemini media resolution for the mindmap-from-video path "
+            "(default: low). LOW yields equivalent quality at 3x lower input-token "
+            "cost for theme/concept extraction (issue #58 Gate 3); HIGH is for the "
+            "rare case where the prompt depends on reading fine on-screen text. "
+            "Ignored on the mindmap-from-transcript path (text-only)."
+        ),
     )
 
     # concepts command

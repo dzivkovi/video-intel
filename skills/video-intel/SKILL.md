@@ -244,6 +244,16 @@ Local files produce `{name}.transcript.md` and `{name}.meta.json` in the same
 directory as the source by default. Uploaded files auto-expire from Gemini
 after 48 hours.
 
+**LOW media resolution by default.** Both the single-shot transcript path
+(local files and short YouTube videos) and the chunked-transcript path
+(long YouTube videos) use Gemini's LOW media resolution by default
+(~70 tokens/frame instead of HIGH ~258 tokens/frame). LOW gives equivalent
+quality on talking-head + slide content at 3× lower input-token cost, and
+keeps hour-long videos under Gemini's 1M-token cap. Pass
+`--media-resolution high` only when the prompt depends on reading fine
+on-screen text (slides, burned-in captions). HIGH on a video over ~67 minutes
+will fail with `400 INVALID_ARGUMENT` (token-cap exceeded).
+
 **When a YouTube URL returns 403 (members-only / gated content)**
 
 **Detection.** Gemini cannot fetch members-only, paid, age-gated, or
@@ -359,6 +369,15 @@ How `process` differs from calling `mindmap --file` then `transcript --file`:
 - **Exit-code contract.** Exit 0 if mindmap succeeded, regardless of
   transcript / concepts outcome. Automation callers that need partial-success
   detail inspect `modes_completed` in the resulting meta.json.
+- **LOW media resolution by default.** The mindmap-from-video step uses
+  Gemini's LOW media resolution by default (~70 tokens/frame) instead of
+  the API default HIGH (~258 tokens/frame). LOW yields equivalent quality
+  for theme/concept extraction at 3× lower input-token cost, and removes
+  the previous ~67-minute ceiling — hour-long meeting recordings, conference
+  talks, and member interviews now fit cleanly under Gemini's 1M-token
+  input cap. Pass `--media-resolution high` only when the prompt depends on
+  reading fine on-screen text (slides, burned-in captions). Same flag is
+  available on `mindmap --file`.
 
 Concepts extraction runs inline when the channel is configured in
 `config.yaml`. For loose files (no channel match), concepts is skipped with
@@ -375,6 +394,10 @@ Options:
 - `--start`/`--end` - Segment time offsets (shared across both video calls).
 - `--force` - Regenerate all artifacts from scratch.
 - `--prompt NAME` - Mindmap prompt override (default from config.yaml).
+- `--media-resolution {low,high}` - Gemini media resolution for the mindmap
+  step (default: low). Use `high` only when the prompt depends on reading
+  fine on-screen text. LOW handles hour-long videos that HIGH cannot fit
+  under Gemini's 1M-token cap.
 
 ### Build the search index
 
