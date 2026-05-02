@@ -350,34 +350,49 @@ python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" process \
   --file "./video-intel/earlyaidopters/some-talk.mp4" --force
 ```
 
-How `process` differs from calling `mindmap --file` then `transcript --file`:
+How `process --file` works:
 
-- **One upload** per invocation. The 40+MB MP4 is uploaded to Gemini Files
-  API exactly once and threaded to both the mindmap and transcript calls.
-  Old flow uploaded twice, costing bandwidth and wall-clock.
+- **Pipeline ordering: transcript first, then mindmap, then concepts.**
+  Step 1 transcribes the video (chunked into ~50-min windows on long files,
+  single-shot otherwise). Step 2 generates the mindmap by reading the on-disk
+  transcript via a cheap text-only Gemini call (~10× cheaper than reading
+  video frames again, no 10800-frame cap). Step 3 extracts concepts from
+  the mindmap. Mirrors `process --url`. Local files where the on-disk
+  transcript can't be produced (e.g., transcript step fails entirely) fall
+  back to mindmap-from-video automatically via the `mindmap_source` resolver.
+- **Long-video chunking.** Transcripts on videos longer than `--chunk-minutes`
+  (default 50) auto-chunk into uniform windows. Each chunk is a separate
+  Gemini call with `VideoMetadata.start_offset/end_offset` against the SAME
+  upload — implicit caching makes follow-up chunks cheap. The "one upload"
+  guarantee is preserved. Without chunking, hour-long single-shot transcript
+  requests return malformed JSON intermittently from Gemini 2.5 Pro
+  (different break point each retry, irrecoverable).
+- **One upload** per invocation. The MP4 is uploaded to Gemini Files API
+  exactly once and referenced by every Step-1 chunk + the optional Step-2
+  mindmap-from-video fallback.
 - **Lazy upload skip.** When meta.json already shows all modes completed and
   artifacts exist, `process` uploads nothing and exits quickly. A partial
-  prior run (e.g., mindmap succeeded but transcript did not) re-uploads
+  prior run (e.g., transcript succeeded but mindmap did not) re-uploads
   once and regenerates only the missing steps.
 - **File-expiry recovery.** If Gemini's 48h Files API TTL expires mid-run
   (rare), `process` detects the expiry error, re-uploads once, retries
   once, then fails cleanly.
 - **Observability.** Each Gemini call emits a
   `usage <label> prompt=N cached=N candidates=N total=N` log line at info
-  level. `cached>0` on the transcript line means implicit caching fired and
-  you got a token discount; `cached=0` means it did not.
+  level. `cached>0` on follow-up calls (chunks 2..N, or the mindmap step
+  when it falls back to source=video) means implicit caching fired and you
+  got a token discount.
 - **Exit-code contract.** Exit 0 if mindmap succeeded, regardless of
   transcript / concepts outcome. Automation callers that need partial-success
   detail inspect `modes_completed` in the resulting meta.json.
-- **LOW media resolution by default.** The mindmap-from-video step uses
-  Gemini's LOW media resolution by default (~70 tokens/frame) instead of
-  the API default HIGH (~258 tokens/frame). LOW yields equivalent quality
-  for theme/concept extraction at 3× lower input-token cost, and removes
-  the previous ~67-minute ceiling — hour-long meeting recordings, conference
-  talks, and member interviews now fit cleanly under Gemini's 1M-token
-  input cap. Pass `--media-resolution high` only when the prompt depends on
-  reading fine on-screen text (slides, burned-in captions). Same flag is
-  available on `mindmap --file`.
+- **LOW media resolution by default.** The mindmap-from-video fallback
+  step (and the chunked-transcript step) use Gemini's LOW media resolution
+  by default (~70 tokens/frame) instead of the API default HIGH
+  (~258 tokens/frame). LOW yields equivalent quality for theme/concept
+  extraction at 3× lower input-token cost, and removes the previous
+  ~67-minute ceiling under Gemini's 1M-token input cap. Pass
+  `--media-resolution high` only when the prompt depends on reading fine
+  on-screen text (slides, burned-in captions).
 
 Concepts extraction runs inline when the channel is configured in
 `config.yaml`. For loose files (no channel match), concepts is skipped with
@@ -394,6 +409,9 @@ Options:
 - `--start`/`--end` - Segment time offsets (shared across both video calls).
 - `--force` - Regenerate all artifacts from scratch.
 - `--prompt NAME` - Mindmap prompt override (default from config.yaml).
+- `--chunk-minutes N` - Chunk size for the transcript step on long videos
+  (default: 50). Auto-triggered when video duration exceeds this; disabled
+  when manual `--start`/`--end` is set.
 - `--media-resolution {low,high}` - Gemini media resolution for the mindmap
   step (default: low). Use `high` only when the prompt depends on reading
   fine on-screen text. LOW handles hour-long videos that HIGH cannot fit

@@ -330,27 +330,39 @@ class TestCmdProcessLazyUpload:
 
 
 class TestCmdProcessExitCodeContract:
-    def test_mindmap_failure_exits_non_zero_and_skips_transcript(self, stub_env, monkeypatch, tmp_path):
+    def test_mindmap_failure_exits_non_zero_and_skips_concepts(self, stub_env, monkeypatch, tmp_path):
+        """After 2026-05-02 inversion: transcript runs FIRST, then mindmap.
+        Mindmap failure aborts the run before concepts (preserves the `process` exit-code contract:
+        non-zero when the AI's discovery surface fails). Transcript runs regardless because it's
+        Step 1 — its presence on disk is the input mindmap-from-transcript would read."""
         mp4, _ = _prep_mp4(tmp_path)
 
         monkeypatch.setattr("video_intel.upload_local_video", lambda _c, _p: "files/test")
-        monkeypatch.setattr(
-            "video_intel.process_mindmap",
-            lambda *a, **kw: (kw.get("prefix") or "video", "error: boom"),
-        )
+        # Make transcript succeed so we reach the mindmap step
         transcript_called = []
         monkeypatch.setattr(
             "video_intel.process_transcript",
             lambda *a, **kw: transcript_called.append(kw) or ("video", "done"),
         )
-        monkeypatch.setattr("video_intel.process_concepts", lambda *a, **kw: ("video", "done"))
+        monkeypatch.setattr(
+            "video_intel.process_mindmap",
+            lambda *a, **kw: (kw.get("prefix") or "video", "error: boom"),
+        )
+        concepts_called = []
+        monkeypatch.setattr(
+            "video_intel.process_concepts",
+            lambda *a, **kw: concepts_called.append(kw) or ("video", "done"),
+        )
 
         args = _make_args(file=mp4, channel="everyinc")
         with pytest.raises(SystemExit) as exc_info:
             cmd_process(args, _config())
 
         assert exc_info.value.code != 0
-        assert transcript_called == []
+        # Transcript runs FIRST in the new ordering, so it WAS called
+        assert len(transcript_called) == 1
+        # Concepts must NOT run when mindmap fails
+        assert concepts_called == []
 
     def test_transcript_failure_after_mindmap_exits_zero(self, stub_env, monkeypatch, tmp_path):
         """Partial-success contract: mindmap succeeded, so exit 0 regardless of transcript outcome."""

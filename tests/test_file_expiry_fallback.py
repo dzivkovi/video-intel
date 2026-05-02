@@ -168,7 +168,12 @@ class TestCmdProcessFileExpiryFallback:
         assert mindmap_call["n"] == 1  # mindmap still only called once
 
     def test_unrelated_error_does_not_trigger_re_upload(self, stub_env, monkeypatch):
-        """Quota-exceeded 403 must NOT false-positive as file-expiry."""
+        """Quota-exceeded 403 must NOT false-positive as file-expiry.
+
+        After 2026-05-02 inversion: transcript runs FIRST, so it IS called once
+        (and succeeds in this test). Mindmap then fails with the quota 403.
+        Single upload, no re-upload, abort before concepts.
+        """
         mp4, _ = self._prep_mp4(stub_env)
 
         upload_count = {"n": 0}
@@ -177,6 +182,13 @@ class TestCmdProcessFileExpiryFallback:
             lambda _c, _p: upload_count.__setitem__("n", upload_count["n"] + 1) or "files/upload-1",
         )
 
+        # Transcript succeeds (runs first in new ordering)
+        transcript_called = []
+        monkeypatch.setattr(
+            "video_intel.process_transcript",
+            lambda *a, **kw: transcript_called.append(kw) or ("video", "done"),
+        )
+        # Mindmap fails with a quota error (NOT a file-expiry error)
         monkeypatch.setattr(
             "video_intel.process_mindmap",
             lambda *a, **kw: (
@@ -184,20 +196,19 @@ class TestCmdProcessFileExpiryFallback:
                 "error: APIError: 403 quota exceeded for project X",
             ),
         )
-
-        transcript_called = []
+        concepts_called = []
         monkeypatch.setattr(
-            "video_intel.process_transcript",
-            lambda *a, **kw: transcript_called.append(kw) or ("video", "done"),
+            "video_intel.process_concepts",
+            lambda *a, **kw: concepts_called.append(kw) or ("video", "done"),
         )
-        monkeypatch.setattr("video_intel.process_concepts", lambda *a, **kw: ("video", "done"))
 
         with pytest.raises(SystemExit) as exc_info:
             cmd_process(_make_args(file=mp4, channel="everyinc"), _config())
 
         assert exc_info.value.code != 0
-        assert upload_count["n"] == 1  # no re-upload on quota error
-        assert transcript_called == []  # aborted after mindmap failure
+        assert upload_count["n"] == 1  # no re-upload on quota error (the contract under test)
+        assert len(transcript_called) == 1  # transcript runs first in new ordering
+        assert concepts_called == []  # aborted after mindmap failure
 
     def test_re_upload_failure_does_not_loop(self, stub_env, monkeypatch):
         """If re-upload itself fails, cmd_process must not enter a second retry loop."""

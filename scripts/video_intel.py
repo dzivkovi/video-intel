@@ -19,6 +19,7 @@ import os
 import random
 import re
 import shutil
+import subprocess
 import sys
 import time
 import uuid
@@ -1445,8 +1446,20 @@ def _run_chunked_transcript_url(
     duration_seconds: int,
     chunk_minutes: int,
     force: bool,
+    media_uri: str | None = None,
 ) -> str:
-    """Run transcript in N chunks against a YouTube URL, merge, write artifact.
+    """Run transcript in N chunks against a YouTube URL or Files API URI, merge,
+    write artifact.
+
+    The function name keeps `_url` for backward compatibility, but the
+    `media_uri` keyword override lets callers point it at a Gemini Files API
+    URI (`files/xyz`) for local-file chunked transcription. Each chunk is a
+    separate Gemini call with `VideoMetadata.start_offset/end_offset` against
+    the same `media_uri` — Gemini's implicit cache makes follow-up chunks
+    cheaper than the first (empirically verified at `cached=560495` on a
+    follow-up call against the same upload). No re-upload occurs across
+    chunks; the "one upload" guarantee is preserved when `media_uri` points
+    to a single Files API URI.
 
     Skipped (exists, not forced) -> "skipped (exists)".
     All chunks succeeded -> "done".
@@ -1457,7 +1470,8 @@ def _run_chunked_transcript_url(
     if transcript_path.exists() and not force:
         return "skipped (exists)"
 
-    media_uri = video["url"]
+    if media_uri is None:
+        media_uri = video["url"]
     thinking_config = _make_thinking_config_for_transcript(types, model)
     # Force LOW media resolution for transcription regardless of model. Tucker-
     # class interview content (talking heads + overlay text) doesn't need HIGH
@@ -1818,6 +1832,46 @@ def _make_thinking_config_for_transcript(types, model: str):
     if "2.5-pro" in model:
         return types.ThinkingConfig(thinking_budget=128)
     return None
+
+
+def _local_file_duration_seconds(path: Path) -> int | None:
+    """Return the duration of a local media file in seconds, via ffprobe.
+
+    Returns None if ffprobe is not available, the file is unreadable, or
+    the duration cannot be parsed. Callers must fall back to single-shot
+    transcription (current behavior) when this returns None.
+
+    Used by cmd_process / cmd_transcript local-file paths to decide whether
+    to chunk a long video transcript. The chunked-transcript path is
+    significantly more reliable than single-shot on hour-long inputs
+    (single-shot returns malformed JSON intermittently — see the
+    2026-05-02 raw sidecars for the empirical evidence).
+    """
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        duration_str = result.stdout.strip()
+        if not duration_str:
+            return None
+        return int(float(duration_str))
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+        return None
 
 
 def _resolve_media_resolution(types, choice: str):
@@ -4321,7 +4375,7 @@ def cmd_process(args, config):
         log.info("All pipeline artifacts up to date for %s (no upload).", prefix)
 
     # Shared re-upload counter: bounded at one re-upload per invocation across
-    # both mindmap and transcript steps (file-expiry fallback, Unit 3).
+    # both transcript and mindmap steps (file-expiry fallback).
     reupload_available = [True]
 
     def _call_with_file_expiry_retry(label: str, call_fn):
@@ -4344,69 +4398,163 @@ def cmd_process(args, config):
             result = call_fn(file_uri)
         return result
 
-    # Step 1: mindmap
-    def _mindmap_call(uri):
-        return process_mindmap(
-            client,
-            types,
-            video,
-            mindmap_prompt,
-            model,
-            output_dir,
-            channel_name or "",
-            prompt_name=prompt_name,
-            force=mindmap_force,
-            prefix=prefix,
-            channel_dir_override=channel_dir,
-            media_uri=uri,
-            media_resolution=media_resolution_enum,
-        )
+    # Resolve channel config for the mindmap_source resolver below.
+    channel_cfg: dict = next(
+        (c for c in config.get("channels", []) if c.get("name") == channel_name),
+        {},
+    )
+    chunk_minutes = getattr(args, "chunk_minutes", None) or TRANSCRIPT_CHUNK_MINUTES_DEFAULT
+    mindmap_from_transcript_prompt = load_prompt("mindmap-from-transcript")
 
-    # Issue #42: per-mode skip MUST gate the helper call here, not just the
-    # upload upstream. process_mindmap/process_transcript only short-circuit on
-    # `path.exists() and not force` -- when an artifact is missing, they fall
-    # through to a Gemini call. Without this gate, skip_modes would be silently
-    # ignored on a fresh-prefix run.
-    if skip_mindmap:
-        mindmap_status = "skipped (skip_modes)"
-        log.info("  mindmap [%s]: %s", prefix, mindmap_status)
-    else:
-        _, mindmap_status = _call_with_file_expiry_retry("mindmap", _mindmap_call)
-        log.info("  mindmap [%s]: %s", prefix, mindmap_status)
-        # Loose prefix: process_mindmap / process_transcript surface errors as
-        # `error: <exception>` AND (for the JSON-parse-fail path) `error parsing JSON:`,
-        # so starts-with("error") catches both. Anything else ("done",
-        # "skipped (exists)") passes through.
-        if mindmap_status.startswith("error"):
-            log.error("Mindmap failed; aborting before transcript.")
-            sys.exit(1)
-
-    # Step 2: transcript
-    def _transcript_call(uri):
-        return process_transcript(
-            client,
-            types,
-            video,
-            transcript_prompt,
-            model,
-            channel_dir,
-            prefix,
-            force=transcript_force,
-            start_offset=start_offset,
-            end_offset=end_offset,
-            media_uri=uri,
-            media_resolution=media_resolution_enum,
-        )
+    # ============================================================================
+    # Step 1/3: transcript (chunked for long videos, single-shot otherwise).
+    #
+    # Issue #54 ordering applied to local files (2026-05-02): transcript runs
+    # FIRST so the mindmap step below can read the on-disk transcript via the
+    # cheap text-only path. This mirrors `_cmd_process_url` and resolves the
+    # cost asymmetry where mindmap-from-video on hour-long local files cost
+    # ~10x more than mindmap-from-transcript would. It also makes long single-
+    # shot transcripts (which Pro returns malformed JSON for intermittently)
+    # work reliably via chunking — same upload, multiple Gemini calls with
+    # VideoMetadata.start_offset/end_offset offsets, "one upload" guarantee
+    # preserved (the empirical cached=560495 hit on a follow-up call against
+    # the same file_uri proves implicit caching kicks in).
+    #
+    # Wrapped in try/except so an uncaught transcript exception still lets the
+    # mindmap step run (with `source="video"` fallback via the resolver). This
+    # mirrors `_cmd_process_url`'s "mindmap is the AI's discovery surface and
+    # must always run" invariant from CLAUDE.md.
+    # ============================================================================
+    duration_seconds = _local_file_duration_seconds(input_path) if not has_segment else None
 
     if skip_transcript:
         transcript_status = "skipped (skip_modes)"
-        log.info("  transcript [%s]: %s", prefix, transcript_status)
+        log.info("  Step 1/3: transcript [%s]: %s", prefix, transcript_status)
     else:
-        _, transcript_status = _call_with_file_expiry_retry("transcript", _transcript_call)
-        log.info("  transcript [%s]: %s", prefix, transcript_status)
-        if transcript_status.startswith("error"):
-            log.warning("Transcript failed; skipping concepts. Mindmap artifact preserved.")
-            return
+        log.info("  Step 1/3: transcript")
+        try:
+            if duration_seconds and duration_seconds > chunk_minutes * 60:
+                # Long file: chunk via VideoMetadata.start_offset/end_offset against the same file_uri.
+                # No re-upload; the existing single upload is referenced by N calls.
+                chunks = _build_transcript_chunks(duration_seconds, chunk_minutes)
+                log.info(
+                    "    %s is %s; running %d chunks of %d min each.",
+                    input_path.name,
+                    _fmt_hms(duration_seconds),
+                    len(chunks),
+                    chunk_minutes,
+                )
+
+                def _chunked_transcript_call(uri):
+                    status = _run_chunked_transcript_url(
+                        client=client,
+                        types=types,
+                        video=video,
+                        prompt_text=transcript_prompt,
+                        model=model,
+                        channel_dir=channel_dir,
+                        prefix=prefix,
+                        chunks=chunks,
+                        duration_seconds=duration_seconds,
+                        chunk_minutes=chunk_minutes,
+                        force=transcript_force,
+                        media_uri=uri,
+                    )
+                    return prefix, status
+
+                _, transcript_status = _call_with_file_expiry_retry("transcript", _chunked_transcript_call)
+            else:
+                # Short file or manual --start/--end segment: single-shot.
+                def _transcript_call(uri):
+                    return process_transcript(
+                        client,
+                        types,
+                        video,
+                        transcript_prompt,
+                        model,
+                        channel_dir,
+                        prefix,
+                        force=transcript_force,
+                        start_offset=start_offset,
+                        end_offset=end_offset,
+                        media_uri=uri,
+                        media_resolution=media_resolution_enum,
+                    )
+
+                _, transcript_status = _call_with_file_expiry_retry("transcript", _transcript_call)
+        except Exception as exc:
+            transcript_status = f"error: {exc}"
+            log.warning("    transcript [%s] raised: %s", prefix, exc)
+        log.info("    transcript [%s]: %s", prefix, transcript_status)
+
+    # ============================================================================
+    # Step 2/3: mindmap. Resolver picks source based on channel config and whether
+    # transcript exists on disk now (it may have been written by Step 1 this run,
+    # or already present from a prior run). Falls back to `source="video"` when
+    # no transcript exists and `mindmap_source` is auto/video.
+    # ============================================================================
+    transcript_available = transcript_path.exists()
+    try:
+        resolved_source = resolve_mindmap_source(channel_cfg, transcript_available=transcript_available)
+    except ValueError as exc:
+        log.error("Mindmap source unresolvable: %s", exc)
+        sys.exit(1)
+
+    if skip_mindmap:
+        mindmap_status = "skipped (skip_modes)"
+        log.info("  Step 2/3: mindmap [%s]: %s", prefix, mindmap_status)
+    elif resolved_source == "skip":
+        mindmap_status = "skipped (mindmap_source=none)"
+        log.info("  Step 2/3: mindmap [%s]: %s", prefix, mindmap_status)
+    else:
+        log.info("  Step 2/3: mindmap (source=%s)", resolved_source)
+        if resolved_source == "transcript":
+            # Cheap text-only call against the on-disk transcript. No file_uri needed.
+            _, mindmap_status = process_mindmap(
+                client,
+                types,
+                video,
+                mindmap_from_transcript_prompt,
+                model,
+                output_dir,
+                channel_name or "",
+                prompt_name="mindmap-from-transcript",
+                force=mindmap_force,
+                prefix=prefix,
+                channel_dir_override=channel_dir,
+                source="transcript",
+                transcript_path=transcript_path,
+            )
+        else:
+            # Legacy mindmap-from-video fallback. Watches the same upload.
+            def _mindmap_call(uri):
+                return process_mindmap(
+                    client,
+                    types,
+                    video,
+                    mindmap_prompt,
+                    model,
+                    output_dir,
+                    channel_name or "",
+                    prompt_name=prompt_name,
+                    force=mindmap_force,
+                    prefix=prefix,
+                    channel_dir_override=channel_dir,
+                    media_uri=uri,
+                    media_resolution=media_resolution_enum,
+                )
+
+            _, mindmap_status = _call_with_file_expiry_retry("mindmap", _mindmap_call)
+        log.info("    mindmap [%s]: %s", prefix, mindmap_status)
+        if mindmap_status.startswith("error"):
+            log.error("Mindmap failed; aborting concepts step.")
+            sys.exit(1)
+
+    # If transcript failed (and we're past the mindmap step which may have
+    # succeeded via video fallback), abort before concepts.
+    if not skip_transcript and transcript_status.startswith("error"):
+        log.warning("Transcript failed; skipping concepts. Mindmap artifact preserved if any.")
+        return
 
     # Step 3: concepts (text-only; channel must be configured).
     if not channel_name:
@@ -5991,7 +6139,12 @@ Examples:
         type=int,
         default=TRANSCRIPT_CHUNK_MINUTES_DEFAULT,
         dest="chunk_minutes",
-        help=f"Chunk size for long-video transcripts via --url (default: {TRANSCRIPT_CHUNK_MINUTES_DEFAULT}). Ignored with --file.",
+        help=(
+            f"Chunk size in minutes for the transcript step on long videos "
+            f"(default: {TRANSCRIPT_CHUNK_MINUTES_DEFAULT}). Applies to both --url and --file paths. "
+            "Auto-triggered when video duration exceeds the threshold; disabled when "
+            "manual --start/--end is set on --file."
+        ),
     )
     process_parser.add_argument(
         "--media-resolution",
