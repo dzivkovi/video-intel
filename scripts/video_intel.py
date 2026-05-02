@@ -2415,27 +2415,54 @@ def _strip_cyrillic_for_structure(text: str) -> str:
 
 
 def _wrapper_to_envelope_dict(parsed) -> dict | None:
-    """If `parsed` matches Pro's `[{"task": ..., "output": [...]}, ...]` shape
-    with at least one task in `_KNOWN_TASK_KEYS`, rebuild a flat envelope dict.
-    Otherwise return None so callers can pass the original parsed value through.
+    """If `parsed` matches one of Pro's known wrapper shapes, rebuild a flat
+    envelope dict. Otherwise return None so callers can pass the original
+    parsed value through.
+
+    Recognized shapes (any list-of-dicts where the items match):
+      A. Task-wrapper (issue #45): ``[{"task": "transcripts", "output": [...]}, ...]``
+         where ``task`` is in ``_KNOWN_TASK_KEYS``.
+      B. Single-key wrapper (observed 2026-05-02 on long single-shot transcripts):
+         ``[{"transcripts": [...]}, {"screen_content": [...]}, {"speakers": [...]}]``
+         where each dict has exactly one key from ``_KNOWN_TASK_KEYS`` mapping
+         to a list. Pro emits this when it skips the explicit ``task``/``output``
+         scaffolding but still produces the three-task structure.
 
     Used by both `try_parse_transcript_json` (full-parse path) and
     `_normalize_task_wrapper` (text-level salvage path), so a wrapper response
     is normalized whether or not it also has a Cyrillic intrusion that breaks
-    the full parse. See issue #45.
+    the full parse.
     """
     if not (isinstance(parsed, list) and parsed):
         return None
-    known_items = [it for it in parsed if isinstance(it, dict) and it.get("task") in _KNOWN_TASK_KEYS]
-    if not known_items:
-        return None
+
     envelope: dict[str, list] = {k: [] for k in _KNOWN_TASK_KEYS}
-    for item in known_items:
-        task = item["task"]
-        output = item.get("output", [])
-        if isinstance(output, list):
-            envelope[task] = output
-    return envelope
+
+    # Shape A: task-wrapper with explicit `task` field.
+    known_items = [it for it in parsed if isinstance(it, dict) and it.get("task") in _KNOWN_TASK_KEYS]
+    if known_items:
+        for item in known_items:
+            task = item["task"]
+            output = item.get("output", [])
+            if isinstance(output, list):
+                envelope[task] = output
+        return envelope
+
+    # Shape B: list of single-key dicts where the key is one of the known tasks.
+    # Each dict must have exactly one key from _KNOWN_TASK_KEYS mapping to a list.
+    matched_any = False
+    for item in parsed:
+        if not isinstance(item, dict) or len(item) != 1:
+            continue
+        key = next(iter(item.keys()))
+        value = item[key]
+        if key in _KNOWN_TASK_KEYS and isinstance(value, list):
+            envelope[key] = value
+            matched_any = True
+    if matched_any:
+        return envelope
+
+    return None
 
 
 def _normalize_task_wrapper(text: str) -> str:
@@ -2641,6 +2668,30 @@ def process_transcript(
         raw_json, parse_error = try_parse_transcript_json(raw)
 
         if raw_json is not None:
+            # Observability: log the parsed JSON's shape so an empty fused body
+            # is diagnosable without re-running. Catches the silent regression
+            # where Gemini returns a wrapper or unknown shape that parses but
+            # produces zero entries (see docs/solutions/integration-issues/
+            # gemini-pro-task-wrapper-and-cyrillic-intrusions-20260426.md).
+            if isinstance(raw_json, dict):
+                log.info(
+                    "  transcript JSON parsed: dict keys=%s, transcripts=%d, screen_content=%d, speakers=%d",
+                    sorted(list(raw_json.keys()))[:8],
+                    len(raw_json.get("transcripts", [])),
+                    len(raw_json.get("screen_content", [])),
+                    len(raw_json.get("speakers", [])),
+                )
+            elif isinstance(raw_json, list):
+                first_keys = (
+                    sorted(list(raw_json[0].keys()))[:8] if raw_json and isinstance(raw_json[0], dict) else None
+                )
+                log.info(
+                    "  transcript JSON parsed: list of %d items, first_keys=%s",
+                    len(raw_json),
+                    first_keys,
+                )
+            else:
+                log.info("  transcript JSON parsed: type=%s", type(raw_json).__name__)
             # Full parse succeeded - write transcript, no raw sidecar
             fused = merge_transcript_json(raw_json, {})
             _write_transcript_md(transcript_path, video, fused)

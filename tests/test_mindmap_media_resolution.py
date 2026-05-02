@@ -289,6 +289,86 @@ class TestProcessTranscriptMediaResolution:
         assert captured["kw"]["thinking_config"] == "STUB_THINKING_CONFIG"
 
 
+class TestWrapperShapeBNormalization:
+    """Issue observed 2026-05-02: Pro returns `[{"transcripts": [...]}, {"screen_content": [...]}, {"speakers": [...]}]`
+    on long single-shot transcripts — list of single-key dicts where each key is one of the known
+    task names. Without normalization, the parsed list reaches merge_transcript_json which takes
+    raw_json[0] (a dict with the wrong outer key) and produces an empty fused transcript with
+    transcript_status: "complete" — a silent regression.
+    """
+
+    def test_shape_b_three_task_dicts_normalizes_to_envelope(self):
+        from video_intel import _wrapper_to_envelope_dict
+
+        shape_b = [
+            {"transcripts": [{"start": "00:00", "voice": 1, "text": "hello"}]},
+            {"screen_content": [{"start": "00:00", "end": "00:10", "type": "ui_demo", "description": "x"}]},
+            {"speakers": [{"voice": 1, "name": "Alice"}]},
+        ]
+        result = _wrapper_to_envelope_dict(shape_b)
+        assert result is not None
+        assert len(result["transcripts"]) == 1
+        assert result["transcripts"][0]["text"] == "hello"
+        assert len(result["screen_content"]) == 1
+        assert len(result["speakers"]) == 1
+        assert result["speakers"][0]["name"] == "Alice"
+
+    def test_shape_b_partial_subset_normalizes(self):
+        """Pro sometimes only returns one or two of the three tasks; missing tasks must be empty lists."""
+        from video_intel import _wrapper_to_envelope_dict
+
+        result = _wrapper_to_envelope_dict([{"transcripts": [{"start": "00:00", "voice": 1, "text": "hi"}]}])
+        assert result is not None
+        assert len(result["transcripts"]) == 1
+        assert result["screen_content"] == []
+        assert result["speakers"] == []
+
+    def test_shape_b_unknown_keys_return_none(self):
+        """List of single-key dicts with non-task keys must NOT be normalized (caller passes through)."""
+        from video_intel import _wrapper_to_envelope_dict
+
+        result = _wrapper_to_envelope_dict([{"results": []}, {"metadata": {}}])
+        assert result is None
+
+    def test_shape_b_multi_key_dicts_return_none(self):
+        """If items have more than one key, this isn't shape B — return None."""
+        from video_intel import _wrapper_to_envelope_dict
+
+        result = _wrapper_to_envelope_dict([{"transcripts": [], "screen_content": []}])
+        assert result is None
+
+    def test_shape_a_still_works(self):
+        """Regression guard: the original task-wrapper shape (issue #45) must still normalize."""
+        from video_intel import _wrapper_to_envelope_dict
+
+        shape_a = [
+            {"task": "transcripts", "output": [{"start": "00:00", "voice": 1, "text": "hi"}]},
+            {"task": "screen_content", "output": []},
+        ]
+        result = _wrapper_to_envelope_dict(shape_a)
+        assert result is not None
+        assert len(result["transcripts"]) == 1
+        assert result["transcripts"][0]["text"] == "hi"
+
+    def test_shape_b_routes_through_try_parse_transcript_json(self):
+        """End-to-end: a clean shape-B response parses → normalizes → produces non-empty envelope."""
+        import json
+
+        from video_intel import try_parse_transcript_json
+
+        shape_b_json = json.dumps(
+            [
+                {"transcripts": [{"start": "00:00", "voice": 1, "text": "hello"}]},
+                {"screen_content": []},
+                {"speakers": []},
+            ]
+        )
+        parsed, err = try_parse_transcript_json(shape_b_json)
+        assert err is None
+        assert isinstance(parsed, dict)
+        assert len(parsed["transcripts"]) == 1
+
+
 class TestTryParseTranscriptJsonNoneDefense:
     """try_parse_transcript_json must not crash on None / empty input.
 
