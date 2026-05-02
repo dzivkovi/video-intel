@@ -55,7 +55,9 @@ MAX_OUTPUT_TOKENS = 65536
 TRANSCRIPT_PARSE_RETRY_LIMIT = 1
 SALVAGE_MIN_SPEECH_ENTRIES = 5
 KEYWORD_MAX_PAGES = 4  # 200 results max per keyword, 400 quota units
-LARGE_FILE_THRESHOLD_BYTES = 500 * 1024 * 1024  # 500MB - segment required above this
+LARGE_FILE_THRESHOLD_BYTES = (
+    1024 * 1024 * 1024
+)  # 1GB - segment required above this. Gemini Files API allows up to 2GB; this ceiling stays comfortably below the platform cap while accommodating typical hour-long recordings.
 
 
 def _user_config_path() -> Path:

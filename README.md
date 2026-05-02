@@ -277,7 +277,7 @@ python scripts/video_intel.py transcript \
 # Transcribe a local MP4 file (output next to source)
 python scripts/video_intel.py transcript --file ~/Videos/meeting.mp4
 
-# Transcribe a segment of a local MP4 (required for files >500MB)
+# Transcribe a segment of a local MP4 (required for files >1GB)
 python scripts/video_intel.py transcript \
   --file ~/Videos/long-demo.mp4 --start 05:30 --end 18:45
 

@@ -231,11 +231,11 @@ python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" --log-level info trans
 **Local MP4 file** (works for screen recordings, meetings, Dropbox/GDrive sync folders):
 
 ```bash
-# Full file (<500MB)
+# Full file (<1GB)
 python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" --log-level info transcript \
   --file ~/Videos/meeting.mp4
 
-# Specific segment (required for files >500MB)
+# Specific segment (required for files >1GB)
 python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" --log-level info transcript \
   --file ~/Videos/meeting.mp4 --start 05:30 --end 18:45
 ```

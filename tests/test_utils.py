@@ -2073,8 +2073,8 @@ class TestUploadLocalVideo:
         with pytest.raises(FileNotFoundError):
             upload_local_video(client, tmp_path / "nonexistent.mp4")
 
-    def test_large_file_threshold_is_500mb(self):
-        assert LARGE_FILE_THRESHOLD_BYTES == 500 * 1024 * 1024
+    def test_large_file_threshold_is_1gb(self):
+        assert LARGE_FILE_THRESHOLD_BYTES == 1024 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
