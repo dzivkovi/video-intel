@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "mcp__exa__crawling_exa",
-      "Read(//g/My Drive/video-intel/**)"
+      "Read(//g/My Drive/video-intel/**)",
+      "Skill"
     ],
     "additionalDirectories": [
       "C:\\Users\\danie\\.claude"
