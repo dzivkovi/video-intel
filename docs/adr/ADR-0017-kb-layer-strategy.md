@@ -317,3 +317,70 @@ discarded. It is being executed literally: the eval is the gate. The
 gate said *recall is broken more than synthesis*, so the ordering
 changes, and Future D becomes Stage 3 instead of Stage 1. The
 philosophical direction — synthesis over pure retrieval — is preserved.
+
+## Subsequent Refinements
+
+> Added 2026-05-28. The staged-strategy decision above remains accepted.
+> Two subsequent decisions refine — but do not invalidate — the trajectory.
+
+### 1. Stage 2 promotion is now gated by ADR-0018's three named signals
+
+[`ADR-0018`](ADR-0018-nugget-cli-cross-creator-synthesis.md) (accepted 2026-04-22)
+shipped the `nugget` CLI for cross-creator synthesis as Path 1 against the
+nugget-finding goal. The decision deferred Stage 2 LightRAG behind **three
+specific signals**, any of which promotes it from *deferred* to *scheduled*:
+
+1. **Usage signal** — 3+ real queries return nugget briefs that materially
+   miss multi-hop connections that exist in the corpus (verifiable by grep).
+2. **Eval signal** — 25-query golden dataset baseline remains ≤3/25 after
+   any second retrieval-tuning pass.
+3. **Re-lensing signal** — 2+ different conceptual lenses per month, where
+   schema-free extraction is cheaper than per-lens prompt engineering of
+   `nugget-brief.md`.
+
+Until any of those fires, the original "proceed to Stage 2 because Stage 1
+landed at 1/25" reasoning in §"Decision rule between stages" above is
+**superseded** by ADR-0018's gate. The
+[`docs/plans/2026-04-20-feat-kb-stage2-lightrag-plan.md`](../plans/2026-04-20-feat-kb-stage2-lightrag-plan.md)
+plan is preserved with `status: deferred`.
+
+### 2. The 2026-05-28 roadmap pivots the active direction to a structured intelligence layer
+
+[`docs/brainstorms/2026-05-28-intelligence-layer-roadmap.md`](../brainstorms/2026-05-28-intelligence-layer-roadmap.md)
+diagnosed that the user-experienced gap is **not** what the 1/25 eval
+measures. The eval measures recall of similar passages; the example
+questions the user actually wants answered (*"where are people no longer
+flying"*, *"where are people suddenly wanting to travel and why"*) are
+**aggregate + polarity + causation** questions. Top-k passage retrieval is
+the wrong primitive for them — vector embeddings collapse negation (NevIR,
+EACL 2024), so even a perfect retriever cannot serve "no longer X" queries.
+
+The roadmap proposes a phased path:
+
+- **Phase 0a** — manual `prompts/discovery-brief-window.md` validation
+  ([shipped via PR #62 / issue #61](https://github.com/dzivkovi/video-intel/pull/62))
+- **Phase 1** — DuckDB structured backbone, 6-node / 6-edge calming starter
+  schema, silent-fading detector
+- **Phase 1.5** (parallel) — Neo4j Graph Builder learning spike on 2–3
+  known videos, written observations as the deliverable
+  ([issue #63](https://github.com/dzivkovi/video-intel/issues/63))
+- **Phase 2** — bidirectional Displacement + Magnet lenses, receipts-vs-synthesis contract, PROCEED/CAVEAT/REFUSE health signal (borrowed verbatim from the sibling [`xb-travel` skill](https://github.com/dzivkovi/horizon-scanner))
+- **Phase 3** — 6-tuple stance schema as one sentence added to
+  `prompts/concepts.md`
+- **Phase 4** — top-20 stable-topic wiki pre-bake (later)
+- **Phase F** — LightRAG, gated by the three signals above
+
+The roadmap is a brainstorm, not yet an ADR. Specific decisions graduate
+into ADRs as Phase 1.5 spike + Phase 2 produce evidence. The "let the
+benchmark decide" rule still holds — Phase 0b will extend
+`golden_dataset.yaml` with a `query_type: aggregate` cohort so the
+new question class can be measured.
+
+### What is unchanged
+
+- ADR-0017's eval-as-gate discipline is intact.
+- ADR-0010 (concept normalization), ADR-0012 (LanceDB vector), ADR-0013
+  (hybrid RRF) all remain in force.
+- The 25-query golden dataset stays a frozen contract.
+- Stage 3 (Wiki) remains a real future option, partially realized
+  already as the `nugget` CLI per ADR-0018.
