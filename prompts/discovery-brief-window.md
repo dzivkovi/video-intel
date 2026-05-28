@@ -36,7 +36,8 @@ For each video in scope, read the sibling `*.concepts.json`. Build:
 - **Per-concept channel set** — `concept_id → {channel: count}`. Across the window, which channels touched each concept?
 - **Per-channel concept list** — `channel → [concept_id, ...]`. What did each channel emphasize?
 - **Per-concept video list** — `concept_id → [(channel, video_id, title, video_url, first_timestamp_seconds), ...]`. First-timestamp comes from the matching `as_mentioned` line in the mindmap when available (Step 4); use `null` until then.
-- **Spike ratio.** For each concept, compute `spike_ratio = window_video_count / max(1, taxonomy.concepts[cid].video_count)`. A concept with 14 in-window mentions and 19 lifetime-total mentions has spike_ratio ≈ 0.74 — meaning 74% of its lifetime mentions landed in this window. Anything ≥0.40 is a candidate "news cycle" topic and **must** be surfaced in Section 3 with the percentage stated explicitly. This is the load-bearing differentiator versus scan logs, which only report absolute counts.
+- **Spike ratio.** For each concept, compute `spike_ratio = window_video_count / max(1, taxonomy.concepts[cid].video_count)`. The taxonomy's `video_count` is the lifetime total **including** the in-window mentions (taxonomy.json is rebuilt cumulatively, not as a pre-window snapshot), so `window_video_count` is a subset of the denominator and the ratio sits in `[0, 1]`. A concept with 14 in-window mentions and a taxonomy `video_count` of 19 has spike_ratio ≈ 0.74 — meaning **14 of its 19 lifetime mentions landed in this single window**. Anything ≥0.40 is a candidate "news cycle" topic and **must** be surfaced in Section 3 with the percentage stated explicitly. This is the load-bearing differentiator versus scan logs, which only report absolute counts.
+- **Dedup rule (Section 2 ↔ Section 3).** Concepts surfaced in Section 2 "New This Window" are **excluded** from Section 3 spike-ratio scoring even though their spike_ratio mechanically equals 1.0. Section 3 measures *acceleration of existing concepts*, not novelty. Without this exclusion every newly introduced concept double-counts as a "news cycle" topic and floods the section.
 
 ### Step 3 — Compare against prior taxonomy
 
@@ -50,16 +51,20 @@ Read `OUTPUT_DIR/taxonomy.json`. For each concept observed in Step 2:
 
 ### Step 4 — Pull evidence from mindmaps
 
-For the concepts surfaced in Sections "New this window", "Cross-creator consensus", and "Outliers worth a look" (Step 5), open the corresponding `*.mindmap.md` files and grep for the `as_mentioned` string. Capture:
+For every concept that will be cited in any section of the brief (Sections 2 "New This Window", 3 "Cross-Creator Consensus & Spike Stories", 4 "Outliers Worth a Look", and the citations inside Sections 6 "Recommended Reads" and 7 "Pre-existing Stories That Continued"), open the corresponding `*.mindmap.md` files and search for the `as_mentioned` string. Capture:
 
-- The `[MM:SS]` timestamp adjacent to the matching bullet (the mindmap convention).
+- The `[MM:SS]` timestamp adjacent to the matching bullet (the mindmap convention is `(M:SS)` or `(MM:SS)` in parentheses at the end of a bullet line).
 - One verbatim sub-bullet line that grounds the citation (≤150 chars).
 
-If the `as_mentioned` string is not literally in the mindmap, fall back to the concept's `branch` heading and use its first dated bullet. If no timestamp is present at all, omit the `&t=` parameter but keep the URL.
+**Lookup robustness.** Match `as_mentioned` substrings case-insensitively. Apply Unicode NFKC normalization on both sides before comparison so smart quotes (`’` vs `'`), em-dashes (`—` vs `--`), and similar cosmetic differences do not silently fail the lookup. If still no hit, fall back to the concept's `branch` field and locate the matching `## Branch` heading in the mindmap; use the first parenthesized timestamp under that heading. If even the branch heading cannot be matched (case-insensitive, token-overlap ≥0.7 of words), emit the citation without `&t=` and append `[no time anchor]` per the Citation Discipline rule.
+
+Section 5 "Conspicuously Absent" lists taxonomy entries with **no in-window mentions**, so it has no mindmap.md to cite from. Its bullets do not get mindmap evidence; they are grounded in `taxonomy.json` data (prior `video_count`, `first_seen`) alone.
 
 ### Step 5 — Write the brief
 
 Use the output structure below. Stay within ~1 page. Trim any section that has nothing concrete to say — empty sections are worse than no section.
+
+**Ordering within Step 5.** Compute and write Sections 2, 3, and 4 first (novelty, consensus, outliers) — these only depend on Step 2 aggregation and Step 3 filtering. **Then** write Section 5 (conspicuously absent), because the rename suppression filter in Step 3 requires the Section-3 consensus list to already exist. Sections 6 and 7 reference all earlier sections and come last.
 
 ## Citation Discipline
 
@@ -67,7 +72,7 @@ Use the output structure below. Stay within ~1 page. Trim any section that has n
   - `[channel @ video title @ MM:SS](video_url&t=<seconds>)`
 - **Video title MUST be copied verbatim from the meta.json `title` field.** Do not paraphrase, abbreviate, or "improve" titles.
 - **`&t=<seconds>`** is the deep-link convention. Convert `MM:SS` → seconds. Never strip this parameter.
-- **Missing-timestamp fallback.** If Step 4 cannot find a timestamp adjacent to the `as_mentioned` bullet, search the matching `branch` heading section of the mindmap and use the first `(M:SS)` or `(MM:SS)` numerical timestamp under that heading. If still nothing, emit the citation without `&t=` and append ` [no time anchor]` after the closing paren so the reader can audit the gap. Do not silently emit a URL with no timestamp — silent omission masks evidence weakness.
+- **Missing-timestamp fallback.** If Step 4 cannot find a timestamp adjacent to the `as_mentioned` bullet, search the matching `branch` heading section of the mindmap and use the first `(M:SS)` or `(MM:SS)` numerical timestamp under that heading. If still nothing, emit the citation without `&t=` and append `[no time anchor]` after the closing paren so the reader can audit the gap. Do not silently emit a URL with no timestamp — silent omission masks evidence weakness.
 - If you cannot ground a claim in a specific bullet line of a specific mindmap, do not make the claim. Insight without evidence is a hallucination risk.
 - When a claim sits across multiple channels, list all of them.
 
@@ -137,7 +142,7 @@ Optional. 1-3 bullets. Concepts that were already in the taxonomy and got reinfo
 
 ## Self-check before emitting
 
-1. Did every claim get a citation with a working `&t=` deep link, OR an explicit ` [no time anchor]` tag where time could not be recovered?
+1. Did every claim get a citation with a working `&t=` deep link, OR an explicit `[no time anchor]` tag where time could not be recovered?
 2. Did you copy each video title verbatim from `meta.json`?
 3. Did Section 3 lead with **spike ratio**, not raw channel count, and end with one bolded sentence naming the underlying story arc?
 4. Did you run the normalization-drift filter before listing anything in Section 2 (new concepts whose label already exists under a different concept_id belong in the bottom sub-bullet, not the main list)?
