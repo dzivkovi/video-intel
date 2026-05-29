@@ -28,23 +28,6 @@ The fix is not a better retriever. It is a **structured intelligence layer** sit
 
 A DuckDB structured backbone holds the corpus as a graph-shaped relational store (Source → Artifact → Segment → Entity / Concept / Claim) with every claim provenance-linked to the exact transcript span that supports it. Discovery is bidirectional (Displacement + Magnet lenses) and produces *receipts plus a health signal*, not a finished brief. The host LLM (you, or Claude in a session) owns the synthesis layer. The existing LanceDB hybrid index remains in force as the retrieval primitive for evidence look-up. The schema is deliberately minimal at start — six node types, six edge types — and evolves via multi-label specialization rather than rebuild.
 
-## The cross-corpus unification
-
-The two questions that motivated this — *"where are people no longer flying"* and *"where are people suddenly wanting to travel"* — originated in a sibling discovery skill in a separate project. That skill answers them against a different corpus type via a `/last30days`-style runner. This project will answer the same shape of question against the video corpus.
-
-The two projects are **siblings under the same contract**:
-
-| | Sibling discovery skill | video-intel (after this roadmap) |
-|---|---|---|
-| Question class | Displacement + Magnet | Displacement + Magnet |
-| Retrieval backend | `/last30days` (web + social) | LanceDB hybrid + DuckDB analytical |
-| Output contract | Per-lens markdown receipts + audit JSON | Per-lens markdown receipts + audit JSON |
-| Health signal | PROCEED / CAVEAT / REFUSE | PROCEED / CAVEAT / REFUSE |
-| Synthesis | Host LLM owns it | Host LLM owns it (`nugget` CLI already does this) |
-| Schema | implicit in receipts | Generic schema below, with Video overlay |
-
-The unification is not "one tool that does both." It is "**two retrieval engines, one output contract, one lens vocabulary.**" Later, a thin orchestrator could run both against the same question and combine the receipts into a cross-corpus brief.
-
 ## The schema — calming starter
 
 Deliberately minimal. Six node types. Six edges. *That is enough to start.*
@@ -88,28 +71,25 @@ Both views describe the **same shape**. Graph databases give you visual explorat
 
 ### Multi-label evolution — how schemas grow without rebuild
 
-When a vertical specialization emerges (travel data joins, blog posts get ingested), we **add labels to existing nodes** rather than build new tables:
+When a new artifact type joins the corpus (blog posts get ingested, source READMEs get added), we **add labels to existing nodes** rather than build new tables:
 
 ```text
 (:Artifact:Video)      — video, the bootstrap case
-(:Artifact:BlogPost)   — added when blog posts arrive
-(:Artifact:CodeRepo)   — added when source READMEs join
-(:Concept:TravelTrend) — Travel overlay on a generic Concept
-(:Entity:Destination)  — Travel-specific entity subtype
-(:Claim:PolicyClaim)   — Legal/policy overlay
+(:Artifact:BlogPost)   — added when creators publish blog posts
+(:Artifact:CodeRepo)   — added when creator source READMEs join the corpus
 ```
 
 In SQL, this translates to **kind columns** on the node tables plus optional overlay tables for specialization fields when needed. Same principle: existing data isn't migrated; new shape is added.
 
 ### Stable core, evolving overlays
 
-The six-node / six-edge starter is the **stable core**. It is the same across every corpus we'll ever ingest — video, travel discourse, blogs, code, policy docs.
+The six-node / six-edge starter is the **stable core**. It is the same across every artifact type the corpus will ever ingest from creator networks — videos, blogs, source READMEs.
 
-Overlays are the **vertical specializations** added as the corpus grows:
+Overlays are the **artifact-type and segment-shape specializations** added as the corpus grows:
 
 - **Video overlay** — Creator (`:Source:Creator`), Video (`:Artifact:Video`), TranscriptSegment (`:Segment:TranscriptSegment` with timestamp_seconds)
-- **Travel overlay** — TravelTrend (`:Concept:TravelTrend`), Destination (`:Entity:Destination`), Origin (`:Entity:Origin`)
-- Future overlays (Legal, Medical, Corporate) follow the same pattern
+- **Blog overlay** (when the same creators' blog posts are ingested) — Author (`:Source:Author`), BlogPost (`:Artifact:BlogPost`), Section (`:Segment:Section`)
+- **Code overlay** (when the same creators' READMEs are ingested) — Repository (`:Source:Repository`), CodeRepo (`:Artifact:CodeRepo`), CodeSection (`:Segment:CodeSection`)
 
 You do not design overlays up front. You observe what your data wants to become and add labels as patterns emerge. The starter schema is **a hypothesis you collect evidence against**, not architecture carved in stone.
 
@@ -229,7 +209,7 @@ Both return the same shape: segments, quotes, confidence scores, ordered by evid
 
 ## The two-lens discovery framework
 
-Single-direction queries ("top concepts this week") return lists. Bidirectional queries return **substitution maps**, which are what actually answer the questions we care about. Borrowed verbatim from the sibling discovery skill:
+Single-direction queries ("top concepts this week") return lists. Bidirectional queries return **substitution maps**, which are what actually answer the questions we care about. The discovery framework has two lenses:
 
 | Lens | Strategic question | What it computes (video-intel) |
 |---|---|---|
@@ -240,7 +220,7 @@ The lenses are **frozen prompts** — not user-tunable per run. This is on purpo
 
 ## The receipts-vs-synthesis contract
 
-Mirrors the sibling discovery architecture verbatim. Two separable layers:
+Two separable layers:
 
 1. **Runner produces receipts.** Per-lens markdown documents (one for Displacement, one for Magnet) with citations + timestamps + verbatim quotes. Plus a structured audit JSON capturing what ran, what was found, and how strong the evidence is.
 2. **Host LLM owns synthesis.** A separate LLM call reads the receipts and writes the human-facing brief. Optional. The receipts alone are usable.
@@ -255,7 +235,7 @@ This is also the same architecture the existing [`nugget` CLI (ADR-0018)](../adr
 
 ## The PROCEED / CAVEAT / REFUSE health signal
 
-Borrowed verbatim from the sibling discovery skill. The audit JSON has a `health_summary` block positioned early in the file so consumers can branch on REFUSE without parsing the bulky payload.
+The audit JSON has a `health_summary` block positioned early in the file so consumers can branch on REFUSE without parsing the bulky payload.
 
 ```jsonc
 {
@@ -296,7 +276,7 @@ This block prevents the *confident-looking weekly brief over an empty data week*
 | **0c** | If 0a fails to surface signal → pivot to **Path B**: aggregate existing `skip_video_ids` / `enabled:false` / `skip_modes` signals into a negative-filter intelligence layer. | 0.5–1 day | Compounds independently of discovery. The skip-corpus is silently-labeled training data nothing currently consumes. |
 | **1** | DuckDB structured backbone with the 6-node / 6-edge starter (above). Authority inversion: concepts become the source of truth; mindmaps become regenerable. Silent-fading detector ships here. | 2–4 days | Foundation for everything analytical. Already answers Displacement-half ("what stopped") with zero new LLM passes. |
 | **1.5** | **Parallel** Neo4j Graph Builder learning spike on 2–3 known videos via knowledge packets. Deliverable: written observations document (useful labels / useless labels / useful edges / missing provenance / surprising connections). | 1 afternoon | Visually validates the starter schema. Breaks the schema-fear stall. Spike-only — does not affect Phase 1 production decisions. Tracked as [#63](https://github.com/dzivkovi/video-intel/issues/63), parallel to the now-shipped #61. |
-| **2** | Two-lens briefing runner: produces per-lens markdown receipts + audit JSON with `health_summary`. Operations underneath the lenses: EWMA momentum, silent-fading detector, cross-creator NLI (`cross-encoder/nli-deberta-v3-small`, local CPU). | 3–5 days | The receipts layer. Host LLM owns synthesis. Same contract as the sibling discovery skill. |
+| **2** | Two-lens briefing runner: produces per-lens markdown receipts + audit JSON with `health_summary`. Operations underneath the lenses: EWMA momentum, silent-fading detector, cross-creator NLI (`cross-encoder/nli-deberta-v3-small`, local CPU). | 3–5 days | The receipts layer. Host LLM owns synthesis. |
 | **3** | Add the 6-tuple stance schema as **one sentence in `prompts/concepts.md`**: `{claim, target, time_horizon, confidence, evidence_span, counterevidence}`. Stored as properties on the `expresses` join (DuckDB) / edge (Neo4j). | 1 afternoon | Closes the polarity gap. Cheap because piggybacks on existing extraction call. |
 | **4 (later)** | Pre-bake top-20 stable / evergreen topics from `nugget` query patterns into wiki pages with citation discipline. Long-tail stays query-time via `nugget`. | 1 week | Consulting UX surface — when query traffic has shape. |
 | **F (deferred per ADR-0018)** | LightRAG — gated on three signals (see ADR). | — | Heavy retrieval graph layer; not yet justified. |
@@ -340,8 +320,8 @@ Two reframes worth pinning, both from the 2026-05-28 ChatGPT chat:
 
 Combined with two existing project disciplines:
 
-3. **"Stable core, evolving overlays."** Source → Artifact → Segment → Claim/Entity/Concept stays stable across every corpus and vertical. Overlays (Video, Travel, Legal, Medical) layer on via multi-label specialization.
-4. **"Two earns the right to become three only after quarterly review identifies a recurring blind spot."** Borrowed from the sibling discovery skill. Lenses, prompts, schema features — none earn third-instance status without empirical evidence of need.
+1. **"Stable core, evolving overlays."** Source → Artifact → Segment → Claim/Entity/Concept stays stable. Artifact-type overlays (Video, BlogPost, CodeRepo) layer on via multi-label specialization as new creator-output formats join the corpus.
+2. **"Two earns the right to become three only after quarterly review identifies a recurring blind spot."** Lenses, prompts, schema features — none earn third-instance status without empirical evidence of need.
 
 ## Tools — adopt / defer / reject
 
@@ -380,7 +360,6 @@ This roadmap stands on:
 - [`ADR-0018`](../adr/ADR-0018-nugget-cli-cross-creator-synthesis.md) — the `nugget` CLI receipts→synthesis architecture and the three-signal LightRAG gate (operative rule).
 - [`docs/brainstorms/2026-04-19-kb-layer-staged-experiments-brainstorm.md`](2026-04-19-kb-layer-staged-experiments-brainstorm.md) — the precursor brainstorm that promoted "let the benchmark decide" into ADR-0017.
 - [`examples/nugget-lightrag-vs-openbrain-architectural-tension.md`](../../examples/nugget-lightrag-vs-openbrain-architectural-tension.md) — the user's "Compiled Graph on SQL" thesis. The architectural pattern is named there: *"SQL = immutable source of truth, Graph/Wiki = disposable regenerable presentation layer."*
-- A sibling discovery skill in a separate project — provides the lens vocabulary, the receipts/synthesis contract, and the PROCEED/CAVEAT/REFUSE health-summary pattern.
 
 When this roadmap's decisions firm up (likely after Phase 1.5 spike + Phase 2 ships), they graduate into ADRs and this doc gets a "consolidated into ADR-XXXX" status block at top — matching the existing pattern from `docs/brainstorms/2026-04-19-kb-layer-staged-experiments-brainstorm.md`.
 
