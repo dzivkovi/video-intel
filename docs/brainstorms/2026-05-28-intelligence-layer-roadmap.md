@@ -97,9 +97,12 @@ When a vertical specialization emerges (travel data joins, blog posts get ingest
 (:Concept:TravelTrend) — Travel overlay on a generic Concept
 (:Entity:Destination)  — Travel-specific entity subtype
 (:Claim:PolicyClaim)   — Legal/policy overlay
+(:Claim:CausalEvent)   — Upstream event as precursor (cross-corpus overlay)
 ```
 
 In SQL, this translates to **kind columns** on the node tables plus optional overlay tables for specialization fields when needed. Same principle: existing data isn't migrated; new shape is added.
+
+The `(:Claim:CausalEvent)` overlay is the pattern for corpora that need to distinguish upstream causal events (with future-dated `event_date`, lifecycle `status`, and `magnitude_estimate` properties) from observed consequences. A future 7th `:CAUSED_BY` edge linking observed signals back to the events that drove them is the natural addition when both record types coexist in the same store — deferred for the video-intel starter. Domain-specific extensions live in the relevant downstream project's design documents; this brainstorm acknowledges the pattern without changing the starter.
 
 ### Stable core, evolving overlays
 
