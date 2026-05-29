@@ -30,11 +30,11 @@ A DuckDB structured backbone holds the corpus as a graph-shaped relational store
 
 ## The cross-corpus unification
 
-The two questions that motivated this — *"where are people no longer flying"* and *"where are people suddenly wanting to travel"* — are the literal frozen prompts in a sibling skill, [`xb-travel`](https://github.com/dzivkovi/horizon-scanner). That skill answers them against travel discourse via `/last30days`. This project will answer the same shape of question against the video corpus.
+The two questions that motivated this — *"where are people no longer flying"* and *"where are people suddenly wanting to travel"* — originated in a sibling discovery skill in a separate project. That skill answers them against a different corpus type via a `/last30days`-style runner. This project will answer the same shape of question against the video corpus.
 
 The two projects are **siblings under the same contract**:
 
-| | xb-travel | video-intel (after this roadmap) |
+| | Sibling discovery skill | video-intel (after this roadmap) |
 |---|---|---|
 | Question class | Displacement + Magnet | Displacement + Magnet |
 | Retrieval backend | `/last30days` (web + social) | LanceDB hybrid + DuckDB analytical |
@@ -97,12 +97,9 @@ When a vertical specialization emerges (travel data joins, blog posts get ingest
 (:Concept:TravelTrend) — Travel overlay on a generic Concept
 (:Entity:Destination)  — Travel-specific entity subtype
 (:Claim:PolicyClaim)   — Legal/policy overlay
-(:Claim:CausalEvent)   — Upstream event as precursor (cross-corpus overlay)
 ```
 
 In SQL, this translates to **kind columns** on the node tables plus optional overlay tables for specialization fields when needed. Same principle: existing data isn't migrated; new shape is added.
-
-The `(:Claim:CausalEvent)` overlay is the pattern for corpora that need to distinguish upstream causal events (with future-dated `event_date`, lifecycle `status`, and `magnitude_estimate` properties) from observed consequences. A future 7th `:CAUSED_BY` edge linking observed signals back to the events that drove them is the natural addition when both record types coexist in the same store — deferred for the video-intel starter. Domain-specific extensions live in the relevant downstream project's design documents; this brainstorm acknowledges the pattern without changing the starter.
 
 ### Stable core, evolving overlays
 
@@ -232,7 +229,7 @@ Both return the same shape: segments, quotes, confidence scores, ordered by evid
 
 ## The two-lens discovery framework
 
-Single-direction queries ("top concepts this week") return lists. Bidirectional queries return **substitution maps**, which are what actually answer the questions we care about. Borrowed verbatim from the sibling `xb-travel` skill:
+Single-direction queries ("top concepts this week") return lists. Bidirectional queries return **substitution maps**, which are what actually answer the questions we care about. Borrowed verbatim from the sibling discovery skill:
 
 | Lens | Strategic question | What it computes (video-intel) |
 |---|---|---|
@@ -243,7 +240,7 @@ The lenses are **frozen prompts** — not user-tunable per run. This is on purpo
 
 ## The receipts-vs-synthesis contract
 
-Mirrors the xb-travel architecture verbatim. Two separable layers:
+Mirrors the sibling discovery architecture verbatim. Two separable layers:
 
 1. **Runner produces receipts.** Per-lens markdown documents (one for Displacement, one for Magnet) with citations + timestamps + verbatim quotes. Plus a structured audit JSON capturing what ran, what was found, and how strong the evidence is.
 2. **Host LLM owns synthesis.** A separate LLM call reads the receipts and writes the human-facing brief. Optional. The receipts alone are usable.
@@ -258,7 +255,7 @@ This is also the same architecture the existing [`nugget` CLI (ADR-0018)](../adr
 
 ## The PROCEED / CAVEAT / REFUSE health signal
 
-Borrowed verbatim from xb-travel. The audit JSON has a `health_summary` block positioned early in the file so consumers can branch on REFUSE without parsing the bulky payload.
+Borrowed verbatim from the sibling discovery skill. The audit JSON has a `health_summary` block positioned early in the file so consumers can branch on REFUSE without parsing the bulky payload.
 
 ```jsonc
 {
@@ -299,7 +296,7 @@ This block prevents the *confident-looking weekly brief over an empty data week*
 | **0c** | If 0a fails to surface signal → pivot to **Path B**: aggregate existing `skip_video_ids` / `enabled:false` / `skip_modes` signals into a negative-filter intelligence layer. | 0.5–1 day | Compounds independently of discovery. The skip-corpus is silently-labeled training data nothing currently consumes. |
 | **1** | DuckDB structured backbone with the 6-node / 6-edge starter (above). Authority inversion: concepts become the source of truth; mindmaps become regenerable. Silent-fading detector ships here. | 2–4 days | Foundation for everything analytical. Already answers Displacement-half ("what stopped") with zero new LLM passes. |
 | **1.5** | **Parallel** Neo4j Graph Builder learning spike on 2–3 known videos via knowledge packets. Deliverable: written observations document (useful labels / useless labels / useful edges / missing provenance / surprising connections). | 1 afternoon | Visually validates the starter schema. Breaks the schema-fear stall. Spike-only — does not affect Phase 1 production decisions. Tracked as [#63](https://github.com/dzivkovi/video-intel/issues/63), parallel to the now-shipped #61. |
-| **2** | Two-lens briefing runner: produces per-lens markdown receipts + audit JSON with `health_summary`. Operations underneath the lenses: EWMA momentum, silent-fading detector, cross-creator NLI (`cross-encoder/nli-deberta-v3-small`, local CPU). | 3–5 days | The receipts layer. Host LLM owns synthesis. Same contract as xb-travel. |
+| **2** | Two-lens briefing runner: produces per-lens markdown receipts + audit JSON with `health_summary`. Operations underneath the lenses: EWMA momentum, silent-fading detector, cross-creator NLI (`cross-encoder/nli-deberta-v3-small`, local CPU). | 3–5 days | The receipts layer. Host LLM owns synthesis. Same contract as the sibling discovery skill. |
 | **3** | Add the 6-tuple stance schema as **one sentence in `prompts/concepts.md`**: `{claim, target, time_horizon, confidence, evidence_span, counterevidence}`. Stored as properties on the `expresses` join (DuckDB) / edge (Neo4j). | 1 afternoon | Closes the polarity gap. Cheap because piggybacks on existing extraction call. |
 | **4 (later)** | Pre-bake top-20 stable / evergreen topics from `nugget` query patterns into wiki pages with citation discipline. Long-tail stays query-time via `nugget`. | 1 week | Consulting UX surface — when query traffic has shape. |
 | **F (deferred per ADR-0018)** | LightRAG — gated on three signals (see ADR). | — | Heavy retrieval graph layer; not yet justified. |
@@ -344,7 +341,7 @@ Two reframes worth pinning, both from the 2026-05-28 ChatGPT chat:
 Combined with two existing project disciplines:
 
 3. **"Stable core, evolving overlays."** Source → Artifact → Segment → Claim/Entity/Concept stays stable across every corpus and vertical. Overlays (Video, Travel, Legal, Medical) layer on via multi-label specialization.
-4. **"Two earns the right to become three only after quarterly review identifies a recurring blind spot."** Borrowed from xb-travel. Lenses, prompts, schema features — none earn third-instance status without empirical evidence of need.
+4. **"Two earns the right to become three only after quarterly review identifies a recurring blind spot."** Borrowed from the sibling discovery skill. Lenses, prompts, schema features — none earn third-instance status without empirical evidence of need.
 
 ## Tools — adopt / defer / reject
 
@@ -383,7 +380,7 @@ This roadmap stands on:
 - [`ADR-0018`](../adr/ADR-0018-nugget-cli-cross-creator-synthesis.md) — the `nugget` CLI receipts→synthesis architecture and the three-signal LightRAG gate (operative rule).
 - [`docs/brainstorms/2026-04-19-kb-layer-staged-experiments-brainstorm.md`](2026-04-19-kb-layer-staged-experiments-brainstorm.md) — the precursor brainstorm that promoted "let the benchmark decide" into ADR-0017.
 - [`examples/nugget-lightrag-vs-openbrain-architectural-tension.md`](../../examples/nugget-lightrag-vs-openbrain-architectural-tension.md) — the user's "Compiled Graph on SQL" thesis. The architectural pattern is named there: *"SQL = immutable source of truth, Graph/Wiki = disposable regenerable presentation layer."*
-- The sibling [`xb-travel` skill](https://github.com/dzivkovi/horizon-scanner) — provides the lens vocabulary, the receipts/synthesis contract, and the PROCEED/CAVEAT/REFUSE health-summary pattern.
+- A sibling discovery skill in a separate project — provides the lens vocabulary, the receipts/synthesis contract, and the PROCEED/CAVEAT/REFUSE health-summary pattern.
 
 When this roadmap's decisions firm up (likely after Phase 1.5 spike + Phase 2 ships), they graduate into ADRs and this doc gets a "consolidated into ADR-XXXX" status block at top — matching the existing pattern from `docs/brainstorms/2026-04-19-kb-layer-staged-experiments-brainstorm.md`.
 
