@@ -349,11 +349,13 @@ plan is preserved with `status: deferred`.
 [`docs/brainstorms/2026-05-28-intelligence-layer-roadmap.md`](../brainstorms/2026-05-28-intelligence-layer-roadmap.md)
 diagnosed that the user-experienced gap is **not** what the 1/25 eval
 measures. The eval measures recall of similar passages; the example
-questions the user actually wants answered (*"where are people no longer
-flying"*, *"where are people suddenly wanting to travel and why"*) are
-**aggregate + polarity + causation** questions. Top-k passage retrieval is
-the wrong primitive for them — vector embeddings collapse negation (NevIR,
-EACL 2024), so even a perfect retriever cannot serve "no longer X" queries.
+questions the user actually wants answered (*"which AI tools have creators
+moved away from in the last 90 days, and what did they move to"*, *"which
+concepts went silent across the corpus that were weekly through April"*)
+are **aggregate + polarity + causation** questions. Top-k passage retrieval
+is the wrong primitive for them — vector embeddings collapse negation
+(NevIR, EACL 2024), so even a perfect retriever cannot serve "no longer X"
+queries.
 
 The roadmap proposes a phased path:
 
@@ -364,7 +366,7 @@ The roadmap proposes a phased path:
 - **Phase 1.5** (parallel) — Neo4j Graph Builder learning spike on 2–3
   known videos, written observations as the deliverable
   ([issue #63](https://github.com/dzivkovi/video-intel/issues/63))
-- **Phase 2** — bidirectional Displacement + Magnet lenses, receipts-vs-synthesis contract, PROCEED/CAVEAT/REFUSE health signal (borrowed verbatim from the sibling [`xb-travel` skill](https://github.com/dzivkovi/horizon-scanner))
+- **Phase 2** — bidirectional Displacement + Magnet lenses, receipts-vs-synthesis contract, PROCEED/CAVEAT/REFUSE health signal
 - **Phase 3** — 6-tuple stance schema as one sentence added to
   `prompts/concepts.md`
 - **Phase 4** — top-20 stable-topic wiki pre-bake (later)
