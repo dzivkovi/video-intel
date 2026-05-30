@@ -1,10 +1,19 @@
 ---
 title: "feat: KB Stage 2 - LightRAG dual-level graph retrieval"
 type: feat
-status: active
+status: deferred
 date: 2026-04-20
 adr: ADR-0017
+deferred_date: 2026-05-28
+deferred_by: [ADR-0018, docs/brainstorms/2026-05-28-intelligence-layer-roadmap.md]
 ---
+
+> **DEFERRED 2026-05-28.** This plan is preserved as the canonical record of what Stage 2 LightRAG would have looked like, but it is no longer the active next step. Two superseding artifacts:
+>
+> - [`ADR-0018`](../adr/ADR-0018-nugget-cli-cross-creator-synthesis.md) — formalized a three-signal gate that must fire before Stage 2 LightRAG is scheduled (3+ failed multi-hop usage queries, eval ≤3/25 after second retrieval-tuning pass, or 2+ conceptual lenses requiring schema-free extraction). Until any of those signals fires, this plan does not execute.
+> - [`docs/brainstorms/2026-05-28-intelligence-layer-roadmap.md`](../brainstorms/2026-05-28-intelligence-layer-roadmap.md) — pivoted the active trajectory toward a **structured intelligence layer** (DuckDB starter schema + bidirectional Displacement/Magnet lenses + 6-tuple stance schema in `prompts/concepts.md`) instead of LightRAG retrieval bridging. The reasoning: the failure shape the 1/25 eval surfaced is sparse taxonomy coverage, but the *user-experienced gap* is aggregate / contrastive / polarity-flipped queries — which are SQL-shaped, not graph-shaped.
+>
+> The plan body below is unchanged from its 2026-04-20 form. Read it as the *fallback* if any of ADR-0018's three signals fires later.
 
 # feat: KB Stage 2 - LightRAG dual-level graph retrieval
 

@@ -2,7 +2,7 @@
 
 **Date:** 2026-04-19
 
-**Status:** consolidated into [ADR-0017](../adr/ADR-0017-kb-layer-strategy.md)
+**Status:** consolidated into [ADR-0017](../adr/ADR-0017-kb-layer-strategy.md); subsequent refinements live in [ADR-0018](../adr/ADR-0018-nugget-cli-cross-creator-synthesis.md) and [`docs/brainstorms/2026-05-28-intelligence-layer-roadmap.md`](2026-05-28-intelligence-layer-roadmap.md) (the active forward direction)
 
 ## Supersedes
 
