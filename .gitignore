@@ -63,3 +63,4 @@ skill-eval-workspace/**
 /.smoke/
 /.firecrawl/
 /tv-stitch-*/
+.codex/config.toml
