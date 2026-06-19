@@ -168,6 +168,25 @@ Per video with `auto_transcript: all`: 1 expensive transcript call +
 path, used when no transcript is on disk). Wait for the user's go-ahead
 before running the real scan.
 
+## When processing fails
+
+A video that does not process cleanly almost always matches one of these
+scenarios. Route by symptom; the full causes + step-by-step recovery SOPs
+live in [`docs/troubleshooting.md`](../../docs/troubleshooting.md), and the
+meta.json fields these reference are in [`docs/meta-json-schema.md`](../../docs/meta-json-schema.md).
+
+| Symptom | Cause | Recovery |
+|---|---|---|
+| Scan never finds a video that exists | **Unlisted** (not in the uploads feed - a hard YouTube Data API limit) | manual `process --url`/`--file`, or `--transcript-source yt-captions` for a cheap captions index |
+| `403 PERMISSION_DENIED` (grep every URL run for it) | **Members-only / gated** | download via membership, then `process --file` |
+| `400 INVALID_ARGUMENT`, fails fast | **Token cap** on a long video | `process --url --chunk-minutes 50`, or set `transcript_source: auto` (captions failover) |
+| Transcript hangs for many minutes | **Gemini stall** | `mark-skip --mode transcript`, or add the id to `skip_video_ids` |
+| Tiny `prompt=0` transcript that looked "complete" | **Future/scheduled premiere** confabulated | the issue #60 confab guard now discards it; delete any old stub |
+| Two mindmaps/metas for one video | **Title rotation** | `dedupe` |
+
+Governing principle: **the corpus indexes things that have happened, not
+things that will happen** - skip future/scheduled premieres (`liveBroadcastContent: upcoming`).
+
 ## Model Selection
 
 The default model (`gemini-3-flash-preview` from config.yaml) works for most
