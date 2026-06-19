@@ -159,6 +159,8 @@ def _scan_setup_with_transcript(monkeypatch, videos, durations=None):
         return dict.fromkeys(video_ids) | {k: v for k, v in durations.items() if k in video_ids}
 
     monkeypatch.setattr(vi, "enrich_with_durations", fake_enrich)
+    # Issue #70: stub the new pre-flight metadata call (keep all videos).
+    monkeypatch.setattr(vi, "fetch_preflight_status", lambda _yt, ids: {vid: {} for vid in ids})
     monkeypatch.setattr(vi, "_is_youtube_short_url", lambda video_id: False)
 
     captured = {"mindmaps": [], "transcripts": []}
@@ -1011,6 +1013,7 @@ class TestSkipVideoIdsConfig:
             return dict.fromkeys(video_ids, "PT10M")
 
         monkeypatch.setattr(vi, "enrich_with_durations", recording_enrich)
+        monkeypatch.setattr(vi, "fetch_preflight_status", lambda _yt, ids: {vid: {} for vid in ids})
         monkeypatch.setattr(vi, "process_mindmap", lambda *a, **kw: ("p", "done"))
 
         config = {
