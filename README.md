@@ -538,6 +538,11 @@ python scripts/video_intel.py --model gemini-2.5-pro transcript \
 On parse failure, the raw Gemini response is saved as a `.transcript.raw.txt`
 sidecar file for debugging.
 
+When a video does not process cleanly (unlisted, members-only, token-cap, hang, or a confabulated future-premiere stub), see the operator references:
+
+- [`docs/troubleshooting.md`](docs/troubleshooting.md) - failure scenarios, causes, and step-by-step recovery SOPs (including the captions/SRT bridge for unlisted videos).
+- [`docs/meta-json-schema.md`](docs/meta-json-schema.md) - the canonical meta.json field reference.
+
 ## Bosnian/Croatian/Serbian (BCS) Translation Utility
 
 A separate utility script for translating YouTube video audio into
