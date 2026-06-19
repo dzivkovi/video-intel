@@ -25,10 +25,18 @@ def _coerce_token_count(value: object) -> int:
     return 0
 
 
-def log_usage_metadata(response: object, label: str) -> None:
+def log_usage_metadata(response: object, label: str) -> dict | None:
     """Log a single info-level line summarizing Gemini token usage.
 
     Emits: ``usage {label} prompt=N cached=N thoughts=N candidates=N total=N``.
+
+    Returns the parsed counts as a dict (keys: prompt, cached, thoughts,
+    candidates, total) so callers that need the numbers - e.g. the issue #60
+    confabulation guard, which treats ``prompt == 0`` as "Gemini ingested no
+    video tokens" - can read them off the same call that logs them. Returns
+    ``None`` when usage_metadata is missing or unreadable, so a None return
+    means "could not confirm" (never flag a confabulation on missing data).
+    Existing callers ignore the return value, so this is backward compatible.
 
     ``thoughts_token_count`` is Gemini 3.x-specific (the thinking process);
     legacy 2.x responses omit it and we default to 0. Per Gemini usage_metadata
@@ -36,13 +44,13 @@ def log_usage_metadata(response: object, label: str) -> None:
     ``total_token_count`` will exceed ``prompt + cached + candidates``.
 
     Observability must never break the caller. Any unexpected shape
-    produces a warning log and returns — it does not raise.
+    produces a warning log and returns ``None`` — it does not raise.
     """
     try:
         usage = getattr(response, "usage_metadata", None)
         if usage is None:
             log.warning("usage %s: response.usage_metadata missing or None", label)
-            return
+            return None
         prompt = _coerce_token_count(getattr(usage, "prompt_token_count", 0))
         cached = _coerce_token_count(getattr(usage, "cached_content_token_count", 0))
         thoughts = _coerce_token_count(getattr(usage, "thoughts_token_count", 0))
@@ -57,8 +65,16 @@ def log_usage_metadata(response: object, label: str) -> None:
             candidates,
             total,
         )
+        return {
+            "prompt": prompt,
+            "cached": cached,
+            "thoughts": thoughts,
+            "candidates": candidates,
+            "total": total,
+        }
     except Exception as exc:
         log.warning("usage %s: failed to read usage_metadata (%s)", label, exc)
+        return None
 
 
 # ---------------------------------------------------------------------------

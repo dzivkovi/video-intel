@@ -33,6 +33,7 @@ from typing import Any
 import httpx
 import yaml
 from googleapiclient.errors import HttpError
+from youtube_captions import CaptionsResult, fetch_english_captions
 
 from gemini_common import (
     build_permissive_safety_settings,
@@ -410,6 +411,40 @@ _VALID_MINDMAP_SOURCE_VALUES = {"auto", "video", "transcript", "none"}
 # (:2419), salvage writes "partial" (:2449). Any non-healthy value triggers
 # the partial-source mindmap marker. Keep this set in sync with the writers.
 _HEALTHY_TRANSCRIPT_STATUSES = {"ok", "complete"}
+
+# Issue #60: how the transcript step sources its text.
+_VALID_TRANSCRIPT_SOURCE_VALUES = {"gemini", "yt-captions", "auto"}
+# meta.json transcript_source value written when a transcript is built from the
+# YouTube caption track (mirrors the existing "local_file" value for uploads).
+TRANSCRIPT_SOURCE_CAPTIONS = "youtube_captions"
+TRANSCRIPT_SOURCE_GEMINI = "gemini"
+
+
+def resolve_transcript_source(channel_config: dict, cli_override: str | None = None) -> str:
+    """Decide how the transcript step sources its text (issue #60).
+
+    Returns one of ``"gemini" | "yt-captions" | "auto"``.
+
+    - ``"gemini"`` (default): Gemini multimodal transcript - current behavior,
+      now with the confabulation guard (a ``prompt == 0`` / thin response is
+      never written as ``transcript_status: complete``).
+    - ``"yt-captions"``: skip Gemini, build the transcript from the public
+      YouTube English caption track. Cheap, but speech-only (no SCREEN /
+      diarization). Fails (returns an error status) when no captions exist.
+    - ``"auto"``: try Gemini; on failure (exception, 403, token-cap, or the
+      confabulation guard tripping), fall back to ``yt-captions``. Falls all
+      the way through to the normal Gemini failure path when captions are also
+      unavailable, so behavior is never worse than ``gemini``.
+
+    Precedence: CLI override > channel config ``transcript_source`` > ``"gemini"``.
+    Unknown values raise ``ValueError`` to surface typos at call time.
+    """
+    raw = cli_override if cli_override is not None else channel_config.get("transcript_source", "gemini")
+    if raw not in _VALID_TRANSCRIPT_SOURCE_VALUES:
+        raise ValueError(
+            f"Invalid transcript_source={raw!r}. Expected one of: {sorted(_VALID_TRANSCRIPT_SOURCE_VALUES)}"
+        )
+    return raw
 
 
 def resolve_mindmap_source(channel_config: dict, *, transcript_available: bool) -> str:
@@ -2602,6 +2637,36 @@ def salvage_transcript_sections(text: str) -> tuple[dict, str | None]:
     return result, warning
 
 
+def _build_captions_transcript_body(captions: CaptionsResult) -> str:
+    """Render a CaptionsResult as the body of a video-intel transcript.md.
+
+    Speech-only: one ``[MM:SS] "text"`` line per caption snippet, no SCREEN
+    sections and no speaker diarization (the caption track carries neither).
+    Overlapping auto-caption cues (rolling-window ASR repeats the same words
+    across adjacent cues) are de-duplicated to one line per start-second,
+    keeping the longest text, to cut repeated phrases. Pure function.
+
+    Known limitation (accepted for this lower-fidelity artifact): when two
+    distinct cues round to the same second, only the longer is kept, so a
+    short tail cue sharing a second with a longer one is dropped. This trades
+    a little content loss for far fewer duplicate phrases; the artifact is
+    already flagged speech-only and is replaceable via ``process --file``.
+    """
+    seen: dict[int, tuple[int, str]] = {}
+    for start, text in captions.snippets:
+        clean = " ".join(text.split())
+        if not clean:
+            continue
+        key = round(start)
+        if key not in seen or len(clean) > len(seen[key][1]):
+            seen[key] = (key, clean)
+    lines = []
+    for start, clean in (seen[k] for k in sorted(seen)):
+        mm, ss = divmod(start, 60)
+        lines.append(f'[{mm:02d}:{ss:02d}] "{clean}"')
+    return "\n".join(lines)
+
+
 def _write_transcript_md(
     path: Path,
     video: dict,
@@ -2610,8 +2675,15 @@ def _write_transcript_md(
     status: str = "Complete",
     recovery: str | None = None,
     warning: str | None = None,
+    transcript_source: str | None = None,
 ) -> None:
-    """Write a transcript markdown file with header and optional warning block."""
+    """Write a transcript markdown file with header and optional warning block.
+
+    ``transcript_source`` (issue #60) records provenance in the header. When it
+    is the captions source, a banner + reader note flag the lower fidelity
+    (speech-only, no SCREEN / diarization) so the file is never mistaken for a
+    Gemini-multimodal transcript.
+    """
     header = (
         f"# Transcript: {video['title']}\n\n"
         f"**Source:** {video['url']}\n"
@@ -2619,9 +2691,20 @@ def _write_transcript_md(
         f"**Processed:** {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}\n"
         f"**Status:** {status}\n"
     )
+    if transcript_source:
+        header += f"**Transcript source:** {transcript_source}\n"
     if recovery:
         header += f"**Recovery:** {recovery}\n"
-    header += "\n---\n\n"
+    header += "\n"
+    if transcript_source == TRANSCRIPT_SOURCE_CAPTIONS:
+        header += (
+            "<!-- source: youtube-auto-captions; no SCREEN sections, no speaker "
+            "diarization. Speech-only transcript from the public caption track. "
+            "Replace via `process --file` for full fidelity. -->\n\n"
+            "> NOTE: Derived from YouTube auto-captions, not Gemini multimodal - "
+            "spoken content only (no on-screen text, slides, code, or speaker IDs).\n\n"
+        )
+    header += "---\n\n"
 
     body = ""
     if warning:
@@ -2640,6 +2723,81 @@ def _write_transcript_md(
     tmp_path.replace(path)
 
 
+def _record_transcript_error(meta_path: Path, error: str) -> None:
+    """Record last_error on an existing meta.json without clobbering other fields."""
+    if not meta_path.exists():
+        return
+    try:
+        meta = json.loads(meta_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        meta = {}
+    meta["last_error"] = error
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+
+def _try_captions_transcript(
+    video: dict,
+    transcript_path: Path,
+    meta_path: Path,
+    prefix: str,
+    *,
+    reason: str | None = None,
+    start_offset: int | None = None,
+    end_offset: int | None = None,
+) -> tuple[str, str] | None:
+    """Build a transcript from the YouTube English caption track (issue #60).
+
+    Returns ``(prefix, status)`` on success, or ``None`` when no usable captions
+    are available so the caller can decide what to do next (the ``yt-captions``
+    source records an error; the ``auto`` source lets the normal Gemini failure
+    path run). Writes a speech-only transcript flagged
+    ``transcript_source: youtube_captions`` so it is never mistaken for a
+    Gemini-multimodal transcript. ``reason`` records why captions were used
+    (e.g. the Gemini error that triggered the auto-failover).
+
+    ``start_offset``/``end_offset`` (seconds) clip the caption snippets to
+    ``[start, end)`` so ``--start``/``--end`` segments behave like the Gemini
+    path instead of silently transcribing the whole video.
+    """
+    video_id = video.get("video_id")
+    if not video_id:
+        return None
+    captions = fetch_english_captions(video_id)
+    if captions is None:
+        return None
+    snippets = captions.snippets
+    if start_offset is not None or end_offset is not None:
+        lo = start_offset or 0
+        snippets = [(s, t) for (s, t) in snippets if s >= lo and (end_offset is None or s < end_offset)]
+    body = _build_captions_transcript_body(CaptionsResult(snippets, captions.is_generated, captions.language))
+    if not body.strip():
+        log.info("  %s: caption track present but empty after dedup/clip - not usable", prefix)
+        return None
+    _write_transcript_md(
+        transcript_path,
+        video,
+        body,
+        status="Captions (YouTube auto-generated)" if captions.is_generated else "Captions (manual)",
+        transcript_source=TRANSCRIPT_SOURCE_CAPTIONS,
+    )
+    fields = {
+        "processed": datetime.now(UTC).isoformat(),
+        "transcript_status": "complete",
+        "transcript_source": TRANSCRIPT_SOURCE_CAPTIONS,
+        "captions_is_generated": bool(captions.is_generated),
+    }
+    if reason:
+        fields["transcript_failover_reason"] = reason
+    update_meta(meta_path, fields, "transcript")
+    log.info(
+        "  %s: transcript from YouTube captions (%d cues, %s)",
+        prefix,
+        len(snippets),
+        "auto-gen" if captions.is_generated else "manual",
+    )
+    return prefix, "done (captions)"
+
+
 def process_transcript(
     client,
     types,
@@ -2654,6 +2812,7 @@ def process_transcript(
     end_offset: int | None = None,
     media_uri: str | None = None,
     media_resolution=None,
+    transcript_source: str = "gemini",
 ):
     """Generate a fused transcript for a single video with layered JSON resilience.
 
@@ -2678,6 +2837,17 @@ def process_transcript(
     if transcript_path.exists() and not force:
         return prefix, "skipped (exists)"
 
+    # Issue #60: explicit captions-only source skips Gemini entirely (cheap,
+    # speech-only). Fails when no captions exist - the caller chose this source.
+    if transcript_source == "yt-captions":
+        captioned = _try_captions_transcript(
+            video, transcript_path, meta_path, prefix, start_offset=start_offset, end_offset=end_offset
+        )
+        if captioned is not None:
+            return captioned
+        _record_transcript_error(meta_path, "no English captions available (transcript_source=yt-captions)")
+        return prefix, "error: no captions available (yt-captions)"
+
     effective_media_uri = media_uri if media_uri is not None else video["url"]
     # Default to LOW media resolution: same justification as process_mindmap
     # (issue #58 Gate 3 — LOW = same quality at 3x lower input-token cost for
@@ -2696,7 +2866,18 @@ def process_transcript(
     # #58 Gate 2). Transcription is mechanical (diarize + log on-screen content),
     # not analytical — minimum thinking is the right setting.
     transcript_thinking_config = _make_thinking_config_for_transcript(types, model)
+    # Issue #60 confabulation guard: capture the prompt-token count off the usage
+    # callback so we can detect prompt == 0 (Gemini ingested no video tokens).
+    usage_capture: dict = {}
+
+    def _on_resp(r):
+        counts = log_usage_metadata(r, "transcript")
+        if counts is not None:
+            usage_capture.clear()
+            usage_capture.update(counts)
+
     for attempt in range(1 + TRANSCRIPT_PARSE_RETRY_LIMIT):
+        usage_capture.clear()
         try:
             raw = call_gemini(
                 client,
@@ -2709,14 +2890,48 @@ def process_transcript(
                 end_offset=end_offset,
                 media_resolution=effective_media_resolution,
                 thinking_config=transcript_thinking_config,
-                on_response=lambda r: log_usage_metadata(r, "transcript"),
+                on_response=_on_resp,
             )
         except Exception as e:
-            if meta_path.exists():
-                meta = json.loads(meta_path.read_text())
-                meta["last_error"] = str(e)
-                meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            # Issue #60: on auto, try the captions fallback before recording error.
+            if transcript_source == "auto":
+                fb = _try_captions_transcript(
+                    video,
+                    transcript_path,
+                    meta_path,
+                    prefix,
+                    reason=f"gemini error: {e}",
+                    start_offset=start_offset,
+                    end_offset=end_offset,
+                )
+                if fb is not None:
+                    return fb
+            _record_transcript_error(meta_path, str(e))
             return prefix, f"error: {e}"
+
+        # Issue #60 confabulation guard: prompt == 0 means Gemini ingested zero
+        # video tokens (gated / future-premiere / unfetchable) and confabulated a
+        # stub. Never write that as a healthy transcript. The count is absent
+        # (None) when usage_metadata was unreadable - do not flag on missing data.
+        if usage_capture.get("prompt") == 0:
+            log.warning(
+                "  %s: confabulation guard tripped - Gemini reported prompt=0 (no video ingested); discarding",
+                prefix,
+            )
+            if transcript_source == "auto":
+                fb = _try_captions_transcript(
+                    video,
+                    transcript_path,
+                    meta_path,
+                    prefix,
+                    reason="gemini prompt=0 (confabulation)",
+                    start_offset=start_offset,
+                    end_offset=end_offset,
+                )
+                if fb is not None:
+                    return fb
+            _record_transcript_error(meta_path, "confabulation guard: Gemini prompt=0 (no video ingested)")
+            return prefix, "error: confabulation guard (prompt=0)"
 
         # Layer 1: try full parse (direct + isolation)
         raw_json, parse_error = try_parse_transcript_json(raw)
@@ -2748,10 +2963,14 @@ def process_transcript(
                 log.info("  transcript JSON parsed: type=%s", type(raw_json).__name__)
             # Full parse succeeded - write transcript, no raw sidecar
             fused = merge_transcript_json(raw_json, {})
-            _write_transcript_md(transcript_path, video, fused)
+            _write_transcript_md(transcript_path, video, fused, transcript_source=TRANSCRIPT_SOURCE_GEMINI)
             update_meta(
                 meta_path,
-                {"processed": datetime.now(UTC).isoformat(), "transcript_status": "complete"},
+                {
+                    "processed": datetime.now(UTC).isoformat(),
+                    "transcript_status": "complete",
+                    "transcript_source": TRANSCRIPT_SOURCE_GEMINI,
+                },
                 "transcript",
             )
             return prefix, "done"
@@ -2776,12 +2995,14 @@ def process_transcript(
                 status="Partial transcript",
                 recovery="salvaged_sections",
                 warning="Gemini returned malformed JSON. This transcript was salvaged from a partial response and may be incomplete.",
+                transcript_source=TRANSCRIPT_SOURCE_GEMINI,
             )
             update_meta(
                 meta_path,
                 {
                     "processed": datetime.now(UTC).isoformat(),
                     "transcript_status": "partial",
+                    "transcript_source": TRANSCRIPT_SOURCE_GEMINI,
                     "transcript_recovery": "salvaged_sections",
                     "transcript_parse_error": parse_error,
                     "transcript_warning": salvage_warning,
@@ -2796,7 +3017,19 @@ def process_transcript(
             log.info("  %s: salvage insufficient (%d entries), retrying...", prefix, speech_count)
             continue
 
-    # All attempts exhausted
+    # All attempts exhausted. Issue #60: on auto, try captions before giving up.
+    if transcript_source == "auto":
+        fb = _try_captions_transcript(
+            video,
+            transcript_path,
+            meta_path,
+            prefix,
+            reason=f"gemini parse failure: {parse_error}",
+            start_offset=start_offset,
+            end_offset=end_offset,
+        )
+        if fb is not None:
+            return fb
     if meta_path.exists():
         meta = json.loads(meta_path.read_text())
         meta["last_error"] = f"JSON parse error: {parse_error}"
@@ -3237,6 +3470,10 @@ def cmd_scan(args, config):
         auto = ch.get("auto_transcript", "none")
         if auto == "all":
             transcript_prompt = load_prompt("transcript")
+            # Issue #60: per-channel transcript source (gemini | yt-captions | auto).
+            # Default "gemini" preserves current behavior; "auto" adds the captions
+            # failover when Gemini fails (token-cap, 403, confabulation).
+            transcript_source = resolve_transcript_source(ch)
             # Long-video guard (issue #42): videos longer than the threshold
             # truncate the structured-JSON transcript response. Filter them out
             # of the transcript loop and log the manual-clipping recipe.
@@ -3288,6 +3525,7 @@ def cmd_scan(args, config):
                             model,
                             output_dir / ch_name,
                             video_file_prefix(v),
+                            transcript_source=transcript_source,
                         ): v
                         for v in transcript_videos
                     }
@@ -3729,6 +3967,10 @@ def cmd_transcript(args, config):
     media_resolution_enum = (
         _resolve_media_resolution(types, getattr(args, "media_resolution", "low")) if types is not None else None
     )
+    # Issue #60: transcript source from the CLI flag (defaults to gemini). This
+    # manual one-off command is controlled by the flag; the per-channel
+    # transcript_source config knob is honored by the automated scan path.
+    transcript_source = resolve_transcript_source({}, getattr(args, "transcript_source", None))
 
     # Parse segment offsets (shared between URL and file paths)
     start_offset = parse_time_to_seconds(args.start) if args.start else None
@@ -3875,7 +4117,10 @@ def cmd_transcript(args, config):
     # single-call process_transcript path that has existed since PR #48.
     chunk_minutes = getattr(args, "chunk_minutes", None) or TRANSCRIPT_CHUNK_MINUTES_DEFAULT
     manual_segment = start_offset is not None or end_offset is not None
-    use_chunking = args.url and not manual_segment
+    # Issue #60: yt-captions never needs chunking (the caption track is returned
+    # whole regardless of length), so route it to the single-shot path which
+    # handles the captions source.
+    use_chunking = args.url and not manual_segment and transcript_source != "yt-captions"
 
     if use_chunking:
         duration_seconds = _lookup_video_duration_seconds(video["video_id"])
@@ -3902,8 +4147,21 @@ def cmd_transcript(args, config):
                 force=args.force,
             )
             out_path = channel_dir / f"{prefix}.transcript.md"
+            # Issue #60: on auto, fall back to captions if the whole chunked run
+            # failed (all chunks unparseable). A partial keeps the higher-fidelity
+            # Gemini content; only a hard error triggers the captions failover.
+            if transcript_source == "auto" and status.startswith("error"):
+                fb = _try_captions_transcript(
+                    video,
+                    out_path,
+                    channel_dir / f"{prefix}.meta.json",
+                    prefix,
+                    reason=f"chunked transcript failed: {status}",
+                )
+                if fb is not None:
+                    _, status = fb
             log.info("  %s: %s", prefix, status)
-            if status == "done":
+            if status.startswith("done"):
                 log.info("  Saved: %s", out_path)
             return
 
@@ -3920,6 +4178,7 @@ def cmd_transcript(args, config):
         end_offset=end_offset,
         media_uri=media_uri,
         media_resolution=media_resolution_enum,
+        transcript_source=transcript_source,
     )
     out_path = channel_dir / f"{prefix}.transcript.md"
     log.info("  %s: %s", prefix, status)
@@ -4065,6 +4324,8 @@ def _cmd_process_url(args, config):
         (c for c in config.get("channels", []) if c.get("name") == channel_name),
         {},
     )
+    # Issue #60: transcript source - CLI flag overrides the per-channel knob.
+    transcript_source = resolve_transcript_source(channel_cfg, getattr(args, "transcript_source", None))
 
     duration_seconds = _lookup_video_duration_seconds(video_id)
     transcript_path = channel_dir / f"{prefix}.transcript.md"
@@ -4078,7 +4339,9 @@ def _cmd_process_url(args, config):
     log.info("  Step 1/3: transcript")
     chunk_minutes = getattr(args, "chunk_minutes", None) or TRANSCRIPT_CHUNK_MINUTES_DEFAULT
     try:
-        if duration_seconds and duration_seconds > chunk_minutes * 60:
+        # Issue #60: yt-captions never chunks (caption track is whole); route it
+        # to the single-shot path which builds from captions.
+        if duration_seconds and duration_seconds > chunk_minutes * 60 and transcript_source != "yt-captions":
             chunks = _build_transcript_chunks(duration_seconds, chunk_minutes)
             log.info(
                 "    %s is %s; running %d chunks of %d min each.",
@@ -4100,6 +4363,18 @@ def _cmd_process_url(args, config):
                 chunk_minutes=chunk_minutes,
                 force=args.force,
             )
+            # Issue #60: on auto, fall back to captions if the chunked run failed
+            # outright (a partial keeps the higher-fidelity Gemini content).
+            if transcript_source == "auto" and transcript_status.startswith("error"):
+                fb = _try_captions_transcript(
+                    video,
+                    transcript_path,
+                    channel_dir / f"{prefix}.meta.json",
+                    prefix,
+                    reason=f"chunked transcript failed: {transcript_status}",
+                )
+                if fb is not None:
+                    _, transcript_status = fb
         else:
             _, transcript_status = process_transcript(
                 client,
@@ -4112,6 +4387,7 @@ def _cmd_process_url(args, config):
                 force=args.force,
                 media_uri=None,
                 media_resolution=media_resolution_enum,
+                transcript_source=transcript_source,
             )
     except Exception as exc:
         transcript_status = f"error: {exc}"
@@ -6098,6 +6374,19 @@ Examples:
             "path is hardcoded to LOW regardless of this flag."
         ),
     )
+    tx_parser.add_argument(
+        "--transcript-source",
+        choices=["gemini", "yt-captions", "auto"],
+        default=None,
+        dest="transcript_source",
+        help=(
+            "Where the transcript text comes from (issue #60). 'gemini' (default): "
+            "multimodal transcript. 'yt-captions': build from the YouTube English "
+            "caption track only (cheap, speech-only - no SCREEN/diarization). 'auto': "
+            "try Gemini, fall back to captions on failure (token-cap, 403, confabulation). "
+            "Overrides the per-channel transcript_source config knob."
+        ),
+    )
 
     # process command: one-upload full pipeline for local MP4s
     process_parser = subparsers.add_parser(
@@ -6157,6 +6446,19 @@ Examples:
             "cost for theme/concept extraction (issue #58 Gate 3); HIGH is for the "
             "rare case where the prompt depends on reading fine on-screen text. "
             "Ignored on the mindmap-from-transcript path (text-only)."
+        ),
+    )
+    process_parser.add_argument(
+        "--transcript-source",
+        choices=["gemini", "yt-captions", "auto"],
+        default=None,
+        dest="transcript_source",
+        help=(
+            "Where the transcript text comes from (issue #60). 'gemini' (default): "
+            "multimodal transcript. 'yt-captions': YouTube caption track only "
+            "(cheap, speech-only). 'auto': try Gemini, fall back to captions on "
+            "failure. Overrides the per-channel transcript_source config knob. "
+            "Applies to the --url path; --file uploads are always Gemini multimodal."
         ),
     )
 
