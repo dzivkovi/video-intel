@@ -126,7 +126,7 @@ def _video():
     }
 
 
-def _stub_gemini(monkeypatch, *, prompt_tokens, payload=None, raises=None, calls=None):
+def _stub_gemini(monkeypatch, *, prompt_tokens, payload=None, raises=None, calls=None, raw_text=None):
     def fake_call_gemini(client, types, media_uri, prompt, model, response_json=False, **kw):
         if calls is not None:
             calls.append(media_uri)
@@ -135,6 +135,8 @@ def _stub_gemini(monkeypatch, *, prompt_tokens, payload=None, raises=None, calls
         on_response = kw.get("on_response")
         if on_response is not None:
             on_response(_Resp(prompt_tokens))
+        if raw_text is not None:
+            return raw_text  # unparseable / non-JSON, to exercise the salvage+retry tail
         return json.dumps(payload if payload is not None else _VALID_PAYLOAD)
 
     monkeypatch.setattr(vi, "call_gemini", fake_call_gemini)
@@ -205,6 +207,20 @@ class TestCaptionsSource:
         assert "no captions" in status
         assert not tpath.exists()
 
+    def test_yt_captions_clips_to_segment(self, tmp_path, monkeypatch):
+        # --start/--end must clip the captions, not silently return the whole video.
+        _stub_gemini(monkeypatch, prompt_tokens=5000)
+        monkeypatch.setattr(
+            vi,
+            "fetch_english_captions",
+            lambda vid: CaptionsResult([(5.0, "before"), (15.0, "inside"), (25.0, "after")], True, "en"),
+        )
+        (_, status), tpath, _ = _run(tmp_path, "yt-captions", start_offset=10, end_offset=20)
+        assert "captions" in status
+        text = tpath.read_text()
+        assert "inside" in text
+        assert "before" not in text and "after" not in text
+
 
 class TestAutoFailover:
     def test_auto_falls_back_on_gemini_exception(self, tmp_path, monkeypatch):
@@ -233,3 +249,14 @@ class TestAutoFailover:
         (_, status), tpath, _ = _run(tmp_path, "auto")
         assert status.startswith("error")
         assert not tpath.exists()
+
+    def test_auto_falls_back_on_parse_exhaustion(self, tmp_path, monkeypatch):
+        # Unparseable non-JSON (prompt>0 so the confab guard does NOT fire); after
+        # the bounded retries are exhausted, auto falls back to captions.
+        _stub_gemini(monkeypatch, prompt_tokens=5000, raw_text="this is not json at all {{{")
+        monkeypatch.setattr(
+            vi, "fetch_english_captions", lambda vid: CaptionsResult([(0.0, "salvaged via captions")], True, "en")
+        )
+        (_, status), _, mpath = _run(tmp_path, "auto")
+        assert "captions" in status
+        assert "parse failure" in json.loads(mpath.read_text())["transcript_failover_reason"]

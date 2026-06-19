@@ -2645,6 +2645,12 @@ def _build_captions_transcript_body(captions: CaptionsResult) -> str:
     Overlapping auto-caption cues (rolling-window ASR repeats the same words
     across adjacent cues) are de-duplicated to one line per start-second,
     keeping the longest text, to cut repeated phrases. Pure function.
+
+    Known limitation (accepted for this lower-fidelity artifact): when two
+    distinct cues round to the same second, only the longer is kept, so a
+    short tail cue sharing a second with a longer one is dropped. This trades
+    a little content loss for far fewer duplicate phrases; the artifact is
+    already flagged speech-only and is replaceable via ``process --file``.
     """
     seen: dict[int, tuple[int, str]] = {}
     for start, text in captions.snippets:
@@ -2736,6 +2742,8 @@ def _try_captions_transcript(
     prefix: str,
     *,
     reason: str | None = None,
+    start_offset: int | None = None,
+    end_offset: int | None = None,
 ) -> tuple[str, str] | None:
     """Build a transcript from the YouTube English caption track (issue #60).
 
@@ -2746,6 +2754,10 @@ def _try_captions_transcript(
     ``transcript_source: youtube_captions`` so it is never mistaken for a
     Gemini-multimodal transcript. ``reason`` records why captions were used
     (e.g. the Gemini error that triggered the auto-failover).
+
+    ``start_offset``/``end_offset`` (seconds) clip the caption snippets to
+    ``[start, end)`` so ``--start``/``--end`` segments behave like the Gemini
+    path instead of silently transcribing the whole video.
     """
     video_id = video.get("video_id")
     if not video_id:
@@ -2753,9 +2765,13 @@ def _try_captions_transcript(
     captions = fetch_english_captions(video_id)
     if captions is None:
         return None
-    body = _build_captions_transcript_body(captions)
+    snippets = captions.snippets
+    if start_offset is not None or end_offset is not None:
+        lo = start_offset or 0
+        snippets = [(s, t) for (s, t) in snippets if s >= lo and (end_offset is None or s < end_offset)]
+    body = _build_captions_transcript_body(CaptionsResult(snippets, captions.is_generated, captions.language))
     if not body.strip():
-        log.info("  %s: caption track present but empty after dedup - not usable", prefix)
+        log.info("  %s: caption track present but empty after dedup/clip - not usable", prefix)
         return None
     _write_transcript_md(
         transcript_path,
@@ -2776,7 +2792,7 @@ def _try_captions_transcript(
     log.info(
         "  %s: transcript from YouTube captions (%d cues, %s)",
         prefix,
-        len(captions.snippets),
+        len(snippets),
         "auto-gen" if captions.is_generated else "manual",
     )
     return prefix, "done (captions)"
@@ -2824,7 +2840,9 @@ def process_transcript(
     # Issue #60: explicit captions-only source skips Gemini entirely (cheap,
     # speech-only). Fails when no captions exist - the caller chose this source.
     if transcript_source == "yt-captions":
-        captioned = _try_captions_transcript(video, transcript_path, meta_path, prefix)
+        captioned = _try_captions_transcript(
+            video, transcript_path, meta_path, prefix, start_offset=start_offset, end_offset=end_offset
+        )
         if captioned is not None:
             return captioned
         _record_transcript_error(meta_path, "no English captions available (transcript_source=yt-captions)")
@@ -2877,7 +2895,15 @@ def process_transcript(
         except Exception as e:
             # Issue #60: on auto, try the captions fallback before recording error.
             if transcript_source == "auto":
-                fb = _try_captions_transcript(video, transcript_path, meta_path, prefix, reason=f"gemini error: {e}")
+                fb = _try_captions_transcript(
+                    video,
+                    transcript_path,
+                    meta_path,
+                    prefix,
+                    reason=f"gemini error: {e}",
+                    start_offset=start_offset,
+                    end_offset=end_offset,
+                )
                 if fb is not None:
                     return fb
             _record_transcript_error(meta_path, str(e))
@@ -2894,7 +2920,13 @@ def process_transcript(
             )
             if transcript_source == "auto":
                 fb = _try_captions_transcript(
-                    video, transcript_path, meta_path, prefix, reason="gemini prompt=0 (confabulation)"
+                    video,
+                    transcript_path,
+                    meta_path,
+                    prefix,
+                    reason="gemini prompt=0 (confabulation)",
+                    start_offset=start_offset,
+                    end_offset=end_offset,
                 )
                 if fb is not None:
                     return fb
@@ -2988,7 +3020,13 @@ def process_transcript(
     # All attempts exhausted. Issue #60: on auto, try captions before giving up.
     if transcript_source == "auto":
         fb = _try_captions_transcript(
-            video, transcript_path, meta_path, prefix, reason=f"gemini parse failure: {parse_error}"
+            video,
+            transcript_path,
+            meta_path,
+            prefix,
+            reason=f"gemini parse failure: {parse_error}",
+            start_offset=start_offset,
+            end_offset=end_offset,
         )
         if fb is not None:
             return fb
@@ -4079,7 +4117,10 @@ def cmd_transcript(args, config):
     # single-call process_transcript path that has existed since PR #48.
     chunk_minutes = getattr(args, "chunk_minutes", None) or TRANSCRIPT_CHUNK_MINUTES_DEFAULT
     manual_segment = start_offset is not None or end_offset is not None
-    use_chunking = args.url and not manual_segment
+    # Issue #60: yt-captions never needs chunking (the caption track is returned
+    # whole regardless of length), so route it to the single-shot path which
+    # handles the captions source.
+    use_chunking = args.url and not manual_segment and transcript_source != "yt-captions"
 
     if use_chunking:
         duration_seconds = _lookup_video_duration_seconds(video["video_id"])
@@ -4106,8 +4147,21 @@ def cmd_transcript(args, config):
                 force=args.force,
             )
             out_path = channel_dir / f"{prefix}.transcript.md"
+            # Issue #60: on auto, fall back to captions if the whole chunked run
+            # failed (all chunks unparseable). A partial keeps the higher-fidelity
+            # Gemini content; only a hard error triggers the captions failover.
+            if transcript_source == "auto" and status.startswith("error"):
+                fb = _try_captions_transcript(
+                    video,
+                    out_path,
+                    channel_dir / f"{prefix}.meta.json",
+                    prefix,
+                    reason=f"chunked transcript failed: {status}",
+                )
+                if fb is not None:
+                    _, status = fb
             log.info("  %s: %s", prefix, status)
-            if status == "done":
+            if status.startswith("done"):
                 log.info("  Saved: %s", out_path)
             return
 
@@ -4285,7 +4339,9 @@ def _cmd_process_url(args, config):
     log.info("  Step 1/3: transcript")
     chunk_minutes = getattr(args, "chunk_minutes", None) or TRANSCRIPT_CHUNK_MINUTES_DEFAULT
     try:
-        if duration_seconds and duration_seconds > chunk_minutes * 60:
+        # Issue #60: yt-captions never chunks (caption track is whole); route it
+        # to the single-shot path which builds from captions.
+        if duration_seconds and duration_seconds > chunk_minutes * 60 and transcript_source != "yt-captions":
             chunks = _build_transcript_chunks(duration_seconds, chunk_minutes)
             log.info(
                 "    %s is %s; running %d chunks of %d min each.",
@@ -4307,6 +4363,18 @@ def _cmd_process_url(args, config):
                 chunk_minutes=chunk_minutes,
                 force=args.force,
             )
+            # Issue #60: on auto, fall back to captions if the chunked run failed
+            # outright (a partial keeps the higher-fidelity Gemini content).
+            if transcript_source == "auto" and transcript_status.startswith("error"):
+                fb = _try_captions_transcript(
+                    video,
+                    transcript_path,
+                    channel_dir / f"{prefix}.meta.json",
+                    prefix,
+                    reason=f"chunked transcript failed: {transcript_status}",
+                )
+                if fb is not None:
+                    _, transcript_status = fb
         else:
             _, transcript_status = process_transcript(
                 client,
