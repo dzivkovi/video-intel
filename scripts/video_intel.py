@@ -3448,8 +3448,10 @@ def cmd_scan(args, config):
         # Issue #70: pre-flight metadata filter. Drop videos that have not aired
         # (scheduled premieres / live) or are non-public BEFORE any Gemini call.
         # Gemini ingests no playable stream for these and confabulates a stub
-        # (the 2026-06-18 prompt=0 garbage). Piggybacks the duration call's quota
-        # tier (parts are free). Same quota-exhaustion fail-out as durations.
+        # (the 2026-06-18 prompt=0 garbage). This is a separate videos.list call
+        # from the duration enrich above, so it costs 1 quota unit per 50-id batch
+        # (negligible: ~4 units for a 200-video channel). Same quota-exhaustion
+        # fail-out as durations.
         try:
             statuses = fetch_preflight_status(youtube, [v["video_id"] for v in videos])
         except HttpError as e:

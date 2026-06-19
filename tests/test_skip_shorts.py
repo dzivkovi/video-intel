@@ -426,6 +426,32 @@ class TestCmdScanSkipShorts:
         assert "short1" in ids, "Short must be kept when skip_shorts=false"
         assert "long1" in ids
 
+    def test_preflight_drops_upcoming_before_process(self, tmp_path, monkeypatch):
+        """Issue #70 integration: an upcoming-premiere video is dropped before it
+        reaches processing; an aired public video still processes."""
+        videos = [
+            {"video_id": "premiere1", "title": "Upcoming Premiere", "published": "2026-04-15"},
+            {"video_id": "aired1", "title": "Aired Video", "published": "2026-04-15"},
+        ]
+        durations = {"premiere1": "PT10M", "aired1": "PT10M"}
+        captured = _scan_setup(monkeypatch, videos, durations=durations)
+        # Override the keep-all stub: premiere1 is an upcoming premiere.
+        monkeypatch.setattr(
+            vi,
+            "fetch_preflight_status",
+            lambda _yt, _ids: {
+                "premiere1": {"live_broadcast_content": "upcoming", "privacy_status": "public"},
+                "aired1": {"live_broadcast_content": "none", "privacy_status": "public"},
+            },
+        )
+
+        config = {"output_dir": str(tmp_path), "channels": [{"name": "ch", "url": "https://example.com/ch"}]}
+        vi.cmd_scan(_scan_args(), config)
+
+        ids = [v["video_id"] for v in captured["processed"]]
+        assert "premiere1" not in ids, "Upcoming premiere must be dropped before processing"
+        assert "aired1" in ids, "Aired public video must still process"
+
     def test_quota_exceeded_skips_channel_continues_to_next(self, tmp_path, monkeypatch):
         """Multi-channel: when channel A's enrich raises quotaExceeded, the
         scan must abort that channel cleanly (continue, not return) and still
