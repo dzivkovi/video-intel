@@ -403,6 +403,7 @@ def test_scan_dry_run_does_not_call_alt_title_recorder(tmp_path, monkeypatch):
     # the None youtube client. Returning all-None durations means is_short()
     # falls through to the URL check, which is also stubbed below.
     monkeypatch.setattr(vi, "enrich_with_durations", lambda _yt, ids: dict.fromkeys(ids))
+    monkeypatch.setattr(vi, "fetch_preflight_status", lambda _yt, ids: {vid: {} for vid in ids})
     monkeypatch.setattr(vi, "_is_youtube_short_url", lambda _vid: False)
 
     rotated = [{"video_id": "v1", "title": "Rotated", "published": "2026-04-15"}]
@@ -463,6 +464,7 @@ def test_scan_without_dry_run_calls_alt_title_recorder_on_rotation(tmp_path, mon
     # the None youtube client. Returning all-None durations means is_short()
     # falls through to the URL check, which is also stubbed below.
     monkeypatch.setattr(vi, "enrich_with_durations", lambda _yt, ids: dict.fromkeys(ids))
+    monkeypatch.setattr(vi, "fetch_preflight_status", lambda _yt, ids: {vid: {} for vid in ids})
     monkeypatch.setattr(vi, "_is_youtube_short_url", lambda _vid: False)
 
     rotated = [{"video_id": "v1", "title": "Rotated", "published": "2026-04-15"}]

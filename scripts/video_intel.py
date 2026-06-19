@@ -647,6 +647,53 @@ def enrich_with_durations(youtube, video_ids: list[str]) -> dict[str, str | None
     return durations
 
 
+def fetch_preflight_status(youtube, video_ids: list[str]) -> dict[str, dict]:
+    """Fetch per-video liveBroadcastContent + privacyStatus (issue #70).
+
+    Batches 50 ids per call - 1 quota unit per batch, the same cost as
+    ``enrich_with_durations`` (parts are free), so this is cheap to run on
+    every scan. Returns ``{video_id: {"live_broadcast_content": str|None,
+    "privacy_status": str|None}}``. Ids missing from the response (deleted,
+    gated) map to an empty dict so the caller's fail-safe keeps them - a
+    missing status is never a positive skip signal.
+    """
+    result: dict[str, dict] = {vid: {} for vid in video_ids}
+    if not video_ids:
+        return result
+    for i in range(0, len(video_ids), 50):
+        batch = video_ids[i : i + 50]
+        resp = youtube.videos().list(id=",".join(batch), part="snippet,status").execute()
+        for item in resp.get("items", []):
+            result[item["id"]] = {
+                "live_broadcast_content": item.get("snippet", {}).get("liveBroadcastContent"),
+                "privacy_status": item.get("status", {}).get("privacyStatus"),
+            }
+    return result
+
+
+def preflight_skip_reason(status: dict) -> str | None:
+    """Return why a video should be skipped before any Gemini call, or None to keep.
+
+    Issue #70, enforcing the principle "the corpus indexes things that have
+    happened, not things that will happen." Skips only on POSITIVE signals, so a
+    missing/empty status fails safe to KEEP (mirrors the duration fail-safe):
+
+    - ``liveBroadcastContent`` is ``upcoming`` or ``live``: a scheduled premiere
+      or in-progress stream that has not finished. Gemini fetches no playable
+      stream and confabulates a stub (the 2026-06-18 ``prompt=0`` failures).
+    - ``privacyStatus`` is present and not ``public`` (private/unlisted): scan
+      cannot reliably process these and Gemini's YouTube-URL ingestion is
+      public-only.
+    """
+    lbc = status.get("live_broadcast_content")
+    if lbc in ("upcoming", "live"):
+        return f"not yet aired (liveBroadcastContent={lbc})"
+    privacy = status.get("privacy_status")
+    if privacy and privacy != "public":
+        return f"non-public (privacyStatus={privacy})"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Selective scanning: playlists and keywords
 # ---------------------------------------------------------------------------
@@ -3397,6 +3444,35 @@ def cmd_scan(args, config):
             raise
         for v in videos:
             v["duration_iso"] = durations.get(v["video_id"])
+
+        # Issue #70: pre-flight metadata filter. Drop videos that have not aired
+        # (scheduled premieres / live) or are non-public BEFORE any Gemini call.
+        # Gemini ingests no playable stream for these and confabulates a stub
+        # (the 2026-06-18 prompt=0 garbage). Piggybacks the duration call's quota
+        # tier (parts are free). Same quota-exhaustion fail-out as durations.
+        try:
+            statuses = fetch_preflight_status(youtube, [v["video_id"] for v in videos])
+        except HttpError as e:
+            if e.resp.status == 403 and _is_quota_exceeded(e):
+                log.error(
+                    "[%s] YouTube quota exhausted during pre-flight metadata check; aborting this channel.",
+                    ch_name,
+                )
+                continue
+            raise
+        kept = []
+        n_preflight = 0
+        for v in videos:
+            reason = preflight_skip_reason(statuses.get(v["video_id"], {}))
+            if reason:
+                log.info('  Pre-flight skip "%s": %s', v.get("title", v["video_id"]), reason)
+                n_preflight += 1
+            else:
+                kept.append(v)
+        if n_preflight:
+            log.info("  Pre-flight: skipped %d not-yet-aired/non-public video(s).", n_preflight)
+        videos = kept
+
         if skip_shorts:
             kept = [v for v in videos if not is_short(v["video_id"], v["duration_iso"])]
             n_skipped = len(videos) - len(kept)
