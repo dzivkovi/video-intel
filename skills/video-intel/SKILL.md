@@ -21,7 +21,11 @@ description: >
   "process this local video", "run the full pipeline on [file]", "mindmap
   plus transcript plus concepts on one upload", "do everything on this
   MP4", "extract concepts", "rebuild the taxonomy", "rebuild the index",
-  "build the search index". Requires GEMINI_API_KEY, YOUTUBE_API_KEY, and
+  "build the search index", "captions-only indexing", "just use the YouTube
+  captions", "skip the expensive transcript", "fall back to captions when
+  Gemini fails", "this channel keeps hanging", "fix identity-less metas",
+  "backfill missing video_id", "this video keeps getting re-transcribed".
+  Requires GEMINI_API_KEY, YOUTUBE_API_KEY, and
   `channels:` configured in config.yaml - this skill must run from the
   plugin repo checkout, not a globally-installed cache. Calls Gemini as
   multimodal proxy (frames + on-screen text + audio). For read-only
@@ -47,15 +51,25 @@ Three layers, designed as a narrowing funnel.
    video; (b) and (c) are text-only and read what (a) wrote to disk. The
    `mindmap_source: auto` per-channel knob (default) routes step (b) to the
    text-only path when a transcript exists, with a fallback to mindmap-from-
-   video when no transcript is on disk.
+   video when no transcript is on disk. Per-channel `transcript_source`
+   (default `gemini`) can route step (a) to `yt-captions` (caption track only,
+   no Gemini) or `auto` (Gemini then captions on failure/timeout, issue #60).
+   Before any Gemini call, scan drops `upcoming`/`live` premieres and
+   non-public videos via a pre-flight metadata check (issue #70) - the corpus
+   indexes what has aired, not what is scheduled.
 
 2. **transcript** - Generate a fused document for a single video: diarized
    speech interleaved with timestamped SCREEN sections describing what was
    shown (slides, diagrams, code, demos). Uses a three-task decoupled prompt
-   for best quality. **Always Gemini multimodal in this skill** — there is
-   no YouTube captions / SRT path here. (The SRT-first path lives in
-   `translate_video.py` for BCS subtitle translation only; do not confuse
-   the two.)
+   for best quality. **Gemini multimodal is the default and the only path
+   that captures on-screen content and diarization.** A cheaper speech-only
+   fallback exists (issue #60): `transcript_source: yt-captions` builds the
+   transcript from the YouTube caption track alone (no SCREEN, no diarization,
+   no Gemini), and `transcript_source: auto` tries Gemini first and falls back
+   to captions on failure (token-cap, 403, the `prompt=0` confab guard, or a
+   wall-clock timeout). See the captions rows in the intent table below.
+   (A separate SRT path lives in `translate_video.py` for BCS subtitle
+   translation only - that is a different thing; do not confuse the two.)
 
 3. **concepts** - Extract and normalize key concepts from mind maps into a
    canonical vocabulary (taxonomy.json). Different videos use different words
@@ -102,7 +116,7 @@ Gemini API calls read video frames and audio — they take **1-5 minutes per vid
 - **`--log-level` goes BEFORE the subcommand.** `python video_intel.py --log-level info scan` works; `python video_intel.py scan --log-level info` errors with argparse. Applies to every subcommand.
 - **`--dry-run` is preview only** - shows what would be processed but creates no files and makes no Gemini calls. Use it to verify config before committing to a real scan.
 - **Use a long bash timeout** (at least 600000ms / 10 minutes) for scan and transcript commands. The default 2-minute timeout WILL kill multi-video scans prematurely.
-- **Silence between log lines is normal.** Gemini is processing video - don't diagnose or interrupt.
+- **Silence between log lines is normal.** Gemini is processing video - don't diagnose or interrupt. A genuinely *hung* call is bounded: each transcript Gemini call has a hard `transcript_timeout_seconds` wall-clock cap (default 600s, issue #74). On expiry it raises - and under `transcript_source: auto` falls back to the caption track - so one hung video can no longer freeze a whole scan.
 - **For large scans (10+ videos):** run in the background so the user isn't blocked. Check the output directory afterward for results.
 - **For single transcripts:** 1-3 minutes is typical. Wait for the "Saved:" line before proceeding.
 - **Transcripts are resilient to malformed JSON.** If Gemini returns broken JSON, the script tries to salvage partial content (speech entries, screen content) and writes a partial transcript with a visible warning. A partial transcript is useful for curiosity/search. For strategically important videos, rerun with `--model gemini-2.5-pro` or retry later.
@@ -216,7 +230,7 @@ For searching the corpus, nugget briefs, corpus status, or summarizing a video
 that is already indexed, use the **video-intel-search** skill. It is read-only,
 globally installable, and reads the same `output_dir` this skill writes to.
 This skill covers the write path only: scan, transcribe, process, index,
-concepts, dedupe, taxonomy-build.
+concepts, dedupe, taxonomy-build, prune-shorts, mark-skip, repair-metas.
 
 ## How to Use
 
@@ -350,6 +364,7 @@ Options:
 - `--video-id <ID>` - 11-char YouTube video ID for explicit canonical-meta matching
 - `--title <T>` / `--date YYYY-MM-DD` - Override filename-inferred defaults
 - `--force` - Regenerate even if transcript exists
+- `--transcript-source {gemini,yt-captions,auto}` - Where the transcript text comes from (issue #60). Default `gemini` (multimodal). `yt-captions` = caption track only, speech-only, no SCREEN/diarization. `auto` = Gemini then captions fallback on failure/timeout. Overrides the per-channel config knob. On `--file`, always Gemini (captions need a YouTube URL).
 
 ### Process a local video (full pipeline on one upload)
 
@@ -438,6 +453,10 @@ Options:
   step (default: low). Use `high` only when the prompt depends on reading
   fine on-screen text. LOW handles hour-long videos that HIGH cannot fit
   under Gemini's 1M-token cap.
+- `--transcript-source {gemini,yt-captions,auto}` - Transcript source for the
+  `--url` path (issue #60): `gemini` (default), `yt-captions` (caption track
+  only), or `auto` (Gemini then captions fallback). The `--file` path is always
+  Gemini multimodal (a local upload has no caption track to fall back to).
 
 ### Build the search index
 
@@ -567,6 +586,31 @@ Backward compat: existing meta.json files with the old `skip: true`
 keep behaving as full-skip on every mode. To migrate to per-mode, just
 re-run `mark-skip` with the new flags — `skip_modes` wins outright when
 both keys exist.
+
+### Backfill identity-less metas (repair-metas)
+
+Issue #66: a transcript meta.json written without `video_id` is skipped by the
+video_id index, so the video is re-transcribed every scan (and a re-queued one
+could hang). Going forward the transcript writers stamp full identity; for metas
+already on disk, `repair-metas` reconstructs identity from the `.transcript.md`
+header.
+
+```bash
+# Dry-run (default): report which metas would be backfilled, write nothing.
+python "c:/Users/danie/ws/Skills/video-intel/skills/video-intel/../../scripts/video_intel.py" repair-metas
+
+# Apply: write the reconstructed video_id/url/title/published/channel.
+python "c:/Users/danie/ws/Skills/video-intel/skills/video-intel/../../scripts/video_intel.py" repair-metas --apply
+
+# Restrict to one channel
+python "c:/Users/danie/ws/Skills/video-intel/skills/video-intel/../../scripts/video_intel.py" repair-metas --channel twist --apply
+```
+
+It only fills MISSING fields (never overwrites an existing value) and refuses to
+guess for non-YouTube sources (local/Skool recordings with no Source URL in the
+header - those are reported as "unrepairable"). Like `dedupe`/`prune-shorts`,
+it is dry-run by default. After `--apply`, re-run `index --force` so the
+backfilled videos' chunks carry their identity.
 
 ### Manage channels
 
