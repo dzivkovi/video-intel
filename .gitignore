@@ -58,6 +58,9 @@ skill-eval-workspace/**
 !skill-eval-workspace/**/*-report.html
 !skill-eval-workspace/**/*-trigger-eval.json
 !skill-eval-workspace/README.md
+# Windows-safe trigger-eval runner (the upstream run_eval.py fails on Windows:
+# select.select on a pipe -> WinError 10038, anthropics/skills#1061). Reusable tool.
+!skill-eval-workspace/*.py
 
 # Local smoke-test sandboxes (Gate 1 evidence is committed under docs/plans/gate1-evidence)
 /.smoke/

@@ -1,0 +1,19 @@
+[
+  {"query": "Catch up on @example_creator's videos I'm missing", "should_trigger": true, "tag": "backlog-fuzzy-name"},
+  {"query": "Fully scan the @example_news channel from the very beginning", "should_trigger": true, "tag": "full-history-intent"},
+  {"query": "Transcribe this video for me: https://www.youtube.com/watch?v=dQw4w9WgXcQ", "should_trigger": true, "tag": "single-video-transcript"},
+  {"query": "What's new from @example_ml_creator this week?", "should_trigger": true, "tag": "recent-window-creator"},
+  {"query": "Add the @example_podcast youtube channel to my watchlist so I scan it weekly", "should_trigger": true, "tag": "config-management"},
+  {"query": "Backfill @example_tutorials' last 6 months of videos with mindmaps and transcripts", "should_trigger": true, "tag": "explicit-backlog-with-date"},
+  {"query": "Get me a transcript with on-screen content (slides, code) preserved for https://youtube.com/watch?v=abc123 — I want to read what was shown not just spoken", "should_trigger": true, "tag": "rich-transcript-explicit"},
+  {"query": "This channel posts 2-hour podcasts and the multimodal transcripts keep blowing the token limit — can you just index them from the YouTube captions instead of reading the whole video?", "should_trigger": true, "tag": "captions-only-cost (#60)"},
+  {"query": "A bunch of my videos keep getting re-transcribed on every scan even though they're already done — I think their meta.json files are missing the video id. Can you fix that?", "should_trigger": true, "tag": "repair-metas-identity (#66)"},
+  {"query": "One of my channels keeps freezing my scan on a long interview — it just hangs forever on that video. Make it stop doing that.", "should_trigger": true, "tag": "hang-timeout-failover (#74)"},
+  {"query": "What videos in my library cover MCP servers and the Model Context Protocol?", "should_trigger": false, "tag": "near-miss-search-belongs-to-search-skill"},
+  {"query": "Download the English captions for this YouTube video and save them as an .srt file on my desktop, no indexing, just the raw subtitles: https://youtube.com/watch?v=abc123", "should_trigger": false, "tag": "near-miss-srt-only-belongs-to-translate-bcs"},
+  {"query": "Translate this YouTube video to Bosnian: https://www.youtube.com/watch?v=dQw4w9WgXcQ", "should_trigger": false, "tag": "cross-skill-bcs-translation"},
+  {"query": "Make Croatian subtitles for https://www.youtube.com/watch?v=dQw4w9WgXcQ for someone who doesn't speak English well", "should_trigger": false, "tag": "cross-skill-bcs-subtitles"},
+  {"query": "Just give me the English SRT file for this video, no translation needed: https://youtube.com/watch?v=abc123", "should_trigger": false, "tag": "cross-skill-srt-only"},
+  {"query": "What's the weather forecast for this weekend?", "should_trigger": false, "tag": "totally-unrelated"},
+  {"query": "Fix the bug in scripts/translate_video.py around line 42 where the retry loop never exits", "should_trigger": false, "tag": "repo-coding-task"}
+]

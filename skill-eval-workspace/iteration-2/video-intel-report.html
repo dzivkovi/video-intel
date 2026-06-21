@@ -1,0 +1,25 @@
+<!doctype html><meta charset=utf-8><title>video-intel trigger eval - iteration 2</title>
+<style>body{font:14px/1.5 system-ui;margin:2rem;max-width:1100px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:6px 10px;text-align:left;vertical-align:top}th{background:#f4f4f4}.s{font-size:18px}.n{color:#666;font-size:12px}</style>
+<h1>video-intel — trigger eval (iteration 2)</h1>
+<p>Skill <code>video-intel:video-intel</code> · model claude-opus-4-8 · 2 runs/query · 2026-06-21</p>
+<p class=s><b>16/17 passed</b> (94%).</p>
+<p class=n>Measured with the Windows-safe runner (run_trigger_eval_win.py); the upstream skill-creator run_eval.py fails on Windows (select.select on a pipe → WinError 10038, upstream issue anthropics/skills#1061). Channel names in queries are generic placeholders.</p>
+<table><tr><th></th><th>expected</th><th>rate</th><th>tag</th><th>query</th></tr>
+<tr><td>✓</td><td>trigger</td><td><b style=color:#1b7f37>2/2</b></td><td>backlog-fuzzy-name</td><td>Catch up on @example_creator&#x27;s videos I&#x27;m missing</td></tr>
+<tr><td>✓</td><td>trigger</td><td><b style=color:#1b7f37>2/2</b></td><td>full-history-intent</td><td>Fully scan the @example_news channel from the very beginning</td></tr>
+<tr><td>✓</td><td>trigger</td><td><b style=color:#1b7f37>2/2</b></td><td>single-video-transcript</td><td>Transcribe this video for me: https://www.youtube.com/watch?v=dQw4w9WgXcQ</td></tr>
+<tr><td>✓</td><td>trigger</td><td><b style=color:#1b7f37>2/2</b></td><td>recent-window-creator</td><td>What&#x27;s new from @example_ml_creator this week?</td></tr>
+<tr><td>✓</td><td>trigger</td><td><b style=color:#1b7f37>2/2</b></td><td>config-management</td><td>Add the @example_podcast youtube channel to my watchlist so I scan it weekly</td></tr>
+<tr><td>✓</td><td>trigger</td><td><b style=color:#1b7f37>2/2</b></td><td>explicit-backlog-with-date</td><td>Backfill @example_tutorials&#x27; last 6 months of videos with mindmaps and transcripts</td></tr>
+<tr><td>✓</td><td>trigger</td><td><b style=color:#1b7f37>2/2</b></td><td>rich-transcript-explicit</td><td>Get me a transcript with on-screen content (slides, code) preserved for https://youtube.com/watch?v=abc123 — I want to read what was shown not just spoken</td></tr>
+<tr><td>✓</td><td>trigger</td><td><b style=color:#1b7f37>1/2</b></td><td>captions-only-cost (#60)</td><td>This channel posts 2-hour podcasts and the multimodal transcripts keep blowing the token limit — can you just index them from the YouTube captions instead of reading the whole video?</td></tr>
+<tr><td>✓</td><td>trigger</td><td><b style=color:#1b7f37>1/2</b></td><td>repair-metas-identity (#66)</td><td>A bunch of my videos keep getting re-transcribed on every scan even though they&#x27;re already done — I think their meta.json files are missing the video id. Can you fix that?</td></tr>
+<tr><td>✗</td><td>trigger</td><td><b style=color:#c0392b>0/2</b></td><td>hang-timeout-failover (#74)</td><td>One of my channels keeps freezing my scan on a long interview — it just hangs forever on that video. Make it stop doing that.</td></tr>
+<tr><td>✓</td><td>no-trigger</td><td><b style=color:#1b7f37>0/2</b></td><td>near-miss-search-belongs-to-search-skill</td><td>What videos in my library cover MCP servers and the Model Context Protocol?</td></tr>
+<tr><td>✓</td><td>no-trigger</td><td><b style=color:#1b7f37>0/2</b></td><td>near-miss-srt-only-belongs-to-translate-bcs</td><td>Download the English captions for this YouTube video and save them as an .srt file on my desktop, no indexing, just the raw subtitles: https://youtube.com/watch?v=abc123</td></tr>
+<tr><td>✓</td><td>no-trigger</td><td><b style=color:#1b7f37>0/2</b></td><td>cross-skill-bcs-translation</td><td>Translate this YouTube video to Bosnian: https://www.youtube.com/watch?v=dQw4w9WgXcQ</td></tr>
+<tr><td>✓</td><td>no-trigger</td><td><b style=color:#1b7f37>0/2</b></td><td>cross-skill-bcs-subtitles</td><td>Make Croatian subtitles for https://www.youtube.com/watch?v=dQw4w9WgXcQ for someone who doesn&#x27;t speak English well</td></tr>
+<tr><td>✓</td><td>no-trigger</td><td><b style=color:#1b7f37>0/2</b></td><td>cross-skill-srt-only</td><td>Just give me the English SRT file for this video, no translation needed: https://youtube.com/watch?v=abc123</td></tr>
+<tr><td>✓</td><td>no-trigger</td><td><b style=color:#1b7f37>0/2</b></td><td>totally-unrelated</td><td>What&#x27;s the weather forecast for this weekend?</td></tr>
+<tr><td>✓</td><td>no-trigger</td><td><b style=color:#1b7f37>0/2</b></td><td>repo-coding-task</td><td>Fix the bug in scripts/translate_video.py around line 42 where the retry loop never exits</td></tr>
+</table>
