@@ -2864,13 +2864,17 @@ def _transcript_identity_fields(video: dict, channel_dir: Path) -> dict:
     shape the scan/mindmap and chunked-transcript paths already write
     (scripts/video_intel.py: the chunked ``meta_fields`` block).
     """
-    return {
+    fields = {
         "video_url": video.get("url"),
         "video_id": video.get("video_id"),
         "channel": channel_dir.name,
         "title": video.get("title"),
         "published": video.get("published"),
     }
+    # Drop falsy values so a re-stamp can only ADD identity, never downgrade a
+    # previously-good field to None/"" - e.g. local-file flows where video["url"]
+    # may be empty (ce-data-integrity review, #66). channel is always truthy.
+    return {k: v for k, v in fields.items() if v}
 
 
 def _identity_from_transcript_header(transcript_path: Path) -> dict | None:
@@ -2883,13 +2887,16 @@ def _identity_from_transcript_header(transcript_path: Path) -> dict | None:
     """
     try:
         text = transcript_path.read_text(encoding="utf-8")[:4000]
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None
     src_m = re.search(r"^\*\*Source:\*\*\s*(\S+)", text, re.MULTILINE)
     if not src_m:
         return None
     url = src_m.group(1).strip()
-    vid_m = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})", url)
+    # Exactly 11 id chars with a right boundary: an over-long token after v=
+    # (e.g. a non-canonical URL) fails the match instead of being truncated to a
+    # wrong id (ce-data-integrity + Codex review, #66).
+    vid_m = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])", url)
     if not vid_m:
         return None
     fields = {
@@ -6436,13 +6443,17 @@ def cmd_repair_metas(args, config):
     only = getattr(args, "channel", None)
     repaired = 0
     unrepairable = 0
+    applied = 0
     for meta_path in sorted(output_dir.glob("*/*.meta.json")):
         channel = meta_path.parent.name
         if only and channel != only:
             continue
+        # encoding="utf-8" (not the cp1252 Windows default): a meta with non-ASCII
+        # content (Cyrillic/BCS creators) would otherwise raise UnicodeDecodeError -
+        # which is NOT an OSError - and abort the whole walk (ce-correctness review).
         try:
-            meta = json.loads(meta_path.read_text())
-        except (json.JSONDecodeError, OSError):
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             continue
         if meta.get("video_id"):
             continue  # already has identity
@@ -6458,7 +6469,12 @@ def cmd_repair_metas(args, config):
         if args.apply and missing:
             meta.update(missing)
             meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            applied += 1
         repaired += 1
+    if applied:
+        # A backfilled meta now carries video_id; drop the process-global index
+        # cache so a later step in this process sees it (mirrors dedupe).
+        _invalidate_video_id_cache()
     verb = "Repaired" if args.apply else "Would repair"
     log.info("%s %d identity-less meta(s); %d unrepairable (no usable header).", verb, repaired, unrepairable)
     if not args.apply and repaired:

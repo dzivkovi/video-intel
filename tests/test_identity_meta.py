@@ -123,6 +123,29 @@ class TestIdentityFromHeader:
         t.write_text("# Transcript: No source here\n", encoding="utf-8")
         assert vi._identity_from_transcript_header(t) is None
 
+    def test_rejects_overlong_id_instead_of_truncating(self, tmp_path):
+        # 16 id-chars after v= is not a valid 11-char id; the right-boundary
+        # lookahead must reject it, never truncate to a wrong id (#66 review).
+        t = tmp_path / "x.transcript.md"
+        t.write_text("**Source:** https://www.youtube.com/watch?v=ABCDEFGHIJK12345\n", encoding="utf-8")
+        assert vi._identity_from_transcript_header(t) is None
+
+
+class TestIdentityFieldsDropFalsy:
+    def test_drops_none_and_empty_never_downgrades(self, tmp_path):
+        # Local-file flows can pass url="" / title=None; those must be dropped so a
+        # re-stamp never clobbers a previously-good value (ce-data-integrity #66).
+        out = vi._transcript_identity_fields(
+            {"video_id": "vid123", "url": "", "title": None, "published": None}, tmp_path / "chan"
+        )
+        assert out == {"video_id": "vid123", "channel": "chan"}
+
+    def test_keeps_truthy(self, tmp_path):
+        out = vi._transcript_identity_fields(
+            {"video_id": "v", "url": "u", "title": "t", "published": "2026-01-01"}, tmp_path / "c"
+        )
+        assert out == {"video_url": "u", "video_id": "v", "channel": "c", "title": "t", "published": "2026-01-01"}
+
 
 # ---------------------------------------------------------------------------
 # Backfill command
@@ -166,3 +189,24 @@ class TestRepairMetas:
         (chan / "v.meta.json").write_text(json.dumps({"video_id": "keepme"}), encoding="utf-8")
         vi.cmd_repair_metas(_types.SimpleNamespace(channel=None, apply=True), {})
         assert json.loads((chan / "v.meta.json").read_text())["video_id"] == "keepme"
+
+    def test_non_ascii_meta_does_not_crash(self, tmp_path, monkeypatch):
+        # A Cyrillic-titled meta must not crash the walk via cp1252 decode on
+        # Windows (the encoding="utf-8" fix; ce-correctness #66).
+        chan = self._chan(tmp_path, monkeypatch)
+        (chan / "v.meta.json").write_text(
+            json.dumps({"transcript_status": "complete", "title": "Привет мир"}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        (chan / "v.transcript.md").write_text(
+            "# Transcript: Привет\n**Source:** https://youtu.be/abcDEF12345\n", encoding="utf-8"
+        )
+        vi.cmd_repair_metas(_types.SimpleNamespace(channel=None, apply=True), {})
+        assert json.loads((chan / "v.meta.json").read_text(encoding="utf-8"))["video_id"] == "abcDEF12345"
+
+    def test_missing_transcript_is_unrepairable_not_crash(self, tmp_path, monkeypatch):
+        chan = self._chan(tmp_path, monkeypatch)
+        (chan / "v.meta.json").write_text(json.dumps({"transcript_status": "complete"}), encoding="utf-8")
+        # no sibling v.transcript.md
+        vi.cmd_repair_metas(_types.SimpleNamespace(channel=None, apply=True), {})
+        assert "video_id" not in json.loads((chan / "v.meta.json").read_text(encoding="utf-8"))
