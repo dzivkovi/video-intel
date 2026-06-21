@@ -230,6 +230,22 @@ Source files changed by this decision:
   cloud-synced path is the kind of blast-radius operation that belongs in
   the user's hands.
 
+## Related constraint: meta.json read-after-write on the same mount (issue #67)
+
+The atomicity gap this ADR fixes for LanceDB has a softer sibling for `meta.json`.
+On Google Drive File Stream, a `scan` process can read a **stale** `.meta.json`
+(a cached pre-write version) even after the write flushed locally, so
+`is_processed` can re-queue an already-done video mid-scan. Unlike the LanceDB
+index, the meta layer is **not** relocated off the mount: `.meta.json` is part of
+the portable corpus the user wants Google Drive to preserve and sync, not a
+rebuildable local cache. A code mitigation (defensive re-read) is not reliable -
+a stale read is not distinguishable from a genuine "not done", and a second open
+has no strong reason to bypass the same cached view. The hazard is therefore
+**documented and accepted** rather than code-fixed; its impact is bounded to
+wasted re-transcription (no hang or corruption) now that #66 always stamps
+identity and #74 caps a hung transcript. See
+[`docs/troubleshooting.md`](../troubleshooting.md) ("Cloud-mount stale meta reads").
+
 ## Research References
 
 - [Plan: 2026-04-18-fix-decouple-lancedb-path-plan.md](../plans/2026-04-18-fix-decouple-lancedb-path-plan.md)
