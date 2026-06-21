@@ -15,6 +15,7 @@ This table doubles as the project's **failure-mode registry**: the **Status** co
 | Tiny transcript, `prompt=0`, looked "complete" | **Future/scheduled premiere** confabulated | confab guard discards it; pre-flight skips it before Gemini | auto (#60, #70) |
 | Two mindmaps / metas for one video | **Title rotation** (A/B SEO) | `dedupe` (dry-run first) | manual (run `dedupe`) |
 | Same video re-transcribed every scan; `meta.json` has no `video_id` | **Identity-less meta** (transcript writer was first and didn't stamp identity) | prevented going forward (writers stamp identity); `repair-metas --apply` heals existing ones | auto (#66) + `repair-metas` for old data |
+| An already-done video is re-queued mid-scan though its artifacts are on disk (corpus on Google Drive File Stream) | **Cloud-mount read-after-write staleness** - the mount serves a cached pre-write `meta.json` to the scanning process | accepted environmental constraint; impact is bounded to wasted re-transcription (no hang/corruption) since #66/#74. See the scenario below | documented (#67) - blunted by #66/#74 |
 
 ## Scenarios
 
@@ -56,6 +57,16 @@ The governing principle: **the corpus indexes things that have happened, not thi
 ### Title rotation (duplicate metas)
 
 A creator A/B-tests titles, rotating the slug so the same `video_id` lands under two prefixes. Run `dedupe` (dry-run first) to merge the loser titles into `alt_titles` on the canonical meta and remove the duplicate artifacts; then re-run `taxonomy-build` and `index --force`.
+
+### Cloud-mount stale meta reads (Google Drive File Stream) - accepted constraint
+
+When `output_dir` lives on Google Drive File Stream, a `scan` process can read a **stale `.meta.json`** - the mount serves a cached pre-write version even after the write flushed locally. `_load_video_id_index` then misses a `video_id` that is actually on disk, `is_processed` falls back to the slug path, misses on a rotated title, and re-queues an already-done video. The tell is that the *same on-disk bytes* return different answers depending on when the reading process opened the file. This is the same class of cloud-mount limitation as [ADR-0016](adr/ADR-0016-vector-db-path-config.md) (which relocated the LanceDB index off the mount): a cloud-sync drive does not guarantee the read-after-write consistency the idempotency check assumes.
+
+**Why this is documented, not code-fixed.** A stale read is not reliably distinguishable from a genuine "not done", and pathlib cannot force the mount's cache to refresh - a defensive re-read milliseconds later has no strong reason to bypass the same cached view (so it would be false confidence). Relocating `.meta.json` off the mount like `vector_db_dir` is the wrong trade: the vector index is a rebuildable local cache, but **`meta.json` is part of the portable corpus that Google Drive is meant to preserve and sync across machines.** So the meta layer intentionally stays with the corpus, and this read-after-write hazard is accepted.
+
+**Why the impact is now small.** Two former amplifiers shipped: identity is always stamped into the meta ([#66], so a *fresh* read builds a complete index) and a re-queued transcript that hangs no longer freezes the scan ([#74], it times out and fails over). What remains is at worst **one wasted re-transcription** of an already-done video - no hang, no corruption, no garbage.
+
+**If it bites you:** re-running the scan a few minutes later (a fresh process, after the mount's cache has caught up) processes it correctly. For a video that keeps re-queuing, `mark-skip --mode transcript` or `skip_video_ids` stops it. There is nothing to repair on disk - the artifacts are already correct.
 
 ## SOP: SRT bridge for an unlisted/captioned video
 
