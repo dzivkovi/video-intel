@@ -2,16 +2,18 @@
 
 Operator reference for the failure modes a scan hits in practice, each with its cause and a step-by-step recovery. These are documented procedures, not folklore - when a video does not process, find its symptom below.
 
+This table doubles as the project's **failure-mode registry**: the **Status** column records where each recovery lives. `auto (#N)` means the tool self-recovers at runtime (the fix is in code - nothing for you to do); `manual (...)` means the recovery needs an operator action or a one-off command. New hard-won recoveries get a row here; when one graduates from `manual` to `auto` (a code fix ships), flip its Status and link the PR. See the durability-ladder note in `CLAUDE.md` for when a recovery should become code vs stay a doc row.
+
 ## Quick reference
 
-| Symptom | Cause | Recovery |
-|---|---|---|
-| Scan never finds a video that exists | **Unlisted** (not in the uploads feed) | manual `process --url`/`process --file`, or the SRT bridge below |
-| `403 PERMISSION_DENIED` | **Members-only / gated** | download via membership, then `process --file` |
-| `400 INVALID_ARGUMENT`, fails fast | **Token cap** on a long video (single-shot transcript) | `process --url --chunk-minutes 50`, or `transcript_source: auto` |
-| Transcript call hangs for many minutes | **Gemini stall** on a long/dense video | per-channel time cap / `mark-skip --mode transcript` / blocklist |
-| Tiny transcript, `prompt=0`, looked "complete" | **Future/scheduled premiere** confabulated | the confab guard now discards it; delete any old stub; see #70 pre-flight |
-| Two mindmaps / metas for one video | **Title rotation** (A/B SEO) | `dedupe` |
+| Symptom | Cause | Recovery | Status |
+|---|---|---|---|
+| Scan never finds a video that exists | **Unlisted** (not in the uploads feed) | manual `process --url`/`process --file`, or the SRT bridge below | manual (hard API limit) |
+| `403 PERMISSION_DENIED` | **Members-only / gated** | download via membership, then `process --file` | manual (needs your access) |
+| `400 INVALID_ARGUMENT`, fails fast | **Token cap** on a long video (single-shot transcript) | `transcript_source: auto` (captions fallback), or `process --url --chunk-minutes 50` | auto (#60) |
+| Transcript call hangs for many minutes | **Gemini stall** on a long/dense video | per-transcript wall-clock timeout -> failover under `auto`; `mark-skip`/blocklist as backup | auto (#74) |
+| Tiny transcript, `prompt=0`, looked "complete" | **Future/scheduled premiere** confabulated | confab guard discards it; pre-flight skips it before Gemini | auto (#60, #70) |
+| Two mindmaps / metas for one video | **Title rotation** (A/B SEO) | `dedupe` (dry-run first) | manual (run `dedupe`) |
 
 ## Scenarios
 
@@ -37,10 +39,12 @@ A long video's single-shot structured-JSON transcript exceeds Gemini's input or 
 
 ### Transcript hang (no output for many minutes)
 
-A Gemini transcript call stalls. Defenses:
-- A scan loop with a per-channel time cap moves on after the cap (a single hung video cannot deadlock the batch).
+A Gemini transcript call stalls and never returns. The httpx `read` timeout only bounds per-byte *silence* (1200s), not total time, so a slow-dribble or SDK-internal-retry hang can deadlock a scan indefinitely. Defenses, in order:
+- **Per-transcript wall-clock timeout (issue #74, automatic).** Each transcript Gemini call (single-shot and per chunk) is capped at `transcript_timeout_seconds` (default 600s; per-channel/top-level config override). On expiry it raises `TranscriptTimeout`, which - exactly like a token-cap - **falls back to captions under `transcript_source: auto`** and is a clean error under `gemini`. A hang no longer deadlocks the batch and (under `auto`) self-rescues.
 - `mark-skip --url URL --mode transcript --reason "hang on Nh video"` stops retrying just the transcript while keeping mindmap/concepts.
 - Add the `video_id` to the channel's `skip_video_ids` to drop it before any Gemini call on future scans.
+
+If you see a hang that *isn't* cleared by the timeout, it means the cap is set too high for the situation - lower `transcript_timeout_seconds` (top-level or per-channel). A run-wide external `timeout`/cap wrapper is no longer needed.
 
 ### Confabulation on future/scheduled premieres (`prompt=0`)
 

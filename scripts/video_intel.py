@@ -21,6 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -1241,6 +1242,15 @@ def _fmt_hms(seconds: int) -> str:
 
 TRANSCRIPT_CHUNK_MINUTES_DEFAULT = 50
 
+# Issue #74: hard wall-clock cap (seconds) on a single transcript Gemini call.
+# A hung call never returns and the httpx read timeout (1200s) only catches
+# per-byte silence, not total time - so without this a hang deadlocks scan.
+# On expiry the call raises TimeoutError, which the existing failover treats
+# like any other Gemini failure (captions fallback under transcript_source=auto).
+# Default 600s (10 min): comfortably above a legitimate hour-long transcript's
+# wall-clock, well below the 1200s httpx read timeout so this fires first.
+TRANSCRIPT_TIMEOUT_DEFAULT = 600
+
 
 def _build_transcript_chunks(
     duration_seconds: int,
@@ -1515,6 +1525,50 @@ def merge_chunked_transcripts(
     return merged
 
 
+class TranscriptTimeout(TimeoutError):
+    """Raised when a transcript Gemini call exceeds its wall-clock budget (issue #74)."""
+
+
+def _run_with_timeout(fn: Callable, timeout_seconds: int):
+    """Run ``fn()`` with a hard wall-clock timeout; raise ``TranscriptTimeout`` on expiry.
+
+    Issue #74. A hung Gemini call never returns, and the httpx ``read`` timeout only
+    bounds per-byte silence, not total time - so a slow-dribble or SDK-internal retry
+    hang deadlocks the scan. This wraps the call in a **daemon** thread and joins with
+    a timeout: on expiry we raise (the caller's existing ``except`` routes it to the
+    captions failover, same as any other Gemini failure), and the orphaned worker
+    thread - which we cannot kill in Python - is a daemon, so it never blocks process
+    exit (it dies when the interpreter exits, or sooner when the underlying httpx read
+    timeout finally fires).
+
+    ``signal.alarm`` is deliberately not used: it is Unix-only and this runs on Windows.
+    ``ThreadPoolExecutor`` is not used either: its ``shutdown`` joins workers and would
+    re-block on the still-hung call. ``timeout_seconds <= 0`` disables the cap (runs
+    inline) so tests and power users can opt out.
+    """
+    if timeout_seconds is None or timeout_seconds <= 0:
+        return fn()
+
+    box: dict = {}
+
+    def _runner():
+        try:
+            box["result"] = fn()
+        except BaseException as exc:  # re-raised in the caller's thread below
+            box["error"] = exc
+
+    worker = threading.Thread(target=_runner, name="transcript-gemini-call", daemon=True)
+    worker.start()
+    worker.join(timeout_seconds)
+    if worker.is_alive():
+        raise TranscriptTimeout(
+            f"transcript Gemini call exceeded {timeout_seconds}s wall-clock timeout (hang)"
+        )
+    if "error" in box:
+        raise box["error"]
+    return box.get("result")
+
+
 def _run_chunked_transcript_url(
     *,
     client,
@@ -1529,6 +1583,7 @@ def _run_chunked_transcript_url(
     chunk_minutes: int,
     force: bool,
     media_uri: str | None = None,
+    transcript_timeout_seconds: int = TRANSCRIPT_TIMEOUT_DEFAULT,
 ) -> str:
     """Run transcript in N chunks against a YouTube URL or Files API URI, merge,
     write artifact.
@@ -1576,19 +1631,35 @@ def _run_chunked_transcript_url(
         # deduplicated the URL prefix; cached=0 means each chunk paid full
         # input tokens. The label includes chunk index so multiple-call
         # observability stays readable.
-        raw = call_gemini(
-            client,
-            types,
-            media_uri,
-            prompt_text,
-            model,
-            response_json=True,
-            start_offset=gemini_start,
-            end_offset=gemini_end,
-            on_response=lambda r, _idx=chunk_idx: log_usage_metadata(r, f"transcript-chunk{_idx}"),
-            thinking_config=thinking_config,
-            media_resolution=media_resolution_low,
-        )
+        try:
+            # Issue #74: wall-clock cap per chunk. A hung chunk raises
+            # TranscriptTimeout, which we treat as a per-chunk failure (mark it
+            # FAILED and continue) so one hang loses a single chunk, not the whole
+            # video, and never deadlocks the scan.
+            raw = _run_with_timeout(
+                lambda _s=gemini_start, _e=gemini_end, _i=chunk_idx: call_gemini(
+                    client,
+                    types,
+                    media_uri,
+                    prompt_text,
+                    model,
+                    response_json=True,
+                    start_offset=_s,
+                    end_offset=_e,
+                    on_response=lambda r, _idx=_i: log_usage_metadata(r, f"transcript-chunk{_idx}"),
+                    thinking_config=thinking_config,
+                    media_resolution=media_resolution_low,
+                ),
+                transcript_timeout_seconds,
+            )
+        except TranscriptTimeout as e:
+            log.warning("    chunk %s: %s", chunk_label_for_log, e)
+            failed_chunks.append((start_secs, end_secs, ""))
+            segment_rows.append(
+                {"range": _format_chunk_range_label(start_secs, end_secs or duration_seconds),
+                 "status": "FAILED (timeout)", "speakers": []}
+            )
+            continue
         try:
             parsed = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
@@ -2860,6 +2931,7 @@ def process_transcript(
     media_uri: str | None = None,
     media_resolution=None,
     transcript_source: str = "gemini",
+    transcript_timeout_seconds: int = TRANSCRIPT_TIMEOUT_DEFAULT,
 ):
     """Generate a fused transcript for a single video with layered JSON resilience.
 
@@ -2926,18 +2998,24 @@ def process_transcript(
     for attempt in range(1 + TRANSCRIPT_PARSE_RETRY_LIMIT):
         usage_capture.clear()
         try:
-            raw = call_gemini(
-                client,
-                types,
-                effective_media_uri,
-                prompt_text,
-                model,
-                response_json=True,
-                start_offset=start_offset,
-                end_offset=end_offset,
-                media_resolution=effective_media_resolution,
-                thinking_config=transcript_thinking_config,
-                on_response=_on_resp,
+            # Issue #74: hard wall-clock cap so a hung call raises instead of
+            # deadlocking. TranscriptTimeout is an Exception, so it falls into the
+            # handler below and (under transcript_source=auto) the captions failover.
+            raw = _run_with_timeout(
+                lambda: call_gemini(
+                    client,
+                    types,
+                    effective_media_uri,
+                    prompt_text,
+                    model,
+                    response_json=True,
+                    start_offset=start_offset,
+                    end_offset=end_offset,
+                    media_resolution=effective_media_resolution,
+                    thinking_config=transcript_thinking_config,
+                    on_response=_on_resp,
+                ),
+                transcript_timeout_seconds,
             )
         except Exception as e:
             # Issue #60: on auto, try the captions fallback before recording error.
@@ -3552,6 +3630,13 @@ def cmd_scan(args, config):
             # Default "gemini" preserves current behavior; "auto" adds the captions
             # failover when Gemini fails (token-cap, 403, confabulation).
             transcript_source = resolve_transcript_source(ch)
+            # Issue #74: wall-clock cap so a hung Gemini call raises (-> failover
+            # under auto) instead of deadlocking the whole batch. Per-channel
+            # override > top-level > default, matching every other knob.
+            transcript_timeout_seconds = ch.get(
+                "transcript_timeout_seconds",
+                config.get("transcript_timeout_seconds", TRANSCRIPT_TIMEOUT_DEFAULT),
+            )
             # Long-video guard (issue #42): videos longer than the threshold
             # truncate the structured-JSON transcript response. Filter them out
             # of the transcript loop and log the manual-clipping recipe.
@@ -3604,6 +3689,7 @@ def cmd_scan(args, config):
                             output_dir / ch_name,
                             video_file_prefix(v),
                             transcript_source=transcript_source,
+                            transcript_timeout_seconds=transcript_timeout_seconds,
                         ): v
                         for v in transcript_videos
                     }

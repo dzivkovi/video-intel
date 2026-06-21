@@ -134,7 +134,7 @@ table is the canonical mapping — read it before picking a command.
 | "I want notifications about new videos but no auto-processing", "discover only", "tell me what's new but don't run Gemini", "follow [creator] but don't pay for it" | set `auto_mindmap: none` and `auto_transcript: none` on the channel in `config.yaml` | Notify-only mode: scan logs new videos but skips both Gemini calls. Cherry-pick episodes manually with `mindmap --url URL --channel <name>` when one looks worth indexing. Useful for long-form podcasters (Lex Fridman). |
 | "drop short videos for [creator]", "only count [creator]'s long-form content", "for Lex anything under 30 min isn't worth it" | set `min_duration_seconds: 1800` on the channel in `config.yaml` | Per-channel duration floor (30 min = 1800s in this example). Drops anything shorter before Gemini sees it. Independent from the standard 60s `skip_shorts` filter. |
 | "index this cheaply", "captions only", "skip the expensive transcript for [creator]", "discovery-only indexing", "just use the YouTube captions" | `transcript --url URL --transcript-source yt-captions` (one-off) or set `transcript_source: yt-captions` on the channel (issue #60) | Skips Gemini entirely; builds a speech-only transcript from the YouTube caption track. Cheap, but **no on-screen content / no diarization** (flagged `transcript_source: youtube_captions`). Fails when the video has no captions. |
-| "fall back to captions when Gemini fails", "auto-recover failed transcripts", "this channel keeps hitting the token cap" | set `transcript_source: auto` on the channel, or `--transcript-source auto` (issue #60) | Tries Gemini first; on failure (token-cap `INVALID_ARGUMENT`, 403, or the `prompt=0` confabulation guard) falls back to the YouTube caption track. Never worse than `gemini`. |
+| "fall back to captions when Gemini fails", "auto-recover failed transcripts", "this channel keeps hitting the token cap", "this channel keeps hanging" | set `transcript_source: auto` on the channel, or `--transcript-source auto` (issue #60) | Tries Gemini first; on failure (token-cap `INVALID_ARGUMENT`, 403, the `prompt=0` confabulation guard, **or a wall-clock timeout / hang per issue #74**) falls back to the YouTube caption track. Never worse than `gemini`. |
 | "find videos about X", "search for Y", "nugget brief on Z", "corpus status", "verify quote", "fact-check claim against [creator]" | — | **Wrong skill.** These are read-only queries; use the **video-intel-search** skill. |
 
 ### Channel name resolution
@@ -180,7 +180,7 @@ meta.json fields these reference are in [`docs/meta-json-schema.md`](../../docs/
 | Scan never finds a video that exists | **Unlisted** (not in the uploads feed - a hard YouTube Data API limit) | manual `process --url`/`--file`, or `--transcript-source yt-captions` for a cheap captions index |
 | `403 PERMISSION_DENIED` (grep every URL run for it) | **Members-only / gated** | download via membership, then `process --file` |
 | `400 INVALID_ARGUMENT`, fails fast | **Token cap** on a long video | `process --url --chunk-minutes 50`, or set `transcript_source: auto` (captions failover) |
-| Transcript hangs for many minutes | **Gemini stall** | `mark-skip --mode transcript`, or add the id to `skip_video_ids` |
+| Transcript hangs for many minutes | **Gemini stall** | Auto-capped per transcript (`transcript_timeout_seconds`, default 600s, issue #74) -> failover under `transcript_source: auto`; `mark-skip --mode transcript` or `skip_video_ids` as backup |
 | Tiny `prompt=0` transcript that looked "complete" | **Future/scheduled premiere** confabulated | the issue #60 confab guard now discards it; delete any old stub |
 | Two mindmaps/metas for one video | **Title rotation** | `dedupe` |
 
@@ -586,6 +586,10 @@ transcript_max_duration_seconds: 7200   # Skip transcripts on videos longer than
                                         # (issue #42). Default 2 hours - leaves headroom
                                         # for technical talks. Mindmap phase is
                                         # unaffected. Override per workload.
+transcript_timeout_seconds: 600         # Hard wall-clock cap per transcript Gemini call
+                                        # (issue #74). Default 10 min. On expiry the call
+                                        # raises -> failover under transcript_source: auto.
+                                        # Per-channel override supported.
 
 channels:
   - name: natebjones               # Folder name for output
