@@ -14,6 +14,7 @@ This table doubles as the project's **failure-mode registry**: the **Status** co
 | Transcript call hangs for many minutes | **Gemini stall** on a long/dense video | per-transcript wall-clock timeout -> failover under `auto`; `mark-skip`/blocklist as backup | auto (#74) |
 | Tiny transcript, `prompt=0`, looked "complete" | **Future/scheduled premiere** confabulated | confab guard discards it; pre-flight skips it before Gemini | auto (#60, #70) |
 | Two mindmaps / metas for one video | **Title rotation** (A/B SEO) | `dedupe` (dry-run first) | manual (run `dedupe`) |
+| Same video re-transcribed every scan; `meta.json` has no `video_id` | **Identity-less meta** (transcript writer was first and didn't stamp identity) | prevented going forward (writers stamp identity); `repair-metas --apply` heals existing ones | auto (#66) + `repair-metas` for old data |
 
 ## Scenarios
 

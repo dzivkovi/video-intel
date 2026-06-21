@@ -2853,6 +2853,66 @@ def _record_transcript_error(meta_path: Path, error: str) -> None:
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
 
+def _transcript_identity_fields(video: dict, channel_dir: Path) -> dict:
+    """Identity fields every transcript meta.json must carry (issue #66).
+
+    The single-shot and captions transcript writers used to persist a meta with
+    only ``{processed, transcript_status, ...}`` - no ``video_id`` - so when the
+    transcript loop is the first writer (inverted ordering, #54) it left an
+    identity-less meta that ``_load_video_id_index`` skips, breaking idempotency
+    (the video is re-transcribed every scan). This mirrors the complete-meta
+    shape the scan/mindmap and chunked-transcript paths already write
+    (scripts/video_intel.py: the chunked ``meta_fields`` block).
+    """
+    fields = {
+        "video_url": video.get("url"),
+        "video_id": video.get("video_id"),
+        "channel": channel_dir.name,
+        "title": video.get("title"),
+        "published": video.get("published"),
+    }
+    # Drop falsy values so a re-stamp can only ADD identity, never downgrade a
+    # previously-good field to None/"" - e.g. local-file flows where video["url"]
+    # may be empty (ce-data-integrity review, #66). channel is always truthy.
+    return {k: v for k, v in fields.items() if v}
+
+
+def _identity_from_transcript_header(transcript_path: Path) -> dict | None:
+    """Reconstruct identity fields from a ``.transcript.md`` header (issue #66 backfill).
+
+    Headers written by ``_write_transcript_md`` carry ``# Transcript: {title}``,
+    ``**Source:** {url}``, and ``**Published:** {date}``. Returns the identity
+    fields (``video_url``, ``video_id``, ``channel``, ``title``, ``published``)
+    or ``None`` when no Source URL with a parseable 11-char video id is present.
+    """
+    try:
+        text = transcript_path.read_text(encoding="utf-8")[:4000]
+    except (OSError, UnicodeDecodeError):
+        return None
+    src_m = re.search(r"^\*\*Source:\*\*\s*(\S+)", text, re.MULTILINE)
+    if not src_m:
+        return None
+    url = src_m.group(1).strip()
+    # Exactly 11 id chars with a right boundary: an over-long token after v=
+    # (e.g. a non-canonical URL) fails the match instead of being truncated to a
+    # wrong id (ce-data-integrity + Codex review, #66).
+    vid_m = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])", url)
+    if not vid_m:
+        return None
+    fields = {
+        "video_url": url,
+        "video_id": vid_m.group(1),
+        "channel": transcript_path.parent.name,
+    }
+    title_m = re.search(r"^# Transcript:\s*(.+)$", text, re.MULTILINE)
+    if title_m:
+        fields["title"] = title_m.group(1).strip()
+    pub_m = re.search(r"^\*\*Published:\*\*\s*(\S+)", text, re.MULTILINE)
+    if pub_m:
+        fields["published"] = pub_m.group(1).strip()
+    return fields
+
+
 def _try_captions_transcript(
     video: dict,
     transcript_path: Path,
@@ -2899,6 +2959,7 @@ def _try_captions_transcript(
         transcript_source=TRANSCRIPT_SOURCE_CAPTIONS,
     )
     fields = {
+        **_transcript_identity_fields(video, meta_path.parent),
         "processed": datetime.now(UTC).isoformat(),
         "transcript_status": "complete",
         "transcript_source": TRANSCRIPT_SOURCE_CAPTIONS,
@@ -3092,6 +3153,7 @@ def process_transcript(
             update_meta(
                 meta_path,
                 {
+                    **_transcript_identity_fields(video, channel_dir),
                     "processed": datetime.now(UTC).isoformat(),
                     "transcript_status": "complete",
                     "transcript_source": TRANSCRIPT_SOURCE_GEMINI,
@@ -3125,6 +3187,7 @@ def process_transcript(
             update_meta(
                 meta_path,
                 {
+                    **_transcript_identity_fields(video, channel_dir),
                     "processed": datetime.now(UTC).isoformat(),
                     "transcript_status": "partial",
                     "transcript_source": TRANSCRIPT_SOURCE_GEMINI,
@@ -6367,6 +6430,57 @@ def cmd_nugget(args, config):
         print(response_text)
 
 
+def cmd_repair_metas(args, config):
+    """Backfill identity into identity-less transcript metas (issue #66).
+
+    Finds ``.meta.json`` files missing ``video_id`` and reconstructs identity
+    from the sibling ``.transcript.md`` header. Dry-run by default; ``--apply``
+    writes. Only fills MISSING fields - never overwrites an existing value. This
+    heals metas written before the transcript writer stamped full identity, which
+    otherwise defeat ``_load_video_id_index`` and get re-transcribed every scan.
+    """
+    output_dir = resolve_output_dir(config)
+    only = getattr(args, "channel", None)
+    repaired = 0
+    unrepairable = 0
+    applied = 0
+    for meta_path in sorted(output_dir.glob("*/*.meta.json")):
+        channel = meta_path.parent.name
+        if only and channel != only:
+            continue
+        # encoding="utf-8" (not the cp1252 Windows default): a meta with non-ASCII
+        # content (Cyrillic/BCS creators) would otherwise raise UnicodeDecodeError -
+        # which is NOT an OSError - and abort the whole walk (ce-correctness review).
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            continue
+        if meta.get("video_id"):
+            continue  # already has identity
+        prefix = meta_path.name[: -len(".meta.json")]
+        transcript_path = meta_path.parent / f"{prefix}.transcript.md"
+        identity = _identity_from_transcript_header(transcript_path) if transcript_path.exists() else None
+        if not identity:
+            unrepairable += 1
+            log.warning("  [%s] %s: no usable .transcript.md header to backfill from", channel, prefix)
+            continue
+        missing = {k: v for k, v in identity.items() if v and not meta.get(k)}
+        log.info("  [%s] %s: backfill %s", channel, prefix, ", ".join(sorted(missing)) or "(nothing missing)")
+        if args.apply and missing:
+            meta.update(missing)
+            meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            applied += 1
+        repaired += 1
+    if applied:
+        # A backfilled meta now carries video_id; drop the process-global index
+        # cache so a later step in this process sees it (mirrors dedupe).
+        _invalidate_video_id_cache()
+    verb = "Repaired" if args.apply else "Would repair"
+    log.info("%s %d identity-less meta(s); %d unrepairable (no usable header).", verb, repaired, unrepairable)
+    if not args.apply and repaired:
+        log.info("Re-run with --apply to write. After applying, run 'index --force' if idempotency was affected.")
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -6724,6 +6838,18 @@ Examples:
         help="Actually mutate disk. Default is dry-run (report only).",
     )
 
+    # repair-metas command (issue #66)
+    repair_parser = subparsers.add_parser(
+        "repair-metas",
+        help="Backfill missing identity (video_id/url/title/published) into transcript metas from their .transcript.md headers (issue #66).",
+    )
+    repair_parser.add_argument("--channel", help="Restrict to this channel (default: all channels).")
+    repair_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write the backfilled fields. Default is dry-run (report only).",
+    )
+
     # prune-shorts command
     prune_parser = subparsers.add_parser(
         "prune-shorts",
@@ -6792,6 +6918,8 @@ Examples:
         cmd_nugget(args, config)
     elif args.command == "status":
         cmd_status(args, config)
+    elif args.command == "repair-metas":
+        cmd_repair_metas(args, config)
     elif args.command == "dedupe":
         cmd_dedupe(args, config)
     elif args.command == "prune-shorts":
