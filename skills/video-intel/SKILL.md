@@ -66,8 +66,9 @@ Three layers, designed as a narrowing funnel.
    fallback exists (issue #60): `transcript_source: yt-captions` builds the
    transcript from the YouTube caption track alone (no SCREEN, no diarization,
    no Gemini), and `transcript_source: auto` tries Gemini first and falls back
-   to captions on failure (token-cap, 403, the `prompt=0` confab guard, or a
-   wall-clock timeout). See the captions rows in the intent table below.
+   to the caption track when the Gemini transcript fails (token-cap, 403, the
+   `prompt=0` confab guard; and a hung call on the single-shot path). See the
+   captions rows in the intent table below.
    (A separate SRT path lives in `translate_video.py` for BCS subtitle
    translation only - that is a different thing; do not confuse the two.)
 
@@ -116,7 +117,7 @@ Gemini API calls read video frames and audio — they take **1-5 minutes per vid
 - **`--log-level` goes BEFORE the subcommand.** `python video_intel.py --log-level info scan` works; `python video_intel.py scan --log-level info` errors with argparse. Applies to every subcommand.
 - **`--dry-run` is preview only** - shows what would be processed but creates no files and makes no Gemini calls. Use it to verify config before committing to a real scan.
 - **Use a long bash timeout** (at least 600000ms / 10 minutes) for scan and transcript commands. The default 2-minute timeout WILL kill multi-video scans prematurely.
-- **Silence between log lines is normal.** Gemini is processing video - don't diagnose or interrupt. A genuinely *hung* call is bounded: each transcript Gemini call has a hard `transcript_timeout_seconds` wall-clock cap (default 600s, issue #74). On expiry it raises - and under `transcript_source: auto` falls back to the caption track - so one hung video can no longer freeze a whole scan.
+- **Silence between log lines is normal.** Gemini is processing video - don't diagnose or interrupt. A genuinely *hung* call is bounded: each transcript Gemini call has a hard `transcript_timeout_seconds` wall-clock cap (default 600s, issue #74). On expiry it raises, so one hung video can no longer freeze a whole scan; on the single-shot path under `transcript_source: auto` it then falls back to the caption track.
 - **For large scans (10+ videos):** run in the background so the user isn't blocked. Check the output directory afterward for results.
 - **For single transcripts:** 1-3 minutes is typical. Wait for the "Saved:" line before proceeding.
 - **Transcripts are resilient to malformed JSON.** If Gemini returns broken JSON, the script tries to salvage partial content (speech entries, screen content) and writes a partial transcript with a visible warning. A partial transcript is useful for curiosity/search. For strategically important videos, rerun with `--model gemini-2.5-pro` or retry later.
@@ -364,7 +365,7 @@ Options:
 - `--video-id <ID>` - 11-char YouTube video ID for explicit canonical-meta matching
 - `--title <T>` / `--date YYYY-MM-DD` - Override filename-inferred defaults
 - `--force` - Regenerate even if transcript exists
-- `--transcript-source {gemini,yt-captions,auto}` - Where the transcript text comes from (issue #60). Default `gemini` (multimodal). `yt-captions` = caption track only, speech-only, no SCREEN/diarization. `auto` = Gemini then captions fallback on failure/timeout. Overrides the per-channel config knob. On `--file`, always Gemini (captions need a YouTube URL).
+- `--transcript-source {gemini,yt-captions,auto}` - Where the transcript text comes from (issue #60). Default `gemini` (multimodal). `yt-captions` = caption track only, speech-only, no SCREEN/diarization. `auto` = Gemini then captions fallback on failure. Overrides the per-channel config knob. Captions need a YouTube URL, so keep a local `--file` on `gemini` - `yt-captions`/`auto` have no caption track to fetch on a local upload.
 
 ### Process a local video (full pipeline on one upload)
 
@@ -597,20 +598,22 @@ header.
 
 ```bash
 # Dry-run (default): report which metas would be backfilled, write nothing.
-python "c:/Users/danie/ws/Skills/video-intel/skills/video-intel/../../scripts/video_intel.py" repair-metas
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" repair-metas
 
 # Apply: write the reconstructed video_id/url/title/published/channel.
-python "c:/Users/danie/ws/Skills/video-intel/skills/video-intel/../../scripts/video_intel.py" repair-metas --apply
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" repair-metas --apply
 
 # Restrict to one channel
-python "c:/Users/danie/ws/Skills/video-intel/skills/video-intel/../../scripts/video_intel.py" repair-metas --channel twist --apply
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" repair-metas --channel twist --apply
 ```
 
 It only fills MISSING fields (never overwrites an existing value) and refuses to
 guess for non-YouTube sources (local/Skool recordings with no Source URL in the
-header - those are reported as "unrepairable"). Like `dedupe`/`prune-shorts`,
-it is dry-run by default. After `--apply`, re-run `index --force` so the
-backfilled videos' chunks carry their identity.
+header - those are reported as "unrepairable"). A meta that already has
+`video_id` is skipped entirely, even if other identity fields are missing - the
+index only needs `video_id`. Like `dedupe`/`prune-shorts`, it is dry-run by
+default. After `--apply`, re-run `index --force` so the backfilled videos'
+chunks carry their identity.
 
 ### Manage channels
 
