@@ -144,6 +144,7 @@ table is the canonical mapping — read it before picking a command.
 | "rebuild the index", "reindex after dedupe" | `index --force` | Write-path rebuild of LanceDB; query uses `video-intel-search` |
 | "prune shorts", "remove shorts", "too many shorts in my corpus" | `prune-shorts [--apply]` | **Always `--dry-run` first** — destructive on `--apply`; deletes mindmap/transcript/concepts/meta per Short |
 | "rebuild taxonomy", "update master vocabulary" | `taxonomy-build` | Derived artifact; rebuildable anytime |
+| "catch me up on what I missed", "what haven't I been briefed on", "videos I haven't seen yet", "generate a catch-up briefing", "fill the gaps in my viewing guides" | `briefings --unseen [--dry-run] [--since DATE]` | Surfaces corpus videos absent from every existing `_briefings/*.md` `video_ids` list (strict set difference, never re-surfaced once briefed), within a default 90-day UTC recency window, ranked by overlap with the inferred profile in `_briefings/profile.yaml`. `--dry-run` previews; otherwise writes `_briefings/<date>-catch-up-unseen.md`. No Gemini, no `channels:` required. |
 | "this video keeps getting re-transcribed", "fix identity-less metas", "backfill missing video_id", "meta.json has no video_id" | `repair-metas [--apply]` | **Dry-run first** (issue #66). Reconstructs `video_id`/`url`/`title`/`published` from the `.transcript.md` header for metas missing identity; only fills missing fields; refuses local/non-YouTube sources. Re-run `index --force` after `--apply`. |
 | "skip transcript on this video", "stop trying to transcribe [URL]", "this video keeps failing transcript", "block transcript only" | `mark-skip --url URL --mode transcript [--reason TEXT]` | Per-mode skip (issue #42). Mindmap and concepts continue to run. Repeatable: `--mode transcript --mode concepts`. |
 | "permanently ignore this video", "never re-process [video_id]", "skip these IDs on backfill", "stop touching this URL on every scan" | edit `skip_video_ids` under the channel in `config.yaml` | Declarative pre-fetch blocklist. Listed IDs never reach Gemini, never get a meta.json, no cost. Override = remove the ID from config. Cheaper than `mark-skip` since no meta.json roundtrip needed. |
@@ -231,7 +232,8 @@ For searching the corpus, nugget briefs, corpus status, or summarizing a video
 that is already indexed, use the **video-intel-search** skill. It is read-only,
 globally installable, and reads the same `output_dir` this skill writes to.
 This skill covers the write path only: scan, transcribe, process, index,
-concepts, dedupe, taxonomy-build, prune-shorts, mark-skip, repair-metas.
+concepts, dedupe, taxonomy-build, prune-shorts, mark-skip, repair-metas,
+briefings.
 
 ## How to Use
 
@@ -471,6 +473,29 @@ python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" index --force
 
 The `index` command is a write-path operation (rebuilds the LanceDB hybrid
 index). Querying the index belongs to the `video-intel-search` skill.
+
+### Generate a catch-up briefing (unseen videos)
+
+```bash
+# Preview what hasn't been surfaced in any _briefings/ guide yet (writes nothing)
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" briefings --unseen --dry-run
+
+# Write a catch-up briefing of unseen videos from the last 90 days
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" briefings --unseen
+
+# Widen the window (overrides the 90-day recency floor)
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" briefings --unseen --since 2026-01-01
+```
+
+`briefings --unseen` surfaces corpus videos that appear in no existing
+`_briefings/*.md` front-matter `video_ids` list (strict set difference, so a
+video is never re-surfaced once it lands in any briefing), bounded to a UTC
+date window (default 90-day recency floor; `--since` / `--until` override),
+ranked by concept/taxonomy overlap with an inferred interest profile persisted
+at `_briefings/profile.yaml`. Hand-edit that profile to retune relevance — it
+is never overwritten once it exists. No Gemini calls and no `channels:` config
+required. Writes `_briefings/<date>-catch-up-unseen.md`; `--dry-run` only
+prints the ranked unseen set.
 
 ### Extract and normalize concepts
 
