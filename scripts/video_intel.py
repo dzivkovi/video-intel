@@ -6536,16 +6536,23 @@ def load_seen_video_ids(briefings_dir: Path) -> set[str]:
     return seen
 
 
+def _artifact_count(record: dict) -> int:
+    """How many of a video's optional artifacts (mindmap, concepts) are present."""
+    return sum(1 for key in ("mindmap_path", "concepts_path") if record.get(key))
+
+
 def collect_corpus_videos(output_dir: Path) -> list[dict]:
-    """One record per video that has a meta.json, across all channel dirs.
+    """One record per unique video_id that has a meta.json, across all channel dirs.
 
     Skips dot-dirs and underscore-dirs (e.g. _briefings) so human-note folders
     are never mistaken for channels. Each record carries the catch-up fields
-    plus paths to the mindmap/concepts siblings (None when absent).
+    plus paths to the mindmap/concepts siblings (None when absent). When a
+    video_id has duplicate metas (title-rotation, pre-dedupe), the most complete
+    record wins so a video is never surfaced twice in one briefing.
     """
-    videos: list[dict] = []
+    by_id: dict[str, dict] = {}
     if not output_dir.is_dir():
-        return videos
+        return []
     channel_dirs = [
         d for d in output_dir.iterdir() if d.is_dir() and not d.name.startswith(".") and not d.name.startswith("_")
     ]
@@ -6561,18 +6568,22 @@ def collect_corpus_videos(output_dir: Path) -> list[dict]:
             prefix = meta_path.name[: -len(".meta.json")]
             mindmap_path = channel_dir / f"{prefix}.mindmap.md"
             concepts_path = channel_dir / f"{prefix}.concepts.json"
-            videos.append(
-                {
-                    "video_id": video_id,
-                    "title": meta.get("title", prefix),
-                    "published": meta.get("published", ""),
-                    "channel": meta.get("channel", channel_dir.name),
-                    "url": meta.get("video_url") or f"https://www.youtube.com/watch?v={video_id}",
-                    "mindmap_path": mindmap_path if mindmap_path.exists() else None,
-                    "concepts_path": concepts_path if concepts_path.exists() else None,
-                }
-            )
-    return videos
+            record = {
+                "video_id": video_id,
+                "title": meta.get("title", prefix),
+                "published": meta.get("published", ""),
+                "channel": meta.get("channel", channel_dir.name),
+                "url": meta.get("video_url") or f"https://www.youtube.com/watch?v={video_id}",
+                "mindmap_path": mindmap_path if mindmap_path.exists() else None,
+                "concepts_path": concepts_path if concepts_path.exists() else None,
+            }
+            # Dedupe by video_id - title-rotation can leave >1 meta per id, and a
+            # set-difference against prior briefings won't catch a same-corpus dup.
+            # Keep the most complete record so ranking has concepts to work with.
+            existing = by_id.get(video_id)
+            if existing is None or _artifact_count(record) > _artifact_count(existing):
+                by_id[video_id] = record
+    return list(by_id.values())
 
 
 def _parse_iso_date(value: str):
@@ -6696,12 +6707,23 @@ def rank_unseen(unseen: list[dict], profile: dict) -> list[dict]:
     published desc). Videos without concepts.json score 0 and sort last but are
     NOT dropped - a fresh video may not be concept-extracted yet.
     """
-    # Tolerate a hand-edited profile.yaml where interest_concepts came back as a
-    # list/scalar instead of a map - membership + indexing on a list would crash.
-    interest = profile.get("interest_concepts") or {}
-    if not isinstance(interest, dict):
-        interest = {}
-    domains = set(profile.get("interest_domains", []) or [])
+    # Tolerate a hand-edited profile.yaml: interest_concepts may come back as a
+    # list/scalar (membership+indexing would crash) and weights may be strings;
+    # coerce to a {concept_id: float} map, dropping anything non-numeric.
+    raw_interest = profile.get("interest_concepts")
+    interest: dict[str, float] = {}
+    if isinstance(raw_interest, dict):
+        for cid, weight in raw_interest.items():
+            try:
+                interest[cid] = float(weight)
+            except (TypeError, ValueError):
+                continue
+    # interest_domains may be a bare string ("ai" would otherwise become a set of
+    # single chars); wrap it, and accept only string elements.
+    raw_domains = profile.get("interest_domains") or []
+    if isinstance(raw_domains, str):
+        raw_domains = [raw_domains]
+    domains = {d for d in raw_domains if isinstance(d, str)} if isinstance(raw_domains, list | set | tuple) else set()
     scored: list[dict] = []
     for video in unseen:
         score = 0.0

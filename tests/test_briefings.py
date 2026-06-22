@@ -509,3 +509,38 @@ def test_render_unseen_briefing_escapes_bracket_titles():
     # real video URL rather than being hijacked to "(evil)".
     assert "\\](evil)" in md
     assert "## [free gpt \\](evil) \\[x](https://www.youtube.com/watch?v=v)" in md
+
+
+# --------------------------------------------------------------------------
+# Regression tests for Codex (cross-model) review findings
+# --------------------------------------------------------------------------
+def test_collect_corpus_videos_dedupes_by_video_id(tmp_path):
+    """Title-rotation can leave 2 metas for one video_id; collect emits one record."""
+    from video_intel import collect_corpus_videos
+
+    ch = tmp_path / "natebjones"
+    # Same video_id under two rotated slugs; the second has concepts (more complete).
+    _write_video(ch, "2026-06-01-old-title", video_id="vDUP", published="2026-06-01")
+    _write_video(
+        ch,
+        "2026-06-01-new-title",
+        video_id="vDUP",
+        published="2026-06-01",
+        concepts=[{"concept_id": "x"}],
+    )
+    got = collect_corpus_videos(tmp_path)
+    dup_records = [v for v in got if v["video_id"] == "vDUP"]
+    assert len(dup_records) == 1  # never surfaced twice
+    assert dup_records[0]["concepts_path"] is not None  # most-complete record won
+
+
+def test_rank_unseen_tolerates_scalar_domains_and_string_weights():
+    """A hand-edited profile with a bare-string interest_domains or string weight must not crash or mis-split."""
+    from video_intel import rank_unseen
+
+    unseen = [{"video_id": "v", "published": "2026-06-01", "concepts_path": None}]
+    # interest_domains as a bare string would become set("ai") = {'a','i'} without the guard;
+    # a string weight would crash score += "high".
+    profile = {"interest_concepts": {"ai.agents": "high"}, "interest_domains": "ai-engineering"}
+    ranked = rank_unseen(unseen, profile)
+    assert ranked[0]["score"] == 0  # non-numeric weight dropped, no crash
