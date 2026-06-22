@@ -1561,9 +1561,7 @@ def _run_with_timeout(fn: Callable, timeout_seconds: int):
     worker.start()
     worker.join(timeout_seconds)
     if worker.is_alive():
-        raise TranscriptTimeout(
-            f"transcript Gemini call exceeded {timeout_seconds}s wall-clock timeout (hang)"
-        )
+        raise TranscriptTimeout(f"transcript Gemini call exceeded {timeout_seconds}s wall-clock timeout (hang)")
     if "error" in box:
         raise box["error"]
     return box.get("result")
@@ -1656,8 +1654,11 @@ def _run_chunked_transcript_url(
             log.warning("    chunk %s: %s", chunk_label_for_log, e)
             failed_chunks.append((start_secs, end_secs, ""))
             segment_rows.append(
-                {"range": _format_chunk_range_label(start_secs, end_secs or duration_seconds),
-                 "status": "FAILED (timeout)", "speakers": []}
+                {
+                    "range": _format_chunk_range_label(start_secs, end_secs or duration_seconds),
+                    "status": "FAILED (timeout)",
+                    "speakers": [],
+                }
             )
             continue
         try:
@@ -6482,6 +6483,441 @@ def cmd_repair_metas(args, config):
 
 
 # ---------------------------------------------------------------------------
+# briefings subcommand - catch-up briefings for unseen videos (issue #80)
+# ---------------------------------------------------------------------------
+
+BRIEFINGS_DIR_NAME = "_briefings"
+PROFILE_FILENAME = "profile.yaml"
+DEFAULT_RECENCY_DAYS = 30
+DEFAULT_LIMIT = 30
+PROFILE_TOP_CONCEPTS = 40
+
+_MINDMAP_TIMESTAMP_RE = re.compile(r"\((\d{1,3}):(\d{2})(?::(\d{2}))?\)")
+
+
+def parse_front_matter(text: str) -> tuple[dict, str]:
+    """Split a markdown doc into (front_matter_dict, body).
+
+    Front matter is a leading YAML block delimited by '---' lines. Returns
+    ({}, text) when no well-formed front matter is present and never raises on
+    malformed YAML - a hand-edited briefing must not crash the catch-up scan.
+    """
+    if not text.startswith("---"):
+        return {}, text
+    lines = text.splitlines()
+    closing = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
+    if closing is None:
+        return {}, text
+    try:
+        data = yaml.safe_load("\n".join(lines[1:closing])) or {}
+    except yaml.YAMLError:
+        return {}, text
+    if not isinstance(data, dict):
+        return {}, text
+    return data, "\n".join(lines[closing + 1 :])
+
+
+def load_seen_video_ids(briefings_dir: Path) -> set[str]:
+    """Union of `video_ids` across every _briefings/*.md front matter.
+
+    This is the strict set-difference basis for "unseen": a video that has
+    appeared in ANY briefing is considered surfaced. Missing dir -> empty set.
+    """
+    seen: set[str] = set()
+    if not briefings_dir.is_dir():
+        return seen
+    for md in sorted(briefings_dir.glob("*.md")):
+        try:
+            front_matter, _ = parse_front_matter(md.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        ids = front_matter.get("video_ids") or []
+        if isinstance(ids, list):
+            seen.update(str(v) for v in ids if v)
+    return seen
+
+
+def _artifact_count(record: dict) -> int:
+    """How many of a video's optional artifacts (mindmap, concepts) are present."""
+    return sum(1 for key in ("mindmap_path", "concepts_path") if record.get(key))
+
+
+def collect_corpus_videos(output_dir: Path) -> list[dict]:
+    """One record per unique video_id that has a meta.json, across all channel dirs.
+
+    Skips dot-dirs and underscore-dirs (e.g. _briefings) so human-note folders
+    are never mistaken for channels. Each record carries the catch-up fields
+    plus paths to the mindmap/concepts siblings (None when absent). When a
+    video_id has duplicate metas (title-rotation, pre-dedupe), the most complete
+    record wins so a video is never surfaced twice in one briefing.
+    """
+    by_id: dict[str, dict] = {}
+    if not output_dir.is_dir():
+        return []
+    channel_dirs = [
+        d for d in output_dir.iterdir() if d.is_dir() and not d.name.startswith(".") and not d.name.startswith("_")
+    ]
+    for channel_dir in sorted(channel_dirs):
+        for meta_path in sorted(channel_dir.glob("*.meta.json")):
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            video_id = meta.get("video_id")
+            if not video_id:
+                continue
+            prefix = meta_path.name[: -len(".meta.json")]
+            mindmap_path = channel_dir / f"{prefix}.mindmap.md"
+            concepts_path = channel_dir / f"{prefix}.concepts.json"
+            record = {
+                "video_id": video_id,
+                "title": meta.get("title", prefix),
+                "published": meta.get("published", ""),
+                "channel": meta.get("channel", channel_dir.name),
+                "url": meta.get("video_url") or f"https://www.youtube.com/watch?v={video_id}",
+                "mindmap_path": mindmap_path if mindmap_path.exists() else None,
+                "concepts_path": concepts_path if concepts_path.exists() else None,
+            }
+            # Dedupe by video_id - title-rotation can leave >1 meta per id, and a
+            # set-difference against prior briefings won't catch a same-corpus dup.
+            # Keep the most complete record so ranking has concepts to work with.
+            existing = by_id.get(video_id)
+            if existing is None or _artifact_count(record) > _artifact_count(existing):
+                by_id[video_id] = record
+    return list(by_id.values())
+
+
+def _parse_iso_date(value: str):
+    """Parse a 'YYYY-MM-DD' (or longer ISO) string to a date, else None."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value[:10]).date()
+    except ValueError:
+        return None
+
+
+def compute_catchup_window(*, since=None, until=None, recency_days: int = DEFAULT_RECENCY_DAYS, today=None):
+    """Return (lower, upper) date bounds for a catch-up scan, all UTC dates.
+
+    lower = `since` if given, else today - recency_days (the stale-backfill floor).
+    upper = `until` if given, else today.
+    """
+    if today is None:
+        today = datetime.now(UTC).date()
+    lower = since if since is not None else today - timedelta(days=recency_days)
+    upper = until if until is not None else today
+    return lower, upper
+
+
+def select_unseen(videos: list[dict], seen_ids: set[str], *, lower, upper) -> list[dict]:
+    """Videos whose id is in no briefing and whose published date is in [lower, upper].
+
+    Set-difference on video_id is the primary guard (never window-based), so a
+    video surfaced once is never re-surfaced. Videos with an unparseable
+    `published` are dropped from a date-bounded catch-up - we can't prove their
+    recency, and surfacing unknown-age content is the failure the floor exists
+    to prevent. All comparisons are on UTC dates.
+    """
+    out: list[dict] = []
+    for video in videos:
+        if video["video_id"] in seen_ids:
+            continue
+        published = _parse_iso_date(video.get("published", ""))
+        if published is None or published < lower or published > upper:
+            continue
+        out.append(video)
+    return out
+
+
+def _infer_profile(output_dir: Path, config: dict | None = None, *, today=None) -> dict:
+    """Build a starter interest profile from signals the user already produced.
+
+    Single-tier cold-start (issue #80): the scanned channel list plus the
+    corpus's most-recurring taxonomy concepts (video_count as weight). No
+    questions, no host-agent introspection.
+    """
+    if today is None:
+        today = datetime.now(UTC).date()
+    channels = [c.get("name") for c in (config or {}).get("channels", []) if c.get("name")]
+    interest_concepts: dict[str, int] = {}
+    domains: dict[str, int] = {}
+    tax_path = output_dir / "taxonomy.json"
+    if tax_path.exists():
+        try:
+            tax = json.loads(tax_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            tax = {}
+        concepts = tax.get("concepts", {}) if isinstance(tax, dict) else {}
+        ranked = sorted(
+            concepts.items(),
+            key=lambda kv: (int(kv[1].get("video_count", 0)), kv[0]),
+            reverse=True,
+        )[:PROFILE_TOP_CONCEPTS]
+        for cid, meta in ranked:
+            weight = int(meta.get("video_count", 1)) or 1
+            interest_concepts[cid] = weight
+            dom = meta.get("domain") or cid.split(".")[0]
+            domains[dom] = domains.get(dom, 0) + weight
+    return {
+        "schema_version": 1,
+        "id": f"inferred-{today.isoformat()}",
+        "source": "inferred",
+        "generated": today.isoformat(),
+        "note": (
+            "Auto-inferred from your scanned channels + taxonomy. Hand-edit freely - "
+            "once this file exists it is never overwritten."
+        ),
+        "channels": channels,
+        "interest_domains": sorted(domains, key=lambda d: domains[d], reverse=True),
+        "interest_concepts": interest_concepts,
+    }
+
+
+def infer_or_load_profile(output_dir: Path, config: dict | None = None, *, today=None, persist: bool = True) -> dict:
+    """Load _briefings/profile.yaml if present and usable, else infer it.
+
+    A hand-edited profile is never overwritten: once the file exists with any
+    content, it wins. This is the single explicit-control surface (R7) - editing
+    the file is the correction path. `persist=False` returns the inferred profile
+    WITHOUT writing it, so `--dry-run` stays side-effect-free. (`rank_unseen`
+    tolerates a malformed `interest_concepts`, so preserving a partial hand-edit
+    is safe.)
+    """
+    briefings_dir = output_dir / BRIEFINGS_DIR_NAME
+    profile_path = briefings_dir / PROFILE_FILENAME
+    if profile_path.exists():
+        try:
+            data = yaml.safe_load(profile_path.read_text(encoding="utf-8")) or {}
+        except (yaml.YAMLError, OSError):
+            data = {}
+        if isinstance(data, dict) and data:
+            return data
+    profile = _infer_profile(output_dir, config, today=today)
+    if persist:
+        briefings_dir.mkdir(parents=True, exist_ok=True)
+        profile_path.write_text(yaml.safe_dump(profile, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    return profile
+
+
+def rank_unseen(unseen: list[dict], profile: dict) -> list[dict]:
+    """Score each unseen video by overlap with the profile's interest concepts.
+
+    score = sum of interest weights for the video's concepts that are interest
+    concepts, plus a small domain-affinity bonus. Sorted by (score desc,
+    published desc). Videos without concepts.json score 0 and sort last but are
+    NOT dropped - a fresh video may not be concept-extracted yet.
+    """
+    # Tolerate a hand-edited profile.yaml: interest_concepts may come back as a
+    # list/scalar (membership+indexing would crash) and weights may be strings;
+    # coerce to a {concept_id: float} map, dropping anything non-numeric.
+    raw_interest = profile.get("interest_concepts")
+    interest: dict[str, float] = {}
+    if isinstance(raw_interest, dict):
+        for cid, weight in raw_interest.items():
+            try:
+                interest[cid] = float(weight)
+            except (TypeError, ValueError):
+                continue
+    # interest_domains may be a bare string ("ai" would otherwise become a set of
+    # single chars); wrap it, and accept only string elements.
+    raw_domains = profile.get("interest_domains") or []
+    if isinstance(raw_domains, str):
+        raw_domains = [raw_domains]
+    domains = {d for d in raw_domains if isinstance(d, str)} if isinstance(raw_domains, list | set | tuple) else set()
+    scored: list[dict] = []
+    for video in unseen:
+        score = 0.0
+        matched: list[str] = []
+        concepts_path = video.get("concepts_path")
+        if concepts_path and Path(concepts_path).exists():
+            try:
+                cdata = json.loads(Path(concepts_path).read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                cdata = {}
+            for concept in cdata.get("concepts", []):
+                if not isinstance(concept, dict):
+                    continue
+                cid = concept.get("concept_id")
+                if cid in interest:
+                    score += interest[cid]
+                    matched.append(concept.get("preferred_label") or cid)
+                elif concept.get("domain") in domains:
+                    score += 0.5
+                    matched.append(concept.get("preferred_label") or concept.get("domain"))
+        scored.append({**video, "score": score, "matched_concepts": matched[:5]})
+    scored.sort(key=lambda v: (v["score"], v.get("published", "")), reverse=True)
+    return scored
+
+
+def extract_mindmap_links(mindmap_path, url: str, limit: int = 3) -> list[tuple[str, str]]:
+    """Best-effort: first `limit` '(M:SS)'/'(H:MM:SS)' timestamps -> deep-links.
+
+    Returns [(label, url&t=Ns), ...]; empty when no mindmap or no timestamps.
+    Mirrors the hand-authored viewing-guide style without being load-bearing.
+    """
+    if not mindmap_path or not Path(mindmap_path).exists():
+        return []
+    links: list[tuple[str, str]] = []
+    try:
+        text = Path(mindmap_path).read_text(encoding="utf-8")
+    except OSError:
+        return []
+    for line in text.splitlines():
+        match = _MINDMAP_TIMESTAMP_RE.search(line)
+        if not match:
+            continue
+        first, mm, ss = match.groups()
+        if ss is not None:
+            seconds = int(first) * 3600 + int(mm) * 60 + int(ss)
+            stamp = f"{first}:{mm}:{ss}"
+        else:
+            seconds = int(first) * 60 + int(mm)
+            stamp = f"{first}:{mm}"
+        label = re.sub(r"\s+", " ", line[: match.start()].strip(" \t-*•")).strip() or "jump"
+        links.append((f"{label} ({stamp})", f"{url}&t={seconds}s"))
+        if len(links) >= limit:
+            break
+    return links
+
+
+def render_unseen_briefing(ranked: list[dict], profile: dict, *, lower, upper, today=None) -> str:
+    """Render a catch-up briefing markdown doc with the standard front matter.
+
+    The `video_ids` front-matter list is what makes this briefing count toward
+    future coverage (so the next --unseen run won't re-surface these).
+    """
+    if today is None:
+        today = datetime.now(UTC).date()
+    front_matter = {
+        "artifact_type": "viewing_guide",
+        "schema_version": 1,
+        "title": f"Catch-up briefing - unseen videos ({lower.isoformat()} to {upper.isoformat()})",
+        "created_at": today.isoformat(),
+        "corpus_snapshot_date": today.isoformat(),
+        "scan_window": {"start": lower.isoformat(), "end": upper.isoformat()},
+        "audience_profile": profile.get("id", "inferred"),
+        "generator": {"name": "briefings --unseen", "version": 1},
+        "video_ids": [v["video_id"] for v in ranked],
+    }
+    lines = [
+        "---",
+        yaml.safe_dump(front_matter, sort_keys=False, allow_unicode=True).rstrip(),
+        "---",
+        "",
+        f"# Catch-up briefing - {len(ranked)} unseen video(s)",
+        "",
+        f"**Window:** {lower.isoformat()} to {upper.isoformat()} (UTC)",
+        (
+            f"**Ranking lens:** inferred profile `{profile.get('id', 'inferred')}` "
+            "(top corpus concepts + scanned channels). One reader's lens, not an "
+            "objective ranking - hand-edit `_briefings/profile.yaml` to retune."
+        ),
+        "",
+    ]
+    if not ranked:
+        lines.append("_No unseen videos in this window._")
+        return "\n".join(lines) + "\n"
+    for video in ranked:
+        # Escape link-breaking brackets - YouTube titles are creator-controlled
+        # and a title like "free gpt ](evil)" would otherwise corrupt the link.
+        safe_title = str(video["title"]).replace("[", "\\[").replace("]", "\\]")
+        lines.append(f"## [{safe_title}]({video['url']})")
+        meta_line = f"{video['channel']} · {video.get('published', '')}"
+        if video.get("score"):
+            meta_line += f" · relevance {video['score']:g}"
+        lines.append(meta_line)
+        if video.get("matched_concepts"):
+            lines.append("")
+            lines.append("Why: " + ", ".join(video["matched_concepts"]))
+        # Skip deep-links for zero-score entries: those are the least-trustworthy
+        # mindmaps (often off-topic livestream captures whose timestamps mismatch
+        # the title). Only adorn entries the ranking actually vouched for.
+        links = extract_mindmap_links(video.get("mindmap_path"), video["url"]) if video.get("score") else []
+        if links:
+            lines.append("")
+            lines.append(" · ".join(f"[{label}]({u})" for label, u in links))
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def cmd_briefings(args, config):
+    """Generate catch-up briefings for videos not yet surfaced in any briefing."""
+    if not getattr(args, "unseen", False):
+        log.error("briefings: only --unseen mode is implemented. Pass --unseen.")
+        sys.exit(1)
+
+    output_dir = resolve_output_dir(config)
+    briefings_dir = output_dir / BRIEFINGS_DIR_NAME
+    today = datetime.now(UTC).date()
+    since = parse_since(args.since).date() if getattr(args, "since", None) else None
+    until = parse_since(args.until).date() if getattr(args, "until", None) else None
+    lower, upper = compute_catchup_window(since=since, until=until, today=today)
+    if lower > upper:
+        # An inverted window matches nothing; without this warning a zero-result
+        # run looks identical to "fully caught up". --until takes an absolute date.
+        log.warning(
+            "briefings --unseen: window start %s is after end %s - no videos can match. "
+            "Check --since/--until (--until expects an absolute YYYY-MM-DD).",
+            lower.isoformat(),
+            upper.isoformat(),
+        )
+
+    seen = load_seen_video_ids(briefings_dir)
+    videos = collect_corpus_videos(output_dir)
+    unseen = select_unseen(videos, seen, lower=lower, upper=upper)
+    # --dry-run must be side-effect-free: infer the profile for ranking but do
+    # not persist a freshly-inferred profile.yaml on a preview run.
+    profile = infer_or_load_profile(output_dir, config, today=today, persist=not getattr(args, "dry_run", False))
+    ranked = rank_unseen(unseen, profile)
+    total_unseen = len(ranked)
+    # Cap to a digestible guide (a 589-item dump is an index, not a briefing).
+    # --limit 0 means "no cap"; the rest stay unseen for the next run.
+    limit = getattr(args, "limit", DEFAULT_LIMIT)
+    if limit is None:
+        limit = DEFAULT_LIMIT
+    if limit > 0:
+        ranked = ranked[:limit]
+
+    log.info(
+        "briefings --unseen: %d corpus videos, %d already surfaced, %d unseen in %s..%s; showing %d",
+        len(videos),
+        len(seen),
+        total_unseen,
+        lower.isoformat(),
+        upper.isoformat(),
+        len(ranked),
+    )
+
+    if getattr(args, "dry_run", False):
+        capped = f" (top {len(ranked)} of {total_unseen})" if len(ranked) < total_unseen else ""
+        print(f"Would surface {len(ranked)} unseen video(s){capped} in {lower.isoformat()}..{upper.isoformat()}:")
+        for video in ranked:
+            tag = f"[{video['score']:g}] " if video.get("score") else ""
+            print(f"  {video.get('published', ''):<10}  {video['channel']:<18}  {tag}{video['title']}")
+        if not ranked:
+            print("  (none)")
+        return
+
+    if not ranked:
+        print(f"No unseen videos in {lower.isoformat()}..{upper.isoformat()}. Nothing written.")
+        return
+
+    content = render_unseen_briefing(ranked, profile, lower=lower, upper=upper, today=today)
+    briefings_dir.mkdir(parents=True, exist_ok=True)
+    # Never overwrite an earlier same-day briefing: doing so would drop its
+    # video_ids from the seen-coverage record and re-surface those videos later.
+    base_name = f"{today.isoformat()}-catch-up-unseen"
+    out_path = briefings_dir / f"{base_name}.md"
+    counter = 2
+    while out_path.exists():
+        out_path = briefings_dir / f"{base_name}-{counter}.md"
+        counter += 1
+    out_path.write_text(content, encoding="utf-8")
+    print(f"Wrote catch-up briefing: {out_path} ({len(ranked)} videos)")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -6883,6 +7319,39 @@ Examples:
         help="Optional human-readable reason persisted as skip_reason in meta.json",
     )
 
+    # briefings command (issue #80): catch-up briefings for unseen videos
+    briefings_parser = subparsers.add_parser(
+        "briefings",
+        help="Generate catch-up briefings for videos not yet surfaced in any _briefings/ guide",
+    )
+    briefings_parser.add_argument(
+        "--unseen",
+        action="store_true",
+        help="Catch-up mode: surface corpus videos absent from every existing briefing's video_ids",
+    )
+    briefings_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview the unseen set (count + titles) without writing a briefing",
+    )
+    briefings_parser.add_argument(
+        "--since",
+        help="Lower bound of the catch-up window ('Nd' or 'YYYY-MM-DD'). Overrides the 30-day "
+        "recency floor - widen it (e.g. --since 120d) for a one-time backlog sweep.",
+    )
+    briefings_parser.add_argument(
+        "--until",
+        help="Upper bound of the catch-up window (absolute 'YYYY-MM-DD'). 'Nd' is accepted "
+        "but means 'N days ago', so it is rarely what you want for an upper bound.",
+    )
+    briefings_parser.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_LIMIT,
+        help=f"Cap the briefing to the top-N most relevant unseen videos (default {DEFAULT_LIMIT}). "
+        "0 = no cap. Uncapped videos stay unseen for the next run.",
+    )
+
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.WARNING,
@@ -6926,6 +7395,8 @@ Examples:
         cmd_prune_shorts(args, config)
     elif args.command == "mark-skip":
         cmd_mark_skip(args, config)
+    elif args.command == "briefings":
+        cmd_briefings(args, config)
 
 
 if __name__ == "__main__":
