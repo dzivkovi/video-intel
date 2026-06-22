@@ -6488,7 +6488,8 @@ def cmd_repair_metas(args, config):
 
 BRIEFINGS_DIR_NAME = "_briefings"
 PROFILE_FILENAME = "profile.yaml"
-DEFAULT_RECENCY_DAYS = 90
+DEFAULT_RECENCY_DAYS = 30
+DEFAULT_LIMIT = 30
 PROFILE_TOP_CONCEPTS = 40
 
 _MINDMAP_TIMESTAMP_RE = re.compile(r"\((\d{1,3}):(\d{2})(?::(\d{2}))?\)")
@@ -6829,7 +6830,10 @@ def render_unseen_briefing(ranked: list[dict], profile: dict, *, lower, upper, t
         if video.get("matched_concepts"):
             lines.append("")
             lines.append("Why: " + ", ".join(video["matched_concepts"]))
-        links = extract_mindmap_links(video.get("mindmap_path"), video["url"])
+        # Skip deep-links for zero-score entries: those are the least-trustworthy
+        # mindmaps (often off-topic livestream captures whose timestamps mismatch
+        # the title). Only adorn entries the ranking actually vouched for.
+        links = extract_mindmap_links(video.get("mindmap_path"), video["url"]) if video.get("score") else []
         if links:
             lines.append("")
             lines.append(" · ".join(f"[{label}]({u})" for label, u in links))
@@ -6866,18 +6870,28 @@ def cmd_briefings(args, config):
     # not persist a freshly-inferred profile.yaml on a preview run.
     profile = infer_or_load_profile(output_dir, config, today=today, persist=not getattr(args, "dry_run", False))
     ranked = rank_unseen(unseen, profile)
+    total_unseen = len(ranked)
+    # Cap to a digestible guide (a 589-item dump is an index, not a briefing).
+    # --limit 0 means "no cap"; the rest stay unseen for the next run.
+    limit = getattr(args, "limit", DEFAULT_LIMIT)
+    if limit is None:
+        limit = DEFAULT_LIMIT
+    if limit > 0:
+        ranked = ranked[:limit]
 
     log.info(
-        "briefings --unseen: %d corpus videos, %d already surfaced, %d unseen in %s..%s",
+        "briefings --unseen: %d corpus videos, %d already surfaced, %d unseen in %s..%s; showing %d",
         len(videos),
         len(seen),
-        len(ranked),
+        total_unseen,
         lower.isoformat(),
         upper.isoformat(),
+        len(ranked),
     )
 
     if getattr(args, "dry_run", False):
-        print(f"Would surface {len(ranked)} unseen video(s) in {lower.isoformat()}..{upper.isoformat()}:")
+        capped = f" (top {len(ranked)} of {total_unseen})" if len(ranked) < total_unseen else ""
+        print(f"Would surface {len(ranked)} unseen video(s){capped} in {lower.isoformat()}..{upper.isoformat()}:")
         for video in ranked:
             tag = f"[{video['score']:g}] " if video.get("score") else ""
             print(f"  {video.get('published', ''):<10}  {video['channel']:<18}  {tag}{video['title']}")
@@ -7322,12 +7336,20 @@ Examples:
     )
     briefings_parser.add_argument(
         "--since",
-        help="Lower bound of the catch-up window ('Nd' or 'YYYY-MM-DD'). Overrides the 90-day recency floor.",
+        help="Lower bound of the catch-up window ('Nd' or 'YYYY-MM-DD'). Overrides the 30-day "
+        "recency floor - widen it (e.g. --since 120d) for a one-time backlog sweep.",
     )
     briefings_parser.add_argument(
         "--until",
         help="Upper bound of the catch-up window (absolute 'YYYY-MM-DD'). 'Nd' is accepted "
         "but means 'N days ago', so it is rarely what you want for an upper bound.",
+    )
+    briefings_parser.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_LIMIT,
+        help=f"Cap the briefing to the top-N most relevant unseen videos (default {DEFAULT_LIMIT}). "
+        "0 = no cap. Uncapped videos stay unseen for the next run.",
     )
 
     args = parser.parse_args()

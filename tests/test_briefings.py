@@ -139,13 +139,13 @@ def test_collect_corpus_videos_skips_meta_without_video_id(tmp_path):
 # --------------------------------------------------------------------------
 # compute_catchup_window + select_unseen
 # --------------------------------------------------------------------------
-def test_compute_catchup_window_default_90d_floor():
+def test_compute_catchup_window_default_recency_floor():
     from video_intel import compute_catchup_window
 
     today = date(2026, 6, 22)
     lower, upper = compute_catchup_window(today=today)
     assert upper == today
-    assert lower == date(2026, 3, 24)  # 90 days before
+    assert lower == date(2026, 5, 23)  # default 30-day floor
 
 
 def test_compute_catchup_window_since_overrides_floor():
@@ -544,3 +544,44 @@ def test_rank_unseen_tolerates_scalar_domains_and_string_weights():
     profile = {"interest_concepts": {"ai.agents": "high"}, "interest_domains": "ai-engineering"}
     ranked = rank_unseen(unseen, profile)
     assert ranked[0]["score"] == 0  # non-numeric weight dropped, no crash
+
+
+# --------------------------------------------------------------------------
+# Regression tests for dog-food validation findings (--limit, scoreless links)
+# --------------------------------------------------------------------------
+def test_cmd_briefings_respects_limit(tmp_path):
+    """--limit caps the briefing (and its video_ids) to the top-N; the rest stay unseen."""
+    import video_intel as vi
+
+    for i in range(5):
+        _write_video(
+            tmp_path / "natebjones", f"2026-06-2{i}-v{i}", video_id=f"v{i}", published=f"2026-06-2{i}", concepts=[]
+        )
+    args = SimpleNamespace(unseen=True, dry_run=False, since="3650d", until=None, limit=2)
+    vi.cmd_briefings(args, {"output_dir": str(tmp_path)})
+
+    written = list((tmp_path / "_briefings").glob("*-catch-up-unseen.md"))
+    fm, _ = vi.parse_front_matter(written[0].read_text(encoding="utf-8"))
+    assert len(fm["video_ids"]) == 2  # capped to top-2; other 3 remain unseen next run
+
+
+def test_render_suppresses_links_for_scoreless_entries(tmp_path):
+    """A zero-score entry must not carry (possibly mismatched) mindmap deep-links."""
+    from video_intel import render_unseen_briefing
+
+    mm = tmp_path / "v.mindmap.md"
+    mm.write_text("- Off-topic diagram (3:57)\n", encoding="utf-8")
+    ranked = [
+        {
+            "video_id": "v",
+            "title": "Scoreless",
+            "url": "https://www.youtube.com/watch?v=v",
+            "channel": "ch",
+            "published": "2026-06-20",
+            "score": 0,
+            "matched_concepts": [],
+            "mindmap_path": mm,
+        }
+    ]
+    md = render_unseen_briefing(ranked, {"id": "p"}, lower=date(2026, 3, 1), upper=date(2026, 6, 22))
+    assert "&t=" not in md  # no deep-links on an unvouched entry
