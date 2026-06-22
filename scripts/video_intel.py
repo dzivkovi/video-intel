@@ -6665,10 +6665,12 @@ def _infer_profile(output_dir: Path, config: dict | None = None, *, today=None) 
 def infer_or_load_profile(output_dir: Path, config: dict | None = None, *, today=None, persist: bool = True) -> dict:
     """Load _briefings/profile.yaml if present and usable, else infer it.
 
-    A hand-edited profile is never overwritten: once the file exists with an
-    `interest_concepts` map, it wins. This is the single explicit-control surface
-    (R7) - editing the file is the correction path. `persist=False` returns the
-    inferred profile WITHOUT writing it, so `--dry-run` stays side-effect-free.
+    A hand-edited profile is never overwritten: once the file exists with any
+    content, it wins. This is the single explicit-control surface (R7) - editing
+    the file is the correction path. `persist=False` returns the inferred profile
+    WITHOUT writing it, so `--dry-run` stays side-effect-free. (`rank_unseen`
+    tolerates a malformed `interest_concepts`, so preserving a partial hand-edit
+    is safe.)
     """
     briefings_dir = output_dir / BRIEFINGS_DIR_NAME
     profile_path = briefings_dir / PROFILE_FILENAME
@@ -6677,7 +6679,7 @@ def infer_or_load_profile(output_dir: Path, config: dict | None = None, *, today
             data = yaml.safe_load(profile_path.read_text(encoding="utf-8")) or {}
         except (yaml.YAMLError, OSError):
             data = {}
-        if isinstance(data, dict) and data.get("interest_concepts"):
+        if isinstance(data, dict) and data:
             return data
     profile = _infer_profile(output_dir, config, today=today)
     if persist:
@@ -6694,7 +6696,11 @@ def rank_unseen(unseen: list[dict], profile: dict) -> list[dict]:
     published desc). Videos without concepts.json score 0 and sort last but are
     NOT dropped - a fresh video may not be concept-extracted yet.
     """
-    interest = profile.get("interest_concepts", {}) or {}
+    # Tolerate a hand-edited profile.yaml where interest_concepts came back as a
+    # list/scalar instead of a map - membership + indexing on a list would crash.
+    interest = profile.get("interest_concepts") or {}
+    if not isinstance(interest, dict):
+        interest = {}
     domains = set(profile.get("interest_domains", []) or [])
     scored: list[dict] = []
     for video in unseen:
@@ -6707,12 +6713,15 @@ def rank_unseen(unseen: list[dict], profile: dict) -> list[dict]:
             except (json.JSONDecodeError, OSError):
                 cdata = {}
             for concept in cdata.get("concepts", []):
+                if not isinstance(concept, dict):
+                    continue
                 cid = concept.get("concept_id")
                 if cid in interest:
                     score += interest[cid]
                     matched.append(concept.get("preferred_label") or cid)
                 elif concept.get("domain") in domains:
                     score += 0.5
+                    matched.append(concept.get("preferred_label") or concept.get("domain"))
         scored.append({**video, "score": score, "matched_concepts": matched[:5]})
     scored.sort(key=lambda v: (v["score"], v.get("published", "")), reverse=True)
     return scored
@@ -6787,7 +6796,10 @@ def render_unseen_briefing(ranked: list[dict], profile: dict, *, lower, upper, t
         lines.append("_No unseen videos in this window._")
         return "\n".join(lines) + "\n"
     for video in ranked:
-        lines.append(f"## [{video['title']}]({video['url']})")
+        # Escape link-breaking brackets - YouTube titles are creator-controlled
+        # and a title like "free gpt ](evil)" would otherwise corrupt the link.
+        safe_title = str(video["title"]).replace("[", "\\[").replace("]", "\\]")
+        lines.append(f"## [{safe_title}]({video['url']})")
         meta_line = f"{video['channel']} · {video.get('published', '')}"
         if video.get("score"):
             meta_line += f" · relevance {video['score']:g}"
@@ -6815,6 +6827,15 @@ def cmd_briefings(args, config):
     since = parse_since(args.since).date() if getattr(args, "since", None) else None
     until = parse_since(args.until).date() if getattr(args, "until", None) else None
     lower, upper = compute_catchup_window(since=since, until=until, today=today)
+    if lower > upper:
+        # An inverted window matches nothing; without this warning a zero-result
+        # run looks identical to "fully caught up". --until takes an absolute date.
+        log.warning(
+            "briefings --unseen: window start %s is after end %s - no videos can match. "
+            "Check --since/--until (--until expects an absolute YYYY-MM-DD).",
+            lower.isoformat(),
+            upper.isoformat(),
+        )
 
     seen = load_seen_video_ids(briefings_dir)
     videos = collect_corpus_videos(output_dir)
@@ -6848,7 +6869,14 @@ def cmd_briefings(args, config):
 
     content = render_unseen_briefing(ranked, profile, lower=lower, upper=upper, today=today)
     briefings_dir.mkdir(parents=True, exist_ok=True)
-    out_path = briefings_dir / f"{today.isoformat()}-catch-up-unseen.md"
+    # Never overwrite an earlier same-day briefing: doing so would drop its
+    # video_ids from the seen-coverage record and re-surface those videos later.
+    base_name = f"{today.isoformat()}-catch-up-unseen"
+    out_path = briefings_dir / f"{base_name}.md"
+    counter = 2
+    while out_path.exists():
+        out_path = briefings_dir / f"{base_name}-{counter}.md"
+        counter += 1
     out_path.write_text(content, encoding="utf-8")
     print(f"Wrote catch-up briefing: {out_path} ({len(ranked)} videos)")
 
@@ -7276,7 +7304,8 @@ Examples:
     )
     briefings_parser.add_argument(
         "--until",
-        help="Upper bound of the catch-up window ('YYYY-MM-DD', or 'Nd' relative).",
+        help="Upper bound of the catch-up window (absolute 'YYYY-MM-DD'). 'Nd' is accepted "
+        "but means 'N days ago', so it is rarely what you want for an upper bound.",
     )
 
     args = parser.parse_args()

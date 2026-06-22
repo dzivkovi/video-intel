@@ -375,3 +375,137 @@ def test_cmd_briefings_writes_briefing_and_excludes_seen(tmp_path):
     assert len(written) == 1
     fm, _ = vi.parse_front_matter(written[0].read_text(encoding="utf-8"))
     assert fm["video_ids"] == ["v1"]  # v2 excluded as already-seen
+
+
+# --------------------------------------------------------------------------
+# Regression tests for ce-code-review fixes
+# --------------------------------------------------------------------------
+def test_cmd_briefings_roundtrip_marks_its_own_videos_seen(tmp_path):
+    """Core contract: a generated briefing's video_ids count as seen next run."""
+    import video_intel as vi
+
+    _write_video(tmp_path / "natebjones", "2026-06-20-x", video_id="v1", published="2026-06-20", concepts=[])
+    args = SimpleNamespace(unseen=True, dry_run=False, since="3650d", until=None)
+
+    vi.cmd_briefings(args, {"output_dir": str(tmp_path)})  # run 1 surfaces v1
+    seen_after = vi.load_seen_video_ids(tmp_path / "_briefings")
+    assert "v1" in seen_after  # the written briefing made v1 seen
+
+    vi.cmd_briefings(args, {"output_dir": str(tmp_path)})  # run 2: v1 now seen
+    files = sorted((tmp_path / "_briefings").glob("*-catch-up-unseen.md"))
+    # run 2 has nothing unseen -> writes nothing -> still exactly one briefing
+    assert len(files) == 1
+
+
+def test_cmd_briefings_does_not_overwrite_same_day(tmp_path):
+    """A second same-day run that still has unseen videos must not clobber the first."""
+    import video_intel as vi
+
+    _write_video(tmp_path / "natebjones", "2026-06-20-x", video_id="v1", published="2026-06-20", concepts=[])
+    args = SimpleNamespace(unseen=True, dry_run=False, since="3650d", until=None)
+    vi.cmd_briefings(args, {"output_dir": str(tmp_path)})  # writes file 1 (v1)
+
+    # New unseen video arrives; a second same-day run should add a suffixed file.
+    _write_video(tmp_path / "natebjones", "2026-06-21-z", video_id="v2", published="2026-06-21", concepts=[])
+    vi.cmd_briefings(args, {"output_dir": str(tmp_path)})
+
+    files = sorted((tmp_path / "_briefings").glob("*-catch-up-unseen*.md"))
+    assert len(files) == 2  # first briefing preserved, second suffixed
+
+
+def test_rank_unseen_tolerates_list_interest_concepts():
+    """A hand-edited profile with interest_concepts as a list must not crash."""
+    from video_intel import rank_unseen
+
+    unseen = [{"video_id": "v", "published": "2026-06-01", "concepts_path": None}]
+    # interest_concepts as a list (a natural hand-edit mistake) used to TypeError.
+    ranked = rank_unseen(unseen, {"interest_concepts": ["ai.agents"], "interest_domains": []})
+    assert ranked[0]["score"] == 0
+
+
+def test_rank_unseen_domain_bonus(tmp_path):
+    from video_intel import rank_unseen
+
+    ch = tmp_path / "ch"
+    _write_video(
+        ch,
+        "d",
+        video_id="d",
+        published="2026-06-02",
+        concepts=[{"concept_id": "startup.x", "preferred_label": "X thing", "domain": "startup"}],
+    )
+    unseen = [{"video_id": "d", "published": "2026-06-02", "concepts_path": ch / "d.concepts.json"}]
+    # concept not in interest_concepts, but its domain is in interest_domains
+    profile = {"interest_concepts": {"ai.agents": 5}, "interest_domains": ["startup"]}
+    ranked = rank_unseen(unseen, profile)
+    assert ranked[0]["score"] == 0.5
+    assert ranked[0]["matched_concepts"]  # domain match is now explained
+
+
+def test_compute_catchup_window_until_overrides_upper():
+    from video_intel import compute_catchup_window
+
+    _lower, upper = compute_catchup_window(since=date(2026, 1, 1), until=date(2026, 6, 10), today=date(2026, 6, 22))
+    assert upper == date(2026, 6, 10)
+
+
+def test_select_unseen_inverted_window_is_empty():
+    from video_intel import select_unseen
+
+    videos = [{"video_id": "v", "published": "2026-05-15"}]
+    out = select_unseen(videos, set(), lower=date(2026, 6, 1), upper=date(2026, 1, 1))
+    assert out == []
+
+
+def test_infer_or_load_profile_preserves_existing_without_interest_concepts(tmp_path):
+    """An existing profile.yaml with content but no interest_concepts is not overwritten."""
+    from video_intel import infer_or_load_profile
+
+    briefings = tmp_path / "_briefings"
+    briefings.mkdir()
+    (briefings / "profile.yaml").write_text(yaml.safe_dump({"source": "hand", "channels": ["x"]}), encoding="utf-8")
+    profile = infer_or_load_profile(tmp_path, {}, today=date(2026, 6, 22))
+    assert profile == {"source": "hand", "channels": ["x"]}  # preserved verbatim
+
+
+def test_render_unseen_briefing_includes_mindmap_links(tmp_path):
+    from video_intel import render_unseen_briefing
+
+    mm = tmp_path / "v.mindmap.md"
+    mm.write_text("- Agent loops (3:57)\n", encoding="utf-8")
+    ranked = [
+        {
+            "video_id": "v",
+            "title": "Title",
+            "url": "https://www.youtube.com/watch?v=v",
+            "channel": "ch",
+            "published": "2026-06-20",
+            "score": 5,
+            "matched_concepts": ["Agents"],
+            "mindmap_path": mm,
+        }
+    ]
+    md = render_unseen_briefing(ranked, {"id": "p"}, lower=date(2026, 3, 1), upper=date(2026, 6, 22))
+    assert "&t=237s" in md  # 3:57 deep-link wired through render
+
+
+def test_render_unseen_briefing_escapes_bracket_titles():
+    from video_intel import render_unseen_briefing
+
+    ranked = [
+        {
+            "video_id": "v",
+            "title": "free gpt ](evil) [x",
+            "url": "https://www.youtube.com/watch?v=v",
+            "channel": "ch",
+            "published": "2026-06-20",
+            "score": 0,
+            "matched_concepts": [],
+            "mindmap_path": None,
+        }
+    ]
+    md = render_unseen_briefing(ranked, {"id": "p"}, lower=date(2026, 3, 1), upper=date(2026, 6, 22))
+    # The link-breaking ] is backslash-escaped, so the H2 link target stays the
+    # real video URL rather than being hijacked to "(evil)".
+    assert "\\](evil)" in md
+    assert "## [free gpt \\](evil) \\[x](https://www.youtube.com/watch?v=v)" in md
