@@ -67,3 +67,4 @@ skill-eval-workspace/**
 /.firecrawl/
 /tv-stitch-*/
 .codex/config.toml
+.worktrees
