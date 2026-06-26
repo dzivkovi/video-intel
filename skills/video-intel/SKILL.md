@@ -144,7 +144,7 @@ table is the canonical mapping — read it before picking a command.
 | "rebuild the index", "reindex after dedupe" | `index --force` | Write-path rebuild of LanceDB; query uses `video-intel-search` |
 | "prune shorts", "remove shorts", "too many shorts in my corpus" | `prune-shorts [--apply]` | **Always `--dry-run` first** — destructive on `--apply`; deletes mindmap/transcript/concepts/meta per Short |
 | "rebuild taxonomy", "update master vocabulary" | `taxonomy-build` | Derived artifact; rebuildable anytime |
-| "catch me up on what I missed", "what haven't I been briefed on", "videos I haven't seen yet", "generate a catch-up briefing", "fill the gaps in my viewing guides" | `briefings --unseen [--dry-run] [--since DATE] [--until DATE] [--limit N]` | Surfaces corpus videos absent from every existing `_briefings/*.md` `video_ids` list (strict set difference, never re-surfaced once briefed), within a default 30-day UTC window, ranked by overlap with the inferred profile in `_briefings/profile.yaml` and capped to the top `N` (default 30; `--limit 0` = no cap). `--dry-run` previews; otherwise writes `_briefings/<date>-catch-up-unseen.md`. Widen with `--since 120d` for a one-time backlog sweep. No Gemini, no `channels:` required. |
+| "catch me up on what I missed", "what haven't I been briefed on", "videos I haven't seen yet", "generate a catch-up briefing", "fill the gaps in my viewing guides", "give me the briefing as a PDF", "a briefing I can open on my phone / share" | `briefings --unseen [--dry-run] [--since DATE] [--until DATE] [--limit N] [--pdf]` | Surfaces corpus videos absent from every existing `_briefings/*.md` `video_ids` list (strict set difference, never re-surfaced once briefed), within a default 30-day UTC window, ranked by overlap with the inferred profile in `_briefings/profile.yaml` and capped to the top `N` (default 30; `--limit 0` = no cap). `--dry-run` previews; otherwise writes `_briefings/<date>-catch-up-unseen.md`. `--pdf` additionally writes a clickable `.pdf` beside it (bold, accent-colored, hyperlinked timestamps; needs the `[pdf]` extra). Widen with `--since 120d` for a one-time backlog sweep. No Gemini, no `channels:` required. |
 | "this video keeps getting re-transcribed", "fix identity-less metas", "backfill missing video_id", "meta.json has no video_id" | `repair-metas [--apply]` | **Dry-run first** (issue #66). Reconstructs `video_id`/`url`/`title`/`published` from the `.transcript.md` header for metas missing identity; only fills missing fields; refuses local/non-YouTube sources. Re-run `index --force` after `--apply`. |
 | "skip transcript on this video", "stop trying to transcribe [URL]", "this video keeps failing transcript", "block transcript only" | `mark-skip --url URL --mode transcript [--reason TEXT]` | Per-mode skip (issue #42). Mindmap and concepts continue to run. Repeatable: `--mode transcript --mode concepts`. |
 | "permanently ignore this video", "never re-process [video_id]", "skip these IDs on backfill", "stop touching this URL on every scan" | edit `skip_video_ids` under the channel in `config.yaml` | Declarative pre-fetch blocklist. Listed IDs never reach Gemini, never get a meta.json, no cost. Override = remove the ID from config. Cheaper than `mark-skip` since no meta.json roundtrip needed. |
@@ -485,6 +485,9 @@ python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" briefings --unseen
 
 # One-time backlog sweep: widen the window and raise the cap
 python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" briefings --unseen --since 120d --limit 60
+
+# Also write a clickable PDF beside the Markdown (needs the [pdf] extra)
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" briefings --unseen --pdf
 ```
 
 `briefings --unseen` surfaces corpus videos that appear in no existing
@@ -498,6 +501,14 @@ overlap with an inferred interest profile persisted at `_briefings/profile.yaml`
 (hand-edit to retune; never overwritten once it has content). No Gemini calls
 and no `channels:` config required. Writes `_briefings/<date>-catch-up-unseen.md`;
 `--dry-run` only prints the ranked unseen set.
+
+Pass `--pdf` to additionally write a clickable `_briefings/<date>-catch-up-unseen.pdf`
+rendered from the same ranked set: a one-page-friendly, shareable guide whose
+video titles and timestamped moments are bold, accent-colored hyperlinks that
+open YouTube at the exact second. The PDF is purely additive - the Markdown is
+always written and remains the seen-coverage record. Requires the optional
+`reportlab` dependency (`pip install -e ".[pdf]"`); without it the Markdown
+still writes and an install hint is logged.
 
 ### Extract and normalize concepts
 

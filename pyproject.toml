@@ -15,6 +15,9 @@ vector = [
     "lancedb>=0.20",
     "voyageai>=0.3",
 ]
+pdf = [
+    "reportlab>=4",
+]
 dev = [
     "ruff",
     "pytest",

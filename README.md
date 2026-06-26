@@ -331,6 +331,26 @@ python scripts/video_intel.py nugget "second brain patterns" --output brief.md
 
 See [`examples/nugget-lightrag-vs-openbrain-architectural-tension.md`](examples/nugget-lightrag-vs-openbrain-architectural-tension.md) for a sample output.
 
+### Catch-up briefings (Markdown + PDF)
+
+Once a corpus is indexed, `briefings --unseen` builds a personalized "what should I watch" guide. It surfaces only videos that appear in no previous briefing (a strict set difference, so nothing is ever recommended twice), bounds them to a recency window, and ranks them by how well each one overlaps with an inferred interest profile in `_briefings/profile.yaml` (hand-edit that file to retune). It makes no Gemini calls and needs no `channels:` config: it is a deterministic read over what you have already ingested.
+
+```bash
+# Preview the ranked unseen set (writes nothing)
+python scripts/video_intel.py briefings --unseen --dry-run
+
+# Write a Markdown catch-up guide (top 30 unseen from the last 30 days)
+python scripts/video_intel.py briefings --unseen
+
+# Also write a clickable PDF beside the Markdown (needs the optional [pdf] extra)
+pip install -e ".[pdf]"
+python scripts/video_intel.py briefings --unseen --pdf
+```
+
+The `--pdf` flag is for reading on the go and sharing: it renders the ranked set as a one-page-friendly PDF whose video titles and timestamped moments are bold, accent-colored hyperlinks that open YouTube at the exact second. It is purely additive, the Markdown is always written and remains the record of what has been surfaced. The PDF writer is self-contained ([`scripts/briefing_pdf.py`](scripts/briefing_pdf.py), ~90 lines on top of `reportlab`), so anyone who installs the plugin gets it with no external service.
+
+`briefings --unseen` ranks deterministically; it is the candidate feed, not the final word. The richer, *curated* briefing - a named audience profile, a "watch these N" prioritization, pillar grouping, a "why it matters to you" line per video, and explicit signal/noise calls - is an editorial layer authored on top of that feed. See [`examples/catch-up-briefing-personalized-sample.pdf`](examples/catch-up-briefing-personalized-sample.pdf) for the target output; the curation layer that produces it directly is tracked in [#84](https://github.com/dzivkovi/video-intel/issues/84).
+
 ## Prompt Customization
 
 Prompts live in `prompts/`. Each file is self-contained.
