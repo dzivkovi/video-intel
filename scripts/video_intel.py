@@ -6916,6 +6916,30 @@ def cmd_briefings(args, config):
     out_path.write_text(content, encoding="utf-8")
     print(f"Wrote catch-up briefing: {out_path} ({len(ranked)} videos)")
 
+    # --pdf is purely additive: the Markdown above stays the canonical
+    # seen-coverage record (load_seen_video_ids only parses *.md front matter),
+    # and the PDF is a shareable render of the SAME ranked set. The link
+    # extractor mirrors render_unseen_briefing's zero-score skip exactly so the
+    # two artifacts stay in lockstep.
+    if getattr(args, "pdf", False):
+        try:
+            from briefing_pdf import render_unseen_briefing_pdf
+        except ImportError:
+            log.error(
+                'PDF export needs reportlab. Install the optional extra: pip install -e ".[pdf]" '
+                "(or pip install reportlab). The Markdown briefing was written regardless."
+            )
+        else:
+            pdf_path = out_path.with_suffix(".pdf")
+
+            def _links(video):
+                return extract_mindmap_links(video.get("mindmap_path"), video["url"]) if video.get("score") else []
+
+            render_unseen_briefing_pdf(
+                ranked, profile, pdf_path, lower=lower, upper=upper, link_extractor=_links, today=today
+            )
+            print(f"Wrote catch-up briefing PDF: {pdf_path}")
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -7350,6 +7374,13 @@ Examples:
         default=DEFAULT_LIMIT,
         help=f"Cap the briefing to the top-N most relevant unseen videos (default {DEFAULT_LIMIT}). "
         "0 = no cap. Uncapped videos stay unseen for the next run.",
+    )
+    briefings_parser.add_argument(
+        "--pdf",
+        action="store_true",
+        help="Also write a clickable PDF (<date>-catch-up-unseen.pdf) beside the Markdown, "
+        'rendered from the same ranked set. Requires the [pdf] extra (pip install -e ".[pdf]"). '
+        "The Markdown is always written too - it remains the seen-coverage record.",
     )
 
     args = parser.parse_args()

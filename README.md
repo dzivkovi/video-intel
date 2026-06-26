@@ -331,6 +331,24 @@ python scripts/video_intel.py nugget "second brain patterns" --output brief.md
 
 See [`examples/nugget-lightrag-vs-openbrain-architectural-tension.md`](examples/nugget-lightrag-vs-openbrain-architectural-tension.md) for a sample output.
 
+### Catch-up briefings (Markdown + PDF)
+
+Once a corpus is indexed, `briefings --unseen` builds a personalized "what should I watch" guide. It surfaces only videos that appear in no previous briefing (a strict set difference, so nothing is ever recommended twice), bounds them to a recency window, and ranks them by how well each one overlaps with an inferred interest profile in `_briefings/profile.yaml` (hand-edit that file to retune). It makes no Gemini calls and needs no `channels:` config: it is a deterministic read over what you have already ingested.
+
+```bash
+# Preview the ranked unseen set (writes nothing)
+python scripts/video_intel.py briefings --unseen --dry-run
+
+# Write a Markdown catch-up guide (top 30 unseen from the last 30 days)
+python scripts/video_intel.py briefings --unseen
+
+# Also write a clickable PDF beside the Markdown (needs the optional [pdf] extra)
+pip install -e ".[pdf]"
+python scripts/video_intel.py briefings --unseen --pdf
+```
+
+The `--pdf` flag is for reading on the go and sharing: it renders the same ranked set as a one-page-friendly PDF whose video titles and timestamped moments are bold, accent-colored hyperlinks that open YouTube at the exact second. It is purely additive, the Markdown is always written and remains the record of what has been surfaced. The PDF writer is self-contained ([`scripts/briefing_pdf.py`](scripts/briefing_pdf.py), ~90 lines on top of `reportlab`), so anyone who installs the plugin gets it with no external service.
+
 ## Prompt Customization
 
 Prompts live in `prompts/`. Each file is self-contained.

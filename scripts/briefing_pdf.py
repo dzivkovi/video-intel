@@ -1,0 +1,106 @@
+"""Self-contained PDF renderer for catch-up briefings (issue #82).
+
+A clickable, one-page-friendly PDF rendered from the SAME ranked set the
+Markdown briefing uses (``render_unseen_briefing`` in ``video_intel.py``).
+The design is deliberately lean - the only adornments are the three that
+create a tappable call-to-action: **bold**, an accent color, and a real
+hyperlink. No cover page, no recap section, no tables, no "featured" slot:
+the top-ranked item simply renders first.
+
+reportlab is an OPTIONAL dependency (``pip install -e ".[pdf]"``). Import
+this module lazily so the Markdown path stays dependency-light; callers
+catch ImportError and print an actionable install hint.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Sequence
+
+from reportlab.lib.colors import HexColor
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.platypus import HRFlowable, Paragraph, SimpleDocTemplate
+
+ACCENT = "#c96442"  # the one color that signals "clickable"
+_INK = HexColor("#1a1a1a")
+_BODY = HexColor("#333333")
+_GRAY = HexColor("#777777")
+_RULE = HexColor("#e2e2e2")
+
+_TITLE = ParagraphStyle("bp_title", fontName="Helvetica-Bold", fontSize=19, leading=24, textColor=_INK, spaceAfter=3)
+_SUB = ParagraphStyle("bp_sub", fontName="Helvetica", fontSize=10, leading=14, textColor=_GRAY, spaceAfter=14)
+_VTITLE = ParagraphStyle(
+    "bp_vtitle", fontName="Helvetica-Bold", fontSize=12.5, leading=16, textColor=_INK, spaceBefore=11, spaceAfter=1
+)
+_META = ParagraphStyle("bp_meta", fontName="Helvetica", fontSize=9, leading=12, textColor=_GRAY, spaceAfter=3)
+_WHY = ParagraphStyle("bp_why", fontName="Helvetica", fontSize=11, leading=15.5, textColor=_BODY, spaceAfter=4)
+_JUMP = ParagraphStyle("bp_jump", fontName="Helvetica", fontSize=10.5, leading=16, textColor=_BODY, spaceAfter=2)
+
+
+def _esc(text: object) -> str:
+    """Escape text for reportlab's mini-markup parser (titles are creator-controlled)."""
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _link(url: str, label: str) -> str:
+    """Bold + accent-colored hyperlink - the tappable call-to-action."""
+    return f'<a href="{_esc(url)}" color="{ACCENT}"><b>{_esc(label)}</b></a>'
+
+
+def render_unseen_briefing_pdf(
+    ranked: Sequence[dict],
+    profile: dict,
+    out_path,
+    *,
+    lower,
+    upper,
+    link_extractor: Callable[[dict], list[tuple[str, str]]] | None = None,
+    today=None,
+) -> None:
+    """Write a clickable catch-up-briefing PDF to ``out_path``.
+
+    ``ranked`` items use the same keys as ``render_unseen_briefing``:
+    ``video_id, title, url, channel, published, score, matched_concepts``.
+    ``link_extractor(video) -> [(label, url), ...]`` supplies the timestamped
+    deep-links (the caller passes the same mindmap-link logic the Markdown
+    path uses, so the two renderers stay in lockstep without this module
+    importing from ``video_intel``).
+    """
+    doc = SimpleDocTemplate(
+        str(out_path),
+        pagesize=letter,
+        leftMargin=0.85 * inch,
+        rightMargin=0.85 * inch,
+        topMargin=0.7 * inch,
+        bottomMargin=0.6 * inch,
+        title=f"Catch-up briefing {lower.isoformat()} to {upper.isoformat()}",
+        author="video-intel",
+    )
+    story = [
+        Paragraph("Catch-Up Briefing: Unseen Videos", _TITLE),
+        Paragraph(
+            f"{lower.isoformat()} to {upper.isoformat()} &middot; {len(ranked)} video(s) "
+            "&middot; tap any orange link to jump to that moment",
+            _SUB,
+        ),
+    ]
+    if not ranked:
+        story.append(Paragraph("No unseen videos in this window.", _WHY))
+        doc.build(story)
+        return
+
+    for video in ranked:
+        story.append(Paragraph(_link(video["url"], video["title"]), _VTITLE))
+        meta = f"{_esc(video['channel'])} &middot; {_esc(video.get('published', ''))}"
+        if video.get("score"):
+            meta += f" &middot; relevance {video['score']:g}"
+        story.append(Paragraph(meta, _META))
+        if video.get("matched_concepts"):
+            story.append(Paragraph("Why: " + _esc(", ".join(video["matched_concepts"])), _WHY))
+        links = link_extractor(video) if link_extractor else []
+        if links:
+            story.append(Paragraph("  &middot;  ".join(_link(u, label) for label, u in links), _JUMP))
+        story.append(HRFlowable(width="100%", thickness=0.4, color=_RULE, spaceBefore=7, spaceAfter=1))
+
+    doc.build(story)
