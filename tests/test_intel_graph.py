@@ -295,6 +295,22 @@ class TestLoadCorpus:
         assert counts["concepts"] == 0
         assert counts["artifacts"] == 3  # rest of the load proceeded
 
+    def test_failed_reload_rolls_back_to_previous_store(self, corpus, con, monkeypatch):
+        """A fallible step mid-load must not leave the truth store emptied
+        or half-rebuilt (Codex peer-review catch): the wipe + rebuild run
+        in one transaction."""
+        before = con.execute("SELECT count(*) FROM artifacts").fetchone()[0]
+        assert before == 3
+
+        def boom(_con):
+            raise RuntimeError("simulated mid-load failure")
+
+        monkeypatch.setattr(ig, "ground_mentions", boom)
+        with pytest.raises(RuntimeError):
+            ig.load_corpus(con, corpus)
+        after = con.execute("SELECT count(*) FROM artifacts").fetchone()[0]
+        assert after == before  # rolled back, not emptied
+
 
 class TestTitleRotationSiblings:
     """Two prefixes sharing one video_id (title rotation, pre-dedupe state).
@@ -598,6 +614,51 @@ class TestCheckPair:
         assert result["citation"] is not None
         assert result["citation"]["video_id"] == "vidA"
         assert "cursor" in result["citation"]["quote"].lower()
+
+    def test_citation_requires_word_boundary(self, con):
+        """A citation for 'cursor' must never be a 'precursor' hit: vidB's
+        chunk (t=5s, contains only 'precursor') sorts before vidA's (t=10s),
+        so a substring-matched citation would pick vidB."""
+        fabricate_communities(con, {"term:ralph-loop": 1, "term:cursor": 1})
+        citation = ig._citation_for_phrase(con, ["cursor"])
+        assert citation is not None
+        assert citation["video_id"] == "vidA"
+        assert "cursor" in citation["quote"].lower()
+
+    def test_comention_citation_requires_word_boundaries(self, con):
+        c = ig._citation_for_comention(con, "cursor", "claude code")
+        assert c is not None and c["video_id"] == "vidA"
+
+    def test_failed_projection_clears_stale_communities(self, con, monkeypatch):
+        """A projection that dies mid-way must leave verify loudly
+        stateless, not silently serving the previous run's communities
+        (Codex peer-review catch)."""
+        fabricate_communities(con, {"term:ralph-loop": 7})
+
+        class FakeGD:
+            @staticmethod
+            def driver(*_a, **_k):
+                raise RuntimeError("neo4j down")
+
+        monkeypatch.setattr(ig, "require_neo4j", lambda: FakeGD)
+        ig.compute_co_occurrence(con, max_df=50, min_shared=1)
+        with pytest.raises(RuntimeError):
+            ig.project_to_neo4j(con, "bolt://down", "u", "p")
+        remaining = con.execute("SELECT count(*) FROM entities WHERE community_id IS NOT NULL").fetchone()[0]
+        assert remaining == 0
+
+    def test_overlapping_patterns_do_not_inflate_modal_votes(self, con):
+        """One surface term matched by two patterns must count once
+        (Codex peer-review catch)."""
+        fabricate_communities(con, {"term:autonomous-loop": 1, "term:ralph-loop": 2})
+        pair = {
+            "name": "overlap test",
+            "user_patterns": ["autonomous", "autonomous loop"],  # both hit the same entity
+            "creator_patterns": ["ralph"],
+            "citation_phrases": ["ralph loop"],
+        }
+        result = ig.check_pair(con, pair, {1: 1, 2: 1}, total_nodes=20)
+        assert result["user_communities"] == {"1": 1}  # one vote, not two
 
     def test_anchor_fallback_when_no_entity_matches(self, con):
         """'reliable agents' exists only in vidB's transcript, not as any

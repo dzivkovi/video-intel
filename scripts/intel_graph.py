@@ -155,8 +155,11 @@ def match_pattern_for(phrase: str) -> str:
 
 
 def quote_around(text: str, needle: str, context: int = QUOTE_CONTEXT_CHARS) -> str:
-    """Verbatim snippet of ``text`` centered on the first occurrence of ``needle``."""
-    idx = text.lower().find(normalize_phrase(needle))
+    """Verbatim snippet of ``text`` centered on the first word-boundary
+    occurrence of ``needle`` (substring fallback keeps the snippet useful
+    when the caller already verified presence some other way)."""
+    match = re.search(match_pattern_for(needle), text.lower())
+    idx = match.start() if match else text.lower().find(normalize_phrase(needle))
     if idx < 0:
         return text[:context].strip()
     start = max(0, idx - context // 2)
@@ -268,6 +271,20 @@ def load_corpus(con, output_dir: Path) -> dict[str, int]:
         log.warning("taxonomy.json missing or unreadable at %s - concepts table will be sparse", taxonomy_path)
 
     con.execute(SCHEMA_SQL)
+    # Wipe + rebuild inside one transaction: a fallible read mid-load (bad
+    # transcript, hostile concept value) must roll back to the previous
+    # store, never leave it emptied or half-rebuilt.
+    con.execute("BEGIN TRANSACTION")
+    try:
+        counts = _load_corpus_txn(con, output_dir, concept_rows)
+        con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+    return counts
+
+
+def _load_corpus_txn(con, output_dir: Path, concept_rows: list[tuple]) -> dict[str, int]:
     for table in ALL_TABLES:
         con.execute(f"DELETE FROM {table}")
 
@@ -548,6 +565,13 @@ def project_to_neo4j(
     detection (Leiden by default, seeded and deterministic; Louvain on
     request) + PageRank via GDS, write results back into DuckDB entities."""
     GraphDatabase = require_neo4j()
+    # Invalidate previous algorithm outputs BEFORE the fallible external
+    # phase: a projection that dies mid-way must leave `verify` loudly
+    # stateless ("run project first"), never silently serving the previous
+    # run's communities as current.
+    con.execute("CREATE TABLE IF NOT EXISTS projection_meta (algo VARCHAR, gamma DOUBLE, projected_at TIMESTAMP)")
+    con.execute("UPDATE entities SET community_id = NULL, pagerank = NULL")
+    con.execute("DELETE FROM projection_meta")
     # ORDER BY everywhere: GDS seeds tie-breaking off internal node ids,
     # which follow insertion order - an unordered UNION here made even
     # seeded Leiden runs differ.
@@ -603,7 +627,6 @@ def project_to_neo4j(
     # ground_claims) instead of per-row executemany UPDATEs.
     ranks = dict(pagerank)
     rows = [(eid, community, ranks.get(eid)) for eid, community in communities]
-    con.execute("UPDATE entities SET community_id = NULL, pagerank = NULL")
     con.execute("CREATE OR REPLACE TEMP TABLE _algo_out (entity_id VARCHAR, community_id BIGINT, pagerank DOUBLE)")
     con.executemany("INSERT INTO _algo_out VALUES (?,?,?)", rows)
     con.execute(
@@ -711,7 +734,11 @@ def _anchor_terms(con, phrase: str, limit: int = 200) -> list[tuple[str, int]]:
 
 
 def _citation_for_phrase(con, phrases: list[str]) -> dict[str, Any] | None:
-    """Earliest-published verbatim segment quote for any of the phrases."""
+    """Earliest-published verbatim segment quote for any of the phrases.
+
+    Word-boundary matched, same discipline as grounding: a presented quote
+    for 'cursor' must never be a 'precursor' hit (Codex peer-review catch).
+    """
     for phrase in phrases:
         row = con.execute(
             """
@@ -719,11 +746,11 @@ def _citation_for_phrase(con, phrases: list[str]) -> dict[str, Any] | None:
             FROM segments s
             JOIN artifacts a ON a.artifact_id = s.artifact_id
             JOIN sources so ON so.source_id = a.source_id
-            WHERE contains(lower(s.text), ?)
+            WHERE contains(lower(s.text), ?) AND regexp_matches(lower(s.text), ?)
             ORDER BY a.published_at NULLS LAST, s.start_seconds
             LIMIT 1
             """,
-            [normalize_phrase(phrase)],
+            [normalize_phrase(phrase), match_pattern_for(phrase)],
         ).fetchone()
         if row:
             text, seconds, title, url, video_id, channel = row
@@ -764,10 +791,11 @@ def _citation_for_comention(con, a: str, b: str) -> dict[str, Any] | None:
         JOIN artifacts ar ON ar.artifact_id = s.artifact_id
         JOIN sources so ON so.source_id = ar.source_id
         WHERE contains(lower(s.text), ?) AND contains(lower(s.text), ?)
+          AND regexp_matches(lower(s.text), ?) AND regexp_matches(lower(s.text), ?)
         ORDER BY ar.published_at NULLS LAST, s.start_seconds
         LIMIT 100
         """,
-        [normalize_phrase(a), normalize_phrase(b)],
+        [normalize_phrase(a), normalize_phrase(b), match_pattern_for(a), match_pattern_for(b)],
     ).fetchall()
     if not rows:
         return None
@@ -829,15 +857,19 @@ def check_pair(con, pair: dict[str, Any], community_sizes: dict[int, int], total
     result: dict[str, Any] = {"pair": pair["name"], "recovered": False}
 
     def resolve(patterns: list[str]) -> tuple[Counter, str]:
-        terms: list[tuple[str, int]] = []
+        # Dedup by entity_id across patterns: overlapping patterns must not
+        # let one surface term vote multiple times in the modal count
+        # (Codex peer-review catch - inflated votes could manufacture a
+        # modal community).
+        terms: dict[str, int] = {}
         for p in patterns:
-            terms.extend(_terms_matching(con, p))
+            terms.update(_terms_matching(con, p))
         if terms:
-            return Counter(c for _, c in terms), "entity"
-        anchored: list[tuple[str, int]] = []
+            return Counter(terms.values()), "entity"
+        anchored: dict[str, int] = {}
         for p in patterns:
-            anchored.extend(_anchor_terms(con, p))
-        return Counter(c for _, c in anchored), "anchor"
+            anchored.update(_anchor_terms(con, p))
+        return Counter(anchored.values()), "anchor"
 
     user_counts, user_mode = resolve(pair["user_patterns"])
     creator_counts, creator_mode = resolve(pair["creator_patterns"])
