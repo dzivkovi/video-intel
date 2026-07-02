@@ -20,6 +20,7 @@ pdf = [
 ]
 intelligence = [
     "duckdb>=1.0",
+    "neo4j>=5",
 ]
 dev = [
     "ruff",
