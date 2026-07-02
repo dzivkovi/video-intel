@@ -18,6 +18,9 @@ vector = [
 pdf = [
     "reportlab>=4",
 ]
+intelligence = [
+    "duckdb>=1.0",
+]
 dev = [
     "ruff",
     "pytest",
