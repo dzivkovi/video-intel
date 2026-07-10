@@ -6518,15 +6518,17 @@ def parse_front_matter(text: str) -> tuple[dict, str]:
 
 
 def load_seen_video_ids(briefings_dir: Path) -> set[str]:
-    """Union of `video_ids` across every _briefings/*.md front matter.
+    """Union of `video_ids` across every _briefings/**/*.md front matter.
 
     This is the strict set-difference basis for "unseen": a video that has
     appeared in ANY briefing is considered surfaced. Missing dir -> empty set.
+    Recurses into subfolders (e.g. _briefings/sales/) so topic-based
+    organization of the briefings dir doesn't silently un-see videos.
     """
     seen: set[str] = set()
     if not briefings_dir.is_dir():
         return seen
-    for md in sorted(briefings_dir.glob("*.md")):
+    for md in sorted(briefings_dir.rglob("*.md")):
         try:
             front_matter, _ = parse_front_matter(md.read_text(encoding="utf-8"))
         except OSError:

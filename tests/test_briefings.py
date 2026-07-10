@@ -101,6 +101,33 @@ def test_load_seen_video_ids_briefing_without_ids(tmp_path):
     assert load_seen_video_ids(briefings) == set()
 
 
+def test_load_seen_video_ids_recurses_into_topic_subfolders(tmp_path):
+    """Topic subfolders (e.g. _briefings/sales/) must not un-see their videos."""
+    from video_intel import load_seen_video_ids
+
+    briefings = tmp_path / "_briefings"
+    _write_briefing(briefings, "2026-06-10-a.md", ["v1"])
+    _write_briefing(briefings / "sales", "2026-07-03-sales-catchup.md", ["v2", "v3"])
+
+    assert load_seen_video_ids(briefings) == {"v1", "v2", "v3"}
+
+
+def test_load_seen_video_ids_recurses_into_dot_and_underscore_subfolders(tmp_path):
+    """Unlike collect_corpus_videos's channel-dir skip, dot/underscore-prefixed
+    subfolders *inside* _briefings/ are not special-cased here - they still
+    count as seen. The two functions have deliberately opposite policies:
+    collect_corpus_videos skips _briefings entirely (so it's never mistaken
+    for a channel), while load_seen_video_ids recurses into everything under
+    it (so no organizing scheme inside _briefings can un-see a video)."""
+    from video_intel import load_seen_video_ids
+
+    briefings = tmp_path / "_briefings"
+    _write_briefing(briefings / ".archive", "2026-05-01-old.md", ["v4"])
+    _write_briefing(briefings / "_drafts", "2026-05-02-draft.md", ["v5"])
+
+    assert load_seen_video_ids(briefings) == {"v4", "v5"}
+
+
 # --------------------------------------------------------------------------
 # collect_corpus_videos
 # --------------------------------------------------------------------------
