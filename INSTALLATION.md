@@ -71,6 +71,21 @@ instead of system environment variables (this file is never committed):
 }
 ```
 
+**Where personal permissions belong.** These allow-list entries are just auto-approval rules for Claude Code (they tell it "run this tool without pausing to ask me"). They contain no credentials and grant no access to anyone's data - your Google Drive access comes from your own OAuth connection in your claude.ai connector settings, which lives only on your machine and is never in this repo. Still, the committed `.claude/settings.json` is kept minimal and only holds auto-approvals that make sense for everyone who clones the repo (for example the folder-scoped `Read(//.../video-intel/**)`). An auto-approval that is a personal preference belongs in your never-committed local settings (`.claude/settings.local.json` in the repo, or `~/.claude/settings.local.json` at the user level). The clearest example is letting Claude search your Google Drive corpus via connectors without prompting every time:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "mcp__claude_ai_Google_Drive__search_files",
+      "mcp__claude_ai_Google_Drive__read_file_content"
+    ]
+  }
+}
+```
+
+Keeping this in local settings means each person consciously opts into skipping the approval prompt for their own account, rather than inheriting that choice from a cloned repo. It never exposes your Drive to anyone - the connector always acts as whoever is signed in on their own machine.
+
 ### Claude Code user-level (access the search skill from any project)
 
 After the project-scoped install above works, you can make the **read-only**
