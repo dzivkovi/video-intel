@@ -145,6 +145,7 @@ table is the canonical mapping — read it before picking a command.
 | "prune shorts", "remove shorts", "too many shorts in my corpus" | `prune-shorts [--apply]` | **Always `--dry-run` first** — destructive on `--apply`; deletes mindmap/transcript/concepts/meta per Short |
 | "rebuild taxonomy", "update master vocabulary" | `taxonomy-build` | Derived artifact; rebuildable anytime |
 | "catch me up on what I missed", "what haven't I been briefed on", "videos I haven't seen yet", "generate a catch-up briefing", "fill the gaps in my viewing guides", "give me the briefing as a PDF", "a briefing I can open on my phone / share" | `briefings --unseen [--dry-run] [--since DATE] [--until DATE] [--limit N] [--pdf]` | Surfaces corpus videos absent from every existing `_briefings/**/*.md` `video_ids` list, including topic subfolders like `_briefings/sales/` (strict set difference, never re-surfaced once briefed), **across the whole corpus by default (no recency floor)**, ranked by relevance overlap with the inferred profile in `_briefings/profile.yaml` and capped to the top `N` (default 30; `--limit 0` = no cap). Each entry shows an age badge (`age 3y`) and a "By year" appendix regroups the same set chronologically. `--dry-run` previews; otherwise writes `_briefings/<date>-catch-up-unseen.md`. `--pdf` additionally writes a clickable `.pdf` beside it (bold, accent-colored, hyperlinked timestamps; needs the `[pdf]` extra). Pass `--since 30d` (or any date) to *narrow* to a recency floor. No Gemini, no `channels:` required. |
+| "build me a briefing on **[topic]**", "what should I know about X", "catch me up on **[topic]**", "make me a curated guide on Y" (a **specific topic**, not the deterministic unseen catch-up) | *In-session curation workflow* (see "Curated topic briefing" below) | NOT a single command. Read `_briefings/audience.md`, gather candidates via `search --vector` across several vocabulary angles, verify mindmaps + exact timestamps, author the editorial structure (lens, watch-these-N, pillars, why-it-matters-to-you, signal/noise) with a `video_ids:` front matter, write to `_briefings/<topic>/`, render with `scripts/markdown_pdf.py`. The assistant authors the judgment; the scripts only supply candidates + render. |
 | "this video keeps getting re-transcribed", "fix identity-less metas", "backfill missing video_id", "meta.json has no video_id" | `repair-metas [--apply]` | **Dry-run first** (issue #66). Reconstructs `video_id`/`url`/`title`/`published` from the `.transcript.md` header for metas missing identity; only fills missing fields; refuses local/non-YouTube sources. Re-run `index --force` after `--apply`. |
 | "skip transcript on this video", "stop trying to transcribe [URL]", "this video keeps failing transcript", "block transcript only" | `mark-skip --url URL --mode transcript [--reason TEXT]` | Per-mode skip (issue #42). Mindmap and concepts continue to run. Repeatable: `--mode transcript --mode concepts`. |
 | "permanently ignore this video", "never re-process [video_id]", "skip these IDs on backfill", "stop touching this URL on every scan" | edit `skip_video_ids` under the channel in `config.yaml` | Declarative pre-fetch blocklist. Listed IDs never reach Gemini, never get a meta.json, no cost. Override = remove the ID from config. Cheaper than `mark-skip` since no meta.json roundtrip needed. |
@@ -525,6 +526,55 @@ open YouTube at the exact second. The PDF is purely additive - the Markdown is
 always written and remains the seen-coverage record. Requires the optional
 `reportlab` dependency (`pip install -e ".[pdf]"`); without it the Markdown
 still writes and an install hint is logged.
+
+### Curated topic briefing (the editorial layer, authored in-session)
+
+`briefings --unseen` is the *deterministic candidate feed*. A **curated topic
+briefing** - the kind a user means by "build me a briefing on AI observability"
+or "what should I know about X" - is the richer editorial artifact you (the
+assistant) author in-session. The script never authors this judgment: it has no
+reader context and does not call an LLM during triage. Your job is the curation;
+the committed scripts only supply candidates and render.
+
+Route a "briefing / catch me up / what should I know about **a specific topic**"
+request (as opposed to the deterministic unseen catch-up) to this workflow:
+
+1. **Read the reader context.** If `<output_dir>/_briefings/audience.md` exists,
+   read it - its standing pillars, current goals, and signal/noise calls are what
+   ground the "why it matters to YOU" lines. (Template: `examples/audience.md`.)
+   **If it does NOT exist, do not invent the reader's goals.** Either ask the user
+   for their pillars/priorities (and offer to save them as `audience.md`), or fall
+   back to *topical* relevance - a "why it matters" line grounded only in the
+   video's own content, not a fabricated personalization - and say so. Never
+   manufacture "matters to YOU because you're working on X" without a real source.
+2. **Gather candidates via hybrid search.** Run `search "<angle>" --vector`
+   across several *vocabulary angles* for the topic (creators rarely use the
+   user's exact term - see the observability example: they say "tracing,"
+   "telemetry," "agent analytics," not "observability"). A video surfacing under
+   multiple angles is a strong signal.
+3. **Verify before you cite.** Read the matched `*.mindmap.md` files to confirm
+   each is genuinely on-topic and to copy **exact** timestamps. Drop title-similar
+   results that turn out off-topic; mark honest `core` vs `peripheral`.
+4. **Author the editorial structure** (match `examples/catch-up-briefing-personalized-sample.pdf`):
+   an intro/lens line, a "watch these N" top-picks section, `## Pillar` groupings
+   from `audience.md`, a why-it-matters-to-you line per item grounded in the
+   mindmap + reader context, and an explicit signal/noise ("skim or skip",
+   "explicitly excluded") section. Put a `video_ids:` front-matter list at the top
+   so the briefing counts toward the seen-set.
+5. **Render + place.** Write the Markdown into `_briefings/<topic>/` (a topic
+   subfolder), then render the clickable PDF beside it:
+
+   ```bash
+   python "${CLAUDE_SKILL_DIR}/../../scripts/markdown_pdf.py" _briefings/<topic>/<file>.md _briefings/<topic>/<file>.pdf
+   ```
+
+   `markdown_pdf.py` gives curated briefings the same bold/accent/hyperlink
+   aesthetic as the `--pdf` flag, and keeps `[text](url)` + `&t=` deep-links
+   clickable even inside `**bold**` headers.
+
+Do NOT fabricate "why it matters" prose from the deterministic ranking alone -
+that line requires the reader context in `audience.md`, which is the whole point
+of keeping it separate from the machine-scored `profile.yaml`.
 
 ### Extract and normalize concepts
 
