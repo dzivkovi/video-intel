@@ -358,6 +358,12 @@ The `--pdf` flag is for reading on the go and sharing: it renders the ranked set
 
 `briefings --unseen` ranks deterministically; it is the candidate feed, not the final word. The richer, *curated* briefing - a named audience profile, a "watch these N" prioritization, pillar grouping, a "why it matters to you" line per video, and explicit signal/noise calls - is an editorial layer authored on top of that feed. See [`examples/catch-up-briefing-personalized-sample.pdf`](examples/catch-up-briefing-personalized-sample.pdf) for the target output; the curation layer that produces it directly is tracked in [#84](https://github.com/dzivkovi/video-intel/issues/84).
 
+Those curated briefings are free-form Markdown (authored per topic, not a fixed `ranked` shape), so they render through a general companion, [`scripts/markdown_pdf.py`](scripts/markdown_pdf.py) - the same bold/accent/hyperlink aesthetic as `briefing_pdf.py`, but for arbitrary Markdown. It strips a leading YAML front-matter block, keeps `[text](url)` and bare-URL links (including `&t=` deep-links) clickable even inside `**bold**` headers, and runs standalone:
+
+```bash
+python scripts/markdown_pdf.py _briefings/observability/2026-07-10-ai-observability-catchup.md out.pdf
+```
+
 ## Prompt Customization
 
 Prompts live in `prompts/`. Each file is self-contained.
