@@ -333,19 +333,26 @@ See [`examples/nugget-lightrag-vs-openbrain-architectural-tension.md`](examples/
 
 ### Catch-up briefings (Markdown + PDF)
 
-Once a corpus is indexed, `briefings --unseen` builds a personalized "what should I watch" guide. It surfaces only videos that appear in no previous briefing (a strict set difference, so nothing is ever recommended twice), bounds them to a recency window, and ranks them by how well each one overlaps with an inferred interest profile in `_briefings/profile.yaml` (hand-edit that file to retune). It makes no Gemini calls and needs no `channels:` config: it is a deterministic read over what you have already ingested.
+Once a corpus is indexed, `briefings --unseen` builds a personalized "what should I watch" guide. It surfaces only videos that appear in no previous briefing (a strict set difference, so nothing is ever recommended twice), and ranks them by how well each one overlaps with an inferred interest profile in `_briefings/profile.yaml` (hand-edit that file to retune). By default the scan is **unbounded** - every never-briefed video is a candidate regardless of age, because a catch-up should surface old-but-missed videos rather than hide them; pass `--since` / `--until` to *narrow* to a date window when you want one. It makes no Gemini calls and needs no `channels:` config: it is a deterministic read over what you have already ingested.
 
 ```bash
 # Preview the ranked unseen set (writes nothing)
 python scripts/video_intel.py briefings --unseen --dry-run
 
-# Write a Markdown catch-up guide (top 30 unseen from the last 30 days)
+# Write a Markdown catch-up guide (top 30 unseen across the whole corpus)
 python scripts/video_intel.py briefings --unseen
+
+# Narrow to just the last month, and raise the cap
+python scripts/video_intel.py briefings --unseen --since 30d --limit 60
 
 # Also write a clickable PDF beside the Markdown (needs the optional [pdf] extra)
 pip install -e ".[pdf]"
 python scripts/video_intel.py briefings --unseen --pdf
 ```
+
+Each entry carries an **age badge** (`age 3y`), and a secondary **"By year"** section regroups the same videos chronologically - the primary list stays relevance-ranked (recency is only a tiebreaker, so an old-but-important video still surfaces near the top rather than being buried). On a first run against a large corpus with no tuned `profile.yaml` yet, a one-line warning suggests previewing with `--dry-run` and hand-editing the profile first.
+
+**Organizing briefings by topic:** `_briefings/` may hold arbitrary subfolders (e.g. `_briefings/sales/`, `_briefings/observability/`) for manually curated or moved-there briefings. Seen-tracking recurses into them, so a video surfaced in a subfoldered briefing is never re-surfaced. Folder names are a filesystem convention only - there is no per-topic flag or config.
 
 The `--pdf` flag is for reading on the go and sharing: it renders the ranked set as a one-page-friendly PDF whose video titles and timestamped moments are bold, accent-colored hyperlinks that open YouTube at the exact second. It is purely additive, the Markdown is always written and remains the record of what has been surfaced. The PDF writer is self-contained ([`scripts/briefing_pdf.py`](scripts/briefing_pdf.py), ~90 lines on top of `reportlab`), so anyone who installs the plugin gets it with no external service.
 

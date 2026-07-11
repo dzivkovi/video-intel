@@ -71,6 +71,39 @@ def test_zero_score_video_has_no_deeplinks(tmp_path):
     assert "0:35" in text
 
 
+def test_pdf_shows_age_badge_and_by_year_appendix(tmp_path):
+    """Issue #88 parity: the PDF must carry the same age badge + By Year appendix
+    as the Markdown render, so the two artifacts stay in lockstep."""
+    ranked = [
+        {
+            "video_id": "new",
+            "title": "Recent Talk",
+            "url": "https://youtu.be/new",
+            "channel": "ch",
+            "published": "2026-06-01",
+            "score": 9,
+            "matched_concepts": [],
+        },
+        {
+            "video_id": "old",
+            "title": "Foundational Talk",
+            "url": "https://youtu.be/old",
+            "channel": "ch",
+            "published": "2024-03-01",
+            "score": 8,
+            "matched_concepts": [],
+        },
+    ]
+    out = tmp_path / "brief.pdf"
+    render_unseen_briefing_pdf(
+        ranked, PROFILE, out, lower=date.min, upper=date(2026, 7, 6), link_extractor=_links, today=date(2026, 7, 6)
+    )
+    text = "".join(p.extract_text() for p in pypdf.PdfReader(str(out)).pages)
+    assert "age 2y" in text  # the 2024 video's mechanical age badge
+    assert "By Year" in text
+    assert "2026" in text and "2024" in text
+
+
 def test_empty_ranked_set_does_not_crash(tmp_path):
     out = tmp_path / "empty.pdf"
     render_unseen_briefing_pdf([], PROFILE, out, lower=LOWER, upper=UPPER, link_extractor=_links)

@@ -144,7 +144,7 @@ table is the canonical mapping — read it before picking a command.
 | "rebuild the index", "reindex after dedupe" | `index --force` | Write-path rebuild of LanceDB; query uses `video-intel-search` |
 | "prune shorts", "remove shorts", "too many shorts in my corpus" | `prune-shorts [--apply]` | **Always `--dry-run` first** — destructive on `--apply`; deletes mindmap/transcript/concepts/meta per Short |
 | "rebuild taxonomy", "update master vocabulary" | `taxonomy-build` | Derived artifact; rebuildable anytime |
-| "catch me up on what I missed", "what haven't I been briefed on", "videos I haven't seen yet", "generate a catch-up briefing", "fill the gaps in my viewing guides", "give me the briefing as a PDF", "a briefing I can open on my phone / share" | `briefings --unseen [--dry-run] [--since DATE] [--until DATE] [--limit N] [--pdf]` | Surfaces corpus videos absent from every existing `_briefings/**/*.md` `video_ids` list, including topic subfolders like `_briefings/sales/` (strict set difference, never re-surfaced once briefed), within a default 30-day UTC window, ranked by overlap with the inferred profile in `_briefings/profile.yaml` and capped to the top `N` (default 30; `--limit 0` = no cap). `--dry-run` previews; otherwise writes `_briefings/<date>-catch-up-unseen.md`. `--pdf` additionally writes a clickable `.pdf` beside it (bold, accent-colored, hyperlinked timestamps; needs the `[pdf]` extra). Widen with `--since 120d` for a one-time backlog sweep. No Gemini, no `channels:` required. |
+| "catch me up on what I missed", "what haven't I been briefed on", "videos I haven't seen yet", "generate a catch-up briefing", "fill the gaps in my viewing guides", "give me the briefing as a PDF", "a briefing I can open on my phone / share" | `briefings --unseen [--dry-run] [--since DATE] [--until DATE] [--limit N] [--pdf]` | Surfaces corpus videos absent from every existing `_briefings/**/*.md` `video_ids` list, including topic subfolders like `_briefings/sales/` (strict set difference, never re-surfaced once briefed), **across the whole corpus by default (no recency floor)**, ranked by relevance overlap with the inferred profile in `_briefings/profile.yaml` and capped to the top `N` (default 30; `--limit 0` = no cap). Each entry shows an age badge (`age 3y`) and a "By year" appendix regroups the same set chronologically. `--dry-run` previews; otherwise writes `_briefings/<date>-catch-up-unseen.md`. `--pdf` additionally writes a clickable `.pdf` beside it (bold, accent-colored, hyperlinked timestamps; needs the `[pdf]` extra). Pass `--since 30d` (or any date) to *narrow* to a recency floor. No Gemini, no `channels:` required. |
 | "this video keeps getting re-transcribed", "fix identity-less metas", "backfill missing video_id", "meta.json has no video_id" | `repair-metas [--apply]` | **Dry-run first** (issue #66). Reconstructs `video_id`/`url`/`title`/`published` from the `.transcript.md` header for metas missing identity; only fills missing fields; refuses local/non-YouTube sources. Re-run `index --force` after `--apply`. |
 | "skip transcript on this video", "stop trying to transcribe [URL]", "this video keeps failing transcript", "block transcript only" | `mark-skip --url URL --mode transcript [--reason TEXT]` | Per-mode skip (issue #42). Mindmap and concepts continue to run. Repeatable: `--mode transcript --mode concepts`. |
 | "permanently ignore this video", "never re-process [video_id]", "skip these IDs on backfill", "stop touching this URL on every scan" | edit `skip_video_ids` under the channel in `config.yaml` | Declarative pre-fetch blocklist. Listed IDs never reach Gemini, never get a meta.json, no cost. Override = remove the ID from config. Cheaper than `mark-skip` since no meta.json roundtrip needed. |
@@ -480,11 +480,11 @@ index). Querying the index belongs to the `video-intel-search` skill.
 # Preview what hasn't been surfaced in any _briefings/ guide yet (writes nothing)
 python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" briefings --unseen --dry-run
 
-# Write a catch-up briefing: top 30 unseen videos from the last 30 days
+# Write a catch-up briefing: top 30 unseen videos across the whole corpus (unbounded by default)
 python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" briefings --unseen
 
-# One-time backlog sweep: widen the window and raise the cap
-python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" briefings --unseen --since 120d --limit 60
+# Narrow to just recent videos, and raise the cap
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" briefings --unseen --since 30d --limit 60
 
 # Also write a clickable PDF beside the Markdown (needs the [pdf] extra)
 python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" briefings --unseen --pdf
@@ -492,14 +492,22 @@ python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" briefings --unseen --p
 
 `briefings --unseen` surfaces corpus videos that appear in no existing
 `_briefings/**/*.md` front-matter `video_ids` list (strict set difference, so a
-video is never re-surfaced once it lands in any briefing), bounded to a UTC
-date window (default 30-day recency floor; `--since` / `--until` override) and
-capped to the top `N` by relevance (`--limit`, default 30; `--limit 0` = no
+video is never re-surfaced once it lands in any briefing). By default the scan
+is **unbounded** - every never-briefed video is a candidate regardless of age,
+because a catch-up should surface old-but-missed videos, not hide them. Pass
+`--since` / `--until` to *narrow* to a date window when you want one. Results
+are capped to the top `N` by relevance (`--limit`, default 30; `--limit 0` = no
 cap). Uncapped videos stay unseen for the next run, so the cap creates a
 rolling catch-up rather than dropping anything. Ranking is concept/taxonomy
 overlap with an inferred interest profile persisted at `_briefings/profile.yaml`
-(hand-edit to retune; never overwritten once it has content). No Gemini calls
-and no `channels:` config required. Writes `_briefings/<date>-catch-up-unseen.md`;
+(hand-edit to retune; never overwritten once it has content) - recency is only
+a tiebreaker, so an old-but-important video still ranks near the top. Each entry
+carries an age badge (`age 3y`), and a secondary "By year" section at the end
+regroups the same videos chronologically for quick temporal scanning without
+disturbing the relevance order. On a first run against a large corpus with no
+tuned `profile.yaml` yet, a one-line warning suggests previewing with
+`--dry-run` and hand-editing the profile first. No Gemini calls and no
+`channels:` config required. Writes `_briefings/<date>-catch-up-unseen.md`;
 `--dry-run` only prints the ranked unseen set.
 
 **Organizing briefings into topic subfolders is safe and needs no config.**

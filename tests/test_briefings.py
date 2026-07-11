@@ -1,18 +1,19 @@
 """Tests for the `briefings --unseen` catch-up command (issue #80).
 
 The catch-up path selects corpus videos that no existing briefing has surfaced
-(strict set difference on front-matter `video_ids`), bounds them to a UTC date
-window (default 90-day recency floor), ranks them by concept/taxonomy overlap
-with an inferred profile, and renders a briefing. Coverage here is the
-deterministic core; the LLM-judgment layer is deliberately out of v1 scope.
+(strict set difference on front-matter `video_ids`), across an unbounded date
+window by default (issue #88; `--since`/`--until` narrow it), ranks them by
+concept/taxonomy overlap with an inferred profile, and renders a briefing.
+Coverage here is the deterministic core; the LLM-judgment layer is out of scope.
 """
 
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, timedelta
 from types import SimpleNamespace
 
+import pytest
 import yaml
 
 
@@ -166,13 +167,15 @@ def test_collect_corpus_videos_skips_meta_without_video_id(tmp_path):
 # --------------------------------------------------------------------------
 # compute_catchup_window + select_unseen
 # --------------------------------------------------------------------------
-def test_compute_catchup_window_default_recency_floor():
+def test_compute_catchup_window_default_is_unbounded():
+    """Issue #88: no recency floor by default - lower is date.min so a
+    never-briefed video of any age is a catch-up candidate."""
     from video_intel import compute_catchup_window
 
     today = date(2026, 6, 22)
     lower, upper = compute_catchup_window(today=today)
     assert upper == today
-    assert lower == date(2026, 5, 23)  # default 30-day floor
+    assert lower == date.min
 
 
 def test_compute_catchup_window_since_overrides_floor():
@@ -516,6 +519,108 @@ def test_render_unseen_briefing_includes_mindmap_links(tmp_path):
     assert "&t=237s" in md  # 3:57 deep-link wired through render
 
 
+def test_format_age_units():
+    """Issue #88: age badge is a mechanical y/mo/d derivation, no future/missing."""
+    from video_intel import _format_age
+
+    today = date(2026, 7, 6)
+    assert _format_age(date(2023, 4, 12), today) == "3y"
+    assert _format_age(date(2025, 11, 9), today) == "7mo"
+    assert _format_age(date(2026, 7, 1), today) == "5d"
+    assert _format_age(None, today) == ""
+    assert _format_age(date(2026, 8, 1), today) == ""  # future -> no badge
+
+
+def test_format_age_exact_boundaries():
+    """Lock the 30/365 day boundaries: exactly 365 -> 1y, 364 -> 11mo,
+    exactly 30 -> 1mo, 29 -> 29d. Guards the // approximations."""
+    from video_intel import _format_age
+
+    base = date(2020, 1, 1)  # non-leap-adjacent anchor for stable day math
+    assert _format_age(base, base + timedelta(days=365)) == "1y"
+    # 364 days is still months, and 364//30 == 12 -> "12mo" (a benign 1-day
+    # quirk of the mechanical //30 rule; acceptable for a coarse age badge).
+    assert _format_age(base, base + timedelta(days=364)) == "12mo"
+    assert _format_age(base, base + timedelta(days=30)) == "1mo"
+    assert _format_age(base, base + timedelta(days=29)) == "29d"
+    assert _format_age(base, base) == "0d"  # same day
+
+
+def test_age_helpers_are_behaviourally_identical():
+    """video_intel._format_age and briefing_pdf._age MUST stay in lockstep
+    (issue #88 PDF parity) - the PDF re-implements rather than imports."""
+    pytest.importorskip("reportlab", reason="briefing_pdf needs the [pdf] extra")
+    from briefing_pdf import _age
+
+    from video_intel import _format_age
+
+    base = date(2020, 1, 1)
+    for offset in (0, 1, 29, 30, 31, 60, 364, 365, 366, 730, 1000):
+        d = base + timedelta(days=offset)
+        assert _format_age(base, d) == _age(base, d), f"mismatch at {offset} days"
+    # missing + future agree too
+    assert _format_age(None, base) == _age(None, base) == ""
+    assert _format_age(base + timedelta(days=1), base) == _age(base + timedelta(days=1), base) == ""
+
+
+def test_render_unseen_briefing_shows_age_badge():
+    from video_intel import render_unseen_briefing
+
+    ranked = [
+        {
+            "video_id": "v",
+            "title": "Old but gold",
+            "url": "https://www.youtube.com/watch?v=v",
+            "channel": "ch",
+            "published": "2024-01-08",
+            "score": 3,
+            "matched_concepts": [],
+            "mindmap_path": None,
+        }
+    ]
+    md = render_unseen_briefing(ranked, {"id": "p"}, lower=date.min, upper=date(2026, 7, 6), today=date(2026, 7, 6))
+    assert "age 2y" in md
+
+
+def test_render_unseen_briefing_by_year_appendix():
+    """Primary list stays relevance-ordered; the appendix regroups the SAME
+    video_ids by year (newest first) without reordering the primary list."""
+    from video_intel import render_unseen_briefing
+
+    ranked = [
+        # relevance order: recent low-content first, older high-relevance second
+        {
+            "video_id": "a",
+            "title": "Recent",
+            "url": "https://youtu.be/a",
+            "channel": "ch",
+            "published": "2026-06-01",
+            "score": 9,
+            "matched_concepts": [],
+            "mindmap_path": None,
+        },
+        {
+            "video_id": "b",
+            "title": "Older core",
+            "url": "https://youtu.be/b",
+            "channel": "ch",
+            "published": "2024-03-01",
+            "score": 8,
+            "matched_concepts": [],
+            "mindmap_path": None,
+        },
+    ]
+    md = render_unseen_briefing(ranked, {"id": "p"}, lower=date.min, upper=date(2026, 7, 6), today=date(2026, 7, 6))
+    assert "## By year" in md
+    # Appendix headers present, newest year first.
+    assert md.index("### 2026") < md.index("### 2024")
+    # Both videos appear in the appendix by title.
+    appendix = md.split("## By year", 1)[1]
+    assert "Recent" in appendix and "Older core" in appendix
+    # Primary list order is untouched: "Recent" H2 precedes "Older core" H2.
+    assert md.index("## [Recent]") < md.index("## [Older core]")
+
+
 def test_render_unseen_briefing_escapes_bracket_titles():
     from video_intel import render_unseen_briefing
 
@@ -590,6 +695,86 @@ def test_cmd_briefings_respects_limit(tmp_path):
     written = list((tmp_path / "_briefings").glob("*-catch-up-unseen.md"))
     fm, _ = vi.parse_front_matter(written[0].read_text(encoding="utf-8"))
     assert len(fm["video_ids"]) == 2  # capped to top-2; other 3 remain unseen next run
+
+
+def _seed_five_videos(tmp_path):
+    for i in range(5):
+        _write_video(
+            tmp_path / "natebjones", f"2026-06-2{i}-v{i}", video_id=f"v{i}", published=f"2026-06-2{i}", concepts=[]
+        )
+
+
+def test_cold_start_warning_fires_without_tuned_profile(tmp_path, caplog):
+    """Issue #88: first run, no profile.yaml, more unseen than the cap -> warn."""
+    import logging
+
+    import video_intel as vi
+
+    _seed_five_videos(tmp_path)
+    args = SimpleNamespace(unseen=True, dry_run=True, since=None, until=None, limit=2)
+    with caplog.at_level(logging.WARNING):
+        vi.cmd_briefings(args, {"output_dir": str(tmp_path)})
+    assert any("no tuned _briefings/profile.yaml yet" in r.message for r in caplog.records)
+
+
+def test_cold_start_warning_suppressed_with_usable_profile(tmp_path, caplog):
+    import logging
+
+    import video_intel as vi
+
+    _seed_five_videos(tmp_path)
+    briefings = tmp_path / "_briefings"
+    briefings.mkdir()
+    (briefings / "profile.yaml").write_text("id: hand-tuned\ninterest_concepts: {}\n", encoding="utf-8")
+    args = SimpleNamespace(unseen=True, dry_run=True, since=None, until=None, limit=2)
+    with caplog.at_level(logging.WARNING):
+        vi.cmd_briefings(args, {"output_dir": str(tmp_path)})
+    assert not any("no tuned" in r.message for r in caplog.records)
+
+
+def test_cold_start_warning_fires_on_empty_profile_yaml(tmp_path, caplog):
+    """Codex finding: an empty/broken profile.yaml must NOT suppress the warning -
+    _load_usable_profile treats it as no profile, matching infer_or_load_profile."""
+    import logging
+
+    import video_intel as vi
+
+    _seed_five_videos(tmp_path)
+    briefings = tmp_path / "_briefings"
+    briefings.mkdir()
+    (briefings / "profile.yaml").write_text("", encoding="utf-8")  # exists but empty
+    args = SimpleNamespace(unseen=True, dry_run=True, since=None, until=None, limit=2)
+    with caplog.at_level(logging.WARNING):
+        vi.cmd_briefings(args, {"output_dir": str(tmp_path)})
+    assert any("no tuned _briefings/profile.yaml yet" in r.message for r in caplog.records)
+
+
+def test_window_label_shows_unbounded_for_date_min():
+    from video_intel import _window_label
+
+    assert _window_label(date.min, date(2026, 7, 10)) == "unbounded to 2026-07-10"
+    assert _window_label(date(2026, 6, 1), date(2026, 7, 10)) == "2026-06-01 to 2026-07-10"
+
+
+def test_render_briefing_visible_window_says_unbounded_but_frontmatter_keeps_iso():
+    """Visible prose shows 'unbounded'; machine-readable front matter keeps date.min ISO."""
+    from video_intel import render_unseen_briefing
+
+    ranked = [
+        {
+            "video_id": "v",
+            "title": "T",
+            "url": "https://youtu.be/v",
+            "channel": "ch",
+            "published": "2026-06-01",
+            "score": 1,
+            "matched_concepts": [],
+            "mindmap_path": None,
+        }
+    ]
+    md = render_unseen_briefing(ranked, {"id": "p"}, lower=date.min, upper=date(2026, 7, 10), today=date(2026, 7, 10))
+    assert "**Window:** unbounded to 2026-07-10" in md
+    assert "start: '0001-01-01'" in md  # scan_window front matter stays machine-stable
 
 
 def test_render_suppresses_links_for_scoreless_entries(tmp_path):
