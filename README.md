@@ -364,6 +364,8 @@ Those curated briefings are free-form Markdown (authored per topic, not a fixed 
 python scripts/markdown_pdf.py _briefings/observability/2026-07-10-ai-observability-catchup.md out.pdf
 ```
 
+The curation itself is authored **in-session by the assistant**, not scripted (the script has no reader context and makes no LLM call during triage). Two pieces make it repeatable: a hand-editable **audience profile** ([`examples/audience.md`](examples/audience.md) - copy it to `<output_dir>/_briefings/audience.md` and edit) that holds your standing pillars, current goals, and signal/noise calls (distinct from the machine-scored `profile.yaml`); and a documented **curation workflow** in the video-intel skill (read the profile → gather candidates via `search --vector` across several vocabulary angles → verify mindmaps and exact timestamps → author lens / watch-these-N / pillars / why-it-matters-to-you / signal-noise → render to `_briefings/<topic>/`). The `briefings --topic` convenience that scaffolds the candidate set is tracked in [#91](https://github.com/dzivkovi/video-intel/issues/91).
+
 ## Prompt Customization
 
 Prompts live in `prompts/`. Each file is self-contained.

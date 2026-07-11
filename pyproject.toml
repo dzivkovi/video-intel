@@ -25,6 +25,11 @@ dev = [
     "ruff",
     "pytest",
     "pytest-cov",
+    # PDF test deps: without these, the briefing/markdown PDF tests silently
+    # importorskip on a clean dev install and their strongest assertions
+    # (clickable-link counts, sample-structure drift guard) never run.
+    "reportlab>=4",
+    "pypdf",
 ]
 
 [tool.ruff]
