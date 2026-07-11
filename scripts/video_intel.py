@@ -26,7 +26,7 @@ import time
 import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from html import unescape
 from pathlib import Path
 from typing import Any
@@ -6488,7 +6488,6 @@ def cmd_repair_metas(args, config):
 
 BRIEFINGS_DIR_NAME = "_briefings"
 PROFILE_FILENAME = "profile.yaml"
-DEFAULT_RECENCY_DAYS = 30
 DEFAULT_LIMIT = 30
 PROFILE_TOP_CONCEPTS = 40
 
@@ -6599,15 +6598,19 @@ def _parse_iso_date(value: str):
         return None
 
 
-def compute_catchup_window(*, since=None, until=None, recency_days: int = DEFAULT_RECENCY_DAYS, today=None):
+def compute_catchup_window(*, since=None, until=None, today=None):
     """Return (lower, upper) date bounds for a catch-up scan, all UTC dates.
 
-    lower = `since` if given, else today - recency_days (the stale-backfill floor).
-    upper = `until` if given, else today.
+    lower = `since` if given, else `date.min` - i.e. **unbounded by default**
+    (issue #88). The permanent set-difference on `video_id` (see
+    `load_seen_video_ids` / `select_unseen`) is the real "never re-surface"
+    guard; a recency floor only hid old-but-never-briefed videos, which is the
+    opposite of what a catch-up should do. Pass `--since` to *narrow* back to a
+    floor when you want one. upper = `until` if given, else today.
     """
     if today is None:
         today = datetime.now(UTC).date()
-    lower = since if since is not None else today - timedelta(days=recency_days)
+    lower = since if since is not None else date.min
     upper = until if until is not None else today
     return lower, upper
 
@@ -6617,9 +6620,10 @@ def select_unseen(videos: list[dict], seen_ids: set[str], *, lower, upper) -> li
 
     Set-difference on video_id is the primary guard (never window-based), so a
     video surfaced once is never re-surfaced. Videos with an unparseable
-    `published` are dropped from a date-bounded catch-up - we can't prove their
-    recency, and surfacing unknown-age content is the failure the floor exists
-    to prevent. All comparisons are on UTC dates.
+    `published` are dropped - with the default window now unbounded (issue #88)
+    they would otherwise have no year to sort or group under, and every real
+    YouTube-sourced corpus video carries a `published` date anyway. All
+    comparisons are on UTC dates; `lower` is `date.min` on an unbounded run.
     """
     out: list[dict] = []
     for video in videos:
@@ -6676,6 +6680,24 @@ def _infer_profile(output_dir: Path, config: dict | None = None, *, today=None) 
     }
 
 
+def _load_usable_profile(briefings_dir: Path) -> dict | None:
+    """Return a hand-tuned profile.yaml as a dict, or None if absent/empty/broken.
+
+    "Usable" = the file exists AND parses to a non-empty dict. An empty or
+    unreadable profile.yaml counts as no profile (so a fresh inference runs and
+    the cold-start warning still fires). Shared by `infer_or_load_profile` and
+    the cold-start check in `cmd_briefings` so both agree on what "tuned" means.
+    """
+    profile_path = briefings_dir / PROFILE_FILENAME
+    if not profile_path.exists():
+        return None
+    try:
+        data = yaml.safe_load(profile_path.read_text(encoding="utf-8")) or {}
+    except (yaml.YAMLError, OSError):
+        return None
+    return data if isinstance(data, dict) and data else None
+
+
 def infer_or_load_profile(output_dir: Path, config: dict | None = None, *, today=None, persist: bool = True) -> dict:
     """Load _briefings/profile.yaml if present and usable, else infer it.
 
@@ -6687,18 +6709,15 @@ def infer_or_load_profile(output_dir: Path, config: dict | None = None, *, today
     is safe.)
     """
     briefings_dir = output_dir / BRIEFINGS_DIR_NAME
-    profile_path = briefings_dir / PROFILE_FILENAME
-    if profile_path.exists():
-        try:
-            data = yaml.safe_load(profile_path.read_text(encoding="utf-8")) or {}
-        except (yaml.YAMLError, OSError):
-            data = {}
-        if isinstance(data, dict) and data:
-            return data
+    existing = _load_usable_profile(briefings_dir)
+    if existing is not None:
+        return existing
     profile = _infer_profile(output_dir, config, today=today)
     if persist:
         briefings_dir.mkdir(parents=True, exist_ok=True)
-        profile_path.write_text(yaml.safe_dump(profile, sort_keys=False, allow_unicode=True), encoding="utf-8")
+        (briefings_dir / PROFILE_FILENAME).write_text(
+            yaml.safe_dump(profile, sort_keys=False, allow_unicode=True), encoding="utf-8"
+        )
     return profile
 
 
@@ -6783,11 +6802,40 @@ def extract_mindmap_links(mindmap_path, url: str, limit: int = 3) -> list[tuple[
     return links
 
 
+def _format_age(published: date | None, today: date) -> str:
+    """Human-readable age badge from a publish date, e.g. "3y", "8mo", "5d".
+
+    Mechanically derived from the date only (issue #88) - deliberately NOT a
+    semantic "evergreen" judgment, which the ranking score does not support.
+    Returns "" when the date is missing or in the future (nothing to badge).
+    """
+    if published is None or published > today:
+        return ""
+    days = (today - published).days
+    if days >= 365:
+        return f"{days // 365}y"
+    if days >= 30:
+        return f"{days // 30}mo"
+    return f"{days}d"
+
+
+def _window_label(lower: date, upper: date) -> str:
+    """Human-facing window label. Shows "unbounded" rather than the bare
+    0001-01-01 sentinel when there's no lower floor (issue #88). Front-matter
+    fields keep the machine-stable ISO date; only visible prose uses this."""
+    lower_txt = "unbounded" if lower == date.min else lower.isoformat()
+    return f"{lower_txt} to {upper.isoformat()}"
+
+
 def render_unseen_briefing(ranked: list[dict], profile: dict, *, lower, upper, today=None) -> str:
     """Render a catch-up briefing markdown doc with the standard front matter.
 
     The `video_ids` front-matter list is what makes this briefing count toward
-    future coverage (so the next --unseen run won't re-surface these).
+    future coverage (so the next --unseen run won't re-surface these). The
+    primary list stays strictly relevance-ranked (issue #88) - old-but-high-
+    relevance videos surface near the top, not buried by recency. Temporal
+    structure lives in a per-item age badge and a secondary "By year" appendix,
+    never as headers inside the primary list (which would fight the sort).
     """
     if today is None:
         today = datetime.now(UTC).date()
@@ -6809,7 +6857,7 @@ def render_unseen_briefing(ranked: list[dict], profile: dict, *, lower, upper, t
         "",
         f"# Catch-up briefing - {len(ranked)} unseen video(s)",
         "",
-        f"**Window:** {lower.isoformat()} to {upper.isoformat()} (UTC)",
+        f"**Window:** {_window_label(lower, upper)} (UTC)",
         (
             f"**Ranking lens:** inferred profile `{profile.get('id', 'inferred')}` "
             "(top corpus concepts + scanned channels). One reader's lens, not an "
@@ -6826,6 +6874,9 @@ def render_unseen_briefing(ranked: list[dict], profile: dict, *, lower, upper, t
         safe_title = str(video["title"]).replace("[", "\\[").replace("]", "\\]")
         lines.append(f"## [{safe_title}]({video['url']})")
         meta_line = f"{video['channel']} · {video.get('published', '')}"
+        age = _format_age(_parse_iso_date(video.get("published", "")), today)
+        if age:
+            meta_line += f" · age {age}"
         if video.get("score"):
             meta_line += f" · relevance {video['score']:g}"
         lines.append(meta_line)
@@ -6840,7 +6891,35 @@ def render_unseen_briefing(ranked: list[dict], profile: dict, *, lower, upper, t
             lines.append("")
             lines.append(" · ".join(f"[{label}]({u})" for label, u in links))
         lines.append("")
+
+    lines.extend(_render_by_year_appendix(ranked))
     return "\n".join(lines) + "\n"
+
+
+def _render_by_year_appendix(ranked: list[dict]) -> list[str]:
+    """Secondary chronological index of the SAME videos in the primary list.
+
+    Groups the ranked set by publish year (newest year first) for quick
+    temporal scanning, without touching the relevance-first primary order
+    (issue #88). Same video_ids, same links - just a different lens. Videos
+    with an unparseable year (should be none post-`select_unseen`) are skipped.
+    """
+    by_year: dict[int, list[dict]] = {}
+    for video in ranked:
+        published = _parse_iso_date(video.get("published", ""))
+        if published is None:
+            continue
+        by_year.setdefault(published.year, []).append(video)
+    if not by_year:
+        return []
+    out = ["---", "", "## By year", ""]
+    for year in sorted(by_year, reverse=True):
+        out.append(f"### {year}")
+        for video in by_year[year]:
+            safe_title = str(video["title"]).replace("[", "\\[").replace("]", "\\]")
+            out.append(f"- [{safe_title}]({video['url']}) · {video['channel']}")
+        out.append("")
+    return out
 
 
 def cmd_briefings(args, config):
@@ -6868,9 +6947,15 @@ def cmd_briefings(args, config):
     seen = load_seen_video_ids(briefings_dir)
     videos = collect_corpus_videos(output_dir)
     unseen = select_unseen(videos, seen, lower=lower, upper=upper)
+    # Capture "is there a tuned profile?" BEFORE infer_or_load_profile, which may
+    # create profile.yaml as a side effect. Uses the same usable-profile notion as
+    # the loader (non-empty dict), so an empty/broken profile.yaml still counts as
+    # cold-start rather than silently suppressing the warning below.
+    dry_run = getattr(args, "dry_run", False)
+    had_tuned_profile = _load_usable_profile(briefings_dir) is not None
     # --dry-run must be side-effect-free: infer the profile for ranking but do
     # not persist a freshly-inferred profile.yaml on a preview run.
-    profile = infer_or_load_profile(output_dir, config, today=today, persist=not getattr(args, "dry_run", False))
+    profile = infer_or_load_profile(output_dir, config, today=today, persist=not dry_run)
     ranked = rank_unseen(unseen, profile)
     total_unseen = len(ranked)
     # Cap to a digestible guide (a 589-item dump is an index, not a briefing).
@@ -6880,6 +6965,27 @@ def cmd_briefings(args, config):
         limit = DEFAULT_LIMIT
     if limit > 0:
         ranked = ranked[:limit]
+
+    # Cold-start guard (issue #88): on the first run against a large corpus the
+    # profile is freshly inferred (no hand-tuning yet), so it can overweight
+    # generic/frequent concepts. That only matters when videos are actually
+    # being deferred (total > cap) - then rank order decides what you see now vs
+    # later. Warn rather than reimpose a recency floor (a floor hides old-but-
+    # important videos, a strictly worse failure).
+    if not had_tuned_profile and limit > 0 and total_unseen > limit:
+        # Don't tell someone already in --dry-run to "preview with --dry-run".
+        next_step = (
+            "hand-edit _briefings/profile.yaml to retune, then generate."
+            if dry_run
+            else "consider --dry-run to preview, then hand-edit _briefings/profile.yaml to retune."
+        )
+        log.warning(
+            "briefings --unseen: %d unseen videos but no tuned _briefings/profile.yaml yet; "
+            "the top %d are ranked by a freshly-inferred profile. %s",
+            total_unseen,
+            limit,
+            next_step,
+        )
 
     log.info(
         "briefings --unseen: %d corpus videos, %d already surfaced, %d unseen in %s..%s; showing %d",
@@ -6893,7 +6999,7 @@ def cmd_briefings(args, config):
 
     if getattr(args, "dry_run", False):
         capped = f" (top {len(ranked)} of {total_unseen})" if len(ranked) < total_unseen else ""
-        print(f"Would surface {len(ranked)} unseen video(s){capped} in {lower.isoformat()}..{upper.isoformat()}:")
+        print(f"Would surface {len(ranked)} unseen video(s){capped} in {_window_label(lower, upper)}:")
         for video in ranked:
             tag = f"[{video['score']:g}] " if video.get("score") else ""
             print(f"  {video.get('published', ''):<10}  {video['channel']:<18}  {tag}{video['title']}")
@@ -6902,7 +7008,7 @@ def cmd_briefings(args, config):
         return
 
     if not ranked:
-        print(f"No unseen videos in {lower.isoformat()}..{upper.isoformat()}. Nothing written.")
+        print(f"No unseen videos in {_window_label(lower, upper)}. Nothing written.")
         return
 
     content = render_unseen_briefing(ranked, profile, lower=lower, upper=upper, today=today)
@@ -7362,8 +7468,9 @@ Examples:
     )
     briefings_parser.add_argument(
         "--since",
-        help="Lower bound of the catch-up window ('Nd' or 'YYYY-MM-DD'). Overrides the 30-day "
-        "recency floor - widen it (e.g. --since 120d) for a one-time backlog sweep.",
+        help="Lower bound of the catch-up window ('Nd' or 'YYYY-MM-DD'). The default is "
+        "unbounded (every never-briefed video); pass this to NARROW to a recency floor "
+        "(e.g. --since 30d for just the last month).",
     )
     briefings_parser.add_argument(
         "--until",
