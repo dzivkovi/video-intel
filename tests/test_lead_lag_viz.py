@@ -204,3 +204,57 @@ class TestRenderHtml:
         # robust tier, so the tier group labels must exist in the renderer
         for marker in ["robust tier", "small sample - leads to verify", "mid tier"]:
             assert marker in html
+
+
+class TestPrintSupport:
+    """Issue #101: print stylesheet + print-only chain expansion.
+
+    Contract: the screen design is reviewed and locked - everything
+    print-specific lives inside `@media print` and `.print-only` (hidden on
+    screen), so print support can never alter screen rendering.
+    """
+
+    @pytest.fixture()
+    def html(self) -> str:
+        return render_html(build_viz_payload(_data(), min_ranked_concepts=5))
+
+    def test_print_stylesheet_present_and_scoped(self, html: str):
+        assert "@media print" in html
+        # the only print-specific screen rule is hiding the print-only blocks
+        assert ".print-only{display:none;}" in html
+
+    def test_print_chains_container_and_renderer_present(self, html: str):
+        assert 'id="printchains"' in html
+        assert "print chains (#101)" in html  # the JS block that expands ALL chains
+        assert "DATA.chains.forEach" in html
+
+    def test_print_palette_is_black_on_white(self, html: str):
+        media = html.split("@media print")[1].split("</style>")[0]
+        assert "--ground:#fff" in media
+        assert "--text:#111" in media
+        assert "print-color-adjust:exact" in media
+
+    def test_interactive_timeline_hidden_in_print(self, html: str):
+        media = html.split("@media print")[1].split("</style>")[0]
+        assert ".tlshell" in media and "display:none" in media
+
+    def test_pdf_requires_playwright_with_actionable_error(self, monkeypatch, tmp_path, caplog):
+        import builtins
+        import importlib
+
+        real_import = builtins.__import__
+
+        def no_playwright(name, *a, **k):
+            if name.startswith("playwright"):
+                raise ImportError(name)
+            return real_import(name, *a, **k)
+
+        monkeypatch.setattr(builtins, "__import__", no_playwright)
+        from scripts.lead_lag_viz import render_pdf
+
+        html_file = tmp_path / "x.html"
+        html_file.write_text("<!doctype html><p>x</p>", encoding="utf-8")
+        with pytest.raises(SystemExit):
+            render_pdf(html_file, tmp_path / "x.pdf")
+        assert "pip install playwright" in caplog.text
+        importlib.invalidate_caches()
