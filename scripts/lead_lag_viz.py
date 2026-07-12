@@ -280,6 +280,7 @@ _TEMPLATE = r"""<!doctype html>
   /* print (#101): the screen design above is reviewed and locked - everything
      print-specific lives in .print-only (hidden on screen) and this block */
   .print-only{display:none;}
+  @page{size:Letter;margin:12mm 10mm;}
   @media print{
     :root{--ground:#fff;--ground2:#fff;--panel:#fff;--panel2:#ececec;--line:#bbb;--line2:#999;
       --text:#111;--muted:#444;--faint:#666;--accent:#7a5a1e;--accent-dim:#a5854a;--good:#2e6b47;--miss:#8a4a28;}
@@ -593,7 +594,7 @@ def render_pdf(html_path: Path, pdf_path: Path) -> None:
         try:
             page = browser.new_page()
             page.goto(html_path.resolve().as_uri())
-            page.wait_for_load_state("networkidle")
+            page.wait_for_load_state("load")  # self-contained file:// page; networkidle is the wrong primitive here
             pdf_path.parent.mkdir(parents=True, exist_ok=True)
             page.pdf(
                 path=str(pdf_path),
