@@ -276,6 +276,30 @@ _TEMPLATE = r"""<!doctype html>
   .explain b{color:var(--text);}
   @media(max-width:860px){ .tlshell{grid-template-columns:1fr;} .lbar{grid-template-columns:110px 1fr;}
     .lbar .meta{grid-column:2;} header.hero h1{font-size:30px;} }
+
+  /* print (#101): the screen design above is reviewed and locked - everything
+     print-specific lives in .print-only (hidden on screen) and this block */
+  .print-only{display:none;}
+  @page{size:Letter;margin:12mm 10mm;}
+  @media print{
+    :root{--ground:#fff;--ground2:#fff;--panel:#fff;--panel2:#ececec;--line:#bbb;--line2:#999;
+      --text:#111;--muted:#444;--faint:#666;--accent:#7a5a1e;--accent-dim:#a5854a;--good:#2e6b47;--miss:#8a4a28;}
+    *{-webkit-print-color-adjust:exact;print-color-adjust:exact;}
+    body{background:#fff;color:#111;padding:0;font-size:12px;}
+    header.hero{background:#fff;padding:12px 0 10px;}
+    header.hero h1{font-size:26px;}
+    section{padding:14px 0 4px;break-inside:avoid;}
+    .callout,.diag,.explain,.lbar{break-inside:avoid;}
+    .lbar .fill{background:#a5854a;} .lbar.robust .fill{background:#2e6b47;}
+    .tlshell,.tlhint,#tip{display:none !important;}
+    .print-only{display:block;}
+    .pchain{break-inside:avoid;border-bottom:1px solid #bbb;padding:8px 0 10px;}
+    .pchain h3{font-size:14px;margin:0 0 6px;}
+    .pchain ol{margin:0;padding-left:20px;}
+    .pchain li{margin:0 0 6px;}
+    .pchain .pq{font-family:var(--serif);font-style:italic;color:#333;}
+    .pchain .purl{font-family:var(--mono);font-size:9.5px;color:#555;word-break:break-all;}
+  }
 </style>
 </head>
 <body>
@@ -322,6 +346,14 @@ _TEMPLATE = r"""<!doctype html>
       only the horizontal axis carries meaning - vertical position is reading order</p>
     </div>
   </div>
+</div></section>
+
+<section class="print-only"><div class="wrap">
+  <p class="eyebrow">Adoption chains</p>
+  <h2 class="stitle">All concept adoption chains</h2>
+  <p class="sdesc">Print has no interactivity, so every chain the interactive timeline offers renders here in full,
+  with the evidence link URL for each first mention.</p>
+  <div id="printchains"></div>
 </div></section>
 
 <section><div class="wrap">
@@ -495,6 +527,28 @@ function esc(s){return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;
   if(DATA.chains.length) draw(0); else document.querySelector('.tlbox').textContent = 'No chains with follow edges.';
 })();
 
+/* print chains (#101): all chains expanded sequentially, URLs visible */
+(function(){
+  const host = document.getElementById('printchains');
+  DATA.chains.forEach(c => {
+    const box = el('div','pchain');
+    box.append(el('h3','', esc(c.concept)+' &middot; '+c.mentions.length+' adopters over '+c.spanDays+' days'));
+    const ol = el('ol');
+    const first = c.mentions[0] ? c.mentions[0].date : '';
+    c.mentions.forEach((m,i) => {
+      const lag = i===0 ? 'leader' : '+' + Math.round((new Date(m.date)-new Date(first))/86400000) + 'd';
+      const li = el('li');
+      let html = '<b>'+esc(m.creator)+'</b>'+(m.subThreshold?' (below ranking threshold)':'')+' &middot; '+esc(m.date)+' &middot; '+lag+'<br>'+esc(m.title);
+      if(m.quote) html += '<br><span class="pq">&ldquo;'+esc(m.quote)+'&rdquo;</span>';
+      html += '<br><span class="purl">'+esc(m.link)+'</span>';
+      li.innerHTML = html;
+      ol.append(li);
+    });
+    box.append(ol);
+    host.append(box);
+  });
+})();
+
 /* explain */
 (function(){
   const p = DATA.params;
@@ -515,7 +569,42 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db", default=str(DEFAULT_DB), help=f"DuckDB path (default {DEFAULT_DB})")
     parser.add_argument("--out", help="write HTML here (default: stdout)")
     parser.add_argument("--top", type=int, default=TOP_FINDINGS_DEFAULT, help="number of chains to include")
+    parser.add_argument(
+        "--pdf",
+        help="also print-to-PDF here via headless Chromium (optional dependency: "
+        "pip install playwright && playwright install chromium); requires --out",
+    )
     return parser
+
+
+def render_pdf(html_path: Path, pdf_path: Path) -> None:
+    """Print the generated page to PDF with headless Chromium (issue #101).
+
+    Lazy import: playwright is an optional dependency, same pattern as the
+    repo's other extras. printBackground keeps the print stylesheet's
+    palette; the @media print rules handle black-on-white and expansion.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        log.error("playwright not installed. Run: pip install playwright && playwright install chromium")
+        sys.exit(1)
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        try:
+            page = browser.new_page()
+            page.goto(html_path.resolve().as_uri())
+            page.wait_for_load_state("load")  # self-contained file:// page; networkidle is the wrong primitive here
+            pdf_path.parent.mkdir(parents=True, exist_ok=True)
+            page.pdf(
+                path=str(pdf_path),
+                format="Letter",
+                print_background=True,
+                margin={"top": "12mm", "bottom": "12mm", "left": "10mm", "right": "10mm"},
+            )
+        finally:
+            browser.close()
+    log.info("PDF written to %s", pdf_path)
 
 
 def main() -> None:
@@ -534,12 +623,17 @@ def main() -> None:
         data = build_report_data(con)
     finally:
         con.close()
+    if args.pdf and not args.out:
+        log.error("--pdf requires --out (the PDF is printed from the written HTML file)")
+        sys.exit(1)
     html = render_html(build_viz_payload(data, top_findings=args.top))
     if args.out:
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(html, encoding="utf-8")
         log.info("Visualization written to %s", out)
+        if args.pdf:
+            render_pdf(out, Path(args.pdf))
     else:
         print(html)
 
