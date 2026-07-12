@@ -2,41 +2,51 @@
 
 Generated: 2026-07-12 | Issue #93 | Substrate: DuckDB truth store (PR #86)
 
-Corpus: 1247 artifacts across 23 creators (>= 5 artifacts each); 551 concepts total, 69 pass the adoption + eligibility filters (adopted by >= 4 creators, >= 3 of them with coverage active at emergence).
+Corpus: 1259 artifacts across 31 creators (23 rankable at >= 5 artifacts); 551 concepts total, 69 pass the adoption + eligibility filters (adopted by >= 4 creators, >= 3 of them with coverage active at emergence).
 
 ## Method in one paragraph
 
-First-mention dates come from `has_concept -> artifacts.published_at`. The confound: creators entered the corpus with different lookback depths, so a deep-backfill channel is 'first' on anything that emerged before the others were indexed. Correction (minimal form of arXiv:1009.0119): (1) a concept only counts if enough adopters' coverage windows were active at its emergence; (2) expected firsts are proportional to posting rate among those eligible adopters, so `lift = observed firsts / expected firsts` rewards leading beyond volume-implied chance. Lift > 1 means the creator is first more often than their posting volume predicts.
+First-mention dates come from `has_concept -> artifacts.published_at`. The confound: creators entered the corpus with different lookback depths, so a deep-backfill channel is 'first' on anything that emerged before the others were indexed. Correction (minimal form of arXiv:1009.0119): (1) a concept only counts if enough adopters' coverage windows were active at its emergence; (2) expected firsts are proportional to posting rate among those eligible adopters, so `lift = observed firsts / expected firsts` rewards leading beyond volume-implied chance. Lift > 1 means the creator is first more often than their posting volume predicts. Creators below the artifact floor still set emergence dates (so nobody inherits a first they did not earn) but are not themselves ranked.
 
 ## Corpus coverage windows (the confound, stated)
 
-| Creator | Coverage start | Coverage end | Artifacts | Rate/day |
-|---|---|---|---|---|
-| gregisenberg | 2024-08-28 | 2026-06-11 | 16 | 0.025 |
-| engineerprompt | 2024-10-15 | 2026-07-01 | 226 | 0.362 |
-| seankochel | 2025-01-15 | 2026-06-26 | 134 | 0.254 |
-| vanishinggradients | 2025-05-23 | 2026-06-19 | 48 | 0.122 |
-| graceleungyl | 2025-07-04 | 2026-06-12 | 29 | 0.085 |
-| lennyspodcast | 2025-07-17 | 2026-05-24 | 12 | 0.039 |
-| chase_h_ai | 2025-10-24 | 2026-06-26 | 122 | 0.498 |
-| iangarlic | 2025-11-18 | 2026-04-24 | 5 | 0.032 |
-| natebjones | 2025-11-30 | 2026-06-26 | 199 | 0.957 |
-| samwitteveenai | 2025-12-03 | 2026-06-26 | 48 | 0.234 |
-| ramjad | 2025-12-10 | 2026-06-25 | 29 | 0.147 |
-| ycombinator | 2026-01-08 | 2026-06-27 | 47 | 0.276 |
-| thenextnewthingai | 2026-02-03 | 2026-06-19 | 66 | 0.485 |
-| mark_kashef | 2026-02-15 | 2026-06-30 | 34 | 0.252 |
-| colemedin | 2026-02-23 | 2026-06-25 | 32 | 0.262 |
-| saminyasar | 2026-02-23 | 2026-06-24 | 14 | 0.116 |
-| simonscrapes | 2026-02-27 | 2026-06-25 | 39 | 0.331 |
-| benai92 | 2026-03-14 | 2026-06-25 | 17 | 0.165 |
-| everyinc | 2026-03-17 | 2026-06-24 | 42 | 0.424 |
-| austinmarchese | 2026-03-19 | 2026-06-23 | 23 | 0.240 |
-| brockmesarich | 2026-04-09 | 2026-06-24 | 25 | 0.329 |
-| twist | 2026-04-28 | 2026-06-24 | 16 | 0.281 |
-| claude | 2026-05-18 | 2026-06-21 | 24 | 0.706 |
+| Creator | Coverage start | Coverage end | Artifacts | Rate/day | Ranked |
+|---|---|---|---|---|---|
+| gregisenberg | 2024-08-28 | 2026-06-11 | 16 | 0.025 | yes |
+| engineerprompt | 2024-10-15 | 2026-07-01 | 226 | 0.362 | yes |
+| seankochel | 2025-01-15 | 2026-06-26 | 134 | 0.254 | yes |
+| vanishinggradients | 2025-05-23 | 2026-06-19 | 48 | 0.122 | yes |
+| graceleungyl | 2025-07-04 | 2026-06-12 | 29 | 0.084 | yes |
+| lennyspodcast | 2025-07-17 | 2026-05-24 | 12 | 0.038 | yes |
+| chase_h_ai | 2025-10-24 | 2026-06-26 | 122 | 0.496 | yes |
+| iangarlic | 2025-11-18 | 2026-04-24 | 5 | 0.032 | yes |
+| propertydaily | 2025-11-30 | 2026-06-17 | 3 | 0.015 | no |
+| natebjones | 2025-11-30 | 2026-06-26 | 199 | 0.952 | yes |
+| samwitteveenai | 2025-12-03 | 2026-06-26 | 48 | 0.233 | yes |
+| ramjad | 2025-12-10 | 2026-06-25 | 29 | 0.146 | yes |
+| ycombinator | 2026-01-08 | 2026-06-27 | 47 | 0.275 | yes |
+| thenextnewthingai | 2026-02-03 | 2026-06-19 | 66 | 0.482 | yes |
+| mark_kashef | 2026-02-15 | 2026-06-30 | 34 | 0.250 | yes |
+| bioinfquests | 2026-02-23 | 2026-02-23 | 2 | 2.000 | no |
+| colemedin | 2026-02-23 | 2026-06-25 | 32 | 0.260 | yes |
+| saminyasar | 2026-02-23 | 2026-06-24 | 14 | 0.115 | yes |
+| simonscrapes | 2026-02-27 | 2026-06-25 | 39 | 0.328 | yes |
+| benai92 | 2026-03-14 | 2026-06-25 | 17 | 0.163 | yes |
+| everyinc | 2026-03-17 | 2026-06-24 | 42 | 0.420 | yes |
+| austinmarchese | 2026-03-19 | 2026-06-23 | 23 | 0.237 | yes |
+| double-down-news | 2026-04-07 | 2026-04-07 | 1 | 1.000 | no |
+| brockmesarich | 2026-04-09 | 2026-06-24 | 25 | 0.325 | yes |
+| kieranklaassen | 2026-04-23 | 2026-04-23 | 1 | 1.000 | no |
+| prismlabs | 2026-04-24 | 2026-04-24 | 1 | 1.000 | no |
+| twist | 2026-04-28 | 2026-06-24 | 16 | 0.276 | yes |
+| simon-scrapes | 2026-04-30 | 2026-04-30 | 1 | 1.000 | no |
+| claude | 2026-05-18 | 2026-06-21 | 24 | 0.686 | yes |
+| saastr | 2026-05-20 | 2026-05-20 | 1 | 1.000 | no |
+| databricks | 2026-06-16 | 2026-06-18 | 2 | 0.667 | no |
 
 ## Corrected leader ranking (precursor lift)
+
+Creators shown: >= 5 artifacts and >= 5 eligible concepts (9 rankable creators omitted for too few eligible concepts).
 
 | # | Creator | Lift | Firsts (obs) | Firsts (expected) | Eligible concepts | Mean lag (days) |
 |---|---|---|---|---|---|---|
@@ -56,8 +66,8 @@ First-mention dates come from `has_concept -> artifacts.published_at`. The confo
 |---|---|---|
 | 1 | seankochel | 73.0 |
 | 2 | engineerprompt | 48.0 |
-| 3 | natebjones | 10.0 |
-| 4 | vanishinggradients | 10.0 |
+| 3 | vanishinggradients | 10.0 |
+| 4 | natebjones | 10.0 |
 | 5 | graceleungyl | 8.0 |
 | 6 | lennyspodcast | 7.0 |
 | 7 | chase_h_ai | 6.0 |
@@ -70,8 +80,8 @@ First-mention dates come from `has_concept -> artifacts.published_at`. The confo
 
 ## Kill-criterion diagnostics
 
-- Spearman(corrected lift, coverage-start date): **-0.18** (strongly negative = older-indexed channels still dominate = corpus artifact)
-- Spearman(corrected lift, corpus size): **-0.50** (strongly positive = biggest channels still dominate = corpus artifact)
+- Spearman(corrected lift, coverage-start date): **-0.18**. Negative means earlier-indexed channels still rank higher (coverage artifact); near zero means the correction removed the indexing-age effect.
+- Spearman(corrected lift, corpus size): **-0.50**. Positive means bigger channels still rank higher (popularity artifact); negative means smaller channels out-lead their posting volume.
 - Issue #93 kill criterion: if, after coverage correction, the leaders are just the biggest / oldest-indexed channels, the influence signal is not there.
 
 ## Top 10 findings (adoption chains with evidence)
@@ -84,7 +94,7 @@ Leader evidence (chase_h_ai first on 2026-01-09):
 
 > "...." SCREEN [35:11-35:38] [terminal]: Claude Code terminal showing the command '/gsd:plan-phase 6' for Stripe integration. [35:14] Chase Hannegan (Host): "So at this point we should have finished up phase five, which was t..."
 >
-> - chase_h_ai, [Claude Code: n8n Workflow to Deployed SaaS (Complete System)](https://www.youtube.com/watch?v=QgL-Z6YlHeA&t=2086s), 2026-01-09
+> - chase_h_ai, [Claude Code: n8n Workflow to Deployed SaaS (Complete System)](https://www.youtube.com/watch?v=QgL-Z6YlHeA&t=2086), 2026-01-09
 
 ### 2. `ai-engineering.disposable_software`
 
@@ -94,7 +104,7 @@ Leader evidence (natebjones first on 2026-01-20):
 
 > "[00:00] Nate B. Jones (Content Creator/Writer): "The age of disposable software is here and almost no one understands what that really means. Look, everyone's talking about dispos..."
 >
-> - natebjones, [Disposable Software: The Trend 90% of People are Getting Wrong--The Hidden Costs We Need to Consider](https://www.youtube.com/watch?v=ra7nYJe86GI&t=0s), 2026-01-20
+> - natebjones, [Disposable Software: The Trend 90% of People are Getting Wrong--The Hidden Costs We Need to Consider](https://www.youtube.com/watch?v=ra7nYJe86GI&t=0), 2026-01-20
 
 ### 3. `ai-engineering.ai_personalization`
 
@@ -102,9 +112,9 @@ Chain: iangarlic(25-12-15) -> natebjones(26-02-05) -> engineerprompt(26-04-14) -
 
 Leader evidence (iangarlic first on 2025-12-15):
 
-> "...derstand that. So AI now has—there's so many subtle things that we see in human faces. But I think hyper-personalization is the future. And it's not just like hyper-personalization in the videos, it's how we deliver the..."
+> "...derstand that. So AI now has-there's so many subtle things that we see in human faces. But I think hyper-personalization is the future. And it's not just like hyper-personalization in the videos, it's how we deliver the..."
 >
-> - iangarlic, [The YouTube Strategy Smart Business Owners Use to Win Premium Clients](https://www.youtube.com/watch?v=C4eSW921lhQ&t=1271s), 2025-12-15
+> - iangarlic, [The YouTube Strategy Smart Business Owners Use to Win Premium Clients](https://www.youtube.com/watch?v=C4eSW921lhQ&t=1271), 2025-12-15
 
 ### 4. `ai-engineering.autonomous_software_production`
 
@@ -114,7 +124,7 @@ Leader evidence (natebjones first on 2026-02-18):
 
 > "...el 2: Junior Developer Level 3: Developer as Manager Level 4: Developer as Product Manager Level 5: The Dark Factory" [02:49] Nate B. Jones (AI Strategy Consultant & Content Creator): "This is GitHub Copilot in its origi..."
 >
-> - natebjones, [The 5 Levels of AI Coding (Why Most of You Won't Make It Past Level 2)](https://www.youtube.com/watch?v=bDcgHzCBgmQ&t=142s), 2026-02-18
+> - natebjones, [The 5 Levels of AI Coding (Why Most of You Won't Make It Past Level 2)](https://www.youtube.com/watch?v=bDcgHzCBgmQ&t=142), 2026-02-18
 
 ### 5. `ai-engineering.continual_learning`
 
@@ -124,7 +134,7 @@ Leader evidence (engineerprompt first on 2026-01-08):
 
 > "[03:16] Narrator (AI Researcher/Content Creator): "And then we have level 4, which I would call true continual learning. So here, updating the model's weights in real-time without forgetting, without degradation. This is..."
 >
-> - engineerprompt, [The Holy Grail of Intelligence - Explained.](https://www.youtube.com/watch?v=2NDMtAEu7FQ&t=196s), 2026-01-08
+> - engineerprompt, [The Holy Grail of Intelligence - Explained.](https://www.youtube.com/watch?v=2NDMtAEu7FQ&t=196), 2026-01-08
 
 ### 6. `ai-engineering.information_filtering`
 
@@ -134,7 +144,7 @@ Leader evidence (natebjones first on 2026-01-29):
 
 > "[00:00] Nate B. Jones (Content Creator and Analyst): "The most powerful digital platforms in our lives lost their edge in late 2025 and early 2026 and almost nobody has noticed it yet. For as long as we've used digital p..."
 >
-> - natebjones, [Why Every Cold Application You Send Is a Waste of Time (And What Actually Works)](https://www.youtube.com/watch?v=AoA9h3TjxE0&t=0s), 2026-01-29
+> - natebjones, [Why Every Cold Application You Send Is a Waste of Time (And What Actually Works)](https://www.youtube.com/watch?v=AoA9h3TjxE0&t=0), 2026-01-29
 
 ### 7. `ai-engineering.autonomous_ai_agents`
 
@@ -144,7 +154,7 @@ Leader evidence (seankochel first on 2025-03-14):
 
 > "[02:00] Sean Kochel (Business Owner and AI Educator): "The reason I feel confident teaching you guys this stuff is because I build and deploy these systems myself in my own businesses that combined do eight figures per y..."
 >
-> - seankochel, [Why AI Amateurs Are Building Better Agents Than You](https://www.youtube.com/watch?v=BNTcAhmoF1Q&t=120s), 2025-03-14
+> - seankochel, [Why AI Amateurs Are Building Better Agents Than You](https://www.youtube.com/watch?v=BNTcAhmoF1Q&t=120), 2025-03-14
 
 ### 8. `ai-engineering.automated_asset_production`
 
@@ -154,7 +164,7 @@ Leader evidence (gregisenberg first on 2025-07-23):
 
 > "SCREEN [13:16-14:00] [other]: Cody Schneider speaking full screen. [13:50] Greg Isenberg (Host): "Right. Cool. What's the next idea?" [13:52] Cody Schneider (Guest): "Awesome. So, uh, the next one on the list, uh, is Fac..."
 >
-> - gregisenberg, [The 6 Best AI Agency Niches to Make $50K/mo (Data-Backed)](https://www.youtube.com/watch?v=6FSih5a5aIA&t=796s), 2025-07-23
+> - gregisenberg, [The 6 Best AI Agency Niches to Make $50K/mo (Data-Backed)](https://www.youtube.com/watch?v=6FSih5a5aIA&t=796), 2025-07-23
 
 ### 9. `ai-engineering.ai_product_management`
 
@@ -164,7 +174,7 @@ Leader evidence (lennyspodcast first on 2025-09-25):
 
 > "SCREEN [01:18-01:27] [text_overlay]: Two quotes on screen. One from Mike Krieger, Anthropic CPO: 'If there is one thing we can teach people, it's that writing evals is probably the most important thing.' The other from K..."
 >
-> - lennyspodcast, [Why AI evals are the hottest new skill for product builders | Hamel Husain & Shreya Shankar](https://www.youtube.com/watch?v=BsWxPI9UM4c&t=78s), 2025-09-25
+> - lennyspodcast, [Why AI evals are the hottest new skill for product builders | Hamel Husain & Shreya Shankar](https://www.youtube.com/watch?v=BsWxPI9UM4c&t=78), 2025-09-25
 
 ### 10. `ai-engineering.robotic_learning`
 
@@ -174,7 +184,7 @@ Leader evidence (natebjones first on 2025-12-20):
 
 > "[07:49] Nate B. Jones (AI News Presenter): "I would watch Peter DeSantis's first major announcements here, whether he's got custom silicon roadmaps with Trainium, whether he's got an AGI team product launch to put togeth..."
 >
-> - natebjones, [Amazon Fired Their AI Chief. Here's Why It Took So Long (Plus 5 Newsworthy Moments in AI This Week)](https://www.youtube.com/watch?v=EaMz3g1OYPA&t=469s), 2025-12-20
+> - natebjones, [Amazon Fired Their AI Chief. Here's Why It Took So Long (Plus 5 Newsworthy Moments in AI This Week)](https://www.youtube.com/watch?v=EaMz3g1OYPA&t=469), 2025-12-20
 
 ## Caveats
 

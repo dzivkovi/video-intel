@@ -15,8 +15,11 @@ arXiv:1009.0119):
    discarded: nobody else could have been observed covering it earlier, so
    "first" is a corpus artifact, not a signal.
 3. Rate normalization: expected firsts per creator are proportional to their
-   posting rate among the eligible adopters, so prolific channels only score
-   when they beat their volume-implied chance. Precursor lift = observed / expected.
+   posting rate among the rankable eligible adopters, so prolific channels only
+   score when they beat their volume-implied chance. Precursor lift =
+   observed / expected. Creators below --min-artifacts are observed (their
+   first mentions set emergence dates and block false credit) but not ranked
+   (their rates are too noisy to compete on).
 4. Kill-criterion diagnostics: Spearman correlation of the corrected ranking
    against coverage-start rank and corpus-size rank, plus the naive ranking
    side by side. High correlation means the "signal" is the corpus artifact
@@ -35,6 +38,12 @@ import logging
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+from intel_graph import timestamped_url
+
+if TYPE_CHECKING:
+    from duckdb import DuckDBPyConnection
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger("lead_lag_report")
@@ -42,7 +51,8 @@ log = logging.getLogger("lead_lag_report")
 DEFAULT_DB = Path.home() / ".cache" / "video-intel" / "intel.duckdb"
 MIN_ADOPTERS_DEFAULT = 4  # concept must be adopted by >= N creators (issue #93 spec)
 MIN_ELIGIBLE_DEFAULT = 3  # concept must have >= N adopters whose coverage was active at emergence
-MIN_ARTIFACTS_DEFAULT = 5  # creators below this corpus size are too noisy to rank
+MIN_ARTIFACTS_DEFAULT = 5  # creators below this corpus size are observed but not ranked
+MIN_RANKED_CONCEPTS_DEFAULT = 5  # creators with fewer eligible concepts are omitted from the ranked table
 FOLLOW_WINDOW_DAYS_DEFAULT = 90  # max lag for an "A leads, B follows" edge
 TOP_FINDINGS_DEFAULT = 10
 QUOTE_WIDTH = 220
@@ -59,8 +69,8 @@ class Coverage:
 
     @property
     def rate(self) -> float:
-        """Artifacts per active day; the volume-implied chance of being first."""
-        return self.n_artifacts / max(1, (self.end - self.start).days)
+        """Artifacts per active day (inclusive window); the volume-implied chance of being first."""
+        return self.n_artifacts / ((self.end - self.start).days + 1)
 
 
 @dataclass(frozen=True)
@@ -103,6 +113,7 @@ class Chain:
 @dataclass(frozen=True)
 class ReportData:
     coverage: dict[str, Coverage]
+    rankable: frozenset[str]
     stats: dict[str, CreatorStats]
     naive: dict[str, float]
     chains: list[Chain]
@@ -112,11 +123,7 @@ class ReportData:
 
 
 def _eligible(mentions: list[FirstMention], coverage: dict[str, Coverage]) -> list[FirstMention]:
-    """Adopters whose coverage window was already active at the concept's emergence.
-
-    Emergence is the earliest first mention among adopters that are in the
-    coverage map at all (creators filtered out by --min-artifacts don't count).
-    """
+    """Adopters whose coverage window was already active at the concept's emergence."""
     known = [m for m in sorted(mentions, key=lambda m: m.first_date) if m.source_id in coverage]
     if not known:
         return []
@@ -128,19 +135,30 @@ def precursor_stats(
     first_mentions: dict[str, list[FirstMention]],
     coverage: dict[str, Coverage],
     min_eligible: int,
+    rankable: frozenset[str] | None = None,
 ) -> dict[str, CreatorStats]:
-    """Coverage-corrected, rate-normalized precursor statistics per creator."""
+    """Coverage-corrected, rate-normalized precursor statistics per creator.
+
+    The leader date is taken over ALL eligible adopters, including creators
+    outside `rankable` - so a sub-threshold true first-mover blocks false
+    credit instead of silently crowning the second adopter. Only rankable
+    creators accrue firsts/expected/lag (their concept simply goes unwon when
+    a sub-threshold creator led it).
+    """
     stats: dict[str, CreatorStats] = {}
     for mentions in first_mentions.values():
         eligible = _eligible(mentions, coverage)
         if len(eligible) < min_eligible:
             continue
-        total_rate = sum(coverage[m.source_id].rate for m in eligible)
+        ranked_eligible = [m for m in eligible if rankable is None or m.source_id in rankable]
+        if not ranked_eligible:
+            continue
+        total_rate = sum(coverage[m.source_id].rate for m in ranked_eligible)
         if total_rate <= 0:
             continue
         leader_date = eligible[0].first_date
         tied = [m for m in eligible if m.first_date == leader_date]
-        for m in eligible:
+        for m in ranked_eligible:
             s = stats.setdefault(m.source_id, CreatorStats(source_id=m.source_id))
             s.eligible_concepts += 1
             s.expected += coverage[m.source_id].rate / total_rate
@@ -171,7 +189,7 @@ def adoption_chains(
     chains: list[Chain] = []
     for concept_id, mentions in first_mentions.items():
         eligible = _eligible(mentions, coverage)
-        if len(eligible) < min_eligible:
+        if len(eligible) < max(1, min_eligible):
             continue
         edges: list[tuple[str, str, int]] = []
         for a, b in itertools.pairwise(eligible):
@@ -209,8 +227,12 @@ def spearman(xs: list[float], ys: list[float]) -> float:
 
 
 def extract_quote(text: str, term: str, width: int = QUOTE_WIDTH) -> str:
-    """A single-line excerpt around the first occurrence of term (or the head)."""
-    flat = " ".join(text.split())
+    """A single-line excerpt around the first occurrence of term (or the head).
+
+    Dashes are normalized to '-' (repo-wide no-em-dash rule; the timestamped
+    link, not the excerpt, is the ground truth).
+    """
+    flat = " ".join(text.split()).replace(chr(0x2014), "-").replace(chr(0x2013), "-")
     idx = flat.lower().find(term.lower())
     if idx < 0:
         excerpt = flat[:width]
@@ -228,28 +250,31 @@ def extract_quote(text: str, term: str, width: int = QUOTE_WIDTH) -> str:
 # ---------------------------------------------------------------------------
 
 
-def load_coverage(con: object, min_artifacts: int) -> dict[str, Coverage]:
-    rows = con.execute(  # type: ignore[attr-defined]
+def load_coverage(con: DuckDBPyConnection) -> dict[str, Coverage]:
+    """Coverage windows for ALL creators - the rankable cut happens downstream.
+
+    Filtering here would erase sub-threshold creators' observations entirely,
+    letting a second adopter inherit false first-mover credit.
+    """
+    rows = con.execute(
         """
         SELECT source_id, MIN(published_at), MAX(published_at), COUNT(*)
         FROM artifacts
         WHERE published_at IS NOT NULL
         GROUP BY source_id
-        HAVING COUNT(*) >= ?
-        """,
-        [min_artifacts],
+        """
     ).fetchall()
     return {r[0]: Coverage(source_id=r[0], start=r[1], end=r[2], n_artifacts=r[3]) for r in rows}
 
 
-def load_first_mentions(con: object, min_adopters: int) -> tuple[dict[str, list[FirstMention]], int]:
+def load_first_mentions(con: DuckDBPyConnection, min_adopters: int) -> tuple[dict[str, list[FirstMention]], int]:
     """First mention per (concept, creator), with the best evidence row attached.
 
     Evidence preference: a grounded row with a segment timestamp beats an
     ungrounded mindmap-level row, because it yields a quotable excerpt and a
     &t= deep link.
     """
-    rows = con.execute(  # type: ignore[attr-defined]
+    rows = con.execute(
         """
         WITH firsts AS (
             SELECT hc.concept_id, a.source_id, MIN(a.published_at) AS first_date
@@ -287,7 +312,7 @@ def load_first_mentions(con: object, min_adopters: int) -> tuple[dict[str, list[
         """,
         [min_adopters],
     ).fetchall()
-    n_total = con.execute("SELECT COUNT(DISTINCT concept_id) FROM has_concept").fetchone()[0]  # type: ignore[attr-defined]
+    n_total = con.execute("SELECT COUNT(DISTINCT concept_id) FROM has_concept").fetchone()[0]
     mentions: dict[str, list[FirstMention]] = {}
     for r in rows:
         mentions.setdefault(r[0], []).append(
@@ -306,7 +331,7 @@ def load_first_mentions(con: object, min_adopters: int) -> tuple[dict[str, list[
     return mentions, n_total
 
 
-def backfill_evidence(con: object, chains: list[Chain]) -> list[Chain]:
+def backfill_evidence(con: DuckDBPyConnection, chains: list[Chain]) -> list[Chain]:
     """Give chain leaders without a grounded segment a second chance at a quote.
 
     A first mention can come from an ungrounded (mindmap-level) row while the
@@ -319,6 +344,9 @@ def backfill_evidence(con: object, chains: list[Chain]) -> list[Chain]:
     """
     result: list[Chain] = []
     for chain in chains:
+        if not chain.mentions:
+            result.append(chain)
+            continue
         leader = chain.mentions[0]
         if leader.segment_text is None:
             row = _find_evidence_segment(con, leader)
@@ -330,17 +358,17 @@ def backfill_evidence(con: object, chains: list[Chain]) -> list[Chain]:
     return result
 
 
-def _find_evidence_segment(con: object, m: FirstMention) -> tuple[int | None, str] | None:
+def _find_evidence_segment(con: DuckDBPyConnection, m: FirstMention) -> tuple[int | None, str] | None:
     term = m.as_mentioned.lower().strip()
     if term:
-        row = con.execute(  # type: ignore[attr-defined]
+        row = con.execute(
             "SELECT start_seconds, text FROM segments WHERE artifact_id = ? AND contains(lower(text), ?)"
             " ORDER BY start_seconds ASC NULLS LAST LIMIT 1",
             [m.artifact_id, term],
         ).fetchone()
         if row is not None:
             return row
-    row = con.execute(  # type: ignore[attr-defined]
+    row = con.execute(
         """
         SELECT s.start_seconds, s.text
         FROM segments s
@@ -356,7 +384,7 @@ def _find_evidence_segment(con: object, m: FirstMention) -> tuple[int | None, st
     tokens = [t for t in term.split() if len(t) > 3]
     if tokens:
         clause = " AND ".join("contains(lower(text), ?)" for _ in tokens)
-        row = con.execute(  # type: ignore[attr-defined]
+        row = con.execute(
             f"SELECT start_seconds, text FROM segments WHERE artifact_id = ? AND {clause}"
             " ORDER BY start_seconds ASC NULLS LAST LIMIT 1",
             [m.artifact_id, *tokens],
@@ -367,18 +395,20 @@ def _find_evidence_segment(con: object, m: FirstMention) -> tuple[int | None, st
 
 
 def build_report_data(
-    con: object,
+    con: DuckDBPyConnection,
     min_adopters: int = MIN_ADOPTERS_DEFAULT,
     min_eligible: int = MIN_ELIGIBLE_DEFAULT,
     min_artifacts: int = MIN_ARTIFACTS_DEFAULT,
     follow_window_days: int = FOLLOW_WINDOW_DAYS_DEFAULT,
 ) -> ReportData:
-    coverage = load_coverage(con, min_artifacts)
+    coverage = load_coverage(con)
+    rankable = frozenset(s for s, c in coverage.items() if c.n_artifacts >= min_artifacts)
     first_mentions, n_total = load_first_mentions(con, min_adopters)
-    stats = precursor_stats(first_mentions, coverage, min_eligible)
+    stats = precursor_stats(first_mentions, coverage, min_eligible, rankable)
     chains = backfill_evidence(con, adoption_chains(first_mentions, coverage, min_eligible, follow_window_days))
     return ReportData(
         coverage=coverage,
+        rankable=rankable,
         stats=stats,
         naive=naive_leader_counts(first_mentions),
         chains=chains,
@@ -399,9 +429,7 @@ def build_report_data(
 
 
 def _evidence_line(m: FirstMention) -> str:
-    link = m.url
-    if m.start_seconds is not None and "youtube.com" in m.url:
-        link = f"{m.url}&t={m.start_seconds}s"
+    link = timestamped_url(m.url, m.start_seconds if "youtube.com" in m.url else None)
     quote = extract_quote(m.segment_text, m.as_mentioned) if m.segment_text else "(mindmap-level mention, no segment)"
     return f'> "{quote}"\n>\n> - {m.source_id}, [{m.title}]({link}), {m.first_date.isoformat()}'
 
@@ -411,20 +439,28 @@ def _chain_line(chain: Chain) -> str:
     return hops
 
 
-def render_report(data: ReportData, top_findings: int = TOP_FINDINGS_DEFAULT) -> str:
+def render_report(
+    data: ReportData,
+    top_findings: int = TOP_FINDINGS_DEFAULT,
+    min_ranked_concepts: int = MIN_RANKED_CONCEPTS_DEFAULT,
+) -> str:
     ranked = sorted(
-        (s for s in data.stats.values() if s.eligible_concepts >= 5),
+        (s for s in data.stats.values() if s.eligible_concepts >= min_ranked_concepts),
         key=lambda s: s.lift,
         reverse=True,
     )
+    omitted = len(data.stats) - len(ranked)
     naive_ranked = sorted(data.naive.items(), key=lambda kv: kv[1], reverse=True)
 
     # kill-criterion diagnostics over creators present in the corrected ranking
-    lifts = [s.lift for s in ranked]
-    cov_starts = [float(data.coverage[s.source_id].start.toordinal()) for s in ranked]
-    sizes = [float(data.coverage[s.source_id].n_artifacts) for s in ranked]
-    rho_start = spearman(lifts, cov_starts)
-    rho_size = spearman(lifts, sizes)
+    if len(ranked) >= 2:
+        lifts = [s.lift for s in ranked]
+        cov_starts = [float(data.coverage[s.source_id].start.toordinal()) for s in ranked]
+        sizes = [float(data.coverage[s.source_id].n_artifacts) for s in ranked]
+        rho_start_s = f"{spearman(lifts, cov_starts):+.2f}"
+        rho_size_s = f"{spearman(lifts, sizes):+.2f}"
+    else:
+        rho_start_s = rho_size_s = "n/a (fewer than 2 ranked creators - diagnostics undefined)"
 
     # strongest findings: quotable leaders first (issue #93 requires quoted
     # evidence), then longest connected chains (most followers within window),
@@ -444,7 +480,7 @@ def render_report(data: ReportData, top_findings: int = TOP_FINDINGS_DEFAULT) ->
     lines.append("")
     lines.append(
         f"Corpus: {sum(c.n_artifacts for c in data.coverage.values())} artifacts across "
-        f"{len(data.coverage)} creators (>= {p['min_artifacts']} artifacts each); "
+        f"{len(data.coverage)} creators ({len(data.rankable)} rankable at >= {p['min_artifacts']} artifacts); "
         f"{data.n_concepts_total} concepts total, {data.n_concepts_eligible} pass the adoption + eligibility "
         f"filters (adopted by >= {p['min_adopters']} creators, >= {p['min_eligible']} of them with coverage "
         f"active at emergence)."
@@ -459,17 +495,24 @@ def render_report(data: ReportData, top_findings: int = TOP_FINDINGS_DEFAULT) ->
         "only counts if enough adopters' coverage windows were active at its emergence; (2) expected firsts are "
         "proportional to posting rate among those eligible adopters, so `lift = observed firsts / expected "
         "firsts` rewards leading beyond volume-implied chance. Lift > 1 means the creator is first more often "
-        "than their posting volume predicts."
+        "than their posting volume predicts. Creators below the artifact floor still set emergence dates (so "
+        "nobody inherits a first they did not earn) but are not themselves ranked."
     )
     lines.append("")
     lines.append("## Corpus coverage windows (the confound, stated)")
     lines.append("")
-    lines.append("| Creator | Coverage start | Coverage end | Artifacts | Rate/day |")
-    lines.append("|---|---|---|---|---|")
+    lines.append("| Creator | Coverage start | Coverage end | Artifacts | Rate/day | Ranked |")
+    lines.append("|---|---|---|---|---|---|")
     for c in sorted(data.coverage.values(), key=lambda c: c.start):
-        lines.append(f"| {c.source_id} | {c.start} | {c.end} | {c.n_artifacts} | {c.rate:.3f} |")
+        ranked_mark = "yes" if c.source_id in data.rankable else "no"
+        lines.append(f"| {c.source_id} | {c.start} | {c.end} | {c.n_artifacts} | {c.rate:.3f} | {ranked_mark} |")
     lines.append("")
     lines.append("## Corrected leader ranking (precursor lift)")
+    lines.append("")
+    lines.append(
+        f"Creators shown: >= {p['min_artifacts']} artifacts and >= {min_ranked_concepts} eligible concepts "
+        f"({omitted} rankable creators omitted for too few eligible concepts)."
+    )
     lines.append("")
     lines.append("| # | Creator | Lift | Firsts (obs) | Firsts (expected) | Eligible concepts | Mean lag (days) |")
     lines.append("|---|---|---|---|---|---|---|")
@@ -489,12 +532,13 @@ def render_report(data: ReportData, top_findings: int = TOP_FINDINGS_DEFAULT) ->
     lines.append("## Kill-criterion diagnostics")
     lines.append("")
     lines.append(
-        f"- Spearman(corrected lift, coverage-start date): **{rho_start:+.2f}** "
-        "(strongly negative = older-indexed channels still dominate = corpus artifact)"
+        f"- Spearman(corrected lift, coverage-start date): **{rho_start_s}**. Negative means earlier-indexed "
+        "channels still rank higher (coverage artifact); near zero means the correction removed the "
+        "indexing-age effect."
     )
     lines.append(
-        f"- Spearman(corrected lift, corpus size): **{rho_size:+.2f}** "
-        "(strongly positive = biggest channels still dominate = corpus artifact)"
+        f"- Spearman(corrected lift, corpus size): **{rho_size_s}**. Positive means bigger channels still rank "
+        "higher (popularity artifact); negative means smaller channels out-lead their posting volume."
     )
     lines.append(
         "- Issue #93 kill criterion: if, after coverage correction, the leaders are just the biggest / "
@@ -505,11 +549,15 @@ def render_report(data: ReportData, top_findings: int = TOP_FINDINGS_DEFAULT) ->
     lines.append("")
     for i, chain in enumerate(findings, 1):
         leader = chain.mentions[0]
+        tied_with = [x.source_id for x in chain.mentions[1:] if x.first_date == leader.first_date]
+        leader_label = f"{leader.source_id} first on {leader.first_date}"
+        if tied_with:
+            leader_label += f", tied with {', '.join(tied_with)}"
         lines.append(f"### {i}. `{chain.concept_id}`")
         lines.append("")
         lines.append(f"Chain: {_chain_line(chain)}")
         lines.append("")
-        lines.append(f"Leader evidence ({leader.source_id} first on {leader.first_date}):")
+        lines.append(f"Leader evidence ({leader_label}):")
         lines.append("")
         lines.append(_evidence_line(leader))
         lines.append("")
@@ -546,14 +594,50 @@ def render_report(data: ReportData, top_findings: int = TOP_FINDINGS_DEFAULT) ->
 # ---------------------------------------------------------------------------
 
 
+def _positive_int(value: str) -> int:
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
+    return n
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Coverage-corrected lead-lag report (issue #93)")
     parser.add_argument("--db", default=str(DEFAULT_DB), help=f"DuckDB path (default {DEFAULT_DB})")
     parser.add_argument("--out", help="write markdown report here (default: stdout)")
-    parser.add_argument("--min-adopters", type=int, default=MIN_ADOPTERS_DEFAULT)
-    parser.add_argument("--min-eligible", type=int, default=MIN_ELIGIBLE_DEFAULT)
-    parser.add_argument("--min-artifacts", type=int, default=MIN_ARTIFACTS_DEFAULT)
-    parser.add_argument("--follow-window-days", type=int, default=FOLLOW_WINDOW_DAYS_DEFAULT)
+    parser.add_argument(
+        "--min-adopters",
+        type=_positive_int,
+        default=MIN_ADOPTERS_DEFAULT,
+        help=f"concept must be adopted by >= N creators to be analyzed (default {MIN_ADOPTERS_DEFAULT})",
+    )
+    parser.add_argument(
+        "--min-eligible",
+        type=_positive_int,
+        default=MIN_ELIGIBLE_DEFAULT,
+        help="concept must have >= N adopters whose coverage was active at emergence, else 'first' is a "
+        f"corpus artifact (default {MIN_ELIGIBLE_DEFAULT})",
+    )
+    parser.add_argument(
+        "--min-artifacts",
+        type=_positive_int,
+        default=MIN_ARTIFACTS_DEFAULT,
+        help="creators below this corpus size are observed (set emergence dates) but not ranked "
+        f"(default {MIN_ARTIFACTS_DEFAULT})",
+    )
+    parser.add_argument(
+        "--min-ranked-concepts",
+        type=_positive_int,
+        default=MIN_RANKED_CONCEPTS_DEFAULT,
+        help="hide creators with fewer eligible concepts from the ranked table and diagnostics "
+        f"(default {MIN_RANKED_CONCEPTS_DEFAULT})",
+    )
+    parser.add_argument(
+        "--follow-window-days",
+        type=_positive_int,
+        default=FOLLOW_WINDOW_DAYS_DEFAULT,
+        help=f"max days between mentions for an 'A leads, B follows' edge (default {FOLLOW_WINDOW_DAYS_DEFAULT})",
+    )
     parser.add_argument("--top", type=int, default=TOP_FINDINGS_DEFAULT, help="number of findings to render")
     return parser
 
@@ -563,7 +647,7 @@ def main() -> None:
     try:
         import duckdb
     except ImportError:
-        log.error("duckdb not installed. Run: pip install duckdb")
+        log.error("duckdb not installed. Run: pip install 'video-intel[intelligence]'")
         sys.exit(1)
     db_path = Path(args.db)
     if not db_path.exists():
@@ -580,7 +664,12 @@ def main() -> None:
         )
     finally:
         con.close()
-    report = render_report(data, top_findings=args.top)
+    if data.n_concepts_eligible == 0:
+        log.warning(
+            "no concepts passed the adoption + eligibility filters - the report will be empty; "
+            "check --db points at a loaded store and consider lowering --min-adopters/--min-eligible"
+        )
+    report = render_report(data, top_findings=args.top, min_ranked_concepts=args.min_ranked_concepts)
     if args.out:
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
