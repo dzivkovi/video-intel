@@ -34,6 +34,8 @@ from lead_lag_report import (
     ReportData,
     build_report_data,
     extract_quote,
+    finding_chains,
+    ranked_creators,
     spearman,
 )
 
@@ -47,6 +49,11 @@ SMALL_SAMPLE_EXPECTED = 2.0  # below this, a lift is one lucky first away from n
 ROBUST_EXPECTED = 5.0  # at or above this, the lift is backed by enough trials to trust
 
 
+def _clean_text(text: str) -> str:
+    """Whitespace-flatten and dash-normalize corpus strings (same rule as extract_quote)."""
+    return " ".join(text.split()).replace(chr(0x2014), "-").replace(chr(0x2013), "-")
+
+
 def _chain_payload(chain: Chain, rankable: frozenset[str]) -> dict:
     mentions = []
     for m in chain.mentions:
@@ -55,7 +62,7 @@ def _chain_payload(chain: Chain, rankable: frozenset[str]) -> dict:
             {
                 "creator": m.source_id,
                 "date": m.first_date.isoformat(),
-                "title": m.title,
+                "title": _clean_text(m.title),
                 "link": link,
                 "quote": extract_quote(m.segment_text, m.as_mentioned, width=180) if m.segment_text else None,
                 "subThreshold": m.source_id not in rankable,
@@ -75,11 +82,7 @@ def build_viz_payload(
     min_ranked_concepts: int = MIN_RANKED_CONCEPTS_DEFAULT,
 ) -> dict:
     """The JSON the page embeds. Mirrors render_report's selection logic exactly."""
-    ranked = sorted(
-        (s for s in data.stats.values() if s.eligible_concepts >= min_ranked_concepts),
-        key=lambda s: s.lift,
-        reverse=True,
-    )
+    ranked = ranked_creators(data, min_ranked_concepts)
     naive_order = [src for src, _ in sorted(data.naive.items(), key=lambda kv: kv[1], reverse=True)]
     leaders = []
     for s in ranked:
@@ -91,16 +94,28 @@ def build_viz_payload(
                 "firsts": round(s.firsts, 1),
                 "expected": round(s.expected, 1),
                 "eligible": s.eligible_concepts,
-                "meanLag": round(s.mean_lag_days),
                 "smallSample": s.expected < SMALL_SAMPLE_EXPECTED,
                 "robust": s.expected >= ROBUST_EXPECTED,
                 "naiveRank": naive_order.index(s.source_id) + 1 if s.source_id in naive_order else None,
-                "coverageStart": c.start.isoformat(),
                 "artifacts": c.n_artifacts,
             }
         )
-    robust_leaders = [x for x in leaders if x["robust"] and x["lift"] > 1.0]
-    most_robust = max(robust_leaders, key=lambda x: x["lift"])["creator"] if robust_leaders else None
+    # select on the UNROUNDED lift: a 2-dp rounded 1.0 must not fail the > 1.0
+    # gate that the ranking order itself treats as above baseline (PR #97 review)
+    robust_stats = [s for s in ranked if s.expected >= ROBUST_EXPECTED and s.lift > 1.0]
+    most_robust = max(robust_stats, key=lambda s: s.lift).source_id if robust_stats else None
+    # the biggest ranked channel's naive-vs-corrected movement is what the
+    # kill-rule card cites; derived from data, never hardcoded (PR #97 review)
+    kill_rule = None
+    if ranked:
+        biggest = max(ranked, key=lambda s: data.coverage[s.source_id].n_artifacts)
+        kill_rule = {
+            "creator": biggest.source_id,
+            "artifacts": data.coverage[biggest.source_id].n_artifacts,
+            "naiveRank": (naive_order.index(biggest.source_id) + 1 if biggest.source_id in naive_order else None),
+            "correctedRank": ranked.index(biggest) + 1,
+            "rankedCount": len(ranked),
+        }
 
     if len(ranked) >= 2:
         lifts = [s.lift for s in ranked]
@@ -109,15 +124,7 @@ def build_viz_payload(
     else:
         rho_start = rho_size = None
 
-    def chain_key(c: Chain) -> tuple[int, int, int]:
-        span = (c.mentions[-1].first_date - c.mentions[0].first_date).days
-        has_quote = c.mentions[0].segment_text is not None
-        return (0 if has_quote else 1, -len(c.edges), span)
-
-    chains = [
-        _chain_payload(c, data.rankable)
-        for c in sorted((c for c in data.chains if c.edges), key=chain_key)[:top_findings]
-    ]
+    chains = [_chain_payload(c, data.rankable) for c in finding_chains(data, top_findings)]
     return {
         "generated": dt.date.today().isoformat(),
         "stats": {
@@ -127,17 +134,35 @@ def build_viz_payload(
             "concepts": data.n_concepts_total,
             "eligibleConcepts": data.n_concepts_eligible,
         },
-        "params": {**data.params, "min_ranked_concepts": min_ranked_concepts, "top": top_findings},
+        "params": {
+            **data.params,
+            "min_ranked_concepts": min_ranked_concepts,
+            "top": top_findings,
+            "small_sample_expected": SMALL_SAMPLE_EXPECTED,
+            "robust_expected": ROBUST_EXPECTED,
+        },
         "leaders": leaders,
+        "omittedRanked": len(data.rankable) - len(ranked),
         "mostRobust": most_robust,
+        "killRule": kill_rule,
         "diagnostics": {"rhoStart": rho_start, "rhoSize": rho_size},
         "chains": chains,
     }
 
 
 def render_html(payload: dict) -> str:
-    """One self-contained page. </ is escaped in the JSON so it can never close the script tag."""
-    data_json = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
+    """One self-contained page.
+
+    ALL angle brackets in the JSON are unicode-escaped, not just "</": a
+    corpus string containing "<!--" plus "<script" flips the HTML tokenizer
+    into the script-data double-escaped state, where the template's real
+    closing tag no longer ends the script element and the whole page renders
+    blank (adversarial review on PR #97, reproduced in-browser). YouTube
+    titles are attacker-adjacent input; escape the class, not the instance.
+    """
+    data_json = (
+        json.dumps(payload, ensure_ascii=False).replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e")
+    )
     return _TEMPLATE.replace("__DATA_JSON__", data_json).replace("__GENERATED__", payload["generated"])
 
 
@@ -347,7 +372,8 @@ function esc(s){return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;
     }
   }
   const legend = document.getElementById('legend');
-  legend.textContent = 'Bars sorted by lift within each evidence tier; bar length is comparable across tiers. Vertical line = lift 1.0 (leading exactly as much as posting volume predicts). obs/exp = observed vs volume-expected firsts over that creator\'s eligible concepts; naive #N = rank in the uncorrected first-mention count.';
+  const omitted = DATA.omittedRanked ? ' '+DATA.omittedRanked+' rankable creators omitted for fewer than '+DATA.params.min_ranked_concepts+' eligible concepts.' : '';
+  legend.textContent = 'Bars sorted by lift within each evidence tier; bar length is comparable across tiers. Vertical line = lift 1.0 (leading exactly as much as posting volume predicts). obs/exp = observed vs volume-expected firsts over that creator\'s eligible concepts; naive #N = rank in the uncorrected first-mention count.' + omitted;
   const cal = document.getElementById('callout');
   if(DATA.mostRobust){
     const r = L.find(x=>x.creator===DATA.mostRobust);
@@ -368,7 +394,7 @@ function esc(s){return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;
   }
   card('Spearman: lift vs corpus size', d.rhoSize,
     d.rhoSize===null ? 'not enough ranked creators' :
-    (d.rhoSize < 0 ? 'Negative: bigger channels rank LOWER after correction. If popularity were driving the ranking this would be strongly positive.' :
+    (d.rhoSize <= 0 ? 'Negative or zero: bigger channels do not rank higher after correction. If popularity were driving the ranking this would be strongly positive.' :
      'Positive: bigger channels still rank higher - popularity contamination.'), d.rhoSize!==null && d.rhoSize <= 0);
   card('Spearman: lift vs coverage start', d.rhoStart,
     d.rhoStart===null ? 'not enough ranked creators' :
@@ -376,7 +402,15 @@ function esc(s){return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;
      'Strong: indexing depth still drives the ranking - coverage artifact.'), d.rhoStart!==null && Math.abs(d.rhoStart) < 0.35);
   const c3 = el('div','diag');
   c3.append(el('div','k','The kill rule'));
-  c3.append(el('p','', 'Issue #93: if, after coverage correction, the leaders are just the biggest / oldest-indexed channels, the influence signal is not there. Verdict from the independent (Codex) gate: the criterion is NOT met - the largest, oldest channel drops from naive #2 to corrected #8.'));
+  let verdict = 'Issue #93: if, after coverage correction, the leaders are just the biggest / oldest-indexed channels, the influence signal is not there.';
+  const kr = DATA.killRule;
+  if(kr){
+    verdict += ' On this data: the largest ranked channel, '+esc(kr.creator)+' ('+kr.artifacts+' videos'+(kr.naiveRank?', naive #'+kr.naiveRank:'')+'), lands at corrected #'+kr.correctedRank+' of '+kr.rankedCount+'.';
+    verdict += (d.rhoSize!==null && d.rhoSize <= 0 && kr.correctedRank > kr.rankedCount/2)
+      ? ' The criterion is not met - the signal survives.'
+      : ' Re-examine before trusting the ranking: size still tracks rank on this regeneration.';
+  }
+  c3.append(el('p','', verdict));
   host.append(c3);
 })();
 
@@ -406,7 +440,7 @@ function esc(s){return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;
     /* axis */
     const ax = document.createElementNS(NS,'g'); ax.setAttribute('class','axis');
     const axLine = document.createElementNS(NS,'line');
-    axLine.setAttribute('x1',padL+60); axLine.setAttribute('x2',W-padR+60);
+    axLine.setAttribute('x1',padL+60); axLine.setAttribute('x2',W-padR);
     axLine.setAttribute('y1',padT-16); axLine.setAttribute('y2',padT-16);
     ax.append(axLine);
     for(const [t,anchor] of [[t0,'start'],[t1,'end']]){
@@ -464,7 +498,7 @@ function esc(s){return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;
   const p = DATA.params;
   document.getElementById('explain').innerHTML =
     '<p><b>What was corrected.</b> Channels entered this corpus with very different lookback depths, so a deep-backfill channel would look "first" on anything that emerged before the others were indexed. A concept only counts here when at least '+p.min_eligible+' of its adopters were already being indexed at emergence, and expected firsts are proportional to posting rate - so a channel only scores by leading beyond its volume-implied chance.</p>' +
-    '<p><b>What the hatching means.</b> A hatched bar has fewer than 2 expected firsts: one or two lucky calls produce a huge lift. Read those rows as leads to verify, not verdicts. The green rows have enough trials to take at face value.</p>' +
+    '<p><b>What the hatching means.</b> A hatched bar has fewer than '+DATA.params.small_sample_expected+' expected firsts: one or two lucky calls produce a huge lift. Read those rows as leads to verify, not verdicts. The green rows (>= '+DATA.params.robust_expected+' expected) have enough trials to take at face value.</p>' +
     '<p><b>What this is not.</b> Not a subscriber ranking, not a view-count ranking, and not causal proof that one creator watched another. It is precedence in this corpus, on '+DATA.stats.eligibleConcepts+' concepts that clear the filters, over '+DATA.stats.artifacts+' videos. Upload date stands in for idea date; anything said earlier off-platform is invisible.</p>' +
     '<p><b>Where the numbers come from.</b> scripts/lead_lag_report.py (issue #93), read-only over the DuckDB truth store; this page renders the same statistics without recomputing them. Method: minimal form of the coverage correction in "Precursors and Laggards" (arXiv:1009.0119).</p>';
 })();

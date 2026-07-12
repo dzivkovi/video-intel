@@ -7,6 +7,7 @@ context (Codex gate constraint from PR #96).
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 
 import pytest
@@ -104,7 +105,50 @@ class TestPayload:
         data = _data()
         payload = build_viz_payload(data, min_ranked_concepts=19)  # only big (20) qualifies
         assert payload["diagnostics"]["rhoStart"] is None
-        assert payload["mostRobust"] is None or payload["mostRobust"] == "big"
+        # big's lift is 0.5, below the > 1.0 gate, so no robust leader exists
+        assert payload["mostRobust"] is None
+
+    def test_diagnostics_values_computed_over_ranked_set(self):
+        # lifts desc [6.0, 1.67, 0.5] vs sizes [10, 40, 100] -> perfect inversion;
+        # coverage starts all identical -> tied ranks -> rho undefined -> 0.0
+        payload = build_viz_payload(_data(), min_ranked_concepts=5)
+        assert payload["diagnostics"]["rhoSize"] == pytest.approx(-1.0)
+        assert payload["diagnostics"]["rhoStart"] == pytest.approx(0.0)
+
+    def test_every_leader_lands_in_exactly_one_tier(self):
+        payload = build_viz_payload(_data(), min_ranked_concepts=5)
+        for x in payload["leaders"]:
+            assert x["smallSample"] + x["robust"] <= 1  # disjoint flags
+
+    def test_omitted_ranked_counts_creators_hidden_from_table(self):
+        # rankable has 3 creators; min_ranked_concepts=19 keeps only big
+        payload = build_viz_payload(_data(), min_ranked_concepts=19)
+        assert payload["omittedRanked"] == 2
+
+    def test_kill_rule_derived_from_data_not_hardcoded(self):
+        payload = build_viz_payload(_data(), min_ranked_concepts=5)
+        kr = payload["killRule"]
+        assert kr["creator"] == "big"  # 100 artifacts, largest ranked channel
+        assert kr["naiveRank"] == 1
+        assert kr["correctedRank"] == 3  # lowest lift of the three ranked
+        assert kr["rankedCount"] == 3
+
+    def test_empty_report_data_renders_without_crashing(self):
+        data = ReportData(
+            coverage={},
+            rankable=frozenset(),
+            stats={},
+            naive={},
+            chains=[],
+            n_concepts_total=0,
+            n_concepts_eligible=0,
+            params={"min_adopters": 4, "min_eligible": 3, "min_artifacts": 5, "follow_window_days": 90},
+        )
+        payload = build_viz_payload(data)
+        assert payload["leaders"] == []
+        assert payload["killRule"] is None
+        html = render_html(payload)
+        assert "const DATA =" in html
 
 
 class TestRenderHtml:
@@ -123,10 +167,26 @@ class TestRenderHtml:
 
     def test_data_embedded_and_script_safe(self, html: str):
         assert "const DATA =" in html
-        # </ inside the JSON must be escaped so it can never close the script tag
+        # ALL angle brackets in the JSON are unicode-escaped: "<!--" + "<script"
+        # would flip the parser into the double-escaped state and blank the page
         start = html.index("const DATA =")
         end = html.index(";", start)
-        assert "</" not in html[start:end]
+        blob = html[start:end]
+        assert "<" not in blob.replace("<", "")
+        assert ">" not in blob.replace(">", "")
+
+    def test_hostile_title_cannot_break_script_context(self):
+        data = _data()
+        hostile = dataclasses.replace(
+            data.chains[0].mentions[0], title="<!--<script>alert(1)</script>", segment_text=None
+        )
+        data.chains[0] = Chain(data.chains[0].concept_id, (hostile, *data.chains[0].mentions[1:]), data.chains[0].edges)
+        html = render_html(build_viz_payload(data, min_ranked_concepts=5))
+        start = html.index("const DATA =")
+        end = html.index(";", start)
+        blob = html[start:end]
+        assert "<!--" not in blob
+        assert "<script" not in blob
 
     def test_key_sections_present(self, html: str):
         for marker in ['id="bars"', 'id="tl"', 'id="diag"', 'id="tlist"', 'id="explain"', "<title>"]:
