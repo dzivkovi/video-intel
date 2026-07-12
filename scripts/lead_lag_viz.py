@@ -163,7 +163,9 @@ def render_html(payload: dict) -> str:
     data_json = (
         json.dumps(payload, ensure_ascii=False).replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e")
     )
-    return _TEMPLATE.replace("__DATA_JSON__", data_json).replace("__GENERATED__", payload["generated"])
+    # order matters: fill the static sentinel FIRST so corpus strings inside the
+    # JSON can never contain-and-get-mutated-by a template placeholder (Codex review)
+    return _TEMPLATE.replace("__GENERATED__", payload["generated"]).replace("__DATA_JSON__", data_json)
 
 
 _TEMPLATE = r"""<!doctype html>
@@ -406,9 +408,9 @@ function esc(s){return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;
   const kr = DATA.killRule;
   if(kr){
     verdict += ' On this data: the largest ranked channel, '+esc(kr.creator)+' ('+kr.artifacts+' videos'+(kr.naiveRank?', naive #'+kr.naiveRank:'')+'), lands at corrected #'+kr.correctedRank+' of '+kr.rankedCount+'.';
-    verdict += (d.rhoSize!==null && d.rhoSize <= 0 && kr.correctedRank > kr.rankedCount/2)
+    verdict += (d.rhoSize!==null && d.rhoSize <= 0 && Math.abs(d.rhoStart) < 0.35 && kr.correctedRank > kr.rankedCount/2)
       ? ' The criterion is not met - the signal survives.'
-      : ' Re-examine before trusting the ranking: size still tracks rank on this regeneration.';
+      : ' Re-examine before trusting the ranking: a size or indexing-age artifact tracks rank on this regeneration.';
   }
   c3.append(el('p','', verdict));
   host.append(c3);

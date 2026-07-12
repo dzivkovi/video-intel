@@ -172,8 +172,11 @@ class TestRenderHtml:
         start = html.index("const DATA =")
         end = html.index(";", start)
         blob = html[start:end]
-        assert "<" not in blob.replace("<", "")
-        assert ">" not in blob.replace(">", "")
+        # every angle bracket must be escaped, so the raw characters cannot
+        # appear anywhere in the assignment slice (Codex review: the earlier
+        # replace()-based form was a tautology)
+        assert "<" not in blob
+        assert ">" not in blob
 
     def test_hostile_title_cannot_break_script_context(self):
         data = _data()
