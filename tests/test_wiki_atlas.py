@@ -10,6 +10,7 @@ Contract (the non-dull checklist, enforced at generation):
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 
 from scripts.lead_lag_report import Chain, Coverage, CreatorStats, FirstMention, ReportData
@@ -136,7 +137,74 @@ class TestNonDullChecklist:
         assert index.count(PROSE_INLINE) == 4  # 3 creators + 1 concept
 
 
+class TestReviewRegressions:
+    """Locks the PR #106 review findings (in-family + Codex convergence)."""
+
+    def test_tied_same_day_co_leader_renders_as_lead_not_follow(self):
+        data = _data()
+        tied = Chain(
+            concept_id="dom.tied",
+            mentions=(
+                _mention("steady", "2026-04-01", concept_id="dom.tied"),
+                _mention("big", "2026-04-01", concept_id="dom.tied"),
+                _mention("lucky", "2026-05-01", concept_id="dom.tied"),
+            ),
+            edges=(("big", "lucky", 30),),
+        )
+        data.chains.append(tied)
+        pages = build_atlas(data, min_ranked_concepts=5)
+        big = pages["creators/big.md"]
+        assert "Leads on (1 concepts)" in big
+        assert "0 days behind" not in big
+
+    def test_follow_beyond_window_is_stated_but_not_wikilinked(self):
+        data = _data()
+        late = Chain(
+            concept_id="dom.late",
+            mentions=(
+                _mention("steady", "2026-01-05", concept_id="dom.late"),
+                _mention("big", "2026-06-24", concept_id="dom.late"),  # 170d > 90d window
+            ),
+            edges=(),
+        )
+        data.chains.append(late)
+        pages = build_atlas(data, min_ranked_concepts=5)
+        big = pages["creators/big.md"]
+        assert "170 days behind steady" in big
+        assert "170 days behind [[steady]]" not in big
+
+    def test_ranked_creator_without_naive_firsts_renders_unranked_not_zero(self):
+        data = _data()
+        data.naive.pop("lucky")
+        pages = build_atlas(data, min_ranked_concepts=5)
+        assert "unranked (no naive firsts)" in pages["creators/lucky.md"]
+        assert "| #0 |" not in pages["creators/lucky.md"]
+
+    def test_log_inventory_includes_itself(self):
+        pages = build_atlas(_data(), min_ranked_concepts=5)
+        assert f"- Pages: {len(pages)}" in pages["log.md"]
+        assert "log.md" in pages["log.md"]
+
+    def test_write_atlas_rejects_path_escape(self, tmp_path):
+        import pytest
+
+        with pytest.raises(ValueError, match="escapes wiki dir"):
+            write_atlas({"../evil.md": "x"}, tmp_path)
+
+
 class TestHelpers:
+    def test_colliding_concept_slugs_get_distinct_pages(self):
+        data = _data()
+        second = dataclasses.replace(
+            data.chains[0],
+            concept_id="dom_pact",
+            mentions=tuple(dataclasses.replace(m, concept_id="dom_pact") for m in data.chains[0].mentions),
+        )
+        data.chains.append(second)
+        pages = build_atlas(data, min_ranked_concepts=5)
+        assert "concepts/dom-pact.md" in pages
+        assert "concepts/dom-pact-2.md" in pages
+
     def test_slugify_safe_for_filesystem_and_wikilinks(self):
         assert slugify("dom.pact") == "dom-pact"
         assert slugify("C++ / .NET (MCP)") == "c-net-mcp"

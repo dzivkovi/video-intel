@@ -72,7 +72,9 @@ def tier_label(expected: float) -> str:
 
 
 def _naive_ranks(data: ReportData) -> dict[str, int]:
-    ordered = sorted(data.naive.items(), key=lambda kv: kv[1], reverse=True)
+    # source_id tiebreak: ties otherwise swap ranks run-to-run with the DB's
+    # row order, making regeneration non-deterministic
+    ordered = sorted(data.naive.items(), key=lambda kv: (-kv[1], kv[0]))
     return {sid: i + 1 for i, (sid, _) in enumerate(ordered)}
 
 
@@ -107,13 +109,17 @@ def _dossier(
     leads: list[tuple[Chain, FirstMention]] = []
     follows: list[tuple[Chain, FirstMention, int]] = []
     for chain in data.chains:
+        leader_date = chain.mentions[0].first_date
         for m in chain.mentions:
             if m.source_id != s.source_id:
                 continue
-            if m is chain.mentions[0]:
+            # tie on the leader date = shared first (precursor_stats splits the
+            # credit fractionally); rendering a tied co-leader as a follower
+            # would contradict the statistics this page claims to render
+            if m.first_date == leader_date:
                 leads.append((chain, m))
             else:
-                follows.append((chain, m, (m.first_date - chain.mentions[0].first_date).days))
+                follows.append((chain, m, (m.first_date - leader_date).days))
 
     lines = [
         "---",
@@ -135,7 +141,7 @@ def _dossier(
         "|---|---|",
         f"| Corrected rank | #{corrected_rank} (lift {s.lift:.2f}) |",
         f"| Observed vs expected firsts | {s.firsts:.1f} vs {s.expected:.1f} over {s.eligible_concepts} eligible concepts |",
-        f"| Naive rank (uncorrected) | #{naive_ranks.get(s.source_id, 0)} |",
+        f"| Naive rank (uncorrected) | {f'#{naive_ranks[s.source_id]}' if s.source_id in naive_ranks else 'unranked (no naive firsts)'} |",
         f"| Mean lag behind leaders | {s.mean_lag_days:.0f} days |",
         f"| Coverage window | {cov.start.isoformat()} to {cov.end.isoformat()} ({cov.n_artifacts} artifacts) |",
         f"| Evidence tier | {tier} |",
@@ -147,6 +153,7 @@ def _dossier(
             "this lift is one lucky first away from noise. Read as a lead for inspection, not a verdict."
         )
     lines += ["", f"## Leads on ({len(leads)} concepts)", ""]
+    leads.sort(key=lambda t: (t[1].first_date, t[0].concept_id))
     for chain, m in leads[:MAX_LEADS_LISTED]:
         target = (
             _link(concept_pages[chain.concept_id], set(concept_pages.values()))
@@ -158,15 +165,19 @@ def _dossier(
         lines.append(
             f"- ...and {len(leads) - MAX_LEADS_LISTED} more (full set in the [lead-lag report](../../_reports/))"
         )
+    follow_window = data.params.get("follow_window_days", 0)
     lines += ["", f"## Follows on ({len(follows)} concepts)", ""]
-    for chain, _m, lag in sorted(follows, key=lambda t: t[2])[:MAX_FOLLOWS_LISTED]:
+    for chain, _m, lag in sorted(follows, key=lambda t: (t[2], t[0].concept_id))[:MAX_FOLLOWS_LISTED]:
         leader = chain.mentions[0].source_id
         target = (
             _link(concept_pages[chain.concept_id], set(concept_pages.values()))
             if chain.concept_id in concept_pages
             else chain.concept_id
         )
-        lines.append(f"- {target} - {lag} days behind {_link(leader, creator_pages)}")
+        # beyond the follow window the lag is a date fact, not a validated
+        # lead->follow edge - state it, but do not wikilink the "leader"
+        leader_ref = _link(leader, creator_pages) if lag <= follow_window else leader
+        lines.append(f"- {target} - {lag} days behind {leader_ref}")
     if len(follows) > MAX_FOLLOWS_LISTED:
         lines.append(f"- ...and {len(follows) - MAX_FOLLOWS_LISTED} more")
     lines.append("")
@@ -286,7 +297,18 @@ def build_atlas(
     ranked = ranked_creators(data, min_ranked_concepts)
     chains = finding_chains(data, top_findings)
     creator_pages = {s.source_id for s in ranked}
-    concept_pages = {c.concept_id: slugify(c.concept_id) for c in chains}
+    # Distinct concept_ids can slugify identically ("dom.pact" / "dom_pact");
+    # disambiguate deterministically so one page never silently overwrites another.
+    concept_pages: dict[str, str] = {}
+    used_slugs: set[str] = set()
+    for c in chains:
+        slug = base = slugify(c.concept_id)
+        n = 2
+        while slug in used_slugs:
+            slug = f"{base}-{n}"
+            n += 1
+        used_slugs.add(slug)
+        concept_pages[c.concept_id] = slug
     naive_ranks = _naive_ranks(data)
 
     pages: dict[str, str] = {}
@@ -297,13 +319,17 @@ def build_atlas(
             chain, concept_pages[chain.concept_id], creator_pages
         )
     pages["index.md"] = _index(ranked, chains, concept_pages, data)
+    pages["log.md"] = ""  # placeholder so the log's own inventory includes itself
     pages["log.md"] = _log(data, pages, generated, db)
     return pages
 
 
 def write_atlas(pages: dict[str, str], wiki_dir: Path) -> None:
+    root = wiki_dir.resolve()
     for rel, content in pages.items():
-        path = wiki_dir / rel
+        path = (root / rel).resolve()
+        if root not in path.parents:
+            raise ValueError(f"page path escapes wiki dir: {rel}")
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
 
