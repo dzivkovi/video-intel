@@ -109,6 +109,8 @@ pip install lancedb voyageai
 
 If prerequisites are missing, tell the user what's needed and where to get it.
 
+For ad-hoc analytics over the corpus (who covered a concept first, what is bursting), point the user at the optional DuckDB intelligence store - see "Exploring the Intelligence Store" in the repo README for install (`pip install -e ".[intelligence]"` plus the separate `duckdb` CLI binary) and the ready-made analysis scripts.
+
 ## Important: These Commands Are Slow
 
 Gemini API calls read video frames and audio — they take **1-5 minutes per video**. A scan of 10 videos can take 10-30 minutes. This is normal.

@@ -108,7 +108,9 @@ def require_neo4j():
 
         return GraphDatabase
     except ImportError:
-        log.error("neo4j driver not installed. Run: pip install 'video-intel[intelligence]'")
+        # not in the [intelligence] extras: #95 retired Neo4j/GDS as the
+        # analytics engine, so this experimental path is a manual install
+        log.error("neo4j driver not installed. Run: pip install neo4j (plus a running Neo4j server)")
         sys.exit(1)
 
 

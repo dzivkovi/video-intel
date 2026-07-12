@@ -16,6 +16,7 @@ This table doubles as the project's **failure-mode registry**: the **Status** co
 | Two mindmaps / metas for one video | **Title rotation** (A/B SEO) | `dedupe` (dry-run first) | manual (run `dedupe`) |
 | Same video re-transcribed every scan; `meta.json` has no `video_id` | **Identity-less meta** (transcript writer was first and didn't stamp identity) | prevented going forward (writers stamp identity); `repair-metas --apply` heals existing ones | auto (#66) + `repair-metas` for old data |
 | An already-done video is re-queued mid-scan though its artifacts are on disk (corpus on Google Drive File Stream) | **Cloud-mount read-after-write staleness** - the mount serves a cached pre-write `meta.json` to the scanning process | accepted environmental constraint; impact is bounded to wasted re-transcription (no hang/corruption) since #66/#74. See the scenario below | documented (#67) - blunted by #66/#74 |
+| `duckdb: command not found` after `pip install -e ".[intelligence]"` | **The CLI is a separate binary** - the pip package is only the Python driver | `winget install DuckDB.cli` (Windows) / `brew install duckdb` (macOS), then `duckdb -readonly -ui ~/.cache/video-intel/intel.duckdb`; see README "Exploring the Intelligence Store" | manual (#102) |
 
 ## Scenarios
 
