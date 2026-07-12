@@ -19,8 +19,10 @@ pdf = [
     "reportlab>=4",
 ]
 intelligence = [
+    # neo4j deliberately absent: issue #95 retired Neo4j/GDS as the analytics
+    # engine. The experimental intel_graph.py project/verify subcommands name
+    # the manual `pip install neo4j` in their error message instead.
     "duckdb>=1.0",
-    "neo4j>=5",
 ]
 dev = [
     "ruff",
@@ -32,6 +34,16 @@ dev = [
     "reportlab>=4",
     "pypdf",
 ]
+
+[tool.setuptools]
+# This repo is a plugin of standalone scripts, not an importable package:
+# nothing under scripts/ is meant to be site-packages-installed. Without
+# this, setuptools flat-layout auto-discovery sees the plugin's top-level
+# folders (skills/, prompts/, evals/, ...) as "multiple packages" and every
+# documented `pip install -e ".[extra]"` fails on a fresh clone (found
+# testing issue #102). Empty packages = install registers dependencies and
+# metadata only, which is exactly the intent.
+packages = []
 
 [tool.ruff]
 line-length = 120

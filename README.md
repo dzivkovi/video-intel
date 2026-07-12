@@ -458,6 +458,60 @@ See [ADR-0012](docs/adr/ADR-0012-vector-search-lancedb-voyage.md) for
 embedding choices and [ADR-0013](docs/adr/ADR-0013-hybrid-search-rrf-fusion.md)
 for the hybrid search decision. Evaluation queries in `evals/`.
 
+## Exploring the Intelligence Store (optional)
+
+Beyond search, the repo can build a small **DuckDB analytics store** from your existing corpus artifacts - a queryable database of who said what, when, about which concepts. Everything here is optional: the scan/transcript/search workflow above never touches it.
+
+### Install the two layers (they are different things)
+
+The Python package and the interactive CLI are **separate installs** - `pip install duckdb` gives Python scripts a driver but does NOT put a `duckdb` command on your PATH:
+
+```bash
+# 1. Python layer - lets the analysis scripts run
+pip install -e ".[intelligence]"
+
+# 2. CLI + local notebook UI - a separate binary
+winget install DuckDB.cli      # Windows
+brew install duckdb            # macOS
+curl https://install.duckdb.org | sh   # Linux
+```
+
+### Build and explore the store
+
+```bash
+# Build (read-only over your corpus; writes ~/.cache/video-intel/intel.duckdb)
+python scripts/intel_graph.py load
+
+# Open the local notebook UI in your browser (pass -readonly: the scripts
+# expect to be the only writer)
+duckdb -readonly -ui ~/.cache/video-intel/intel.duckdb
+```
+
+The UI is a local notebook (nothing leaves your machine): browse tables, run SQL, export CSV for spreadsheet work.
+
+### What is in it
+
+The 6-node / 6-edge starter schema. Node tables: `sources` (channels), `artifacts` (videos, with `published_at`), `segments` (transcript chunks), `concepts` (normalized taxonomy concepts), `entities` (surface terms), `mentions` (term occurrences with timestamps). Edge tables connect them: `has_segment`, `has_concept` (video -> concept), `about`, `expresses` (claim -> verbatim quote + timestamp), `claims`, `published`, `co_occurs`. Try:
+
+```sql
+-- which channels cover a concept, in order of first coverage
+SELECT a.source_id, min(a.published_at::DATE) AS first_covered
+FROM has_concept hc JOIN artifacts a USING (artifact_id)
+WHERE hc.concept_id = 'ai-engineering.context_engineering'
+GROUP BY a.source_id ORDER BY first_covered;
+```
+
+### Ready-made analyses over the store
+
+- `python scripts/lead_lag_report.py` - coverage-corrected "who covers a concept first, who follows" ranking with evidence links.
+- `python scripts/lead_lag_viz.py --out report.html` - the same statistics as one self-contained interactive HTML.
+- `python scripts/burst_report.py` - Kleinberg burst detection: which concepts just caught fire, with start dates and intensity.
+- `python scripts/wiki_atlas.py --wiki-dir <output_dir>/_wiki` - generate an Obsidian-readable creator/concept atlas from the lead-lag data.
+
+All four are read-only against the store and print to stdout or a file you choose. The store itself is a derived artifact - delete it any time and rebuild with `load`.
+
+> Note: the experimental `intel_graph.py project` / `verify` subcommands (Neo4j community-detection R&D) need a Neo4j server and the driver, which is no longer part of the `[intelligence]` extras: `pip install neo4j` manually if you want that path. The analyses above do not need it.
+
 ## Cost
 
 Using Gemini 3 Flash ($0.50/M input tokens, $1.00/M audio, $3.00/M output):
