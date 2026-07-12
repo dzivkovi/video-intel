@@ -491,7 +491,7 @@ The UI is a local notebook (nothing leaves your machine): browse tables, run SQL
 
 ### What is in it
 
-The 6-node / 6-edge starter schema. Node tables: `sources` (channels), `artifacts` (videos, with `published_at`), `segments` (transcript chunks), `concepts` (normalized taxonomy concepts), `entities` (surface terms), `mentions` (term occurrences with timestamps). Edge tables connect them: `has_segment`, `has_concept` (video -> concept), `about`, `expresses` (claim -> verbatim quote + timestamp), `claims`, `published`, `co_occurs`. Try:
+The 6-node / 6-edge starter schema. Node tables: `sources` (channels), `artifacts` (videos, with `published_at`), `segments` (transcript chunks), `concepts` (normalized taxonomy concepts), `entities` (surface terms), `claims` (extracted statements). Relationship tables connect them: `published` (source -> artifact), `has_segment`, `mentions` (segment -> entity, with timestamps), `has_concept` (video -> concept), `about`, `expresses` (claim -> verbatim quote + timestamp), plus the derived `co_occurs` (`projection_meta` is internal bookkeeping). Try:
 
 ```sql
 -- which channels cover a concept, in order of first coverage
