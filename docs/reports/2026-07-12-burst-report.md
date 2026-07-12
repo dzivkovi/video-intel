@@ -1,12 +1,14 @@
 # Concept burst report
 
-Kleinberg two-state burst detection over per-concept video streams (issue #103). Corpus end: 2026-07-01. Params: {'min_events': 6, 's': 2.0, 'gamma': 1.0}. A burst is a rate jump against the concept's OWN baseline - 'just caught fire', not 'popular overall'. This corpus is small; every row is a lead for inspection, not a verdict.
+Kleinberg two-state burst detection over per-concept video streams (issue #103). Corpus end: 2026-07-01. Params: {'min_events': 6, 's': 2.0, 'gamma': 1.0, 'min_gap_days': 0.5}. A burst is a rate jump against the concept's OWN baseline - 'just caught fire', not 'popular overall'. Intensity is the burst run's log-likelihood advantage over that concept's own baseline: it is NOT comparable across concepts with different baselines - use it to rank a concept's bursts against each other, not concept vs concept. Same-day videos are spaced at the min_gap_days floor before rate fitting. This corpus is small; every row is a lead for inspection, not a verdict.
+
+> 11 concept-video rows were excluded for missing publish dates - their absence can shift gaps and rising status for the affected concepts.
 
 ## Corpus volume context (read this first)
 
 Every concept stream rides the corpus's indexing volume: when the corpus itself grows, many concepts 'burst' at once. 50 of 95 bursts are currently rising - before reading any single row as a topic catching fire, check whether its start date coincides with a volume surge below.
 
-| Month | Videos indexed |
+| Month | Videos published |
 |---|---|
 | 2025-08 | 31 |
 | 2025-09 | 30 |
@@ -47,5 +49,4 @@ Every concept stream rides the corpus's indexing volume: when the corpus itself 
 
 ## Recent bursts, cooled (45)
 
-(none)
 - ...and 45 more cooled bursts (raise --top)

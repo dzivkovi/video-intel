@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import itertools
 import math
 import sys
 from dataclasses import dataclass
@@ -121,7 +122,7 @@ def detect_bursts(
     for concept_id, events in events_by_concept.items():
         if len(events) < min_events:
             continue
-        gaps = [max(MIN_GAP_DAYS, (b.date - a.date).days) for a, b in zip(events, events[1:])]
+        gaps = [max(MIN_GAP_DAYS, (b.date - a.date).days) for a, b in itertools.pairwise(events)]
         for i, j, weight in kleinberg_burst_spans(gaps, len(events), s, gamma):
             # gap k sits between events k and k+1: the burst covers events i..j+1
             start_ev, end_ev = events[i], events[j + 1]
@@ -140,7 +141,13 @@ def detect_bursts(
     return sorted(bursts, key=lambda b: (not b.rising, -b.start.toordinal(), -b.weight))
 
 
-def load_events(con: DuckDBPyConnection) -> tuple[dict[str, list[Event]], dt.date]:
+def load_events(con: DuckDBPyConnection) -> tuple[dict[str, list[Event]], dt.date, int]:
+    """Returns (events per concept, corpus end date, dropped undated rows).
+
+    corpus_end comes from ALL dated artifacts, not just concept-bearing ones -
+    otherwise later concept-less artifacts would never age out "rising" bursts.
+    Undated rows are counted, not silently dropped (Codex review, PR #107).
+    """
     rows = con.execute(
         """
         SELECT hc.concept_id, a.published_at::DATE AS d, a.source_id, a.title, a.url
@@ -150,12 +157,18 @@ def load_events(con: DuckDBPyConnection) -> tuple[dict[str, list[Event]], dt.dat
         ORDER BY hc.concept_id, d, a.artifact_id
         """
     ).fetchall()
+    dropped = con.execute(
+        """
+        SELECT count(*) FROM (SELECT DISTINCT artifact_id, concept_id FROM has_concept) hc
+        JOIN artifacts a USING (artifact_id) WHERE a.published_at IS NULL
+        """
+    ).fetchone()[0]
+    end_row = con.execute("SELECT max(published_at::DATE) FROM artifacts WHERE published_at IS NOT NULL").fetchone()
+    corpus_end = end_row[0] if end_row and end_row[0] else dt.date.min
     events: dict[str, list[Event]] = {}
-    corpus_end = dt.date.min
     for concept_id, d, source_id, title, url in rows:
         events.setdefault(concept_id, []).append(Event(d, source_id, title or "", url or ""))
-        corpus_end = max(corpus_end, d)
-    return events, corpus_end
+    return events, corpus_end, dropped
 
 
 def load_monthly_volume(con: DuckDBPyConnection, months: int = 12) -> list[tuple[str, int]]:
@@ -197,22 +210,28 @@ def render_report(
     params: dict[str, float],
     top: int,
     monthly_volume: list[tuple[str, int]] | None = None,
+    dropped_undated: int = 0,
 ) -> str:
     rising = [b for b in bursts if b.rising]
     cooled = [b for b in bursts if not b.rising][: max(0, top - len(rising[:top]))]
     lines = [
         "# Concept burst report",
         "",
-        f"Kleinberg two-state burst detection over per-concept video streams (issue #103). Corpus end: {corpus_end.isoformat()}. Params: {params}. A burst is a rate jump against the concept's OWN baseline - 'just caught fire', not 'popular overall'. This corpus is small; every row is a lead for inspection, not a verdict.",
+        f"Kleinberg two-state burst detection over per-concept video streams (issue #103). Corpus end: {corpus_end.isoformat()}. Params: {params}. A burst is a rate jump against the concept's OWN baseline - 'just caught fire', not 'popular overall'. Intensity is the burst run's log-likelihood advantage over that concept's own baseline: it is NOT comparable across concepts with different baselines - use it to rank a concept's bursts against each other, not concept vs concept. Same-day videos are spaced at the min_gap_days floor before rate fitting. This corpus is small; every row is a lead for inspection, not a verdict.",
         "",
     ]
+    if dropped_undated:
+        lines += [
+            f"> {dropped_undated} concept-video rows were excluded for missing publish dates - their absence can shift gaps and rising status for the affected concepts.",
+            "",
+        ]
     if monthly_volume:
         lines += [
             "## Corpus volume context (read this first)",
             "",
             f"Every concept stream rides the corpus's indexing volume: when the corpus itself grows, many concepts 'burst' at once. {len(rising)} of {len(bursts)} bursts are currently rising - before reading any single row as a topic catching fire, check whether its start date coincides with a volume surge below.",
             "",
-            "| Month | Videos indexed |",
+            "| Month | Videos published |",
             "|---|---|",
         ]
         lines += [f"| {m} | {n} |" for m, n in monthly_volume]
@@ -224,9 +243,12 @@ def render_report(
     lines += [_burst_line(b) for b in rising[:top]] or ["(none)"]
     if len(rising) > top:
         lines.append(f"- ...and {len(rising) - top} more rising bursts (raise --top)")
-    lines += ["", f"## Recent bursts, cooled ({len(bursts) - len(rising)})", ""]
-    lines += [_burst_line(b) for b in cooled] or ["(none)"]
-    hidden = len(bursts) - len(rising) - len(cooled)
+    n_cooled = len(bursts) - len(rising)
+    lines += ["", f"## Recent bursts, cooled ({n_cooled})", ""]
+    # "(none)" only when none EXIST - a top-budget that empties the listing
+    # must not read as "no cooled bursts"
+    lines += [_burst_line(b) for b in cooled] or (["(none)"] if n_cooled == 0 else [])
+    hidden = n_cooled - len(cooled)
     if hidden > 0:
         lines.append(f"- ...and {hidden} more cooled bursts (raise --top)")
     lines.append("")
@@ -249,7 +271,7 @@ def main() -> None:
 
     con = duckdb.connect(str(args.db), read_only=True)
     try:
-        events, corpus_end = load_events(con)
+        events, corpus_end, dropped_undated = load_events(con)
         monthly_volume = load_monthly_volume(con)
     finally:
         con.close()
@@ -258,9 +280,10 @@ def main() -> None:
     report = render_report(
         bursts,
         corpus_end,
-        {"min_events": args.min_events, "s": args.s, "gamma": args.gamma},
+        {"min_events": args.min_events, "s": args.s, "gamma": args.gamma, "min_gap_days": MIN_GAP_DAYS},
         args.top,
         monthly_volume=monthly_volume,
+        dropped_undated=dropped_undated,
     )
     if args.out is None:
         print(report)
