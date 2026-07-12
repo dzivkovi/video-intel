@@ -428,6 +428,30 @@ def build_report_data(
 # ---------------------------------------------------------------------------
 
 
+def ranked_creators(data: ReportData, min_ranked_concepts: int) -> list[CreatorStats]:
+    """Shared ranked-table selection for the report AND the HTML renderer.
+
+    Lives here so the two surfaces cannot drift (PR #97 review): any change to
+    the filter or sort updates both in one place.
+    """
+    return sorted(
+        (s for s in data.stats.values() if s.eligible_concepts >= min_ranked_concepts),
+        key=lambda s: s.lift,
+        reverse=True,
+    )
+
+
+def finding_chains(data: ReportData, top_findings: int) -> list[Chain]:
+    """Shared findings selection: quotable leaders first, then most followers, then tightest span."""
+
+    def chain_key(c: Chain) -> tuple[int, int, int]:
+        span = (c.mentions[-1].first_date - c.mentions[0].first_date).days
+        has_quote = c.mentions[0].segment_text is not None
+        return (0 if has_quote else 1, -len(c.edges), span)
+
+    return sorted((c for c in data.chains if c.edges), key=chain_key)[:top_findings]
+
+
 def _evidence_line(m: FirstMention) -> str:
     link = timestamped_url(m.url, m.start_seconds if "youtube.com" in m.url else None)
     quote = extract_quote(m.segment_text, m.as_mentioned) if m.segment_text else "(mindmap-level mention, no segment)"
@@ -444,11 +468,7 @@ def render_report(
     top_findings: int = TOP_FINDINGS_DEFAULT,
     min_ranked_concepts: int = MIN_RANKED_CONCEPTS_DEFAULT,
 ) -> str:
-    ranked = sorted(
-        (s for s in data.stats.values() if s.eligible_concepts >= min_ranked_concepts),
-        key=lambda s: s.lift,
-        reverse=True,
-    )
+    ranked = ranked_creators(data, min_ranked_concepts)
     # count against rankable, not stats: a rankable creator with ZERO eligible
     # concepts never enters stats but is still omitted from the table (Codex
     # peer-review finding on PR #96)
@@ -465,15 +485,7 @@ def render_report(
     else:
         rho_start_s = rho_size_s = "n/a (fewer than 2 ranked creators - diagnostics undefined)"
 
-    # strongest findings: quotable leaders first (issue #93 requires quoted
-    # evidence), then longest connected chains (most followers within window),
-    # tie-broken by tightness (shortest total span)
-    def chain_key(c: Chain) -> tuple[int, int, int]:
-        span = (c.mentions[-1].first_date - c.mentions[0].first_date).days
-        has_quote = c.mentions[0].segment_text is not None
-        return (0 if has_quote else 1, -len(c.edges), span)
-
-    findings = sorted((c for c in data.chains if c.edges), key=chain_key)[:top_findings]
+    findings = finding_chains(data, top_findings)
 
     p = data.params
     lines: list[str] = []
