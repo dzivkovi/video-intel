@@ -69,3 +69,5 @@ skill-eval-workspace/**
 /tv-stitch-*/
 .codex/config.toml
 .worktrees
+.playwright-mcp/
+
