@@ -27,9 +27,9 @@ First-mention dates come from `has_concept -> artifacts.published_at`. The confo
 | ycombinator | 2026-01-08 | 2026-06-27 | 47 | 0.275 | yes |
 | thenextnewthingai | 2026-02-03 | 2026-06-19 | 66 | 0.482 | yes |
 | mark_kashef | 2026-02-15 | 2026-06-30 | 34 | 0.250 | yes |
+| saminyasar | 2026-02-23 | 2026-06-24 | 14 | 0.115 | yes |
 | bioinfquests | 2026-02-23 | 2026-02-23 | 2 | 2.000 | no |
 | colemedin | 2026-02-23 | 2026-06-25 | 32 | 0.260 | yes |
-| saminyasar | 2026-02-23 | 2026-06-24 | 14 | 0.115 | yes |
 | simonscrapes | 2026-02-27 | 2026-06-25 | 39 | 0.328 | yes |
 | benai92 | 2026-03-14 | 2026-06-25 | 17 | 0.163 | yes |
 | everyinc | 2026-03-17 | 2026-06-24 | 42 | 0.420 | yes |
@@ -46,7 +46,7 @@ First-mention dates come from `has_concept -> artifacts.published_at`. The confo
 
 ## Corrected leader ranking (precursor lift)
 
-Creators shown: >= 5 artifacts and >= 5 eligible concepts (9 rankable creators omitted for too few eligible concepts).
+Creators shown: >= 5 artifacts and >= 5 eligible concepts (14 rankable creators omitted for too few eligible concepts).
 
 | # | Creator | Lift | Firsts (obs) | Firsts (expected) | Eligible concepts | Mean lag (days) |
 |---|---|---|---|---|---|---|
@@ -66,8 +66,8 @@ Creators shown: >= 5 artifacts and >= 5 eligible concepts (9 rankable creators o
 |---|---|---|
 | 1 | seankochel | 73.0 |
 | 2 | engineerprompt | 48.0 |
-| 3 | vanishinggradients | 10.0 |
-| 4 | natebjones | 10.0 |
+| 3 | natebjones | 10.0 |
+| 4 | vanishinggradients | 10.0 |
 | 5 | graceleungyl | 8.0 |
 | 6 | lennyspodcast | 7.0 |
 | 7 | chase_h_ai | 6.0 |

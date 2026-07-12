@@ -371,9 +371,12 @@ class TestRenderEdgeCases:
     def test_ranked_table_discloses_omission_threshold(self):
         from scripts.lead_lag_report import CreatorStats, ReportData
 
+        # "c" is rankable but has ZERO eligible concepts, so it never enters
+        # stats - it must still count as omitted (Codex peer-review finding).
         coverage = {
             "a": cov("a", "2026-01-01", "2026-06-30", 10),
             "b": cov("b", "2026-01-01", "2026-06-30", 10),
+            "c": cov("c", "2026-01-01", "2026-06-30", 10),
         }
         stats = {
             "a": CreatorStats(source_id="a", firsts=3.0, expected=2.0, eligible_concepts=9),
@@ -381,7 +384,7 @@ class TestRenderEdgeCases:
         }
         data = ReportData(
             coverage=coverage,
-            rankable=frozenset({"a", "b"}),
+            rankable=frozenset({"a", "b", "c"}),
             stats=stats,
             naive={},
             chains=[],
@@ -390,7 +393,7 @@ class TestRenderEdgeCases:
             params={"min_adopters": 4, "min_eligible": 3, "min_artifacts": 5, "follow_window_days": 90},
         )
         report = render_report(data)
-        assert "1 rankable creators omitted" in report
+        assert "2 rankable creators omitted" in report
         assert ">= 5 eligible concepts" in report
 
 

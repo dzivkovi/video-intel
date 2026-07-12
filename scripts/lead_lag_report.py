@@ -449,7 +449,10 @@ def render_report(
         key=lambda s: s.lift,
         reverse=True,
     )
-    omitted = len(data.stats) - len(ranked)
+    # count against rankable, not stats: a rankable creator with ZERO eligible
+    # concepts never enters stats but is still omitted from the table (Codex
+    # peer-review finding on PR #96)
+    omitted = len(data.rankable) - len(ranked)
     naive_ranked = sorted(data.naive.items(), key=lambda kv: kv[1], reverse=True)
 
     # kill-criterion diagnostics over creators present in the corrected ranking
@@ -638,7 +641,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=FOLLOW_WINDOW_DAYS_DEFAULT,
         help=f"max days between mentions for an 'A leads, B follows' edge (default {FOLLOW_WINDOW_DAYS_DEFAULT})",
     )
-    parser.add_argument("--top", type=int, default=TOP_FINDINGS_DEFAULT, help="number of findings to render")
+    parser.add_argument("--top", type=_positive_int, default=TOP_FINDINGS_DEFAULT, help="number of findings to render")
     return parser
 
 
