@@ -34,11 +34,9 @@ def _adj(edges):
 
 class TestPositivePMI:
     def test_drops_hub_edge_keeps_surprising_pair(self):
-        # H is a hub (10 weight-1 spokes); x and y also share a private edge.
-        # The hub-to-spoke edge is "expected" (pmi < 0, dropped); the private
-        # x-y edge is surprising (pmi > 0, kept).
-        edges = [("H", f"n{i}", 1.0) for i in range(10)] + [("x", "y", 1.0)]
-        # make x, y two of the hub's spokes so they have realistic strength
+        # H is a hub with 10 weight-1 spokes, two of which (x, y) also share a
+        # private edge. The hub-to-spoke edge is "expected" (pmi < 0, dropped);
+        # the private x-y edge is surprising (pmi > 0, kept).
         edges = [("H", "x", 1.0), ("H", "y", 1.0)] + [("H", f"n{i}", 1.0) for i in range(8)] + [("x", "y", 1.0)]
         kept = {(a, b) for a, b, _ in positive_pmi_weights(edges)}
         assert ("x", "y") in kept

@@ -27,9 +27,9 @@ Two backbones are computed and both reported honestly:
     input): produces a real sparse backbone, so the kill metric is evaluable on
     it. This is where the reported overlap comes from.
 
-Read-only over intel.duckdb, stdlib + numpy, hand-rolled Brandes betweenness (no
-new dependency, no community-detection framework - the anti-overbuild guard).
-Corpus is ~100x smaller than the cited studies: a lead, not a verdict.
+Read-only over intel.duckdb, pure stdlib (hand-rolled Brandes betweenness; no
+numpy, no new dependency, no community-detection framework - the anti-overbuild
+guard). Corpus is ~100x smaller than the cited studies: a lead, not a verdict.
 """
 
 from __future__ import annotations
@@ -179,11 +179,12 @@ def top_overlap(betw: dict[str, float], wdeg: dict[str, float], k: int = TOP_K_D
     return len(set(_top(betw, k)) & set(_top(wdeg, k)))
 
 
-def classify_kill(overlap: int, k: int = TOP_K_DEFAULT) -> str:
+def classify_kill(overlap: int) -> str:
     """Pre-registered gate. Returns 'hold' | 'reopen' | 'inconclusive'.
 
-    Thresholds are pinned to the 15-node top set the spec named; they do not
-    rescale with k, so callers passing a different --top get an explicit note.
+    Thresholds (KILL_HOLD_MIN / KILL_REOPEN_MAX) are pinned to the top-15 set
+    the spec named. The diagnostic always runs at top-15 - there is no knob to
+    rescale them against, which is why there is no --top flag.
     """
     if overlap >= KILL_HOLD_MIN:
         return "hold"
@@ -242,7 +243,7 @@ def render_report(
     pmi_min_alpha: float | None,
     alpha: float,
 ) -> str:
-    kill = classify_kill(raw_result.overlap, raw_result.top_k)
+    kill = classify_kill(raw_result.overlap)
     verdicts = {
         "hold": "**KILL HOLDS.** On the disparity backbone, the top betweenness set still equals the "
         "popularity (weighted-degree) set at the strictest standard - terms-as-nodes analytics stays retired. "
@@ -356,7 +357,9 @@ def main() -> None:
     parser.add_argument("--db", type=Path, default=DEFAULT_DB, help="Path to intel.duckdb (read-only)")
     parser.add_argument("--out", type=Path, default=None, help="Write the verdict note here (default: stdout)")
     parser.add_argument("--alpha", type=float, default=ALPHA_DEFAULT, help="Disparity significance (default 0.05)")
-    parser.add_argument("--top", type=int, default=TOP_K_DEFAULT, help="Top-k set size for the overlap")
+    # No --top flag: the kill bands (KILL_HOLD_MIN / KILL_REOPEN_MAX) are pinned
+    # to the top-15 set the pre-registered gate named, so the overlap denominator
+    # is fixed. A configurable top-k would silently invalidate the verdict band.
     args = parser.parse_args()
 
     if not args.db.exists():
@@ -374,7 +377,7 @@ def main() -> None:
     pmi_edges = positive_pmi_weights(edges)
     pmi_backbone = disparity_backbone(pmi_edges, args.alpha)
     pmi_min_alpha = _min_disparity_alpha(pmi_edges) if not pmi_backbone else None
-    raw_result = analyze(edges, alpha=args.alpha, top_k=args.top)
+    raw_result = analyze(edges, alpha=args.alpha, top_k=TOP_K_DEFAULT)
 
     report = render_report(raw_result, len(pmi_backbone), pmi_min_alpha, args.alpha)
     if args.out is None:
@@ -382,9 +385,9 @@ def main() -> None:
     else:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(report, encoding="utf-8")
-        kill = classify_kill(raw_result.overlap, args.top)
+        kill = classify_kill(raw_result.overlap)
         print(
-            f"wrote {args.out}: raw-disparity overlap {raw_result.overlap}/{args.top} -> {kill}; "
+            f"wrote {args.out}: raw-disparity overlap {raw_result.overlap}/{raw_result.top_k} -> {kill}; "
             f"PMI-disparity backbone edges = {len(pmi_backbone)}"
         )
 
