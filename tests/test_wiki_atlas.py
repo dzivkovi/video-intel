@@ -78,8 +78,16 @@ class TestPageSet:
             "creators/lucky.md",
             "concepts/dom-pact.md",
             "index.md",
+            "README.md",
             "log.md",
         }
+
+    def test_readme_is_self_contained_reader_guide(self):
+        pages = build_atlas(_data(), min_ranked_concepts=5)
+        readme = pages["README.md"]
+        assert "Open folder as vault" in readme  # the Obsidian how-to travels with the vault
+        assert "register_obsidian_vault.py" in readme  # points at the repo helper
+        assert PROSE_TODO not in readme  # static, no agent slot to fill
 
     def test_prose_slots_present_in_skeleton(self):
         pages = build_atlas(_data(), min_ranked_concepts=5)

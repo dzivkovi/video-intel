@@ -1,4 +1,6 @@
-# Intelligence-Layer Environment Setup: Neo4j + GDS + DuckDB
+# Intelligence-Layer Environment Setup: Neo4j + GDS (archived graph lens)
+
+> **Archived.** Neo4j/GDS was retired as the analytics engine (issue #95) - on this corpus the graph mostly rediscovered "what's popular," not insight. The current, minimal path (the DuckDB store and the three analyses that read it) is the one-page lecture [`docs/intelligence-layer.md`](intelligence-layer.md); start there. This doc is kept only for anyone reviving the experimental Neo4j graph lens (`intel_graph.py project` / `verify`), which needs a Neo4j server and a manual `pip install neo4j`.
 
 This is the environment prep guide for the DuckDB-truth / Neo4j-graph intelligence layer described in [`docs/brainstorms/2026-05-28-intelligence-layer-roadmap.md`](brainstorms/2026-05-28-intelligence-layer-roadmap.md) and tracked in [issue #85](https://github.com/dzivkovi/video-intel/issues/85). Neither database is required for the core video-intel pipeline (scan/transcript/mindmap/search) — this is only needed once you're working on the intelligence layer.
 
