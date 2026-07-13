@@ -23,6 +23,8 @@ intelligence = [
     # engine. The experimental intel_graph.py project/verify subcommands name
     # the manual `pip install neo4j` in their error message instead.
     "duckdb>=1.0",
+    # numpy powers the SDSM null-model fit (scripts/sdsm_network.py, #98).
+    "numpy>=1.26",
 ]
 dev = [
     "ruff",
