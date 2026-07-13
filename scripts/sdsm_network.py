@@ -220,11 +220,15 @@ def classify_gate(n_edges: int, n_pairs: int) -> str:
     The spec pinned the flag/stop boundary at 175 of 351 pairs (= half). Read
     proportionally ("more than half of all pairs") so it survives the corpus
     growing from Probe C's 351 pairs to today's larger set.
+
+    Stop is tested before the clean-pass band: on a tiny corpus the two ranges
+    can overlap (e.g. 20 edges of 28 pairs is both < 40 AND > half), and "more
+    than half of all pairs survive" is the homogeneity signal that must win.
     """
-    if n_edges < GATE_CLEAN_MAX:
-        return "pass"
     if n_edges > n_pairs / 2:
         return "stop"
+    if n_edges < GATE_CLEAN_MAX:
+        return "pass"
     return "pass-flag"
 
 
@@ -419,6 +423,11 @@ def main() -> None:
 
     creators, concepts, B = build_bipartite(adoptions)
     n_pairs = len(creators) * (len(creators) - 1) // 2
+    if n_pairs == 0:
+        sys.exit(
+            f"not enough data for a network: {len(creators)} creators, {len(concepts)} concepts, "
+            "0 pairs. Load a populated store first (scripts/intel_graph.py load)."
+        )
     P = fit_bicm(B)
     stats = pairwise_significance(B, P, creators)
     edges = significant_edges(stats, alpha=args.alpha)

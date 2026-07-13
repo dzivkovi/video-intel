@@ -467,10 +467,11 @@ pip install -e ".[intelligence]"                            # one-time setup
 python scripts/intel_graph.py load                          # build the store from your corpus
 python scripts/lead_lag_report.py                           # who got to which ideas first
 python scripts/burst_report.py                              # what is heating up right now
+python scripts/sdsm_network.py                              # which creators cluster together (validated ties)
 python scripts/wiki_atlas.py --wiki-dir <output_dir>/_wiki  # a browsable wiki of the findings
 ```
 
-New to this? Read **[docs/intelligence-layer.md](docs/intelligence-layer.md)** first. It is the one-page lecture: the mental model (your corpus becomes a receipts book), the three questions above, how to browse the wiki in Obsidian, and - most importantly - how not to fool yourself. Everything is read-only; the store is derived, so delete and rebuild it any time.
+New to this? Read **[docs/intelligence-layer.md](docs/intelligence-layer.md)** first. It is the one-page lecture: the mental model (your corpus becomes a receipts book), the questions above, how to browse the wiki in Obsidian, and - most importantly - how not to fool yourself. Everything is read-only; the store is derived, so delete and rebuild it any time.
 
 ## Cost
 

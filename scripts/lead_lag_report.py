@@ -586,17 +586,23 @@ def render_report(
     )
     lines.append("|---|---|---|---|---|---|---|---|")
     for i, s in enumerate(ranked, 1):
-        p_value, _q = sig[s.source_id]
+        p_value, q_value = sig[s.source_id]
+        # raw permutation p is shown (that is what `p (perm)` means); the `*`
+        # marks the rows that still clear after BH correction, so nobody reads a
+        # raw p < 0.05 as significant when the multiple-comparison-corrected q is
+        # not (Codex peer-review finding, PR #111).
+        mark = " *" if q_value < 0.05 else ""
         lines.append(
             f"| {i} | {s.source_id} | {s.lift:.2f} | {s.firsts:.1f} | {s.expected:.1f} "
-            f"| {s.eligible_concepts} | {s.mean_lag_days:.0f} | {p_value:.4f} |"
+            f"| {s.eligible_concepts} | {s.mean_lag_days:.0f} | {p_value:.4f}{mark} |"
         )
     lines.append("")
     lines.append(
-        f"`p (perm)` (Spec A.2): P(firsts >= observed) under the rate-proportional null - each concept's "
-        f"single first slot goes to a rankable eligible adopter with probability proportional to its posting "
-        f"rate (the closed-form Poisson-binomial tail of the 10,000-draw permutation). **{n_clearing} of "
-        f"{len(ranked)}** ranked creators clear p < 0.05 after Benjamini-Hochberg correction. A small-sample "
+        f"`p (perm)` (Spec A.2): the RAW P(firsts >= observed) under the rate-proportional null - each "
+        f"concept's single first slot goes to a rankable eligible adopter with probability proportional to its "
+        f"posting rate (the closed-form Poisson-binomial tail of the 10,000-draw permutation). A trailing `*` "
+        f"marks the **{n_clearing} of {len(ranked)}** ranked creators that still clear p < 0.05 AFTER "
+        "Benjamini-Hochberg correction (the raw p alone is not multiple-comparison safe). A small-sample "
         "creator can clear this rate-null and still be a coverage artifact - the column tests 'beyond "
         "volume-implied luck', not 'beyond every confound'; read it with the small-sample caveat below."
     )

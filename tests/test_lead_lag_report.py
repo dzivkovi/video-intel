@@ -475,9 +475,16 @@ class TestPermutationSignificance:
         )
         report = render_report(data)
         assert "p (perm)" in report
-        assert "ranked creators clear p < 0.05 after Benjamini-Hochberg" in report
+        assert "clear p < 0.05 AFTER Benjamini-Hochberg correction" in report
         # the overperformer clears, the at-expectation creator does not -> 1 of 2
         assert "**1 of 2**" in report
+        # the clearing creator's p-cell carries the `*` marker; the other's does
+        # not. Anchor on the ranking rows (rank 1 = over, higher lift; rank 2 =
+        # meh) so we do not match the coverage-table rows that also name them.
+        over_row = next(ln for ln in report.splitlines() if ln.strip().startswith("| 1 | over |"))
+        meh_row = next(ln for ln in report.splitlines() if ln.strip().startswith("| 2 | meh |"))
+        assert over_row.split("|")[-2].strip().endswith("*")
+        assert not meh_row.split("|")[-2].strip().endswith("*")
 
 
 class TestEndToEnd:

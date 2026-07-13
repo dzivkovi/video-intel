@@ -27,9 +27,9 @@ First-mention dates come from `has_concept -> artifacts.published_at`. The confo
 | ycombinator | 2026-01-08 | 2026-06-27 | 47 | 0.275 | yes |
 | thenextnewthingai | 2026-02-03 | 2026-06-19 | 66 | 0.482 | yes |
 | mark_kashef | 2026-02-15 | 2026-06-30 | 34 | 0.250 | yes |
-| colemedin | 2026-02-23 | 2026-06-25 | 32 | 0.260 | yes |
 | saminyasar | 2026-02-23 | 2026-06-24 | 14 | 0.115 | yes |
 | bioinfquests | 2026-02-23 | 2026-02-23 | 2 | 2.000 | no |
+| colemedin | 2026-02-23 | 2026-06-25 | 32 | 0.260 | yes |
 | simonscrapes | 2026-02-27 | 2026-06-25 | 39 | 0.328 | yes |
 | benai92 | 2026-03-14 | 2026-06-25 | 17 | 0.163 | yes |
 | everyinc | 2026-03-17 | 2026-06-24 | 42 | 0.420 | yes |
@@ -50,9 +50,9 @@ Creators shown: >= 5 artifacts and >= 5 eligible concepts (14 rankable creators 
 
 | # | Creator | Lift | Firsts (obs) | Firsts (expected) | Eligible concepts | Mean lag (days) | p (perm) |
 |---|---|---|---|---|---|---|---|
-| 1 | lennyspodcast | 9.57 | 5.0 | 0.5 | 9 | 59 | 0.0001 |
+| 1 | lennyspodcast | 9.57 | 5.0 | 0.5 | 9 | 59 | 0.0001 * |
 | 2 | graceleungyl | 2.42 | 2.0 | 0.8 | 6 | 67 | 0.1924 |
-| 3 | seankochel | 1.79 | 33.0 | 18.5 | 47 | 34 | 0.0000 |
+| 3 | seankochel | 1.79 | 33.0 | 18.5 | 47 | 34 | 0.0000 * |
 | 4 | gregisenberg | 1.17 | 2.0 | 1.7 | 44 | 280 | 0.5150 |
 | 5 | natebjones | 0.85 | 5.0 | 5.9 | 9 | 37 | 0.8421 |
 | 6 | chase_h_ai | 0.78 | 2.0 | 2.6 | 6 | 55 | 0.8215 |
@@ -60,7 +60,7 @@ Creators shown: >= 5 artifacts and >= 5 eligible concepts (14 rankable creators 
 | 8 | engineerprompt | 0.26 | 8.0 | 30.3 | 58 | 107 | 1.0000 |
 | 9 | ycombinator | 0.00 | 0.0 | 1.0 | 5 | 89 | 1.0000 |
 
-`p (perm)` (Spec A.2): P(firsts >= observed) under the rate-proportional null - each concept's single first slot goes to a rankable eligible adopter with probability proportional to its posting rate (the closed-form Poisson-binomial tail of the 10,000-draw permutation). **2 of 9** ranked creators clear p < 0.05 after Benjamini-Hochberg correction. A small-sample creator can clear this rate-null and still be a coverage artifact - the column tests 'beyond volume-implied luck', not 'beyond every confound'; read it with the small-sample caveat below.
+`p (perm)` (Spec A.2): the RAW P(firsts >= observed) under the rate-proportional null - each concept's single first slot goes to a rankable eligible adopter with probability proportional to its posting rate (the closed-form Poisson-binomial tail of the 10,000-draw permutation). A trailing `*` marks the **2 of 9** ranked creators that still clear p < 0.05 AFTER Benjamini-Hochberg correction (the raw p alone is not multiple-comparison safe). A small-sample creator can clear this rate-null and still be a coverage artifact - the column tests 'beyond volume-implied luck', not 'beyond every confound'; read it with the small-sample caveat below.
 
 ## Naive ranking (uncorrected, for contrast)
 
@@ -77,8 +77,8 @@ Creators shown: >= 5 artifacts and >= 5 eligible concepts (14 rankable creators 
 | 9 | ramjad | 4.0 |
 | 10 | gregisenberg | 3.0 |
 | 11 | saminyasar | 2.0 |
-| 12 | ycombinator | 1.0 |
-| 13 | thenextnewthingai | 1.0 |
+| 12 | thenextnewthingai | 1.0 |
+| 13 | ycombinator | 1.0 |
 
 ## Kill-criterion diagnostics
 

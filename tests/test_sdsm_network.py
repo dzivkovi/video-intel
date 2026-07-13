@@ -18,11 +18,13 @@ import pytest
 from scripts.sdsm_network import (
     GATE_CLEAN_MAX,
     PairStat,
+    _hypergeom_sf,
     benjamini_hochberg,
     build_bipartite,
     classify_gate,
     fit_bicm,
     fit_logit_degrees,
+    hypergeometric_significant,
     pairwise_significance,
     render_report,
     significant_edges,
@@ -129,6 +131,32 @@ class TestPairwiseSignificance:
         assert stat.p_value == 1.0  # observed (2) not > mean (2)
 
 
+class TestHypergeometricBaseline:
+    """The hypergeometric null is the baseline SDSM must prune - it anchors the
+    report's headline '314 -> 10' number, so its survival function is pinned."""
+
+    def test_sf_full_draw_equals_top_term(self):
+        # drawing all K successes: P(X >= K) = C(K,K)C(N-K,n-K)/C(N,n)
+        import math
+
+        N, K, n = 45, 15, 15
+        assert _hypergeom_sf(K, N, K, n) == pytest.approx(1.0 / math.comb(N, n))
+
+    def test_sf_boundaries(self):
+        assert _hypergeom_sf(0, 45, 15, 15) == 1.0  # X >= 0 is certain
+        assert _hypergeom_sf(16, 45, 15, 15) == 0.0  # can't draw more than min(K,n)=15
+
+    def test_flags_universal_overlap_that_sdsm_prunes(self):
+        # THE documented weakness: the degree-only hypergeometric null flags a
+        # universal-overlap matrix as significant (expected 6.4, observed 8,
+        # p=1/45<0.05 for every pair) - exactly the noise SDSM's popularity
+        # conditioning removes (cf. test_universal_overlap_is_pruned -> []).
+        B = np.zeros((5, 10))
+        B[:, 0:8] = 1.0
+        n_pairs = 5 * 4 // 2
+        assert hypergeometric_significant(B, [f"c{i}" for i in range(5)]) == n_pairs
+
+
 class TestBenjaminiHochberg:
     def test_monotone_and_capped(self):
         q = benjamini_hochberg([0.001, 0.2, 0.5, 0.9])
@@ -190,6 +218,12 @@ class TestGate:
 
     def test_boundary_at_clean_threshold_flags(self):
         assert classify_gate(GATE_CLEAN_MAX, 465) == "pass-flag"
+
+    def test_tiny_corpus_more_than_half_is_stop_not_clean_pass(self):
+        # 20 edges of 28 pairs is BOTH < 40 (clean band) AND > half (stop band);
+        # "more than half survive" must win or the gate ships a clean verdict on
+        # a corpus its own stop-criterion calls too homogeneous (Codex + correctness).
+        assert classify_gate(20, 28) == "stop"
 
 
 class TestRender:
