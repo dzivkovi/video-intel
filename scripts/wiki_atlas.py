@@ -265,6 +265,63 @@ def _index(
     return "\n".join(lines)
 
 
+def _readme() -> str:
+    """Static 'how to read this' page, emitted into every generated vault.
+
+    The wandering guide is self-contained - it travels with the wiki and needs
+    nothing else to browse it in Obsidian. The one optional convenience it
+    mentions (the register-vault helper) needs the repo checkout, and is flagged
+    as such.
+    """
+    return "\n".join(
+        [
+            "---",
+            "type: help",
+            "---",
+            "",
+            "# Start here: reading this atlas in Obsidian",
+            "",
+            "This folder is a generated knowledge wiki: synthesized, citation-bearing prose about who "
+            "covers an AI idea first in a watched corpus and who follows. It is meant to be *browsed*, not "
+            "read top to bottom. [Obsidian](https://obsidian.md) is the ideal reader because it turns the "
+            "`[[double-bracket]]` links into a navigable web.",
+            "",
+            "## Open it in Obsidian (one time)",
+            "",
+            "1. Install Obsidian (free) and launch it.",
+            "2. Bottom-left corner, click the **Open another vault** icon, then **Open folder as vault**, and "
+            "pick *this* folder. (In the file dialog you can paste the folder path into the address bar.)",
+            "3. That registers the folder as a vault; it stays in your vault list afterwards.",
+            "",
+            "If you have the repo checkout and the GUI fights you, it ships a helper that registers a vault by "
+            "editing Obsidian's vault list directly (Obsidian must be closed): "
+            "`python scripts/register_obsidian_vault.py <this-folder> --open --launch`. Full lecture: the repo's "
+            "`docs/intelligence-layer.md`.",
+            "",
+            "## How to wander",
+            "",
+            "- Start at [[index]] - the map of content, with the ranked creators and the concept adoption stories.",
+            "- Click any `[[name]]` to jump. Hover to preview without leaving the page.",
+            "- Open the **graph view** (the constellation icon) to see the whole web; edges exist only where the "
+            "data shows a validated lead-follow relationship, so it is sparse on purpose, not a hairball.",
+            "- Use **Reading view** (not Editing view) so links render clean and the coloured note callouts show.",
+            "- Plain-text names (not links) are creators too small to rank; they have no page by design.",
+            "",
+            "## It refreshes on its own",
+            "",
+            "Registering the vault is a one-time step per folder. Once open, Obsidian watches the folder live, so "
+            "regenerating this atlas or adding notes shows up immediately - no re-registering.",
+            "",
+            "## Regenerating",
+            "",
+            "This wiki is rebuilt from the corpus by `scripts/wiki_atlas.py`. A regeneration overwrites the "
+            "generated pages, so if you hand-edit prose you want to keep, note it - re-running the generator in "
+            "place replaces `index.md`, the creator, and the concept pages.",
+            "",
+        ]
+    )
+
+
 def _log(data: ReportData, pages: dict[str, str], generated: str, db: str) -> str:
     lines = [
         "---",
@@ -319,6 +376,7 @@ def build_atlas(
             chain, concept_pages[chain.concept_id], creator_pages
         )
     pages["index.md"] = _index(ranked, chains, concept_pages, data)
+    pages["README.md"] = _readme()  # static how-to-read, travels with the vault
     pages["log.md"] = ""  # placeholder so the log's own inventory includes itself
     pages["log.md"] = _log(data, pages, generated, db)
     return pages
