@@ -1,8 +1,8 @@
 # The intelligence layer: uncovering nuggets in your corpus
 
-This is the one page to read if you want to go past "search my videos" and start asking the corpus harder questions: who got to an idea first, what is suddenly heating up, and how the ideas connect. It is optional; the core scan/transcript/search pipeline never touches any of it.
+This is the one page to read if you want to go past "search my videos" and start asking the corpus harder questions: who got to an idea first, what is suddenly heating up, which creators actually cluster together, and how the ideas connect. It is optional; the core scan/transcript/search pipeline never touches any of it.
 
-Everything here is experimental and deliberately small. Read it once, run the three commands, and you will understand what you are looking at.
+Everything here is experimental and deliberately small. Read it once, run the handful of commands, and you will understand what you are looking at.
 
 ## The one idea to hold
 
@@ -46,7 +46,19 @@ The report opens with a corpus-volume table on purpose: read it first. If your w
 
 (Under the hood: Kleinberg burst detection. Again, the label is optional.)
 
-## Question 3: let me just wander the connections
+## Question 3: which creators actually cluster together?
+
+```bash
+python scripts/sdsm_network.py
+```
+
+This finds pairs of creators who share *far more* concepts than you would expect - not because they are both prolific, and not because they both cover whatever is popular, but because they genuinely track the same ideas. The hard part is the "expected": in a corpus where everyone talks about AI coding, almost every pair overlaps a lot, so a naive count calls everyone connected. This tool compares each pair against a null model that already knows how prolific each creator is *and* how popular each concept is, and keeps only the pairs that beat it. On the current corpus that prunes ~300 noisy pairs down to about ten real ties.
+
+Read it as a shortlist of "these two are worth comparing," not as influence: the edges say *overlap beyond chance*, not *who led whom* (that is Question 1). And on a corpus this small, ten ties is a lead for inspection, not a map of the field.
+
+(Under the hood: the Stochastic Degree Sequence Model / bipartite configuration null. You never need that phrase to read the output.)
+
+## Question 4: let me just wander the connections
 
 ```bash
 python scripts/wiki_atlas.py --wiki-dir <output_dir>/_wiki

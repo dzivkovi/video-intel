@@ -19,12 +19,16 @@ from scripts.intel_graph import SCHEMA_SQL
 from scripts.lead_lag_report import (
     Chain,
     Coverage,
+    CreatorStats,
     FirstMention,
+    ReportData,
     adoption_chains,
     backfill_evidence,
     build_report_data,
     extract_quote,
+    firsts_significance,
     naive_leader_counts,
+    poisson_binomial_sf,
     precursor_stats,
     render_report,
     spearman,
@@ -395,6 +399,92 @@ class TestRenderEdgeCases:
         report = render_report(data)
         assert "2 rankable creators omitted" in report
         assert ">= 5 eligible concepts" in report
+
+
+class TestPermutationSignificance:
+    """Spec A.2: the p (perm) column - significance of firsts vs the rate null."""
+
+    def test_poisson_binomial_sf_known_values(self):
+        # two fair coins: P(X>=0)=1, P(X>=1)=0.75, P(X>=2)=0.25, P(X>=3)=0
+        assert poisson_binomial_sf([0.5, 0.5], 0) == pytest.approx(1.0)
+        assert poisson_binomial_sf([0.5, 0.5], 1) == pytest.approx(0.75)
+        assert poisson_binomial_sf([0.5, 0.5], 2) == pytest.approx(0.25)
+        assert poisson_binomial_sf([0.5, 0.5], 3) == pytest.approx(0.0)
+
+    def test_poisson_binomial_sf_empty_and_fractional(self):
+        assert poisson_binomial_sf([], 0) == pytest.approx(1.0)
+        assert poisson_binomial_sf([], 1) == pytest.approx(0.0)
+        # fractional threshold: X is integer, so P(X >= 2.0-credit) needs X>=2
+        assert poisson_binomial_sf([0.5, 0.5, 0.5], 1.5) == pytest.approx(0.5)
+
+    def test_overperformer_is_significant_at_rate_but_atexpectation_is_not(self):
+        # seankochel-shaped: 33 firsts where each of 47 concepts is a long shot
+        over = CreatorStats(
+            source_id="over",
+            firsts=33.0,
+            expected=18.5,
+            eligible_concepts=47,
+            win_probs=[18.5 / 47] * 47,
+        )
+        # a creator whose firsts sit right at its expectation is unremarkable
+        at_exp = CreatorStats(
+            source_id="at",
+            firsts=2.0,
+            expected=2.0,
+            eligible_concepts=44,
+            win_probs=[2.0 / 44] * 44,
+        )
+        sig = firsts_significance([over, at_exp])
+        p_over, _ = sig["over"]
+        p_at, _ = sig["at"]
+        assert p_over < 1e-3
+        assert p_at > 0.3
+
+    def test_bh_q_is_monotone_in_p(self):
+        stats = [
+            CreatorStats(source_id="a", firsts=10.0, expected=1.0, eligible_concepts=20, win_probs=[0.05] * 20),
+            CreatorStats(source_id="b", firsts=2.0, expected=1.5, eligible_concepts=20, win_probs=[0.075] * 20),
+            CreatorStats(source_id="c", firsts=1.0, expected=2.0, eligible_concepts=20, win_probs=[0.1] * 20),
+        ]
+        sig = firsts_significance(stats)
+        by_p = sorted(sig.values(), key=lambda pq: pq[0])
+        qs = [q for _, q in by_p]
+        assert qs == sorted(qs)  # q non-decreasing as p increases
+        assert all(0.0 <= q <= 1.0 for _, q in sig.values())
+
+    def test_render_has_perm_column_and_clearing_caveat(self):
+        coverage = {
+            "over": cov("over", "2026-01-01", "2026-06-30", 40),
+            "meh": cov("meh", "2026-01-01", "2026-06-30", 40),
+        }
+        stats = {
+            "over": CreatorStats(
+                source_id="over", firsts=15.0, expected=2.0, eligible_concepts=20, win_probs=[0.1] * 20
+            ),
+            "meh": CreatorStats(source_id="meh", firsts=2.0, expected=2.0, eligible_concepts=20, win_probs=[0.1] * 20),
+        }
+        data = ReportData(
+            coverage=coverage,
+            rankable=frozenset({"over", "meh"}),
+            stats=stats,
+            naive={},
+            chains=[],
+            n_concepts_total=20,
+            n_concepts_eligible=0,
+            params={"min_adopters": 4, "min_eligible": 3, "min_artifacts": 5, "follow_window_days": 90},
+        )
+        report = render_report(data)
+        assert "p (perm)" in report
+        assert "clear p < 0.05 AFTER Benjamini-Hochberg correction" in report
+        # the overperformer clears, the at-expectation creator does not -> 1 of 2
+        assert "**1 of 2**" in report
+        # the clearing creator's p-cell carries the `*` marker; the other's does
+        # not. Anchor on the ranking rows (rank 1 = over, higher lift; rank 2 =
+        # meh) so we do not match the coverage-table rows that also name them.
+        over_row = next(ln for ln in report.splitlines() if ln.strip().startswith("| 1 | over |"))
+        meh_row = next(ln for ln in report.splitlines() if ln.strip().startswith("| 2 | meh |"))
+        assert over_row.split("|")[-2].strip().endswith("*")
+        assert not meh_row.split("|")[-2].strip().endswith("*")
 
 
 class TestEndToEnd:

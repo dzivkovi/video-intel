@@ -35,6 +35,7 @@ import dataclasses
 import datetime as dt
 import itertools
 import logging
+import math
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -93,6 +94,7 @@ class CreatorStats:
     expected: float = 0.0
     eligible_concepts: int = 0
     lag_days: list[float] = field(default_factory=list)
+    win_probs: list[float] = field(default_factory=list)  # per-concept null win prob (Spec A.2)
 
     @property
     def lift(self) -> float:
@@ -161,7 +163,9 @@ def precursor_stats(
         for m in ranked_eligible:
             s = stats.setdefault(m.source_id, CreatorStats(source_id=m.source_id))
             s.eligible_concepts += 1
-            s.expected += coverage[m.source_id].rate / total_rate
+            win_prob = coverage[m.source_id].rate / total_rate
+            s.expected += win_prob
+            s.win_probs.append(win_prob)  # Spec A.2: the null's per-concept win prob
             s.lag_days.append(float((m.first_date - leader_date).days))
             if m.first_date == leader_date:
                 s.firsts += 1.0 / len(tied)
@@ -177,6 +181,52 @@ def naive_leader_counts(first_mentions: dict[str, list[FirstMention]]) -> dict[s
         for m in tied:
             counts[m.source_id] = counts.get(m.source_id, 0.0) + 1.0 / len(tied)
     return counts
+
+
+def poisson_binomial_sf(probs: list[float], threshold: float) -> float:
+    """P(X >= threshold) where X = sum of independent Bernoulli(p) over probs.
+
+    Exact tail via DP convolution over the success-count distribution (each
+    creator has <= ~60 eligible concepts, so this is trivial and deterministic).
+    X is integer-valued, so P(X >= threshold) sums the mass at ceil(threshold)
+    and above.
+    """
+    dist = [1.0]
+    for p in probs:
+        p = min(1.0, max(0.0, p))
+        nxt = [0.0] * (len(dist) + 1)
+        for k, pk in enumerate(dist):
+            nxt[k] += pk * (1 - p)
+            nxt[k + 1] += pk * p
+        dist = nxt
+    lo = max(0, math.ceil(threshold - 1e-9))
+    return sum(dist[lo:]) if lo < len(dist) else 0.0
+
+
+def firsts_significance(ranked: list[CreatorStats]) -> dict[str, tuple[float, float]]:
+    """Per-creator significance of observed firsts vs the rate-proportional null (Spec A.2).
+
+    Null: each eligible concept independently awards its single first slot to
+    creator i with probability rate_i / sum(rates of that concept's rankable
+    eligible adopters) - exactly the expectation the lift already uses. A
+    creator's total firsts is then a Poisson-binomial over its per-concept win
+    probabilities; p = P(firsts >= observed) is the closed-form tail (the
+    acceptable substitute for the 10,000-draw permutation named in Spec A.2).
+    Same-date co-leaders keep the fractional 1/k credit in the observed
+    statistic (CreatorStats.firsts), so observed and the integer-valued null
+    are compared on the same "each concept contributes 1.0 of first-credit"
+    footing. Returns {source_id: (p_value, bh_q_value)} over the ranked set.
+    """
+    p_values = {s.source_id: poisson_binomial_sf(s.win_probs, s.firsts) for s in ranked}
+    order = sorted(ranked, key=lambda s: p_values[s.source_id])
+    m = len(order)
+    q_values: dict[str, float] = {}
+    prev = 1.0
+    for rank in range(m - 1, -1, -1):
+        s = order[rank]
+        prev = min(prev, p_values[s.source_id] * m / (rank + 1))
+        q_values[s.source_id] = prev
+    return {s.source_id: (p_values[s.source_id], q_values[s.source_id]) for s in ranked}
 
 
 def adoption_chains(
@@ -529,13 +579,33 @@ def render_report(
         f"({omitted} rankable creators omitted for too few eligible concepts)."
     )
     lines.append("")
-    lines.append("| # | Creator | Lift | Firsts (obs) | Firsts (expected) | Eligible concepts | Mean lag (days) |")
-    lines.append("|---|---|---|---|---|---|---|")
+    sig = firsts_significance(ranked)
+    n_clearing = sum(1 for _, q in sig.values() if q < 0.05)
+    lines.append(
+        "| # | Creator | Lift | Firsts (obs) | Firsts (expected) | Eligible concepts | Mean lag (days) | p (perm) |"
+    )
+    lines.append("|---|---|---|---|---|---|---|---|")
     for i, s in enumerate(ranked, 1):
+        p_value, q_value = sig[s.source_id]
+        # raw permutation p is shown (that is what `p (perm)` means); the `*`
+        # marks the rows that still clear after BH correction, so nobody reads a
+        # raw p < 0.05 as significant when the multiple-comparison-corrected q is
+        # not (Codex peer-review finding, PR #111).
+        mark = " *" if q_value < 0.05 else ""
         lines.append(
             f"| {i} | {s.source_id} | {s.lift:.2f} | {s.firsts:.1f} | {s.expected:.1f} "
-            f"| {s.eligible_concepts} | {s.mean_lag_days:.0f} |"
+            f"| {s.eligible_concepts} | {s.mean_lag_days:.0f} | {p_value:.4f}{mark} |"
         )
+    lines.append("")
+    lines.append(
+        f"`p (perm)` (Spec A.2): the RAW P(firsts >= observed) under the rate-proportional null - each "
+        f"concept's single first slot goes to a rankable eligible adopter with probability proportional to its "
+        f"posting rate (the closed-form Poisson-binomial tail of the 10,000-draw permutation). A trailing `*` "
+        f"marks the **{n_clearing} of {len(ranked)}** ranked creators that still clear p < 0.05 AFTER "
+        "Benjamini-Hochberg correction (the raw p alone is not multiple-comparison safe). A small-sample "
+        "creator can clear this rate-null and still be a coverage artifact - the column tests 'beyond "
+        "volume-implied luck', not 'beyond every confound'; read it with the small-sample caveat below."
+    )
     lines.append("")
     lines.append("## Naive ranking (uncorrected, for contrast)")
     lines.append("")
