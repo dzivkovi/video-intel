@@ -182,6 +182,26 @@ is parametrized over the YAML. Adding a metric is a two-step change:
 For LLM-judge (G-Eval) metrics, use DeepEval's `GEval` class and pass
 the `GEMINI_API_KEY`. This is Stage 3 prerequisite work per ADR-0017.
 
+## Two eval lessons worth keeping (in plain English)
+
+Background so future-you does not have to reverse-engineer this: to test search quality, we keep an "answer key" - a list of questions paired with the video and timestamp that *should* come back (the golden dataset). We then score how often search returns the right hit. These two lessons came out of that work (they were issues #18 and #22, now closed) and stay true no matter what eval tool we use.
+
+**Lesson 1: when a test fails, it might be the answer key that is wrong, not the search.**
+A failing score (0) has two very different causes, and they look identical:
+
+- the search genuinely missed the right video, OR
+- the answer key rotted - the video was renamed or deleted, or its timestamp no longer points where the text actually is.
+Example: the answer key says "for the question 'permission problems', the right hit is video X at 3:45." Someone re-titles video X (its `video_id`/slug changes) or re-transcribes it (3:45 now lands on different words). The search is fine, but the test screams "FAIL." So: before trusting a low score, check the answer key still points at real, existing content. A wrong-test-data failure and a bad-search failure need opposite fixes, so you have to tell them apart first.
+
+**Lesson 2: not all "correct timestamps" are measured the same way, so one tolerance does not fit all.**
+Our answer-key timestamps come from two places that measure time differently:
+
+- **mindmap bullets** (`[MM:SS] - topic`) mark the single moment a topic is *first mentioned* (a point), and
+- **transcript chunks** cover a rolling ~30-second window (a range).
+If you allow the same "close enough" window for both, a mindmap-sourced answer looks like a miss just because a first-mention point and a chunk window line up differently - not because search was wrong. Fix: label each answer with where its timestamp came from (a `source:` tag) and allow a different tolerance for each kind. Otherwise the answer key invents failures that are not real.
+
+**Corollary (why we are moving to lighter evals): if plain math can compute it, do not pay an AI to guess it.** Example: "are the results spread across different videos, or all from one?" is just counting distinct videos in the result list - no LLM judge needed. Reach for an AI judge only when the thing you are measuring genuinely needs judgment.
+
 ## See Also
 
 - [ADR-0017 — Staged KB-Layer Strategy](adr/ADR-0017-kb-layer-strategy.md)

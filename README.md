@@ -130,6 +130,16 @@ cards, badges, slide footers) with evidence provided for each identification.
 - **Per-channel config.** Daily creators get `since: 10d`. Monthly creators get `since: 120d`. Each channel captures your relationship with that creator.
 - **The skill only does Gemini work.** Triage and deep-dive are conversations with Claude, not API calls. They were in the design, then deliberately cut.
 
+## Reusable beyond video-intel
+
+This repo is also a worked reference for a few patterns that carry to any corpus-intelligence project, stated with honest maturity so you know what is proven vs still a hypothesis:
+
+- **Hybrid search on LanceDB (BM25 + vector + RRF) - proven, portable.** The retrieval layer ([ADR-0013](docs/adr/ADR-0013-hybrid-search-rrf-fusion.md), [search internals](docs/search-internals.md)) is the piece most worth lifting into another project: local, embedded, no server, and it composes keyword + semantic ranking cleanly. Already reused elsewhere as a default.
+- **A derived analytics layer beside retrieval (DuckDB) - documented decision, not yet a framework.** The vector layer answers "find me the passage"; a derived, rebuildable DuckDB store of extracted, provenance-linked observations answers "who / when / how-often / who-with" (lead-lag, validated creator ties, bursts). When it is worth adding, when to refuse it, and the terminology discipline ("extracted observation store," never "truth store") are captured as a constrained decision record in [ADR-0019](docs/adr/ADR-0019-derived-analytical-layer-beside-retrieval.md). It stays a per-project decision until a second consumer of the analytical half validates it.
+- **Honest statistics as a discipline.** Every analytical claim rides a null model, a pre-registered kill criterion, and a caveat on every number - and one method was retired precisely because it failed its own kill test. The plain-English lecture is [docs/intelligence-layer.md](docs/intelligence-layer.md); the foundations for developers without a stats background are [docs/intelligence-layer-math.md](docs/intelligence-layer-math.md).
+
+If you are scanning to decide whether this repo is worth studying: those three, plus the ADR log in [docs/adr/](docs/adr/), are the transferable core.
+
 ## Plugin Contents — Two Skills
 
 As of v1.5.0, this repo ships as a **plugin** containing two independent skills.
