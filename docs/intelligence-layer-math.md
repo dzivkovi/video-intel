@@ -33,12 +33,12 @@ Learn more (best first stop): search [StatQuest](https://www.youtube.com/c/joshs
 ### 3. Multiple testing and FDR (why the tables show `q`, not `p`)
 
 If you test 465 creator pairs at p < 0.05, roughly 23 will look "significant" *by chance alone* (5% of 465). So a raw p-value lies when you run many tests. The **Benjamini-Hochberg** procedure corrects for this and produces `q`, the "false-discovery-adjusted" p. **When a table shows `q < 0.05`, it means "still significant after accounting for how many things we tested."** That is why the SDSM edge table reports `q`, and why the lead-lag `p (perm)` caveat says "after Benjamini-Hochberg."
-Learn more: StatQuest, ["FDR and the Benjamini-Hochberg method"](https://www.youtube.com/watch?v=K8LQSvtjcEo); original paper: [Benjamini & Hochberg, 1995](https://doi.org/10.1111/j.2517-6161.1995.tb02031.x).
+Learn more: search [StatQuest](https://www.youtube.com/c/joshstarmer) for "False Discovery Rates, clearly explained"; original paper: [Benjamini & Hochberg, 1995](https://doi.org/10.1111/j.2517-6161.1995.tb02031.x).
 
 ### 4. Rank correlation (Spearman) - do two rankings secretly agree?
 
 A number from -1 to +1: +1 = identical order, 0 = unrelated, -1 = reversed. The lead-lag "kill diagnostic" `Spearman(lift, corpus size) = -0.50` is asking one question: *is the "who leads" ranking secretly just the "who is biggest" ranking?* If it were, the whole result would be an artifact. Near zero or negative = the two are independent = the leadership signal is real, not a proxy for size.
-Learn more: StatQuest, ["Spearman correlation, clearly explained"](https://www.youtube.com/watch?v=Yr1Wbas_QPo); reference: [Spearman's rank correlation](https://en.wikipedia.org/wiki/Spearman%27s_rank_correlation_coefficient).
+Learn more: search [StatQuest](https://www.youtube.com/c/joshstarmer) for "Spearman correlation"; reference: [Spearman's rank correlation](https://en.wikipedia.org/wiki/Spearman%27s_rank_correlation_coefficient).
 
 ### 5. Bipartite graph (two kinds of node)
 
@@ -86,7 +86,7 @@ Each tool is the five primitives above plus exactly one new idea (in **bold**). 
 
 ## Part 3 - A learning path (in order)
 
-**First, the five primitives (fastest payoff, ~2 hours total).** [StatQuest](https://www.youtube.com/c/joshstarmer) is the single best resource for a visual, applied learner - watch, in order: p-values, false discovery rate / Benjamini-Hochberg, then Spearman correlation. For the coin-flip intuition behind Poisson-binomial, [3Blue1Brown, "Binomial distributions"](https://www.youtube.com/watch?v=8idr1WZ1A7Q).
+**First, the five primitives (fastest payoff, ~2 hours total).** [StatQuest](https://www.youtube.com/c/joshstarmer) is the single best resource for a visual, applied learner - watch, in order: p-values, false discovery rate / Benjamini-Hochberg, then Spearman correlation. For the coin-flip intuition behind Poisson-binomial, search [3Blue1Brown](https://www.youtube.com/@3blue1brown) for "Binomial distributions".
 
 **Then, one method at a time, skim only the introduction** of each paper linked in Part 2. You now have the vocabulary, so the intros will read like English. Start with the two that shipped as clean wins: "Precursors and Laggards" (lead-lag) and Neal 2021 (SDSM).
 
