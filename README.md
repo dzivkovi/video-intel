@@ -8,6 +8,8 @@ Multimodal video intelligence powered by Gemini. Scan YouTube channels,
 generate thematic mind maps, and produce enriched transcripts that capture
 what was said AND what was shown on screen.
 
+Then, optionally, it turns that whole corpus into a small analytics store and asks it questions a search box cannot - who reached an idea first, which creators genuinely cluster, what is suddenly spiking - with the statistics done honestly: real null models, significance testing, and a plain caveat on every number. See [The intelligence layer](#the-intelligence-layer-optional).
+
 ## Key Principles
 
 - **Multimodal, not transcript-based.** Gemini sees video frames at 1 FPS,
@@ -472,6 +474,8 @@ python scripts/wiki_atlas.py --wiki-dir <output_dir>/_wiki  # a browsable wiki o
 ```
 
 New to this? Read **[docs/intelligence-layer.md](docs/intelligence-layer.md)** first. It is the one-page lecture: the mental model (your corpus becomes a receipts book), the questions above, how to browse the wiki in Obsidian, and - most importantly - how not to fool yourself. Everything is read-only; the store is derived, so delete and rebuild it any time.
+
+Want the science behind the tools? **[docs/intelligence-layer-math.md](docs/intelligence-layer-math.md)** is a foundations companion for developers without a stats background: the five ideas (null models, significance, false-discovery correction, rank correlation, bipartite graphs) that make every report here readable, with links to the source papers.
 
 ## Cost
 
