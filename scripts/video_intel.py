@@ -6382,7 +6382,7 @@ def cmd_nugget(args, config):
     prompt_template = load_prompt("nugget-brief")
     filled_prompt = build_nugget_prompt(prompt_template, args.query, strong)
 
-    gemini_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+    gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not gemini_key:
         log.error("Missing GEMINI_API_KEY or GOOGLE_API_KEY environment variable.")
         sys.exit(1)

@@ -2386,7 +2386,7 @@ Examples:
         if args.title:
             display_title = args.title
         else:
-            api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY", "")
+            api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY", "")
             client = create_client(api_key)
             display_title = translate_title(client, args.model, original_title)
             log.info("Translated title: %s", display_title)
