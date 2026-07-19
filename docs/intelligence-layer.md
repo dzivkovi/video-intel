@@ -1,8 +1,8 @@
 # The intelligence layer: uncovering nuggets in your corpus
 
-This is the one page to read if you want to go past "search my videos" and start asking the corpus harder questions: who got to an idea first, what is suddenly heating up, which creators actually cluster together, and how the ideas connect. It is optional; the core scan/transcript/search pipeline never touches any of it.
+This is the one page to read if you want to turn a passive video library into something you can interrogate: who got to an idea first, what is suddenly heating up, which creators actually cluster together, and where the receipt is for every claim. It is optional; the core scan/transcript/search pipeline never touches any of it.
 
-Everything here is experimental and deliberately small. Read it once, run the handful of commands, and you will understand what you are looking at.
+Everything here is experimental and deliberately small. The trust story is not that every analysis produces a finding; it is that the layer is willing to say "we cannot tell" when the evidence does not earn a conclusion.
 
 ## The one idea to hold
 
