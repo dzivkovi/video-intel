@@ -1,0 +1,16 @@
+{
+  "video_url": "https://www.youtube.com/watch?v=WNcuzmR4HGY",
+  "video_id": "WNcuzmR4HGY",
+  "channel": "tuckercarlson",
+  "title": "Iran War Sparks Global Energy Crisis, Why the US Is Lying About It & What You Can Expect at the Pump",
+  "published": "2026-07-23",
+  "model": "gemini-3-flash-preview",
+  "transcript_status": "ok",
+  "transcript_chunks": 3,
+  "transcript_chunk_minutes": 50,
+  "transcript_thin_chunks": 0,
+  "modes_completed": [
+    "transcript"
+  ],
+  "last_error": null
+}
