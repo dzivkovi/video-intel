@@ -89,6 +89,15 @@ This is the most important section, and the reason this work is worth trusting. 
 - **A link is a claim.** In the wiki, a `[[link]]` exists only where the data validated a real lead-follow relationship. Plain-text names are creators too small to rank, on purpose.
 - **The machine finds convergence; you supply the meaning.** These are leads for a human to inspect, never verdicts. On a corpus this size, that framing is not modesty, it is accuracy.
 
+### The same discipline for the recommendation layer
+
+The briefings and headline surfaces rank content by a personal interest profile, and any ranker that consumes signals can be gamed by the signals - coordinated hype reads as importance, and a profile tuned only by what it already showed you closes into a loop that feeds you yourself. Four standing rules keep those doors shut (they bind every personalization change, including issue #115):
+
+- **Ranking is relevance, never truth.** A high rank means "this matches your interests," not "this is right." Truth lives in the provenance layer above (the receipts book, the `expresses` quotes); the two are kept separate on purpose.
+- **Personalization reorders, never deletes.** Zero-score items still render and uncapped items stay queued for next time. That leftover tail is the serendipity valve - the thing that breaks the loop - so it is a feature, not noise to tune away.
+- **No rank without a receipt.** Every recommended item keeps its click-through link to the primary source. The moment a system trusts its derived numbers over checkable reality, it can be steered by whoever writes the inputs.
+- **Echo is not evidence.** Ten channels repeating a claim is one claim, louder - so cross-channel frequency is not a ranking feature. If independence-weighting is ever needed, the SDSM network already measures which creators actually move together.
+
 ## Poke at the book directly (optional)
 
 If you want to run your own SQL instead of the prepared questions, install the DuckDB command-line app (a separate binary from the Python package: `winget install DuckDB.cli` on Windows, `brew install duckdb` on macOS, `curl https://install.duckdb.org | sh` on Linux) and open the store in its local notebook UI (nothing leaves your machine):
