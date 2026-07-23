@@ -795,6 +795,22 @@ To temporarily bulk-scan such a creator, remove the flag rather than
 overriding it on the command line. The flag's purpose is durable
 manual-only routing, not advisory exclusion.
 
+**Headline digest (`headline_digest: true`):** Peripheral vision over YouTube
+creators you do NOT actively follow. Add `headline_digest: true` alongside
+`enabled: false` and a full `scan` ends with an "Other headlines - new in
+channels you're not actively following" section listing their latest uploads.
+This is metadata-only - NO mindmap/transcript/concepts, NO Gemini calls, NO
+corpus artifacts. Items are ranked by title match against your
+`_briefings/profile.yaml` interests (positive matches first, then a few recent
+"Other headlines"), capped at ~10 per run, and a bounded `_headlines/seen.json`
+means a given upload is surfaced once, not every run. The section is skipped on
+focused `scan --channel X` runs (it is a full-scan concept) and on `--dry-run`
+the seen-set is not advanced. Requires a recognizable YouTube url or `UC...`
+channel id; non-YouTube sources (Skool, Vimeo) are ignored for the digest.
+There is no standalone `headlines` subcommand - it renders only as a trailing
+section of `scan`. Trigger phrases: "any headlines", "what's new in channels I
+don't follow", "peripheral headlines", "flip through new uploads".
+
 ### Prompt files
 
 Prompt templates live at the plugin root, `${CLAUDE_SKILL_DIR}/../../prompts/`:

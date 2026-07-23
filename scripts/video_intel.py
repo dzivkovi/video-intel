@@ -3476,16 +3476,20 @@ def cmd_scan(args, config):
             log.error("Channel '%s' not found in config.yaml", args.channel)
             sys.exit(1)
 
-    # Skip channels with enabled:false. Lets a creator stay in config for
-    # one-off mindmap/transcript --url --channel routing (and concepts
-    # extraction) without being pulled into every regular scan.
-    for ch in [c for c in channels if not c.get("enabled", True)]:
+    # Skip channels not enabled for the primary pipeline. Lets a creator stay in
+    # config for one-off mindmap/transcript --url --channel routing (and concepts
+    # extraction) without being pulled into every regular scan. The gate is a
+    # STRICT boolean (see _channel_scan_enabled): a non-boolean `enabled` is never
+    # truthy-admitted here (issue #113 - a stray "headlines" string must not reach
+    # full Gemini processing).
+    for ch in [c for c in channels if not _channel_scan_enabled(c)]:
         log.info(
-            "[%s] Skipping (enabled: false). Use mindmap/transcript --url --channel %s for one-offs.",
+            "[%s] Skipping (enabled: %r). Use mindmap/transcript --url --channel %s for one-offs.",
             ch["name"],
+            ch.get("enabled"),
             ch["name"],
         )
-    channels = [c for c in channels if c.get("enabled", True)]
+    channels = [c for c in channels if _channel_scan_enabled(c)]
 
     for ch in channels:
         ch_name = ch["name"]
@@ -3924,6 +3928,17 @@ def cmd_scan(args, config):
             log.warning("  [%s] %s: %s", ch, prefix, status)
         log.warning("Failed items will retry on next run.")
         log.warning('To skip permanently: set "skip": true in the video\'s .meta.json')
+
+    # Headline digest (issue #113): peripheral vision over channels the user does
+    # not actively follow (enabled:false + headline_digest:true). Rendered LAST -
+    # after all primary processing AND the failure summary - so headline-quota
+    # failures are non-fatal and peripheral work never delays wanted work. It is a
+    # full-scan concept, so it is skipped on focused `scan --channel X` runs.
+    if not args.channel:
+        try:
+            render_headline_digest(youtube, config, output_dir, dry_run=args.dry_run)
+        except Exception as e:  # non-fatal: never let peripheral work fail a scan
+            log.warning("Headline digest failed (non-fatal): %s", e)
 
     log.info("Done.")
 
@@ -6491,6 +6506,18 @@ PROFILE_FILENAME = "profile.yaml"
 DEFAULT_LIMIT = 30
 PROFILE_TOP_CONCEPTS = 40
 
+# Headline digest (issue #113): peripheral vision over unfollowed channels.
+HEADLINES_DIR_NAME = "_headlines"
+HEADLINES_SEEN_FILENAME = "seen.json"
+HEADLINES_MAX_ITEMS = 10  # global cap per run
+HEADLINES_MAX_ZERO_SCORE = 5  # a few recent "Other headlines" (mirrors briefings zero-score rule)
+HEADLINES_SEEN_MAX = 500  # bound seen.json so it never grows without limit
+HEADLINES_LOOKBACK_DAYS = 14  # "new" window; the seen-set is the real re-surface guard
+HEADLINE_DOMAIN_MATCH_WEIGHT = 0.5  # weak signal, mirrors rank_unseen's domain bonus
+# A bare YouTube channel id: literal "UC" + 22 url-safe base64 chars.
+_UC_CHANNEL_ID_RE = re.compile(r"^UC[0-9A-Za-z_-]{22}$")
+_YOUTUBE_HOSTS = frozenset({"youtube.com", "m.youtube.com", "youtu.be", "www.youtube.com"})
+
 _MINDMAP_TIMESTAMP_RE = re.compile(r"\((\d{1,3}):(\d{2})(?::(\d{2}))?\)")
 
 
@@ -6721,17 +6748,16 @@ def infer_or_load_profile(output_dir: Path, config: dict | None = None, *, today
     return profile
 
 
-def rank_unseen(unseen: list[dict], profile: dict) -> list[dict]:
-    """Score each unseen video by overlap with the profile's interest concepts.
+def _coerce_profile_interests(profile: dict) -> tuple[dict[str, float], set[str]]:
+    """Tolerantly parse a (possibly hand-edited) profile into (interest_concepts, domains).
 
-    score = sum of interest weights for the video's concepts that are interest
-    concepts, plus a small domain-affinity bonus. Sorted by (score desc,
-    published desc). Videos without concepts.json score 0 and sort last but are
-    NOT dropped - a fresh video may not be concept-extracted yet.
+    A hand-edited profile.yaml may carry `interest_concepts` as a list/scalar
+    (membership+indexing would crash) with string weights, and `interest_domains`
+    as a bare string ("ai" would otherwise become a set of single chars). Coerce
+    to a `{concept_id: float}` map (dropping non-numeric weights) and a `set[str]`
+    of domains. Shared by `rank_unseen` and `rank_headlines` so the tolerant
+    parsing stays in one place (both must accept the same malformed inputs).
     """
-    # Tolerate a hand-edited profile.yaml: interest_concepts may come back as a
-    # list/scalar (membership+indexing would crash) and weights may be strings;
-    # coerce to a {concept_id: float} map, dropping anything non-numeric.
     raw_interest = profile.get("interest_concepts")
     interest: dict[str, float] = {}
     if isinstance(raw_interest, dict):
@@ -6740,12 +6766,22 @@ def rank_unseen(unseen: list[dict], profile: dict) -> list[dict]:
                 interest[cid] = float(weight)
             except (TypeError, ValueError):
                 continue
-    # interest_domains may be a bare string ("ai" would otherwise become a set of
-    # single chars); wrap it, and accept only string elements.
     raw_domains = profile.get("interest_domains") or []
     if isinstance(raw_domains, str):
         raw_domains = [raw_domains]
     domains = {d for d in raw_domains if isinstance(d, str)} if isinstance(raw_domains, list | set | tuple) else set()
+    return interest, domains
+
+
+def rank_unseen(unseen: list[dict], profile: dict) -> list[dict]:
+    """Score each unseen video by overlap with the profile's interest concepts.
+
+    score = sum of interest weights for the video's concepts that are interest
+    concepts, plus a small domain-affinity bonus. Sorted by (score desc,
+    published desc). Videos without concepts.json score 0 and sort last but are
+    NOT dropped - a fresh video may not be concept-extracted yet.
+    """
+    interest, domains = _coerce_profile_interests(profile)
     scored: list[dict] = []
     for video in unseen:
         score = 0.0
@@ -6769,6 +6805,309 @@ def rank_unseen(unseen: list[dict], profile: dict) -> list[dict]:
         scored.append({**video, "score": score, "matched_concepts": matched[:5]})
     scored.sort(key=lambda v: (v["score"], v.get("published", "")), reverse=True)
     return scored
+
+
+# ---------------------------------------------------------------------------
+# Headline digest - peripheral vision over unfollowed channels (issue #113)
+# ---------------------------------------------------------------------------
+
+
+def _is_youtube_channel_source(url: str | None) -> bool:
+    """True when `url` is a recognizable YouTube channel URL or a bare UC... id.
+
+    Guards headline eligibility. `get_channel_id()` submits the last URL path
+    segment to the YouTube Data API for ANY host, so a mis-flagged non-YouTube
+    url (Skool, Vimeo, ...) would still cost an API call. This shape check MUST
+    run BEFORE `get_channel_id()` (issue #113 hazard). Host matching is exact
+    against a known set so a suffix trick like `notyoutube.com` is rejected.
+    """
+    if not isinstance(url, str):
+        return False
+    candidate = url.strip()
+    if not candidate:
+        return False
+    if _UC_CHANNEL_ID_RE.match(candidate):
+        return True
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(candidate if "//" in candidate else "https://" + candidate)
+    except ValueError:
+        return False
+    host = (parsed.netloc or "").lower().split(":")[0]
+    return host in _YOUTUBE_HOSTS
+
+
+def _channel_scan_enabled(channel: dict) -> bool:
+    """True when a channel enters the PRIMARY scan pipeline (full Gemini processing).
+
+    `enabled` defaults True when absent. Only a real boolean True admits a channel;
+    a non-boolean `enabled` (e.g. a stray `"headlines"` from a mis-attempted
+    tri-state) is treated as disabled rather than truthy-admitted. Without this the
+    truthiness gate `c.get("enabled", True)` would silently pull a channel labelled
+    with a string into full processing - the exact bug the separate `headline_digest`
+    opt-in exists to avoid (issue #113).
+    """
+    # `.get(..., True)` yields True when the key is absent, so `is True` alone
+    # admits absent + boolean-True and rejects False + every non-boolean value.
+    return channel.get("enabled", True) is True
+
+
+def collect_headline_channels(config: dict) -> list[dict]:
+    """Channels eligible for the headline digest, per the frozen eligibility rule.
+
+    All must hold: `enabled is False`, `headline_digest is True`, and a recognizably
+    YouTube `url`. The YouTube shape check runs HERE, before any `get_channel_id()`
+    call, so a mis-flagged non-YouTube source never reaches the API. `enabled: true`
+    + `headline_digest: true` is redundant (an enabled channel is already visible) and
+    is ignored.
+    """
+    eligible: list[dict] = []
+    for channel in config.get("channels", []):
+        if channel.get("enabled", True) is not False:
+            continue
+        if channel.get("headline_digest") is not True:
+            continue
+        if not _is_youtube_channel_source(channel.get("url")):
+            log.info(
+                "Headline digest: skipping non-YouTube source for '%s' (%s).",
+                channel.get("name", "?"),
+                channel.get("url"),
+            )
+            continue
+        eligible.append(channel)
+    return eligible
+
+
+def _norm_phrase(text: str) -> str:
+    """Lowercase and collapse to space-separated alphanumeric tokens for matching."""
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+
+
+def _humanize_concept_id(concept_id: str) -> str:
+    """`ai-agents.mcp-servers` -> `mcp servers` (drop domain prefix, split separators)."""
+    tail = concept_id.split(".")[-1] if "." in concept_id else concept_id
+    return _norm_phrase(tail)
+
+
+def rank_headlines(videos: list[dict], profile: dict, taxonomy: dict | None = None) -> list[dict]:
+    """Rank metadata-only headline videos by title match against the interest profile.
+
+    Headline videos carry NO concepts.json (no Gemini extraction), so `rank_unseen`
+    would score every one zero and collapse to pure recency (issue #113). Instead we
+    match normalized title phrases against the profile's interest concepts - using
+    taxonomy `preferred_label`/`aliases` where available, else a humanized concept id -
+    and the profile's interest domains (a weaker signal). Ties break by recency.
+
+    Returns each video with `score` and `matched_concepts`, sorted (score desc,
+    published desc). Tolerant of a hand-edited profile (same coercions as `rank_unseen`).
+
+    Ranking quality depends on taxonomy quality: with no `taxonomy.json`, each
+    interest concept contributes only its humanized concept-id phrase (which rarely
+    appears verbatim in a title), so scoring degrades toward pure recency via the
+    zero-score "Other headlines" bucket. That degradation is graceful, not a defect.
+    """
+    interest, domains = _coerce_profile_interests(profile)
+    tax_concepts = taxonomy.get("concepts", {}) if isinstance(taxonomy, dict) else {}
+
+    # Precompute (concept_id, weight, display_label, padded_phrases) per interest concept.
+    concept_terms: list[tuple[str, float, str, list[str]]] = []
+    for cid, weight in interest.items():
+        entry = tax_concepts.get(cid, {}) if isinstance(tax_concepts, dict) else {}
+        entry = entry if isinstance(entry, dict) else {}
+        phrases: set[str] = set()
+        label = entry.get("preferred_label")
+        if isinstance(label, str) and label.strip():
+            phrases.add(label)
+        for alias in entry.get("aliases", []) or []:
+            if isinstance(alias, str):
+                phrases.add(alias)
+        phrases.add(_humanize_concept_id(cid))
+        norm = {_norm_phrase(p) for p in phrases}
+        padded = [f" {p} " for p in norm if len(p) >= MIN_ALIAS_LEN]
+        display = label if isinstance(label, str) and label.strip() else _humanize_concept_id(cid)
+        if padded:
+            concept_terms.append((cid, weight, display, padded))
+
+    domain_terms = [(f" {d} ", d) for d in (_norm_phrase(x) for x in domains) if len(d) >= MIN_ALIAS_LEN]
+
+    scored: list[dict] = []
+    for video in videos:
+        title = f" {_norm_phrase(video.get('title', ''))} "
+        score = 0.0
+        matched: list[str] = []
+        for _cid, weight, display, padded in concept_terms:
+            if any(phrase in title for phrase in padded):
+                score += weight
+                matched.append(display)
+        for padded_domain, domain_label in domain_terms:
+            if padded_domain in title:
+                score += HEADLINE_DOMAIN_MATCH_WEIGHT
+                matched.append(domain_label)
+        scored.append({**video, "score": score, "matched_concepts": matched[:5]})
+    scored.sort(key=lambda v: (v["score"], v.get("published", "")), reverse=True)
+    return scored
+
+
+def load_headlines_seen_ids(output_dir: Path) -> list[str]:
+    """Load the ordered seen-set from `_headlines/seen.json` (empty on any failure)."""
+    path = output_dir / HEADLINES_DIR_NAME / HEADLINES_SEEN_FILENAME
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    ids = data.get("seen") if isinstance(data, dict) else data
+    if not isinstance(ids, list):
+        return []
+    # Dedupe preserving order.
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for vid in ids:
+        key = str(vid)
+        if key not in seen:
+            seen.add(key)
+            ordered.append(key)
+    return ordered
+
+
+def advance_headlines_seen(output_dir: Path, new_ids: list[str]) -> None:
+    """Append `new_ids` to the seen-set and persist, trimmed to the newest HEADLINES_SEEN_MAX.
+
+    Order is preserved (oldest first) so trimming keeps the most-recently-seen ids.
+    Callers advance the set ONLY after a real (non-dry-run) render.
+    """
+    existing = load_headlines_seen_ids(output_dir)
+    seen = set(existing)
+    for vid in new_ids:
+        key = str(vid)
+        if key not in seen:
+            seen.add(key)
+            existing.append(key)
+    trimmed = existing[-HEADLINES_SEEN_MAX:]
+    headlines_dir = output_dir / HEADLINES_DIR_NAME
+    headlines_dir.mkdir(parents=True, exist_ok=True)
+    path = headlines_dir / HEADLINES_SEEN_FILENAME
+    tmp_path = path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps({"seen": trimmed}, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _select_headline_items(ranked: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Split ranked headlines into (positive interest-matches, a few zero-score recents).
+
+    Positive matches come first up to the global cap; remaining slots are filled with
+    the most recent zero-score items (capped), mirroring the briefings rule that
+    zero-score items are surfaced under "Other headlines", not dropped.
+    """
+    positive = [v for v in ranked if v["score"] > 0][:HEADLINES_MAX_ITEMS]
+    remaining = HEADLINES_MAX_ITEMS - len(positive)
+    zero = [v for v in ranked if v["score"] == 0][: min(remaining, HEADLINES_MAX_ZERO_SCORE)] if remaining > 0 else []
+    return positive, zero
+
+
+def render_headline_digest(youtube, config: dict, output_dir: Path, *, dry_run: bool) -> list[dict]:
+    """Fetch, rank, and render the headline digest; advance the seen-set after render.
+
+    Metadata-only: uses the cheap uploads-playlist path plus a duration enrich for the
+    Shorts filter. Makes NO Gemini calls and writes NO corpus artifacts. Non-fatal by
+    construction - the caller runs it last, after wanted work. Returns the rendered
+    items (also useful for a future standalone `headlines` command). A `--dry-run`
+    renders but does not advance `_headlines/seen.json`.
+    """
+    headline_channels = collect_headline_channels(config)
+    log.info("Headline digest: %d channel(s) considered.", len(headline_channels))
+    if not headline_channels:
+        return []
+
+    profile = infer_or_load_profile(output_dir, config, persist=False)
+    # A corrupt taxonomy.json (interrupted taxonomy-build, cloud-mount stale read)
+    # must not silently disable the whole digest via cmd_scan's outer except -
+    # rank_headlines tolerates taxonomy=None (falls back to humanized concept ids).
+    try:
+        taxonomy = load_taxonomy(output_dir)
+    except (json.JSONDecodeError, OSError):
+        log.warning("Headline digest: taxonomy.json unreadable; ranking on concept ids only.")
+        taxonomy = None
+    seen = set(load_headlines_seen_ids(output_dir))
+    since_dt = datetime.now(UTC) - timedelta(days=HEADLINES_LOOKBACK_DAYS)
+
+    collected: list[dict] = []
+    for channel in headline_channels:
+        try:
+            channel_id, channel_title = get_channel_id(youtube, channel["url"])
+        except HttpError as e:
+            # Symmetric with the fetch path below: a quota-exhaustion at channel
+            # resolution stops the digest early rather than aborting the scan.
+            if e.resp.status == 403 and _is_quota_exceeded(e):
+                log.warning("Headline digest: YouTube quota exhausted; stopping digest early.")
+                break
+            raise
+        if not channel_id:
+            log.warning("Headline digest: channel not found: %s", channel.get("url"))
+            continue
+        try:
+            videos = fetch_channel_videos(youtube, channel_id, since_dt)
+        except HttpError as e:
+            if e.resp.status == 403 and _is_quota_exceeded(e):
+                log.warning("Headline digest: YouTube quota exhausted; stopping digest early.")
+                break
+            raise
+        for v in videos:
+            if v.get("video_id") in seen:
+                continue
+            v["channel"] = channel["name"]
+            v["channel_title"] = channel_title or channel["name"]
+            collected.append(v)
+
+    if not collected:
+        log.info("Headline digest: no new uploads to surface.")
+        return []
+
+    # Shorts filter via duration enrich (no Gemini). Quota-exhaustion is non-fatal:
+    # skip the filter entirely rather than fall through to is_short()'s per-video
+    # /shorts HEAD probe - that would trade one quota failure for N live network
+    # round-trips in a path advertised as metadata-only. Un-filtered items are
+    # kept (fail-safe to long-form, same bias as is_short).
+    durations: dict[str, str | None] = {}
+    quota_degraded = False
+    try:
+        durations = enrich_with_durations(youtube, [v["video_id"] for v in collected])
+    except HttpError as e:
+        if e.resp.status == 403 and _is_quota_exceeded(e):
+            log.warning("Headline digest: quota exhausted during Shorts check; keeping items unfiltered.")
+            quota_degraded = True
+        else:
+            raise
+    if not quota_degraded:
+        for v in collected:
+            v["duration_iso"] = durations.get(v["video_id"])
+        collected = [v for v in collected if not is_short(v["video_id"], v["duration_iso"])]
+
+    ranked = rank_headlines(collected, profile, taxonomy)
+    positive, zero = _select_headline_items(ranked)
+    rendered = positive + zero
+    if not rendered:
+        log.info("Headline digest: no new uploads to surface.")
+        return []
+
+    log.info("")
+    log.info("=== Other headlines - new in channels you're not actively following ===")
+    for v in positive:
+        log.info("  * [%s] %s  (%s)  %s", v["channel"], v.get("title", ""), v.get("published", ""), v.get("url", ""))
+        if v.get("matched_concepts"):
+            log.info("      matches: %s", ", ".join(v["matched_concepts"]))
+    if zero:
+        log.info("  -- Other headlines --")
+        for v in zero:
+            log.info(
+                "  . [%s] %s  (%s)  %s", v["channel"], v.get("title", ""), v.get("published", ""), v.get("url", "")
+            )
+
+    if not dry_run:
+        advance_headlines_seen(output_dir, [v["video_id"] for v in rendered])
+    return rendered
 
 
 def extract_mindmap_links(mindmap_path, url: str, limit: int = 3) -> list[tuple[str, str]]:

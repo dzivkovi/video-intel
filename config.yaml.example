@@ -93,3 +93,16 @@ channels:
     url: https://youtube.com/@oneoffcreator
     auto_transcript: all
     enabled: false
+
+  # Peripheral vision: a YouTube creator you do NOT actively follow, but whose
+  # new uploads you want glanced at as "Other headlines" at the end of a full
+  # `scan` (like flipping a newspaper for a catchy title worth a manual look).
+  # `enabled: false` keeps it out of the primary Gemini pipeline; the separate
+  # `headline_digest: true` opt-in surfaces its latest uploads metadata-only -
+  # NO mindmap/transcript/concepts, NO corpus artifacts. Ranked by title match
+  # against _briefings/profile.yaml; a bounded _headlines/seen.json means a
+  # given upload is shown once, not every run. Requires a real YouTube url/id.
+  - name: example_headlines
+    url: https://youtube.com/@peripheralcreator
+    enabled: false
+    headline_digest: true
