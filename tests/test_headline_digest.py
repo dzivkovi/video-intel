@@ -327,3 +327,143 @@ def test_seen_state_is_bounded(monkeypatch, tmp_path):
     # The most recent ids are the ones retained.
     assert ids[-1] in kept
     assert ids[0] not in kept
+
+
+# ---------------------------------------------------------------------------
+# Global cap, Shorts filter, quota degradation, malformed inputs (review hardening)
+# ---------------------------------------------------------------------------
+
+
+def _quota_http_error():
+    resp = MagicMock(status=403)
+    content = b'{"error": {"errors": [{"reason": "quotaExceeded"}], "code": 403, "message": "quota exceeded"}}'
+    return vi.HttpError(resp=resp, content=content)
+
+
+def _non_quota_http_error():
+    resp = MagicMock(status=403)
+    content = b'{"error": {"errors": [{"reason": "forbidden"}], "code": 403, "message": "forbidden"}}'
+    return vi.HttpError(resp=resp, content=content)
+
+
+def test_positive_matches_cap_at_max_items(monkeypatch, tmp_path):
+    """The POSITIVE-match slice honors HEADLINES_MAX_ITEMS, not just the zero sub-cap.
+
+    A prior version tested the cap with all-zero-score titles, which only exercised
+    HEADLINES_MAX_ZERO_SCORE. Here every title matches the profile, so a broken
+    positive-path slice would flood the digest past the global cap.
+    """
+    # Profile whose humanized concept ids appear verbatim in every title.
+    profile = {"interest_concepts": {f"ai.topic{i}": 10 for i in range(30)}, "interest_domains": []}
+    videos = [
+        {"video_id": f"v{i}", "title": f"All about topic{i % 30} and mcp", "published": f"2026-07-{(i % 28) + 1:02d}"}
+        for i in range(25)
+    ]
+    tax = {
+        "concepts": {f"ai.topic{i}": {"preferred_label": f"topic{i}", "aliases": [], "domain": "ai"} for i in range(30)}
+    }
+    ranked = vi.rank_headlines(videos, profile, tax)
+    assert all(v["score"] > 0 for v in ranked), "test setup: every title should score positive"
+    positive, zero = vi._select_headline_items(ranked)
+    assert len(positive) == vi.HEADLINES_MAX_ITEMS
+    assert zero == []  # no slots left for zero-score once positives fill the cap
+    assert len(positive) + len(zero) <= vi.HEADLINES_MAX_ITEMS
+
+
+def test_render_drops_shorts(monkeypatch, tmp_path):
+    """A video classified as a Short must not appear in the rendered digest."""
+    videos = [
+        {"video_id": "long1", "title": "A real long-form talk", "published": "2026-07-01"},
+        {"video_id": "short1", "title": "A quick short", "published": "2026-07-02"},
+    ]
+    monkeypatch.setattr("video_intel.get_channel_id", lambda _yt, _url: ("UCabcdefghijklmnopqrstuv", "Peripheral"))
+    monkeypatch.setattr("video_intel.fetch_channel_videos", lambda _yt, _cid, _since: [dict(v) for v in videos])
+    monkeypatch.setattr("video_intel.enrich_with_durations", lambda _yt, ids: dict.fromkeys(ids, "PT10M"))
+    monkeypatch.setattr("video_intel.is_short", lambda vid, _dur: vid == "short1")
+    rendered = vi.render_headline_digest(MagicMock(), _headline_config(tmp_path), tmp_path, dry_run=True)
+    ids = {v["video_id"] for v in rendered}
+    assert "long1" in ids
+    assert "short1" not in ids
+
+
+def test_fetch_quota_error_stops_digest_gracefully(monkeypatch, tmp_path):
+    monkeypatch.setattr("video_intel.get_channel_id", lambda _yt, _url: ("UCabcdefghijklmnopqrstuv", "Peripheral"))
+
+    def _raise_quota(*_a, **_k):
+        raise _quota_http_error()
+
+    monkeypatch.setattr("video_intel.fetch_channel_videos", _raise_quota)
+    # Must not propagate - the digest degrades to empty, the scan continues.
+    out = vi.render_headline_digest(MagicMock(), _headline_config(tmp_path), tmp_path, dry_run=False)
+    assert out == []
+
+
+def test_channel_resolution_quota_error_stops_digest(monkeypatch, tmp_path):
+    def _raise_quota(*_a, **_k):
+        raise _quota_http_error()
+
+    monkeypatch.setattr("video_intel.get_channel_id", _raise_quota)
+    out = vi.render_headline_digest(MagicMock(), _headline_config(tmp_path), tmp_path, dry_run=False)
+    assert out == []
+
+
+def test_enrich_quota_error_keeps_items_unfiltered(monkeypatch, tmp_path):
+    """When the Shorts-check enrich quota-fails, items are kept without per-video HEAD probes."""
+    videos = [{"video_id": "v1", "title": "Long talk", "published": "2026-07-01"}]
+    monkeypatch.setattr("video_intel.get_channel_id", lambda _yt, _url: ("UCabcdefghijklmnopqrstuv", "Peripheral"))
+    monkeypatch.setattr("video_intel.fetch_channel_videos", lambda _yt, _cid, _since: [dict(v) for v in videos])
+
+    def _raise_quota(*_a, **_k):
+        raise _quota_http_error()
+
+    monkeypatch.setattr("video_intel.enrich_with_durations", _raise_quota)
+
+    def _fail_is_short(*_a, **_k):
+        pytest.fail("is_short must not run when durations are quota-unavailable (avoids N network HEADs)")
+
+    monkeypatch.setattr("video_intel.is_short", _fail_is_short)
+    out = vi.render_headline_digest(MagicMock(), _headline_config(tmp_path), tmp_path, dry_run=True)
+    assert [v["video_id"] for v in out] == ["v1"]
+
+
+def test_non_quota_http_error_propagates(monkeypatch, tmp_path):
+    """A non-quota 403 is a real error and must NOT be swallowed as quota degradation."""
+    monkeypatch.setattr("video_intel.get_channel_id", lambda _yt, _url: ("UCabcdefghijklmnopqrstuv", "Peripheral"))
+
+    def _raise(*_a, **_k):
+        raise _non_quota_http_error()
+
+    monkeypatch.setattr("video_intel.fetch_channel_videos", _raise)
+    with pytest.raises(vi.HttpError):
+        vi.render_headline_digest(MagicMock(), _headline_config(tmp_path), tmp_path, dry_run=False)
+
+
+def test_malformed_seen_json_degrades_to_resurface(monkeypatch, tmp_path):
+    """A corrupt seen.json loses dedup for that run but must not crash."""
+    headlines_dir = tmp_path / "_headlines"
+    headlines_dir.mkdir(parents=True)
+    (headlines_dir / "seen.json").write_text("{not valid json", encoding="utf-8")
+    assert vi.load_headlines_seen_ids(tmp_path) == []
+    videos = [{"video_id": "v1", "title": "Long talk", "published": "2026-07-01"}]
+    _stub_headline_fetch(monkeypatch, videos)
+    out = vi.render_headline_digest(MagicMock(), _headline_config(tmp_path), tmp_path, dry_run=True)
+    assert [v["video_id"] for v in out] == ["v1"]
+
+
+def test_rank_headlines_empty_profile_all_zero(monkeypatch):
+    """rank_headlines on an empty profile scores zero without crashing (coercion path)."""
+    videos = [{"video_id": "v1", "title": "Anything at all", "published": "2026-07-01"}]
+    ranked = vi.rank_headlines(videos, {}, None)
+    assert ranked[0]["score"] == 0
+    assert ranked[0]["matched_concepts"] == []
+
+
+def test_render_returns_empty_when_no_eligible_channels(monkeypatch, tmp_path):
+    """Zero eligible channels short-circuits before any profile/taxonomy load."""
+
+    def _fail_profile(*_a, **_k):
+        pytest.fail("infer_or_load_profile must not be called when there are no eligible channels")
+
+    monkeypatch.setattr("video_intel.infer_or_load_profile", _fail_profile)
+    config = {"output_dir": str(tmp_path), "channels": [{"name": "regular", "url": "https://youtube.com/@r"}]}
+    assert vi.render_headline_digest(MagicMock(), config, tmp_path, dry_run=True) == []

@@ -6748,17 +6748,16 @@ def infer_or_load_profile(output_dir: Path, config: dict | None = None, *, today
     return profile
 
 
-def rank_unseen(unseen: list[dict], profile: dict) -> list[dict]:
-    """Score each unseen video by overlap with the profile's interest concepts.
+def _coerce_profile_interests(profile: dict) -> tuple[dict[str, float], set[str]]:
+    """Tolerantly parse a (possibly hand-edited) profile into (interest_concepts, domains).
 
-    score = sum of interest weights for the video's concepts that are interest
-    concepts, plus a small domain-affinity bonus. Sorted by (score desc,
-    published desc). Videos without concepts.json score 0 and sort last but are
-    NOT dropped - a fresh video may not be concept-extracted yet.
+    A hand-edited profile.yaml may carry `interest_concepts` as a list/scalar
+    (membership+indexing would crash) with string weights, and `interest_domains`
+    as a bare string ("ai" would otherwise become a set of single chars). Coerce
+    to a `{concept_id: float}` map (dropping non-numeric weights) and a `set[str]`
+    of domains. Shared by `rank_unseen` and `rank_headlines` so the tolerant
+    parsing stays in one place (both must accept the same malformed inputs).
     """
-    # Tolerate a hand-edited profile.yaml: interest_concepts may come back as a
-    # list/scalar (membership+indexing would crash) and weights may be strings;
-    # coerce to a {concept_id: float} map, dropping anything non-numeric.
     raw_interest = profile.get("interest_concepts")
     interest: dict[str, float] = {}
     if isinstance(raw_interest, dict):
@@ -6767,12 +6766,22 @@ def rank_unseen(unseen: list[dict], profile: dict) -> list[dict]:
                 interest[cid] = float(weight)
             except (TypeError, ValueError):
                 continue
-    # interest_domains may be a bare string ("ai" would otherwise become a set of
-    # single chars); wrap it, and accept only string elements.
     raw_domains = profile.get("interest_domains") or []
     if isinstance(raw_domains, str):
         raw_domains = [raw_domains]
     domains = {d for d in raw_domains if isinstance(d, str)} if isinstance(raw_domains, list | set | tuple) else set()
+    return interest, domains
+
+
+def rank_unseen(unseen: list[dict], profile: dict) -> list[dict]:
+    """Score each unseen video by overlap with the profile's interest concepts.
+
+    score = sum of interest weights for the video's concepts that are interest
+    concepts, plus a small domain-affinity bonus. Sorted by (score desc,
+    published desc). Videos without concepts.json score 0 and sort last but are
+    NOT dropped - a fresh video may not be concept-extracted yet.
+    """
+    interest, domains = _coerce_profile_interests(profile)
     scored: list[dict] = []
     for video in unseen:
         score = 0.0
@@ -6839,8 +6848,9 @@ def _channel_scan_enabled(channel: dict) -> bool:
     with a string into full processing - the exact bug the separate `headline_digest`
     opt-in exists to avoid (issue #113).
     """
-    value = channel.get("enabled", True)
-    return value is True or ("enabled" not in channel)
+    # `.get(..., True)` yields True when the key is absent, so `is True` alone
+    # admits absent + boolean-True and rejects False + every non-boolean value.
+    return channel.get("enabled", True) is True
 
 
 def collect_headline_channels(config: dict) -> list[dict]:
@@ -6891,20 +6901,13 @@ def rank_headlines(videos: list[dict], profile: dict, taxonomy: dict | None = No
 
     Returns each video with `score` and `matched_concepts`, sorted (score desc,
     published desc). Tolerant of a hand-edited profile (same coercions as `rank_unseen`).
-    """
-    raw_interest = profile.get("interest_concepts")
-    interest: dict[str, float] = {}
-    if isinstance(raw_interest, dict):
-        for cid, weight in raw_interest.items():
-            try:
-                interest[cid] = float(weight)
-            except (TypeError, ValueError):
-                continue
-    raw_domains = profile.get("interest_domains") or []
-    if isinstance(raw_domains, str):
-        raw_domains = [raw_domains]
-    domains = {d for d in raw_domains if isinstance(d, str)} if isinstance(raw_domains, list | set | tuple) else set()
 
+    Ranking quality depends on taxonomy quality: with no `taxonomy.json`, each
+    interest concept contributes only its humanized concept-id phrase (which rarely
+    appears verbatim in a title), so scoring degrades toward pure recency via the
+    zero-score "Other headlines" bucket. That degradation is graceful, not a defect.
+    """
+    interest, domains = _coerce_profile_interests(profile)
     tax_concepts = taxonomy.get("concepts", {}) if isinstance(taxonomy, dict) else {}
 
     # Precompute (concept_id, weight, display_label, padded_phrases) per interest concept.
@@ -6926,7 +6929,7 @@ def rank_headlines(videos: list[dict], profile: dict, taxonomy: dict | None = No
         if padded:
             concept_terms.append((cid, weight, display, padded))
 
-    domain_terms = [(f" {d} ", _norm_phrase(x)) for x in domains for d in [_norm_phrase(x)] if len(d) >= MIN_ALIAS_LEN]
+    domain_terms = [(f" {d} ", d) for d in (_norm_phrase(x) for x in domains) if len(d) >= MIN_ALIAS_LEN]
 
     scored: list[dict] = []
     for video in videos:
@@ -7019,13 +7022,28 @@ def render_headline_digest(youtube, config: dict, output_dir: Path, *, dry_run: 
         return []
 
     profile = infer_or_load_profile(output_dir, config, persist=False)
-    taxonomy = load_taxonomy(output_dir)
+    # A corrupt taxonomy.json (interrupted taxonomy-build, cloud-mount stale read)
+    # must not silently disable the whole digest via cmd_scan's outer except -
+    # rank_headlines tolerates taxonomy=None (falls back to humanized concept ids).
+    try:
+        taxonomy = load_taxonomy(output_dir)
+    except (json.JSONDecodeError, OSError):
+        log.warning("Headline digest: taxonomy.json unreadable; ranking on concept ids only.")
+        taxonomy = None
     seen = set(load_headlines_seen_ids(output_dir))
     since_dt = datetime.now(UTC) - timedelta(days=HEADLINES_LOOKBACK_DAYS)
 
     collected: list[dict] = []
     for channel in headline_channels:
-        channel_id, channel_title = get_channel_id(youtube, channel["url"])
+        try:
+            channel_id, channel_title = get_channel_id(youtube, channel["url"])
+        except HttpError as e:
+            # Symmetric with the fetch path below: a quota-exhaustion at channel
+            # resolution stops the digest early rather than aborting the scan.
+            if e.resp.status == 403 and _is_quota_exceeded(e):
+                log.warning("Headline digest: YouTube quota exhausted; stopping digest early.")
+                break
+            raise
         if not channel_id:
             log.warning("Headline digest: channel not found: %s", channel.get("url"))
             continue
@@ -7048,18 +7066,24 @@ def render_headline_digest(youtube, config: dict, output_dir: Path, *, dry_run: 
         return []
 
     # Shorts filter via duration enrich (no Gemini). Quota-exhaustion is non-fatal:
-    # fall through with whatever durations we have and keep long-form/ambiguous items.
+    # skip the filter entirely rather than fall through to is_short()'s per-video
+    # /shorts HEAD probe - that would trade one quota failure for N live network
+    # round-trips in a path advertised as metadata-only. Un-filtered items are
+    # kept (fail-safe to long-form, same bias as is_short).
+    durations: dict[str, str | None] = {}
+    quota_degraded = False
     try:
         durations = enrich_with_durations(youtube, [v["video_id"] for v in collected])
     except HttpError as e:
         if e.resp.status == 403 and _is_quota_exceeded(e):
-            log.warning("Headline digest: quota exhausted during Shorts check; rendering without it.")
-            durations = {}
+            log.warning("Headline digest: quota exhausted during Shorts check; keeping items unfiltered.")
+            quota_degraded = True
         else:
             raise
-    for v in collected:
-        v["duration_iso"] = durations.get(v["video_id"])
-    collected = [v for v in collected if not is_short(v["video_id"], v["duration_iso"])]
+    if not quota_degraded:
+        for v in collected:
+            v["duration_iso"] = durations.get(v["video_id"])
+        collected = [v for v in collected if not is_short(v["video_id"], v["duration_iso"])]
 
     ranked = rank_headlines(collected, profile, taxonomy)
     positive, zero = _select_headline_items(ranked)
