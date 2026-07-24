@@ -15,6 +15,7 @@ import argparse
 import functools
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -24,12 +25,13 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from html import unescape
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import httpx
@@ -183,11 +185,18 @@ def require_channels_config(config: dict[str, Any]) -> None:
         sys.exit(1)
 
 
-def resolve_output_dir(config):
+def resolve_output_dir(config, *, create: bool = True):
+    """Resolve the corpus root, creating it by default.
+
+    `create=False` is for read-only commands that promise zero filesystem side
+    effects (`profile show`): the default mkdir would otherwise materialize the
+    corpus tree while the command prints "nothing was written".
+    """
     output_dir = Path(config.get("output_dir", "~/video-intel")).expanduser()
     if not output_dir.is_absolute():
         output_dir = SKILL_DIR / output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if create:
+        output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
 
 
@@ -6714,8 +6723,9 @@ def _load_usable_profile(briefings_dir: Path) -> dict | None:
 
     "Usable" = the file exists AND parses to a non-empty dict. An empty or
     unreadable profile.yaml counts as no profile (so a fresh inference runs and
-    the cold-start warning still fires). Shared by `infer_or_load_profile` and
-    the cold-start check in `cmd_briefings` so both agree on what "tuned" means.
+    the cold-start warning still fires). Shared by `load_interest_model`, the
+    cold-start check in `cmd_briefings`, and `profile show` / `profile init` so
+    every surface agrees on what "tuned" means.
     """
     profile_path = briefings_dir / PROFILE_FILENAME
     if not profile_path.exists():
@@ -6725,33 +6735,6 @@ def _load_usable_profile(briefings_dir: Path) -> dict | None:
     except (yaml.YAMLError, OSError):
         return None
     return data if isinstance(data, dict) and data else None
-
-
-def infer_or_load_profile(output_dir: Path, config: dict | None = None, *, today=None, persist: bool = True) -> dict:
-    """Load _briefings/profile.yaml if present and usable, else infer it.
-
-    A hand-edited profile is never overwritten: once the file exists with any
-    content, it wins. This is the single explicit-control surface (R7) - editing
-    the file is the correction path. `persist=False` returns the inferred profile
-    WITHOUT writing it. (`rank_unseen` tolerates a malformed `interest_concepts`,
-    so preserving a partial hand-edit is safe.)
-
-    NOT a ranking path (issue #115): `briefings --unseen` and the headline digest
-    both load through `load_interest_model`, which never persists, and `profile
-    init` is the only writer. Wiring a ranking surface back through here would
-    reintroduce "a scan silently creates your profile".
-    """
-    briefings_dir = output_dir / BRIEFINGS_DIR_NAME
-    existing = _load_usable_profile(briefings_dir)
-    if existing is not None:
-        return existing
-    profile = _infer_profile(output_dir, config, today=today)
-    if persist:
-        briefings_dir.mkdir(parents=True, exist_ok=True)
-        (briefings_dir / PROFILE_FILENAME).write_text(
-            yaml.safe_dump(profile, sort_keys=False, allow_unicode=True), encoding="utf-8"
-        )
-    return profile
 
 
 def _coerce_profile_interests(profile: dict) -> tuple[dict[str, float], set[str]]:
@@ -6769,9 +6752,17 @@ def _coerce_profile_interests(profile: dict) -> tuple[dict[str, float], set[str]
     if isinstance(raw_interest, dict):
         for cid, weight in raw_interest.items():
             try:
-                interest[cid] = float(weight)
+                value = float(weight)
             except (TypeError, ValueError):
                 continue
+            # NaN/inf poison every comparison downstream (a NaN-scored item sorts
+            # into the top slot and then matches neither the >0 nor the ==0
+            # bucket, so it vanishes from the digest entirely). Drop them here,
+            # at the single coercion point, rather than defending every consumer.
+            if not math.isfinite(value):
+                log.warning("Ignoring non-finite weight for interest concept %r in profile.yaml.", cid)
+                continue
+            interest[cid] = value
     raw_domains = profile.get("interest_domains") or []
     if isinstance(raw_domains, str):
         raw_domains = [raw_domains]
@@ -6817,10 +6808,15 @@ class InterestModel:
     `weights` is the concept-evidence view (`rank_unseen`, which reads
     `concepts.json`); `concepts`/`domain_terms` are the text-evidence view
     (`rank_headlines`, which only has a title). Both are derived from the SAME
-    profile in one place, so a single profile edit reorders both surfaces.
+    profile in one place, so one profile edit moves both surfaces wherever each
+    has matching evidence.
+
+    `weights` is exposed read-only: mutating it after compilation would change
+    `rank_unseen` while `rank_headlines` kept the weight already copied into
+    each `InterestConcept` - drift inside the one model that exists to prevent it.
     """
 
-    weights: dict[str, float]
+    weights: Mapping[str, float]
     domains: frozenset[str]
     concepts: tuple[InterestConcept, ...]
     domain_terms: tuple[tuple[str, str], ...]
@@ -6829,6 +6825,10 @@ class InterestModel:
     profile_path: Path | None
     audience_path: Path | None
     raw: dict
+    # False when taxonomy.json exists but could not be read. Ranking still works
+    # (humanized concept ids), but a surface that spends irreversible state on a
+    # ranked render - the headline digest's seen-set - must not do so blind.
+    taxonomy_ok: bool = True
 
 
 def compile_interest_model(
@@ -6838,6 +6838,7 @@ def compile_interest_model(
     source: str = "inferred",
     profile_path: Path | None = None,
     audience_path: Path | None = None,
+    taxonomy_ok: bool = True,
 ) -> InterestModel:
     """Compile a (possibly hand-edited) profile + taxonomy into one interest model.
 
@@ -6872,7 +6873,7 @@ def compile_interest_model(
 
     domain_terms = tuple((f" {d} ", d) for d in (_norm_phrase(x) for x in sorted(domains)) if len(d) >= MIN_ALIAS_LEN)
     return InterestModel(
-        weights=interest,
+        weights=MappingProxyType(dict(interest)),
         domains=frozenset(domains),
         concepts=tuple(concepts),
         domain_terms=domain_terms,
@@ -6881,6 +6882,7 @@ def compile_interest_model(
         profile_path=profile_path,
         audience_path=audience_path,
         raw=profile,
+        taxonomy_ok=taxonomy_ok,
     )
 
 
@@ -6890,13 +6892,22 @@ def _as_interest_model(profile: dict | InterestModel, taxonomy: dict | None = No
     Callers that hold a model pass it straight through (the taxonomy is already
     baked in); callers holding a plain dict get it compiled here, so there is
     exactly one interpretation of profile weights in the codebase.
+
+    Passing both a compiled model AND a taxonomy is a caller error, not a silent
+    no-op: the taxonomy would be ignored, and the caller would believe alias
+    matching was active when it was not.
     """
     if isinstance(profile, InterestModel):
+        if taxonomy is not None:
+            raise ValueError(
+                "taxonomy is ignored when an already-compiled InterestModel is passed; "
+                "compile the model with the taxonomy instead (compile_interest_model)."
+            )
         return profile
     return compile_interest_model(profile or {}, taxonomy)
 
 
-def load_interest_model(output_dir: Path, config: dict | None = None, *, today=None) -> InterestModel:
+def load_interest_model(output_dir: Path, config: dict | None = None, *, today: date | None = None) -> InterestModel:
     """Resolve the user's interest model from disk, inferring one when absent.
 
     Read-only by design (issue #115): a persisted `_briefings/profile.yaml` wins
@@ -6910,17 +6921,23 @@ def load_interest_model(output_dir: Path, config: dict | None = None, *, today=N
     profile = existing if existing is not None else _infer_profile(output_dir, config, today=today)
     # A corrupt taxonomy.json (interrupted taxonomy-build, cloud-mount stale read)
     # must not disable ranking - the compiler falls back to humanized concept ids.
+    # ValueError covers both JSONDecodeError and UnicodeDecodeError: `briefings`
+    # reads taxonomy.json for the first time here, and a half-written file on a
+    # cloud mount is as likely to be invalid UTF-8 as invalid JSON.
+    taxonomy_ok = True
     try:
         taxonomy = load_taxonomy(output_dir)
-    except (json.JSONDecodeError, OSError):
+    except (ValueError, OSError):
         log.warning("taxonomy.json unreadable; ranking on concept ids only.")
         taxonomy = None
+        taxonomy_ok = False
     return compile_interest_model(
         profile,
         taxonomy,
         source="persisted" if existing is not None else "inferred",
         profile_path=briefings_dir / PROFILE_FILENAME,
         audience_path=briefings_dir / AUDIENCE_FILENAME,
+        taxonomy_ok=taxonomy_ok,
     )
 
 
@@ -7053,6 +7070,14 @@ def rank_headlines(videos: list[dict], profile: dict | InterestModel, taxonomy: 
     interest concept contributes only its humanized concept-id phrase (which rarely
     appears verbatim in a title), so scoring degrades toward pure recency via the
     zero-score "Other headlines" bucket. That degradation is graceful, not a defect.
+
+    One observed phrase is paid for ONCE, at the highest weight among the concepts
+    it matched. Taxonomy aliases are shared across concepts (on the live corpus
+    "Context Management" is an alias of three separate concepts), so summing per
+    concept would let a single generic phrase in a title collect several full
+    interest weights - inflating exactly the vaguest headlines, and only on this
+    surface (the concept-evidence surface counts a video's own concept ids, which
+    cannot collide this way).
     """
     model = _as_interest_model(profile, taxonomy)
 
@@ -7061,10 +7086,19 @@ def rank_headlines(videos: list[dict], profile: dict | InterestModel, taxonomy: 
         title = f" {_norm_phrase(video.get('title', ''))} "
         score = 0.0
         matched: list[str] = []
-        for concept in model.concepts:
-            if any(phrase in title for phrase in concept.phrases):
-                score += concept.weight
-                matched.append(concept.label)
+        hits = [(c, {p for p in c.phrases if p in title}) for c in model.concepts]
+        # Heaviest concept claims a contested phrase first, so the cap keeps the
+        # strongest interpretation of the evidence rather than an arbitrary one.
+        hits = sorted((h for h in hits if h[1]), key=lambda h: (-h[0].weight, h[0].concept_id))
+        claimed: set[str] = set()
+        for concept, phrases in hits:
+            if not phrases - claimed:
+                # Every phrase this concept matched was already paid for by a
+                # heavier concept: the same words, not independent evidence.
+                continue
+            claimed |= phrases
+            score += concept.weight  # each concept pays at most once
+            matched.append(concept.label)
         for padded_domain, domain_label in model.domain_terms:
             if padded_domain in title:
                 score += HEADLINE_DOMAIN_MATCH_WEIGHT
@@ -7128,7 +7162,11 @@ def _select_headline_items(ranked: list[dict]) -> tuple[list[dict], list[dict]]:
     """
     positive = [v for v in ranked if v["score"] > 0][:HEADLINES_MAX_ITEMS]
     remaining = HEADLINES_MAX_ITEMS - len(positive)
-    zero = [v for v in ranked if v["score"] == 0][: min(remaining, HEADLINES_MAX_ZERO_SCORE)] if remaining > 0 else []
+    # `<= 0`, not `== 0`: a negative weight (a hand-edit saying "I dislike this")
+    # must rank an item LAST, never delete it - personalization reorders, it does
+    # not filter. With `== 0` a negatively-scored item matched neither bucket, so
+    # it was dropped without ever entering the seen-set and re-dropped every run.
+    zero = [v for v in ranked if v["score"] <= 0][: min(remaining, HEADLINES_MAX_ZERO_SCORE)] if remaining > 0 else []
     return positive, zero
 
 
@@ -7151,6 +7189,17 @@ def render_headline_digest(youtube, config: dict, output_dir: Path, *, dry_run: 
     # side effect. A corrupt taxonomy.json degrades ranking inside the loader
     # rather than aborting the digest via cmd_scan's outer except.
     model = load_interest_model(output_dir, config)
+    if not model.taxonomy_ok:
+        # Rendering here would burn irreversible seen-state on an unranked list:
+        # a corrupt taxonomy.json also empties an inferred profile, so every item
+        # scores 0, five recents get marked seen, and after the taxonomy is
+        # repaired those videos can never be surfaced ranked. Skipping costs one
+        # digest; rendering costs those videos permanently.
+        log.warning(
+            "Headline digest: taxonomy.json is unreadable, so ranking would be blind. "
+            "Skipping the digest this run (nothing marked seen). Re-run `taxonomy-build` to restore it."
+        )
+        return []
     seen = set(load_headlines_seen_ids(output_dir))
     since_dt = datetime.now(UTC) - timedelta(days=HEADLINES_LOOKBACK_DAYS)
 
@@ -7321,7 +7370,8 @@ def render_unseen_briefing(ranked: list[dict], profile: dict, *, lower, upper, t
         (
             f"**Ranking lens:** inferred profile `{profile.get('id', 'inferred')}` "
             "(top corpus concepts + scanned channels). One reader's lens, not an "
-            "objective ranking - hand-edit `_briefings/profile.yaml` to retune."
+            "objective ranking - run `profile init`, then hand-edit "
+            "`_briefings/profile.yaml` to retune."
         ),
         "",
     ]
@@ -7523,7 +7573,16 @@ def _profile_show(output_dir: Path, config: dict) -> None:
     persisted. `profile init` is the only write surface.
     """
     model = load_interest_model(output_dir, config)
-    profile_state = "persisted" if model.source == "persisted" else "inferred (ephemeral - not on disk)"
+    # A file that exists but does not parse to a non-empty mapping is IGNORED for
+    # ranking. Reporting that as "not on disk" would hide the one failure this
+    # command exists to catch: a hand-edit (the only retune path) that broke.
+    profile_on_disk = bool(model.profile_path and model.profile_path.exists())
+    if model.source == "persisted":
+        profile_state = "persisted"
+    elif profile_on_disk:
+        profile_state = "IGNORED - file exists but is empty or unparseable"
+    else:
+        profile_state = "inferred (ephemeral - not on disk)"
     audience_state = "present" if model.audience_path and model.audience_path.exists() else "absent"
 
     print("Personalization profile")
@@ -7531,7 +7590,16 @@ def _profile_show(output_dir: Path, config: dict) -> None:
     print(f"  Ranking weights: {model.profile_path}  [{profile_state}]")
     print(f"  Reader context : {model.audience_path}  [{audience_state}]")
     print(f"  Profile id     : {model.profile_id}")
-    print(f"  Interests      : {len(model.weights)} weighted concept(s), {len(model.domains)} domain(s)")
+    # A concept whose phrases are all shorter than MIN_ALIAS_LEN scores on the
+    # concept surface but is structurally unmatchable in a title, so report both
+    # counts rather than implying every interest reaches both surfaces.
+    matchable = len(model.concepts)
+    interests_line = f"  Interests      : {len(model.weights)} weighted concept(s), {len(model.domains)} domain(s)"
+    if matchable < len(model.weights):
+        interests_line += f"; {matchable} matchable in headline titles"
+    print(interests_line)
+    if not model.taxonomy_ok:
+        print("  Taxonomy       : UNREADABLE - matching falls back to concept ids (run `taxonomy-build`)")
     for cid, weight in sorted(model.weights.items(), key=lambda kv: (-kv[1], kv[0]))[:PROFILE_SHOW_TOP]:
         label = next((c.label for c in model.concepts if c.concept_id == cid), _humanize_concept_id(cid))
         print(f"      {weight:>6g}  {cid}  ({label})")
@@ -7541,7 +7609,13 @@ def _profile_show(output_dir: Path, config: dict) -> None:
         print(f"  Domains        : {', '.join(sorted(model.domains))}")
     print()
     print("Both `briefings --unseen` and the scan's headline digest rank from this one model.")
-    if model.source != "persisted":
+    if profile_state.startswith("IGNORED"):
+        print(
+            f"Your {PROFILE_FILENAME} is not being used: it is empty or not valid YAML, so the weights "
+            "above were inferred instead. Fix the file (or delete it and re-run `profile init`). "
+            "Nothing was written."
+        )
+    elif model.source != "persisted":
         print("Run `profile init` to persist it, then hand-edit the file to retune. Nothing was written.")
 
 
@@ -7557,34 +7631,70 @@ def _profile_init(output_dir: Path, config: dict) -> None:
     profile_path = briefings_dir / PROFILE_FILENAME
     if profile_path.exists():
         print(f"Kept existing ranking weights: {profile_path} (never overwritten - edit it to retune)")
+        # Still never overwritten, but say so out loud: an unusable file is
+        # silently ignored at ranking time, and a neutral "kept" line would let
+        # the user believe a broken hand-edit is in force.
+        if _load_usable_profile(briefings_dir) is None:
+            log.warning(
+                "%s is empty or not valid YAML, so ranking ignores it and infers instead. "
+                "Fix the file, or delete it and re-run `profile init` for a fresh one.",
+                profile_path,
+            )
     else:
         profile = _infer_profile(output_dir, config)
-        profile_path.write_text(yaml.safe_dump(profile, sort_keys=False, allow_unicode=True), encoding="utf-8")
+        if not profile.get("interest_concepts"):
+            # Persisting an empty profile is a one-way trap: it would then be the
+            # "persisted" profile forever (never overwritten, cold-start warning
+            # suppressed), so every surface would score 0 with nothing to explain
+            # why. Almost always this just means the corpus has no taxonomy yet.
+            print(
+                f"Nothing to persist yet: no interest concepts could be inferred from {output_dir}. "
+                "Run `taxonomy-build` first (it needs concept-extracted videos), then `profile init`."
+            )
+            _profile_init_audience(briefings_dir)
+            return
+        # Atomic write (the house idiom for every corpus artifact): a torn write
+        # here would be permanent, because a malformed profile.yaml is never
+        # overwritten by design. Corpora commonly live on cloud-synced mounts.
+        tmp_path = profile_path.with_suffix(".yaml.tmp")
+        tmp_path.write_text(yaml.safe_dump(profile, sort_keys=False, allow_unicode=True), encoding="utf-8")
+        tmp_path.replace(profile_path)
         print(f"Wrote ranking weights: {profile_path} ({len(profile.get('interest_concepts', {}))} concepts)")
 
-    audience_path = briefings_dir / AUDIENCE_FILENAME
-    if audience_path.exists():
-        print(f"Kept existing reader context: {audience_path} (never overwritten)")
-    else:
-        template = SKILL_DIR / "examples" / AUDIENCE_FILENAME
-        try:
-            audience_path.write_text(template.read_text(encoding="utf-8"), encoding="utf-8")
-        except OSError:
-            log.warning("Could not scaffold %s from the template at %s; author it by hand.", audience_path, template)
-        else:
-            print(f"Scaffolded reader context: {audience_path} (edit it - it is prose for you, not weights)")
-
+    _profile_init_audience(briefings_dir)
     print()
     print("Edit the two files to retune. `profile show` prints the resolved model and these paths.")
 
 
+def _profile_init_audience(briefings_dir: Path) -> None:
+    """Scaffold `audience.md` from the template unless the user already has one.
+
+    Independent of the ranking weights on purpose: the prose profile is useful
+    (and hand-editable) even when there is nothing to infer weights from yet.
+    """
+    audience_path = briefings_dir / AUDIENCE_FILENAME
+    if audience_path.exists():
+        print(f"Kept existing reader context: {audience_path} (never overwritten)")
+        return
+    template = SKILL_DIR / "examples" / AUDIENCE_FILENAME
+    try:
+        tmp_audience = audience_path.with_suffix(".md.tmp")
+        tmp_audience.write_text(template.read_text(encoding="utf-8"), encoding="utf-8")
+        tmp_audience.replace(audience_path)
+    except OSError:
+        log.warning("Could not scaffold %s from the template at %s; author it by hand.", audience_path, template)
+    else:
+        print(f"Scaffolded reader context: {audience_path} (edit it - it is prose for you, not weights)")
+
+
 def cmd_profile(args, config):
     """`profile show` (read-only) / `profile init` (persist, never overwrite)."""
-    output_dir = resolve_output_dir(config)
     if getattr(args, "profile_action", None) == "init":
-        _profile_init(output_dir, config)
+        _profile_init(resolve_output_dir(config), config)
     else:
-        _profile_show(output_dir, config)
+        # create=False: `show` promises zero writes, and the default mkdir would
+        # otherwise create the corpus tree while printing "nothing was written".
+        _profile_show(resolve_output_dir(config, create=False), config)
 
 
 # ---------------------------------------------------------------------------
@@ -8035,7 +8145,9 @@ Examples:
         "profile",
         help="Show or initialize the personalization profile that ranks briefings and the headline digest",
     )
-    profile_actions = profile_parser.add_subparsers(dest="profile_action", required=True)
+    # metavar keeps the error on a bare `profile` readable ("required: {show,init}")
+    # instead of leaking the argparse dest name.
+    profile_actions = profile_parser.add_subparsers(dest="profile_action", required=True, metavar="{show,init}")
     profile_actions.add_parser(
         "show",
         help="Print the resolved interest model, its source, and both file paths (writes nothing)",

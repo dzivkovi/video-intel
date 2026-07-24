@@ -542,8 +542,10 @@ python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" profile init
 persists `profile.yaml`, and it never overwrites either file - including a
 partial or malformed one, since hand-editing is the retune path. There is no
 `profile edit`: editing is opening the file, and `show` prints its path. A
-single weight edit reorders BOTH surfaces, because both read the same compiled
-model. Paths are `output_dir`-relative, so the profile travels with the corpus.
+single weight edit moves BOTH surfaces wherever each has matching evidence
+(a headline moves when a current title carries a recognized phrase; a briefing
+entry moves when the video's concepts.json carries the concept id) - one model,
+one interpretation. Paths are `output_dir`-relative, so the profile travels with the corpus.
 
 When a user asks "why am I seeing this", "what is ranking my briefings", "how do
 I retune my recommendations", or "where is my profile" - run `profile show`

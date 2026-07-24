@@ -462,8 +462,10 @@ def test_render_returns_empty_when_no_eligible_channels(monkeypatch, tmp_path):
     """Zero eligible channels short-circuits before any profile/taxonomy load."""
 
     def _fail_profile(*_a, **_k):
-        pytest.fail("infer_or_load_profile must not be called when there are no eligible channels")
+        pytest.fail("the interest model must not be loaded when there are no eligible channels")
 
-    monkeypatch.setattr("video_intel.infer_or_load_profile", _fail_profile)
+    # Guard the loader the digest actually calls (issue #115). Pointed at
+    # infer_or_load_profile it would pass vacuously, guarding nothing.
+    monkeypatch.setattr("video_intel.load_interest_model", _fail_profile)
     config = {"output_dir": str(tmp_path), "channels": [{"name": "regular", "url": "https://youtube.com/@r"}]}
     assert vi.render_headline_digest(MagicMock(), config, tmp_path, dry_run=True) == []

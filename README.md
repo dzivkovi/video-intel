@@ -411,7 +411,12 @@ python scripts/video_intel.py profile init
 
 `profile show` prints the resolved model, whether it came from disk (`persisted`) or was inferred on the fly (`inferred`), the top weighted concepts and domains, and the on-disk path of both files. It has zero write side effects. `profile init` is the only command that persists `profile.yaml`, and **neither file is ever overwritten** - not even a partial or malformed one, because hand-editing is the retune path and a broken file is still your file. Editing is just opening the file; `show` prints the path.
 
-Until you run `profile init`, ranking still works: a profile is inferred in memory from your scanned channels plus the most-recurring concepts in `taxonomy.json`, used once, and discarded. Persisting it is what makes it *yours* to tune - and because one model feeds both surfaces, a single weight edit reorders your briefings and your headlines together.
+Until you run `profile init`, ranking still works: a profile is inferred in memory from your scanned channels plus the most-recurring concepts in `taxonomy.json`, used once, and discarded. Persisting it is what makes it *yours* to tune. Because one model feeds both surfaces, a single weight edit moves your briefings and your headlines together wherever each has matching evidence: a headline moves when a current title actually carries one of that concept's phrases, a briefing entry moves when the video's own `concepts.json` carries the concept id. Same interpretation of your profile on both sides, applied to whatever evidence each side has.
+
+Two details worth knowing, because they shape what you see:
+
+- **A phrase is paid for once.** Taxonomy aliases are shared between concepts, so a single generic phrase in a title can match several of your interests at once. It scores once, at the highest of those weights, rather than collecting all of them. Two *different* matched phrases still stack, because that is real independent evidence.
+- **A negative weight demotes, it does not filter.** Writing `some.concept: -5` ranks matching items last; they still appear. Nothing in the ranking layer can remove an item from view.
 
 Four properties are deliberate and will not change:
 
