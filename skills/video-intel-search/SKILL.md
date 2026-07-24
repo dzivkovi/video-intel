@@ -24,9 +24,15 @@ description: >
   quote against [creator]'s videos", "did [creator] really say [X]",
   "is this [creator] quote real", "find the source for this [creator]
   claim", "check the corpus for the quote [paraphrase]", any YouTube
-  URL followed by a question about its content. For scanning new
+  URL followed by a question about its content. Also answers questions
+  about the personalization lens itself: "why am I seeing this", "what
+  is ranking my briefings", "show my interest profile", "where is my
+  profile", "what does the digest think I care about" - `profile show`
+  prints the resolved interest model and the paths of the two files
+  that produce it, and writes nothing. For scanning new
   videos, transcribing, generating mindmaps, rebuilding the index,
-  or any write operation on the corpus, use the video-intel skill
+  persisting or initializing the profile, or any write operation on the
+  corpus, use the video-intel skill
   from the plugin repo instead - those operations require channels
   configured and API keys the search skill does not need.
 ---
@@ -116,6 +122,7 @@ python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" search "recent takeawa
 | **"verify [creator] said [paraphrase]"** / **"fact-check this quote"** / **"did [creator] really say [X]"** | **`search "<key noun phrase>" --vector --channel C`** then **`nugget`** if multiple chunks help | **Paraphrase verification is a semantic question, not a keyword question. The speaker's vocabulary likely differs from the paraphrase - vector match catches it where keyword grep misses. Try 2-3 noun-phrase variants if the first returns nothing.** |
 | "recent X from [creator]" | `search "X" --vector --channel C --since Nd` | Pre-filtered date window, no recency bias. |
 | "is this [URL] worth watching" | `search "<title or topic>" --vector` | If indexed, returns evidence; if not, tell the user to run the curate skill to process it. |
+| "why am I seeing this", "what is ranking my briefings", "show my interest profile", "where is my profile", "how do I retune my recommendations" | `profile show` | Read-only. Prints the resolved interest model (source `persisted` vs `inferred`, top weighted concepts/domains) and the on-disk paths of `_briefings/profile.yaml` (ranking weights) and `_briefings/audience.md` (reader-context prose). Writes nothing, needs no `channels:`. To *change* the ranking, point the user at those file paths - editing them is the retune path. |
 | "summarize this video" | `search "<video title>"` | If indexed, open the mindmap path from the result. If not, route to curate. |
 
 Hybrid results include evidence directly - follow-up transcript reads are
@@ -156,6 +163,34 @@ Options:
 - `--no-expand` - disable Stage-1 taxonomy query expansion
 - `--output PATH` - write briefing to file instead of stdout
 
+### See what is ranking the results
+
+```bash
+# Resolved interest model + the paths of the two files behind it (writes nothing)
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" profile show
+```
+
+One compiled interest model ranks both the catch-up briefings and the scan's
+headline digest, built from two files in the corpus:
+
+- `<output_dir>/_briefings/profile.yaml` - machine ranking weights
+  (`interest_concepts: {concept_id: weight}` plus `interest_domains`).
+- `<output_dir>/_briefings/audience.md` - hand-written reader context (persona,
+  pillars, goals, signal/noise) used when authoring a curated topic briefing.
+
+Both are hand-edited to retune, and nothing overwrites them. When a user asks
+why something ranked where it did, run `profile show` and read the answer off
+the model - do not re-derive or invent ranking weights in-session, and do not
+edit either file on the user's behalf unless they ask.
+
+Two states worth reading out loud when they appear:
+
+- `[inferred (ephemeral - not on disk)]` - no profile is persisted yet, so every
+  run infers a throwaway one. Tell the user to run `profile init` from the
+  **video-intel (curate)** skill in the plugin repo; this skill does not write.
+- `[IGNORED - file exists but is empty or unparseable]` - a hand-edit broke the
+  file, so ranking silently fell back to inference. Point at the path to fix.
+
 ### Check corpus status
 
 ```bash
@@ -169,6 +204,8 @@ python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" status
 |-------------|-------|
 | Query existing corpus | **video-intel-search** (this) |
 | Summarize a video already scanned | **video-intel-search** (look up in corpus) |
+| See what is ranking briefings / the headline digest (`profile show`) | **video-intel-search** (this - read-only) |
+| Persist or scaffold the profile (`profile init`) | **video-intel** (curate - it writes files) |
 | Scan YouTube channels for new videos | **video-intel** (curate) |
 | Transcribe a video or local MP4 | **video-intel** (curate) |
 | Rebuild the index, taxonomy, or run dedupe | **video-intel** (curate) |

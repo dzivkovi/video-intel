@@ -62,6 +62,12 @@ SEARCH_TRIGGERS = [
     "really say",
     "quote real",
     "find the source",
+    # Personalization read-side (issue #117): "why am I seeing this" is a query
+    # about the corpus, asked from anywhere - `profile show` writes nothing.
+    "why am i seeing",
+    "ranking my briefings",
+    "show my interest profile",
+    "where is my profile",
 ]
 
 # Phrases that belong to video-intel (ingest/curate intent).
@@ -78,6 +84,10 @@ CURATE_TRIGGERS = [
     "prune shorts",
     "remove shorts",
     "delete youtube shorts",
+    # Personalization write-side (issue #117): `profile init` persists files, so
+    # it stays with curate even though its read-side sibling moved to search.
+    "set up my profile",
+    "persist my profile",
 ]
 
 
@@ -179,4 +189,41 @@ class TestSkillMetadataSanity:
         assert "`grep`" in body, "anti-grep callout missing literal `grep` in backticks in video-intel-search body"
         assert "vocabulary" in body, (
             "anti-grep callout missing 'vocabulary' (the why-it-fails reason) in video-intel-search body"
+        )
+
+
+class TestPersonalizationRoutingSplit:
+    """`profile show` (read-only) is reachable from the search skill; `profile
+    init` (writes) stays curate-only. Issue #117.
+
+    The split is by WRITE SCOPE, not by topic: both commands concern the same
+    two files, so a reader who assumes "personalization lives in one skill"
+    would move one of them and break the read-only guarantee.
+    """
+
+    def test_search_body_offers_profile_show(self):
+        body = _load_body(SEARCH_SKILL)
+        assert "profile show" in body, (
+            "video-intel-search body must offer `profile show` - it is the read-only "
+            "answer to 'why am I seeing this' and needs no channels: (issue #117)"
+        )
+
+    def test_search_body_does_not_offer_profile_init_as_a_command(self):
+        """The read-only skill must never hand the user a writing command."""
+        body = _load_body(SEARCH_SKILL)
+        runnable = [
+            line
+            for line in body.splitlines()
+            if "profile init" in line and "video_intel.py" in line and not line.lstrip().startswith("|")
+        ]
+        assert not runnable, f"video-intel-search offers a runnable `profile init`: {runnable}"
+
+    def test_search_body_routes_profile_init_to_curate(self):
+        """Naming the destination is what makes the split navigable rather than
+        a dead end for a user who asked to set the profile up."""
+        body = _load_body(SEARCH_SKILL)
+        init_rows = [line for line in body.splitlines() if "profile init" in line]
+        assert init_rows, "video-intel-search body must mention `profile init` to route it onward"
+        assert any("video-intel" in row and "curate" in row.lower() for row in init_rows), (
+            f"`profile init` is mentioned but not routed to the curate skill: {init_rows}"
         )
