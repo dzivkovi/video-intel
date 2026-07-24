@@ -222,10 +222,11 @@ def test_select_unseen_drops_unparseable_published():
 
 
 # --------------------------------------------------------------------------
-# infer_or_load_profile
+# Profile inference and resolution (issue #115 moved persistence to `profile
+# init`; these lock the #80 inference contract and the resolve-vs-hand-edit rule)
 # --------------------------------------------------------------------------
-def test_infer_profile_from_taxonomy_and_persists(tmp_path):
-    from video_intel import infer_or_load_profile
+def test_infer_profile_from_taxonomy_and_channels(tmp_path):
+    from video_intel import _infer_profile
 
     (tmp_path / "taxonomy.json").write_text(
         json.dumps(
@@ -240,17 +241,17 @@ def test_infer_profile_from_taxonomy_and_persists(tmp_path):
     )
     config = {"channels": [{"name": "natebjones"}, {"name": "ramjad"}]}
 
-    profile = infer_or_load_profile(tmp_path, config, today=date(2026, 6, 22))
+    profile = _infer_profile(tmp_path, config, today=date(2026, 6, 22))
 
     assert profile["source"] == "inferred"
     assert profile["interest_concepts"]["ai-engineering.agents"] == 10
     assert "natebjones" in profile["channels"]
-    # persisted to _briefings/profile.yaml
-    assert (tmp_path / "_briefings" / "profile.yaml").exists()
+    # Inference alone never touches disk - persisting is `profile init`'s job.
+    assert not (tmp_path / "_briefings").exists()
 
 
-def test_infer_or_load_profile_does_not_overwrite_handedit(tmp_path):
-    from video_intel import infer_or_load_profile
+def test_load_interest_model_does_not_overwrite_handedit(tmp_path):
+    from video_intel import load_interest_model
 
     briefings = tmp_path / "_briefings"
     briefings.mkdir()
@@ -258,9 +259,10 @@ def test_infer_or_load_profile_does_not_overwrite_handedit(tmp_path):
         yaml.safe_dump({"source": "hand", "interest_concepts": {"my.custom": 99}}),
         encoding="utf-8",
     )
-    profile = infer_or_load_profile(tmp_path, {}, today=date(2026, 6, 22))
-    assert profile["source"] == "hand"
-    assert profile["interest_concepts"] == {"my.custom": 99}
+    model = load_interest_model(tmp_path, {}, today=date(2026, 6, 22))
+    assert model.source == "persisted"
+    assert model.raw["source"] == "hand"
+    assert model.weights == {"my.custom": 99}
 
 
 # --------------------------------------------------------------------------
@@ -487,15 +489,16 @@ def test_select_unseen_inverted_window_is_empty():
     assert out == []
 
 
-def test_infer_or_load_profile_preserves_existing_without_interest_concepts(tmp_path):
-    """An existing profile.yaml with content but no interest_concepts is not overwritten."""
-    from video_intel import infer_or_load_profile
+def test_load_interest_model_preserves_existing_without_interest_concepts(tmp_path):
+    """An existing profile.yaml with content but no interest_concepts still wins."""
+    from video_intel import load_interest_model
 
     briefings = tmp_path / "_briefings"
     briefings.mkdir()
     (briefings / "profile.yaml").write_text(yaml.safe_dump({"source": "hand", "channels": ["x"]}), encoding="utf-8")
-    profile = infer_or_load_profile(tmp_path, {}, today=date(2026, 6, 22))
-    assert profile == {"source": "hand", "channels": ["x"]}  # preserved verbatim
+    model = load_interest_model(tmp_path, {}, today=date(2026, 6, 22))
+    assert model.raw == {"source": "hand", "channels": ["x"]}  # preserved verbatim
+    assert model.source == "persisted"
 
 
 def test_render_unseen_briefing_includes_mindmap_links(tmp_path):

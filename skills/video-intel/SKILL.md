@@ -147,6 +147,8 @@ table is the canonical mapping — read it before picking a command.
 | "prune shorts", "remove shorts", "too many shorts in my corpus" | `prune-shorts [--apply]` | **Always `--dry-run` first** — destructive on `--apply`; deletes mindmap/transcript/concepts/meta per Short |
 | "rebuild taxonomy", "update master vocabulary" | `taxonomy-build` | Derived artifact; rebuildable anytime |
 | "catch me up on what I missed", "what haven't I been briefed on", "videos I haven't seen yet", "generate a catch-up briefing", "fill the gaps in my viewing guides", "give me the briefing as a PDF", "a briefing I can open on my phone / share" | `briefings --unseen [--dry-run] [--since DATE] [--until DATE] [--limit N] [--pdf]` | Surfaces corpus videos absent from every existing `_briefings/**/*.md` `video_ids` list, including topic subfolders like `_briefings/sales/` (strict set difference, never re-surfaced once briefed), **across the whole corpus by default (no recency floor)**, ranked by relevance overlap with the inferred profile in `_briefings/profile.yaml` and capped to the top `N` (default 30; `--limit 0` = no cap). Each entry shows an age badge (`age 3y`) and a "By year" appendix regroups the same set chronologically. `--dry-run` previews; otherwise writes `_briefings/<date>-catch-up-unseen.md`. `--pdf` additionally writes a clickable `.pdf` beside it (bold, accent-colored, hyperlinked timestamps; needs the `[pdf]` extra). Pass `--since 30d` (or any date) to *narrow* to a recency floor. No Gemini, no `channels:` required. |
+| "why am I seeing this", "what's ranking my briefings", "show my interest profile", "what does the digest think I care about", "where is my profile", "how do I retune my recommendations" | `profile show` | Read-only. Prints the resolved interest model (source: persisted vs inferred), top weighted concepts/domains, and the on-disk paths of `_briefings/profile.yaml` (ranking weights) + `_briefings/audience.md` (reader-context prose). Writes nothing. One model powers both `briefings --unseen` and the scan headline digest. |
+| "set up my profile", "personalize my briefings", "let me tune what surfaces first", "create my audience profile", "save the inferred profile" | `profile init` | Persists the inferred `_briefings/profile.yaml` and scaffolds `_briefings/audience.md` from the template. **Never overwrites** an existing file (even a partial/malformed one) - hand-editing is the retune path. After it runs, point the user at the two files; there is no `profile edit`. |
 | "build me a briefing on **[topic]**", "what should I know about X", "catch me up on **[topic]**", "make me a curated guide on Y" (a **specific topic**, not the deterministic unseen catch-up) | *In-session curation workflow* (see "Curated topic briefing" below) | NOT a single command. Read `_briefings/audience.md`, gather candidates via `search --vector` across several vocabulary angles, verify mindmaps + exact timestamps, author the editorial structure (lens, watch-these-N, pillars, why-it-matters-to-you, signal/noise) with a `video_ids:` front matter, write to `_briefings/<topic>/`, render with `scripts/markdown_pdf.py`. The assistant authors the judgment; the scripts only supply candidates + render. |
 | "this video keeps getting re-transcribed", "fix identity-less metas", "backfill missing video_id", "meta.json has no video_id" | `repair-metas [--apply]` | **Dry-run first** (issue #66). Reconstructs `video_id`/`url`/`title`/`published` from the `.transcript.md` header for metas missing identity; only fills missing fields; refuses local/non-YouTube sources. Re-run `index --force` after `--apply`. |
 | "skip transcript on this video", "stop trying to transcribe [URL]", "this video keeps failing transcript", "block transcript only" | `mark-skip --url URL --mode transcript [--reason TEXT]` | Per-mode skip (issue #42). Mindmap and concepts continue to run. Repeatable: `--mode transcript --mode concepts`. |
@@ -506,16 +508,49 @@ because a catch-up should surface old-but-missed videos, not hide them. Pass
 are capped to the top `N` by relevance (`--limit`, default 30; `--limit 0` = no
 cap). Uncapped videos stay unseen for the next run, so the cap creates a
 rolling catch-up rather than dropping anything. Ranking is concept/taxonomy
-overlap with an inferred interest profile persisted at `_briefings/profile.yaml`
-(hand-edit to retune; never overwritten once it has content) - recency is only
-a tiebreaker, so an old-but-important video still ranks near the top. Each entry
-carries an age badge (`age 3y`), and a secondary "By year" section at the end
-regroups the same videos chronologically for quick temporal scanning without
-disturbing the relevance order. On a first run against a large corpus with no
-tuned `profile.yaml` yet, a one-line warning suggests previewing with
-`--dry-run` and hand-editing the profile first. No Gemini calls and no
-`channels:` config required. Writes `_briefings/<date>-catch-up-unseen.md`;
-`--dry-run` only prints the ranked unseen set.
+overlap with the interest profile at `_briefings/profile.yaml` (hand-edit to
+retune; never overwritten once it exists) - recency is only a tiebreaker, so an
+old-but-important video still ranks near the top. Each entry carries an age
+badge (`age 3y`), and a secondary "By year" section at the end regroups the same
+videos chronologically for quick temporal scanning without disturbing the
+relevance order. When no `profile.yaml` has been persisted yet, one is inferred
+in memory for the run and discarded - `briefings` itself never writes it, and on
+a first run against a large corpus a one-line warning points at `profile init`.
+No Gemini calls and no `channels:` config required. Writes
+`_briefings/<date>-catch-up-unseen.md`; `--dry-run` only prints the ranked
+unseen set.
+
+### Personalization profile (`profile show` / `profile init`)
+
+Both personalized surfaces - `briefings --unseen` and the scan's headline
+digest - rank from ONE compiled interest model built from two corpus files:
+
+- `<output_dir>/_briefings/profile.yaml` - machine ranking weights
+  (`interest_concepts: {concept_id: weight}` + `interest_domains`).
+- `<output_dir>/_briefings/audience.md` - hand-written reader context (persona,
+  pillars, goals, signal/noise) used when YOU author a curated topic briefing.
+
+```bash
+# Print the resolved model, its source, top concepts/domains, and both paths
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" profile show
+
+# Persist the inferred profile.yaml and scaffold audience.md for hand-editing
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" profile init
+```
+
+`profile show` writes nothing at all. `profile init` is the only command that
+persists `profile.yaml`, and it never overwrites either file - including a
+partial or malformed one, since hand-editing is the retune path. There is no
+`profile edit`: editing is opening the file, and `show` prints its path. A
+single weight edit moves BOTH surfaces wherever each has matching evidence
+(a headline moves when a current title carries a recognized phrase; a briefing
+entry moves when the video's concepts.json carries the concept id) - one model,
+one interpretation. Paths are `output_dir`-relative, so the profile travels with the corpus.
+
+When a user asks "why am I seeing this", "what is ranking my briefings", "how do
+I retune my recommendations", or "where is my profile" - run `profile show`
+first, then point at the file to edit. Never re-derive or hand-write ranking
+weights in-session; the file is the control surface.
 
 **Organizing briefings into topic subfolders is safe and needs no config.**
 `_briefings/` can hold arbitrary subfolders (e.g. `_briefings/sales/`,
@@ -800,8 +835,9 @@ creators you do NOT actively follow. Add `headline_digest: true` alongside
 `enabled: false` and a full `scan` ends with an "Other headlines - new in
 channels you're not actively following" section listing their latest uploads.
 This is metadata-only - NO mindmap/transcript/concepts, NO Gemini calls, NO
-corpus artifacts. Items are ranked by title match against your
-`_briefings/profile.yaml` interests (positive matches first, then a few recent
+corpus artifacts. Items are ranked by title match against the same compiled
+interest model `briefings --unseen` uses (see "Personalization profile" above -
+`_briefings/profile.yaml`; positive matches first, then a few recent
 "Other headlines"), capped at ~10 per run, and a bounded `_headlines/seen.json`
 means a given upload is surfaced once, not every run. The section is skipped on
 focused `scan --channel X` runs (it is a full-scan concept) and on `--dry-run`
