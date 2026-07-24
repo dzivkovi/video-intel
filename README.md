@@ -362,7 +362,7 @@ pip install -e ".[pdf]"
 python scripts/video_intel.py briefings --unseen --pdf
 ```
 
-Each entry carries an **age badge** (`age 3y`), and a secondary **"By year"** section regroups the same videos chronologically - the primary list stays relevance-ranked (recency is only a tiebreaker, so an old-but-important video still surfaces near the top rather than being buried). On a first run against a large corpus with no tuned `profile.yaml` yet, a one-line warning suggests previewing with `--dry-run` and hand-editing the profile first.
+Each entry carries an **age badge** (`age 3y`), and a secondary **"By year"** section regroups the same videos chronologically - the primary list stays relevance-ranked (recency is only a tiebreaker, so an old-but-important video still surfaces near the top rather than being buried). On a first run against a large corpus with no tuned `profile.yaml` yet, a one-line warning points at `profile init`.
 
 **Organizing briefings by topic:** `_briefings/` may hold arbitrary subfolders (e.g. `_briefings/sales/`, `_briefings/observability/`) for manually curated or moved-there briefings. Seen-tracking recurses into them, so a video surfaced in a subfoldered briefing is never re-surfaced. Folder names are a filesystem convention only - there is no per-topic flag or config.
 
@@ -377,6 +377,48 @@ python scripts/markdown_pdf.py _briefings/observability/2026-07-10-ai-observabil
 ```
 
 The curation itself is authored **in-session by the assistant**, not scripted (the script has no reader context and makes no LLM call during triage). Two pieces make it repeatable: a hand-editable **audience profile** ([`examples/audience.md`](examples/audience.md) - copy it to `<output_dir>/_briefings/audience.md` and edit) that holds your standing pillars, current goals, and signal/noise calls (distinct from the machine-scored `profile.yaml`); and a documented **curation workflow** in the video-intel skill (read the profile → gather candidates via `search --vector` across several vocabulary angles → verify mindmaps and exact timestamps → author lens / watch-these-N / pillars / why-it-matters-to-you / signal-noise → render to `_briefings/<topic>/`). The `briefings --topic` convenience that scaffolds the candidate set is tracked in [#91](https://github.com/dzivkovi/video-intel/issues/91).
+
+### Headline digest - peripheral vision over channels you don't follow
+
+Not every creator is worth a Gemini bill. Add `headline_digest: true` alongside `enabled: false` on a channel and a full `scan` ends with an **"Other headlines - new in channels you're not actively following"** section listing their latest uploads: title, channel, date, link. That path is metadata-only - no mindmaps, no transcripts, no concepts, no Gemini calls, and nothing written into the corpus. Items are ranked by title match against your interest profile (positive matches first, then a few recent zero-score headlines), capped at ~10 per run, and a bounded `_headlines/seen.json` means a given upload is surfaced once rather than every run.
+
+```yaml
+channels:
+  - name: someone_i_skim
+    url: https://www.youtube.com/@someone_i_skim
+    enabled: false          # never enters the Gemini pipeline
+    headline_digest: true   # but do show me their new titles
+```
+
+It needs a recognizable YouTube URL or `UC...` channel id (non-YouTube sources like Skool or Vimeo are ignored), it is skipped on focused `scan --channel X` runs because it is a full-scan concept, and there is no standalone `headlines` subcommand - it renders only as the trailing section of a scan.
+
+### Personalization - the two files that decide what surfaces first
+
+Both personalized surfaces above (the catch-up briefing and the headline digest) rank from **one** interest model, compiled from two files that live in your corpus at `<output_dir>/_briefings/` (paths are corpus-relative, so the whole thing travels with the corpus - nothing is machine-specific):
+
+| File | What it is | Who reads it |
+| --- | --- | --- |
+| `profile.yaml` | Machine **ranking weights**: `interest_concepts: {concept_id: weight}` plus `interest_domains`. | `briefings --unseen` (concept overlap from each video's `concepts.json`) and the scan headline digest (title match against each concept's label/aliases). |
+| `audience.md` | Hand-written **reader context**: persona, standing pillars, current goals, what counts as signal vs noise. Prose, not weights. | The assistant, when it authors a *curated* topic briefing ("why it matters to YOU"). |
+
+```bash
+# What is ranking my briefings right now, and where do the files live? (writes nothing)
+python scripts/video_intel.py profile show
+
+# Persist the inferred profile + scaffold the audience notes so you can edit them
+python scripts/video_intel.py profile init
+```
+
+`profile show` prints the resolved model, whether it came from disk (`persisted`) or was inferred on the fly (`inferred`), the top weighted concepts and domains, and the on-disk path of both files. It has zero write side effects. `profile init` is the only command that persists `profile.yaml`, and **neither file is ever overwritten** - not even a partial or malformed one, because hand-editing is the retune path and a broken file is still your file. Editing is just opening the file; `show` prints the path.
+
+Until you run `profile init`, ranking still works: a profile is inferred in memory from your scanned channels plus the most-recurring concepts in `taxonomy.json`, used once, and discarded. Persisting it is what makes it *yours* to tune - and because one model feeds both surfaces, a single weight edit reorders your briefings and your headlines together.
+
+Four properties are deliberate and will not change:
+
+- **Personalization reorders, it never deletes.** A low or zero score ranks an item lower; it never removes it. Zero-score items still render (the briefing's tail, the digest's "Other headlines"), and anything past the cap stays unseen for the next run.
+- **No rank without provenance.** Every ranked item keeps its click-through link, with `&t=` deep-links where a timestamp is known.
+- **Popularity is not corroboration.** How many channels repeated a claim is not a ranking feature. Ten creators reacting to one tweet is one source, not ten.
+- **Base rates stay visible.** Volume/context tables on the analytics surfaces are not removed to make a ranking look cleaner.
 
 ## Prompt Customization
 
