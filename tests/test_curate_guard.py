@@ -6,7 +6,9 @@ message when channels is absent - the failure mode R6a guards against.
 Guard scope (per plan Decision batch):
   - Unconditional in cmd_scan, cmd_concepts, cmd_dedupe
   - Inside the args.channel branch of cmd_mindmap, cmd_transcript, cmd_process
-  - NOT called in cmd_taxonomy_build, cmd_index, cmd_search, cmd_nugget, cmd_status
+  - NOT called in cmd_taxonomy_build, cmd_index, cmd_search, cmd_nugget, cmd_status,
+    cmd_profile (issue #117: `profile show` is routed from the globally
+    installable read-only search skill, which has no `channels:`)
 """
 
 from __future__ import annotations
@@ -213,3 +215,32 @@ class TestLooseFileGuardScope:
 
         with pytest.raises(GuardCalled):
             vi.cmd_mindmap(args, config)
+
+
+class TestProfileNeedsNoChannels:
+    """`profile` reads output_dir only, so it must work under the user-level
+    minimal config (`~/.video-intel/config.yaml`) that the globally installed
+    search skill uses - no `channels:` present (issue #117).
+    """
+
+    @staticmethod
+    def _no_guard(monkeypatch):
+        def _sentinel(_config):
+            raise AssertionError("cmd_profile must not require channels: - the search skill has none")
+
+        monkeypatch.setattr(vi, "require_channels_config", _sentinel)
+
+    def test_cmd_profile_show_does_NOT_call_guard(self, monkeypatch, tmp_path, capsys):
+        import argparse
+
+        self._no_guard(monkeypatch)
+        vi.cmd_profile(argparse.Namespace(profile_action="show"), {"output_dir": str(tmp_path)})
+        assert "Personalization profile" in capsys.readouterr().out
+
+    def test_cmd_profile_init_does_NOT_call_guard(self, monkeypatch, tmp_path):
+        """init writes, so it stays curate-routed - but the reason is write scope,
+        not a channels dependency. It must not fail on a channels-less config."""
+        import argparse
+
+        self._no_guard(monkeypatch)
+        vi.cmd_profile(argparse.Namespace(profile_action="init"), {"output_dir": str(tmp_path)})
