@@ -73,7 +73,7 @@ video-intel/                          ← plugin root (git repo root)
 ├── .claude-plugin/plugin.json        ← plugin manifest (name, version, skill list)
 ├── skills/
 │   ├── video-intel/SKILL.md          ← curate: scan / transcript / mindmap / process / index / dedupe / concepts / taxonomy-build
-│   ├── video-intel-search/SKILL.md   ← read-only query: search / nugget / status (globally installable)
+│   ├── video-intel-search/SKILL.md   ← read-only query: search / nugget / status / profile show (globally installable)
 │   └── translate-bcs/SKILL.md        ← BCS subtitle translation
 ├── scripts/                          ← shared by all skills
 ├── prompts/                          ← shared by all skills

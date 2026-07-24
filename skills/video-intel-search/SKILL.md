@@ -44,7 +44,7 @@ skill, which builds and maintains the corpus from the plugin repo.
 
 ## What This Skill Does
 
-Three commands against the pre-built corpus:
+Four read-only commands against the pre-built corpus:
 
 1. **`search`** - find videos and transcript passages by concept, keyword, or
    semantic similarity. Two modes: concept (fast, no API calls, returns video
@@ -57,6 +57,10 @@ Three commands against the pre-built corpus:
 
 3. **`status`** - report on corpus freshness (last scan per channel, video
    counts, taxonomy size). No API calls.
+
+4. **`profile show`** - print the personalization lens that ranks briefings and
+   the headline digest (the resolved interest model and the paths of the two
+   files behind it). Writes nothing, needs no `channels:`.
 
 ## Portability
 

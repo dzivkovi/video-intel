@@ -19,6 +19,7 @@ import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+VIDEO_INTEL_PY = REPO_ROOT / "scripts" / "video_intel.py"
 SEARCH_SKILL = REPO_ROOT / "skills" / "video-intel-search" / "SKILL.md"
 CURATE_SKILL = REPO_ROOT / "skills" / "video-intel" / "SKILL.md"
 
@@ -153,6 +154,43 @@ class TestSkillMetadataSanity:
         data = yaml.safe_load(frontmatter_yaml)
         assert data["name"] == "video-intel"
 
+    def test_quoted_profile_states_match_what_the_code_emits(self):
+        """The search skill tells the assistant to read two `profile show` states
+        verbatim. Those strings live in `_profile_show`, so prose and code can
+        drift silently - a skill telling Claude to look for a string the code
+        stopped printing is a doc that quietly stops working."""
+        skill = _load_body(SEARCH_SKILL)
+        code = VIDEO_INTEL_PY.read_text(encoding="utf-8")
+        for state in ("inferred (ephemeral - not on disk)", "IGNORED - file exists but is empty or unparseable"):
+            assert state in skill, f"video-intel-search body no longer names the {state!r} state"
+            assert state in code, (
+                f"video-intel-search quotes the state {state!r} but scripts/video_intel.py no longer emits it"
+            )
+
+    def test_curate_body_bounces_profile_show_to_search_skill(self):
+        """Mirrors the KD6 bounce pattern: the pointer lives in the curate BODY,
+        never its description. A bounce sentence in the description would inject
+        read-side vocabulary into the write-side routing surface - the exact
+        collision the description mutex exists to prevent."""
+        body = _load_body(CURATE_SKILL)
+        rows = [line for line in body.splitlines() if "profile show" in line]
+        assert rows, "curate body must still document `profile show`"
+        assert any("video-intel-search" in row for row in rows), (
+            "curate body's `profile show` row no longer names video-intel-search - "
+            "a user in the plugin repo loses the pointer to the portable read-only path"
+        )
+
+    def test_curate_description_carries_no_read_side_profile_vocabulary(self):
+        """Belt-and-braces on the near-miss found in review: the curate
+        description said "what is ranking your briefings", one pronoun away from
+        the search trigger "ranking my briefings"."""
+        description = _load_description(CURATE_SKILL).lower()
+        for phrase in ("ranking your briefings", "ranking my briefings", "why am i seeing"):
+            assert phrase not in description, (
+                f"read-side phrase '{phrase}' leaked into the curate description; "
+                "bounce text belongs in the body (see test_curate_skill_routes_verify_intent_to_search_skill)"
+            )
+
     def test_curate_skill_routes_verify_intent_to_search_skill(self):
         """KD6: curate-skill 'Wrong skill' row bounces verification queries.
 
@@ -209,14 +247,25 @@ class TestPersonalizationRoutingSplit:
         )
 
     def test_search_body_does_not_offer_profile_init_as_a_command(self):
-        """The read-only skill must never hand the user a writing command."""
+        """The read-only skill must never hand the user a writing command.
+
+        Semantic, not format-coupled (review finding): any line that mentions
+        `profile init` is allowed ONLY if it also routes the user onward to the
+        curate skill. A line that pairs `profile init` with a runnable invocation
+        (`video_intel.py`) and does NOT name the destination is the regression -
+        whether it is a fenced block, a table row, or prose.
+        """
         body = _load_body(SEARCH_SKILL)
-        runnable = [
+        offending = [
             line
             for line in body.splitlines()
-            if "profile init" in line and "video_intel.py" in line and not line.lstrip().startswith("|")
+            if "profile init" in line
+            and "video_intel.py" in line
+            and "video-intel" not in line.replace("video-intel-search", "")  # the curate skill name
         ]
-        assert not runnable, f"video-intel-search offers a runnable `profile init`: {runnable}"
+        assert not offending, (
+            f"video-intel-search presents a runnable `profile init` without routing to curate: {offending}"
+        )
 
     def test_search_body_routes_profile_init_to_curate(self):
         """Naming the destination is what makes the split navigable rather than

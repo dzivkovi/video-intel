@@ -299,7 +299,7 @@ Two structural changes you should know about:
 
 2. **Skill split into three.** The single `video-intel` skill is now two:
    `video-intel` (ingest / curate — scan, transcribe, index, dedupe) and
-   `video-intel-search` (read-only query — search, nugget, status).
+   `video-intel-search` (read-only query — search, nugget, status, profile show).
    `translate-bcs` is unchanged. After `git pull`, close and reopen Claude
    Code to pick up the new skill registration; both skills auto-discover
    from `.claude/settings.json` as before.

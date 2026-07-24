@@ -26,9 +26,7 @@ description: >
   Gemini fails", "this channel keeps hanging", "fix identity-less metas",
   "backfill missing video_id", "this video keeps getting re-transcribed",
   "set up my profile", "persist my profile", "personalize my briefings",
-  "save the inferred profile", "create my audience profile". To only SEE
-  what is ranking your briefings without changing anything, the read-only
-  video-intel-search skill answers that with `profile show`.
+  "save the inferred profile", "create my audience profile".
   Requires GEMINI_API_KEY, YOUTUBE_API_KEY, and
   `channels:` configured in config.yaml - this skill must run from the
   plugin repo checkout, not a globally-installed cache. Calls Gemini as
