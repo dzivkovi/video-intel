@@ -368,6 +368,11 @@ def _stub_url_env(monkeypatch, tmp_path, *, duration=1800):
     monkeypatch.setattr(video_intel, "load_prompt", lambda name: f"prompt-for-{name}")
     monkeypatch.setattr(video_intel, "load_taxonomy", lambda *_a, **_kw: {"concepts": {}})
     monkeypatch.setattr(video_intel, "_lookup_video_duration_seconds", lambda *_a, **_kw: duration)
+    # Issue #120 hermeticity: the manual --url paths classify the video via
+    # _lookup_was_livestream, which hits youtube.googleapis.com. Its broad
+    # except fails safe to False, so an unstubbed test still PASSES while
+    # silently making a live network call. Pin it.
+    monkeypatch.setattr(video_intel, "_lookup_was_livestream", lambda *_a, **_kw: False)
 
 
 class TestCmdProcessUrlInversion:
@@ -782,6 +787,7 @@ class TestTitleRotationFix:
             "_lookup_video_duration_seconds",
             lambda *_a, **_kw: 600,
         )
+        monkeypatch.setattr(video_intel, "_lookup_was_livestream", lambda *_a, **_kw: False)
 
         fake_youtube = MagicMock()
         fake_youtube.videos.return_value.list.return_value.execute.return_value = {

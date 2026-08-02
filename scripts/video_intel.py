@@ -3070,6 +3070,7 @@ def _try_captions_transcript(
     reason: str | None = None,
     start_offset: int | None = None,
     end_offset: int | None = None,
+    force: bool = False,
 ) -> tuple[str, str] | None:
     """Build a transcript from the YouTube English caption track (issue #60).
 
@@ -3084,9 +3085,21 @@ def _try_captions_transcript(
     ``start_offset``/``end_offset`` (seconds) clip the caption snippets to
     ``[start, end)`` so ``--start``/``--end`` segments behave like the Gemini
     path instead of silently transcribing the whole video.
+
+    Idempotency lives HERE, not in the callers. An existing transcript is
+    returned as ``None`` (no write, no caption fetch) unless ``force``. This
+    used to be safe to leave to callers because captions only ever ran after a
+    Gemini attempt that had already made the exists-check; issue #120's
+    captions-first routing moved it ahead of that check on the chunked paths,
+    where an unguarded call would silently replace a good multimodal transcript
+    (SCREEN sections, diarization) with a speech-only one on a plain re-run.
+    Every call site threads its own ``force`` so the policy is stated once.
     """
     video_id = video.get("video_id")
     if not video_id:
+        return None
+    if transcript_path.exists() and not force:
+        log.info("  %s: transcript already on disk; leaving it alone (pass --force to replace)", prefix)
         return None
     captions = fetch_english_captions(video_id)
     if captions is None:
@@ -3175,7 +3188,7 @@ def process_transcript(
     # speech-only). Fails when no captions exist - the caller chose this source.
     if transcript_source == "yt-captions":
         captioned = _try_captions_transcript(
-            video, transcript_path, meta_path, prefix, start_offset=start_offset, end_offset=end_offset
+            video, transcript_path, meta_path, prefix, start_offset=start_offset, end_offset=end_offset, force=force
         )
         if captioned is not None:
             return captioned
@@ -3199,6 +3212,7 @@ def process_transcript(
             reason=LIVESTREAM_CAPTIONS_FIRST_REASON,
             start_offset=start_offset,
             end_offset=end_offset,
+            force=force,
         )
         if captioned is not None:
             return captioned
@@ -3276,6 +3290,7 @@ def process_transcript(
                     reason=f"gemini error: {e}",
                     start_offset=start_offset,
                     end_offset=end_offset,
+                    force=force,
                 )
                 if fb is not None:
                     return fb
@@ -3300,6 +3315,7 @@ def process_transcript(
                     reason="gemini prompt=0 (confabulation)",
                     start_offset=start_offset,
                     end_offset=end_offset,
+                    force=force,
                 )
                 if fb is not None:
                     return fb
@@ -3403,6 +3419,7 @@ def process_transcript(
             reason=f"gemini parse failure: {parse_error}",
             start_offset=start_offset,
             end_offset=end_offset,
+            force=force,
         )
         if fb is not None:
             return fb
@@ -3797,7 +3814,6 @@ def cmd_scan(args, config):
             raise
         kept = []
         n_preflight = 0
-        n_livestream = 0
         for v in videos:
             status = statuses.get(v["video_id"], {})
             reason = preflight_skip_reason(status)
@@ -3810,10 +3826,19 @@ def cmd_scan(args, config):
                 # without a second API call.
                 v["was_livestream"] = bool(status.get("was_livestream"))
                 if v["was_livestream"]:
-                    n_livestream += 1
+                    # One line PER VIDEO, not an aggregate count. YouTube attaches
+                    # liveStreamingDetails to aired PREMIERES of ordinary uploads
+                    # exactly as it does to genuine livestreams, and exposes no
+                    # field that separates them - so this flag can misfire, and a
+                    # premiere-every-upload channel would quietly slide to
+                    # captions-only transcripts. Naming each video makes that
+                    # auditable from the scan log instead of invisible.
+                    log.info(
+                        '  Livestream/premiere VOD, routing captions-first: %s "%s"',
+                        v["video_id"],
+                        v.get("title", ""),
+                    )
                 kept.append(v)
-        if n_livestream:
-            log.info("  Pre-flight: %d completed livestream VOD(s) will route captions-first.", n_livestream)
         if n_preflight:
             log.info("  Pre-flight: skipped %d not-yet-aired/non-public video(s).", n_preflight)
         videos = kept
@@ -4577,9 +4602,15 @@ def cmd_transcript(args, config):
         # Issue #120: the manual path has no scan pre-flight to inherit the flag
         # from, so classify this one id (1 quota unit, same helper as the scan).
         # A local --file has no YouTube identity to classify, so it stays False.
-        was_livestream = _lookup_was_livestream(video["video_id"])
-        if was_livestream:
-            log.info("  Completed livestream VOD; routing captions-first (issue #120).")
+        # Gated on the exists/force check that every writer downstream makes
+        # anyway: a no-op re-run must not spend a YouTube quota unit to compute
+        # a flag nothing will act on.
+        if (channel_dir / f"{prefix}.transcript.md").exists() and not args.force:
+            was_livestream = False
+        else:
+            was_livestream = _lookup_was_livestream(video["video_id"])
+            if was_livestream:
+                log.info("  Completed livestream/premiere VOD; routing captions-first (issue #120).")
         log.info("Transcribing: %s", video["url"])
 
     # Issue #50: chunked transcript path. Auto-trigger when (a) caller is the
@@ -4608,6 +4639,7 @@ def cmd_transcript(args, config):
                     channel_dir / f"{prefix}.meta.json",
                     prefix,
                     reason=LIVESTREAM_CAPTIONS_FIRST_REASON,
+                    force=args.force,
                 )
                 if fb is not None:
                     _, captions_status = fb
@@ -4648,6 +4680,7 @@ def cmd_transcript(args, config):
                     channel_dir / f"{prefix}.meta.json",
                     prefix,
                     reason=f"chunked transcript failed: {status}",
+                    force=args.force,
                 )
                 if fb is not None:
                     _, status = fb
@@ -4820,12 +4853,19 @@ def _cmd_process_url(args, config):
     transcript_source = resolve_transcript_source(channel_cfg, getattr(args, "transcript_source", None))
 
     duration_seconds = _lookup_video_duration_seconds(video_id)
-    # Issue #120: classify this one id (1 quota unit) so the manual --url path
-    # routes a completed livestream VOD the same way the scan does.
-    was_livestream = _lookup_was_livestream(video_id)
-    if was_livestream:
-        log.info("  Completed livestream VOD; routing captions-first (issue #120).")
     transcript_path = channel_dir / f"{prefix}.transcript.md"
+    # Issue #120: classify this one id (1 quota unit) so the manual --url path
+    # routes a completed livestream VOD the same way the scan does. Gated on the
+    # same exists/force check every writer downstream makes, so a no-op re-run
+    # does not spend a quota unit on a flag nothing will act on. (When the
+    # transcript is already on disk the Step 2 resolver picks source=transcript,
+    # which the livestream mindmap block never applies to.)
+    if transcript_path.exists() and not args.force:
+        was_livestream = False
+    else:
+        was_livestream = _lookup_was_livestream(video_id)
+        if was_livestream:
+            log.info("  Completed livestream/premiere VOD; routing captions-first (issue #120).")
 
     # Step 1/3: transcript (chunked if long, per PR #51 path).
     # Review K1: catch any uncaught exception so the mindmap step (the AI's
@@ -4850,6 +4890,7 @@ def _cmd_process_url(args, config):
                     channel_dir / f"{prefix}.meta.json",
                     prefix,
                     reason=LIVESTREAM_CAPTIONS_FIRST_REASON,
+                    force=args.force,
                 )
                 if was_livestream
                 else None
@@ -4889,6 +4930,7 @@ def _cmd_process_url(args, config):
                         channel_dir / f"{prefix}.meta.json",
                         prefix,
                         reason=f"chunked transcript failed: {transcript_status}",
+                        force=args.force,
                     )
                     if fb is not None:
                         _, transcript_status = fb

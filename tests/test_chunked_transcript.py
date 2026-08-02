@@ -449,6 +449,7 @@ class TestCmdTranscriptUrlChunking:
             "_lookup_video_duration_seconds",
             lambda *_a, **_kw: 1800,  # 30 min
         )
+        monkeypatch.setattr(vi, "_lookup_was_livestream", lambda *_a, **_kw: False)
 
         chunk_calls = _stub_gemini_calls(
             monkeypatch,
@@ -477,6 +478,7 @@ class TestCmdTranscriptUrlChunking:
         monkeypatch.setattr(vi, "resolve_output_dir", lambda _cfg: tmp_path)
         monkeypatch.setattr(vi, "load_prompt", lambda *_a, **_kw: "transcript prompt")
         monkeypatch.setattr(vi, "_lookup_video_duration_seconds", lambda *_a, **_kw: 11752)
+        monkeypatch.setattr(vi, "_lookup_was_livestream", lambda *_a, **_kw: False)
 
         chunk_response_template = {"transcripts": [], "speakers": [{"voice": 1, "name": "S"}], "screen_content": []}
         chunk_calls = _stub_gemini_calls(
@@ -513,6 +515,7 @@ class TestCmdTranscriptUrlChunking:
         monkeypatch.setattr(vi, "resolve_output_dir", lambda _cfg: tmp_path)
         monkeypatch.setattr(vi, "load_prompt", lambda *_a, **_kw: "transcript prompt")
         monkeypatch.setattr(vi, "_lookup_video_duration_seconds", lambda *_a, **_kw: 7200)
+        monkeypatch.setattr(vi, "_lookup_was_livestream", lambda *_a, **_kw: False)
 
         responses = [
             {
@@ -598,6 +601,7 @@ class TestCmdProcessUrl:
         monkeypatch.setattr(vi, "load_prompt", lambda *_a, **_kw: "prompt")
         monkeypatch.setattr(vi, "load_taxonomy", lambda *_a, **_kw: {"concepts": {}})
         monkeypatch.setattr(vi, "_lookup_video_duration_seconds", lambda *_a, **_kw: 1800)
+        monkeypatch.setattr(vi, "_lookup_was_livestream", lambda *_a, **_kw: False)
 
         calls = {"mindmap": 0, "transcript": 0, "concepts": 0}
 
@@ -650,6 +654,7 @@ class TestCmdProcessUrl:
         monkeypatch.setattr(vi, "load_prompt", lambda *_a, **_kw: "prompt")
         monkeypatch.setattr(vi, "load_taxonomy", lambda *_a, **_kw: {"concepts": {}})
         monkeypatch.setattr(vi, "_lookup_video_duration_seconds", lambda *_a, **_kw: 11752)
+        monkeypatch.setattr(vi, "_lookup_was_livestream", lambda *_a, **_kw: False)
 
         # Mindmap stub - writes a fake artifact so concepts step finds something
         def fake_mindmap(*args, **kwargs):

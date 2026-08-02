@@ -330,6 +330,109 @@ class TestLivestreamTranscriptRouting:
 
 
 # ---------------------------------------------------------------------------
+# Idempotency: captions-first must never clobber an existing transcript
+# ---------------------------------------------------------------------------
+
+
+_EXISTING_BYTES = "# Transcript: the good multimodal one\n\n[00:00] SCREEN: slide with the architecture diagram\n"
+
+
+class TestCaptionsFirstIdempotency:
+    """Captions-first runs BEFORE the Gemini exists-check on the chunked paths.
+
+    Without a guard in the shared writer, a plain re-run of a livestream VOD
+    that already has a chunked multimodal transcript (SCREEN sections,
+    diarization) silently replaces it with a speech-only captions transcript.
+    That is exactly the command class docs/troubleshooting.md prescribes for
+    confabulated-mindmap recovery ("land a transcript FIRST..."), so the
+    overwrite would destroy the artifact the recovery just produced.
+    """
+
+    def test_existing_transcript_is_left_alone_without_force(self, tmp_path, monkeypatch):
+        fetches: list[str] = []
+        _stub_captions(monkeypatch, CaptionsResult([(0.0, "speech only")], True, "en"), fetches=fetches)
+        prefix = "2026-07-23-already-done"
+        tpath = tmp_path / f"{prefix}.transcript.md"
+        tpath.write_text(_EXISTING_BYTES, encoding="utf-8")
+
+        result = vi._try_captions_transcript(
+            _video(),
+            tpath,
+            tmp_path / f"{prefix}.meta.json",
+            prefix,
+            reason=vi.LIVESTREAM_CAPTIONS_FIRST_REASON,
+        )
+
+        assert result is None, "an existing transcript must take the None (skip) path"
+        assert tpath.read_text(encoding="utf-8") == _EXISTING_BYTES
+        assert fetches == [], "no caption fetch either - the skip precedes the network call"
+
+    def test_force_does_replace_the_existing_transcript(self, tmp_path, monkeypatch):
+        _stub_captions(monkeypatch, CaptionsResult([(0.0, "speech only")], True, "en"))
+        prefix = "2026-07-23-already-done"
+        tpath = tmp_path / f"{prefix}.transcript.md"
+        tpath.write_text(_EXISTING_BYTES, encoding="utf-8")
+
+        result = vi._try_captions_transcript(
+            _video(),
+            tpath,
+            tmp_path / f"{prefix}.meta.json",
+            prefix,
+            reason=vi.LIVESTREAM_CAPTIONS_FIRST_REASON,
+            force=True,
+        )
+
+        assert result is not None
+        assert tpath.read_text(encoding="utf-8") != _EXISTING_BYTES
+        assert "speech only" in tpath.read_text(encoding="utf-8")
+
+    def test_cmd_transcript_chunked_rerun_does_not_clobber(self, tmp_path, monkeypatch):
+        """End-to-end on the chunked branch: the real repro shape (a long
+        livestream VOD with a good transcript already on disk, re-run without
+        --force). Pre-change this path called captions-first ahead of
+        _run_chunked_transcript_url's own 'skipped (exists)' check."""
+        calls: list[str] = []
+        fetches: list[str] = []
+        monkeypatch.setenv("GEMINI_API_KEY", "test")
+        monkeypatch.setattr(vi, "require_gemini", lambda: (None, None))
+        monkeypatch.setattr(vi, "create_client", lambda *a, **kw: None)
+        monkeypatch.setattr(vi, "_lookup_was_livestream", lambda vid: True)
+        monkeypatch.setattr(vi, "_lookup_video_duration_seconds", lambda vid: 6600)  # 1h50m -> chunked
+        _stub_gemini(monkeypatch, calls=calls)
+        _stub_captions(monkeypatch, CaptionsResult([(0.0, "speech only")], True, "en"), fetches=fetches)
+
+        output_dir = tmp_path / "corpus"
+        video = {"video_id": "ihM91WWU0lE", "title": "Live QA", "published": "2026-07-23"}
+        prefix = vi.video_file_prefix(video)
+        channel_dir = output_dir / "somechannel"
+        channel_dir.mkdir(parents=True)
+        tpath = channel_dir / f"{prefix}.transcript.md"
+        tpath.write_text(_EXISTING_BYTES, encoding="utf-8")
+
+        args = Namespace(
+            url="https://www.youtube.com/watch?v=ihM91WWU0lE",
+            file=None,
+            channel="somechannel",
+            title="Live QA",
+            date="2026-07-23",
+            start=None,
+            end=None,
+            force=False,
+            model=None,
+            media_resolution="low",
+            transcript_source=None,
+            chunk_minutes=None,
+            video_id=None,
+        )
+        vi.cmd_transcript(args, {"output_dir": str(output_dir)})
+
+        assert tpath.read_text(encoding="utf-8") == _EXISTING_BYTES, (
+            "a no-force re-run must not replace a multimodal transcript with a captions one"
+        )
+        assert calls == [], "and it must not spend a Gemini call either"
+
+
+# ---------------------------------------------------------------------------
 # (c) regular uploads keep EXACTLY current routing
 # ---------------------------------------------------------------------------
 
