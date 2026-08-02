@@ -1074,8 +1074,16 @@ class TestAutoMindmapNone:
         }
         vi.cmd_scan(_scan_args(), config)
 
+        # was_livestream is stamped on every kept video by the issue #120
+        # pre-flight pass; False here means "regular upload, routing unchanged".
         assert captured["mindmaps"] == [
-            {"video_id": "v1", "title": "t1", "published": "2026-04-15", "duration_iso": "PT10M"}
+            {
+                "video_id": "v1",
+                "title": "t1",
+                "published": "2026-04-15",
+                "duration_iso": "PT10M",
+                "was_livestream": False,
+            }
         ]
 
 

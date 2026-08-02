@@ -60,6 +60,11 @@ DEFAULT_MODEL = "gemini-3-flash-preview"
 MAX_OUTPUT_TOKENS = 65536
 TRANSCRIPT_PARSE_RETRY_LIMIT = 1
 SALVAGE_MIN_SPEECH_ENTRIES = 5
+# Issue #120: completed-livestream VODs route captions-first. These two strings
+# are part of the contract (meta.json provenance + the scan status line), so
+# they live next to the other transcript constants rather than inline.
+LIVESTREAM_CAPTIONS_FIRST_REASON = "completed livestream VOD: captions-first routing (issue #120)"
+LIVESTREAM_MINDMAP_SKIP_STATUS = "skipped (livestream VOD: transcript failed; mindmap-from-video not attempted)"
 KEYWORD_MAX_PAGES = 4  # 200 results max per keyword, 400 quota units
 LARGE_FILE_THRESHOLD_BYTES = (
     1024 * 1024 * 1024
@@ -658,28 +663,110 @@ def enrich_with_durations(youtube, video_ids: list[str]) -> dict[str, str | None
     return durations
 
 
-def fetch_preflight_status(youtube, video_ids: list[str]) -> dict[str, dict]:
-    """Fetch per-video liveBroadcastContent + privacyStatus (issue #70).
+def _is_completed_livestream(item: dict) -> bool:
+    """True when a videos.list item is a finished livestream VOD (issue #120).
 
-    Batches 50 ids per call - 1 quota unit per batch, the same cost as
-    ``enrich_with_durations`` (parts are free), so this is cheap to run on
-    every scan. Returns ``{video_id: {"live_broadcast_content": str|None,
-    "privacy_status": str|None}}``. Ids missing from the response (deleted,
-    gated) map to an empty dict so the caller's fail-safe keeps them - a
-    missing status is never a positive skip signal.
+    Two conditions, both required: the video carries ``liveStreamingDetails``
+    (YouTube only attaches that resource to broadcasts), and it is not still
+    ``upcoming``/``live`` - a scheduled premiere also carries the resource, but
+    it has not aired and is skipped by ``preflight_skip_reason`` instead. A
+    missing ``liveBroadcastContent`` is treated as "not a live broadcast now",
+    which matches YouTube's own ``none`` default.
+    """
+    if not item.get("liveStreamingDetails"):
+        return False
+    return item.get("snippet", {}).get("liveBroadcastContent") not in ("upcoming", "live")
+
+
+def fetch_preflight_status(youtube, video_ids: list[str]) -> dict[str, dict]:
+    """Fetch per-video liveBroadcastContent + privacyStatus + was_livestream.
+
+    Issue #70 established the first two fields; issue #120 added
+    ``was_livestream`` by asking the SAME call for one more part
+    (``liveStreamingDetails``) - parts are free, so this is still 1 quota unit
+    per 50-id batch and there is no extra API round-trip.
+
+    Returns ``{video_id: {"live_broadcast_content": str|None,
+    "privacy_status": str|None, "was_livestream": bool}}``. Ids missing from
+    the response (deleted, gated) map to an empty dict so the caller's
+    fail-safe keeps them - a missing status is never a positive skip signal,
+    and ``.get("was_livestream")`` on it is falsy, so an unknown video keeps
+    today's routing.
     """
     result: dict[str, dict] = {vid: {} for vid in video_ids}
     if not video_ids:
         return result
     for i in range(0, len(video_ids), 50):
         batch = video_ids[i : i + 50]
-        resp = youtube.videos().list(id=",".join(batch), part="snippet,status").execute()
+        resp = youtube.videos().list(id=",".join(batch), part="snippet,status,liveStreamingDetails").execute()
         for item in resp.get("items", []):
             result[item["id"]] = {
                 "live_broadcast_content": item.get("snippet", {}).get("liveBroadcastContent"),
                 "privacy_status": item.get("status", {}).get("privacyStatus"),
+                "was_livestream": _is_completed_livestream(item),
             }
     return result
+
+
+def _lookup_was_livestream(video_id: str) -> bool:
+    """Classify a single video as a completed-livestream VOD (issue #120).
+
+    The manual ``--url`` commands have no scan pre-flight to inherit the flag
+    from, so they pay one YouTube quota unit here and route through the same
+    ``fetch_preflight_status`` helper the scan uses - exactly one place knows
+    how ``liveStreamingDetails`` maps to the flag. Returns False (today's
+    routing) when there is no API key or the lookup fails: an absent signal
+    must never become a positive livestream signal.
+    """
+    yt_key = os.environ.get("YOUTUBE_API_KEY")
+    if not yt_key:
+        return False
+    try:
+        yt_build = require_youtube()
+        yt = yt_build("youtube", "v3", developerKey=yt_key)
+        return bool(fetch_preflight_status(yt, [video_id]).get(video_id, {}).get("was_livestream"))
+    except Exception as e:
+        log.warning("Could not classify livestream status for %s: %s", video_id, e)
+        return False
+
+
+def should_skip_video_mindmap_for_livestream(
+    *,
+    was_livestream: bool,
+    resolved_source: str,
+    transcript_status: str | None,
+) -> bool:
+    """Whether a mindmap-from-video call must NOT be spent (issue #120).
+
+    Fires only when all three hold: the video is a completed livestream VOD,
+    the mindmap resolver landed on ``"video"`` (no transcript on disk), and a
+    transcript attempt for this video actually FAILED in this run. That last
+    condition is what keeps the rule narrow: a failed attempt is direct
+    evidence that Gemini cannot ingest this URI, so a mindmap-from-video call
+    against the same URI would hard-fail or confabulate the same way. When no
+    transcript was attempted (``transcript_status is None`` - e.g.
+    ``auto_transcript: none``, or the long-video guard filtered it out), the
+    URI was never proven broken and today's routing is preserved.
+    """
+    if not was_livestream or resolved_source != "video":
+        return False
+    return transcript_status is not None and transcript_status.startswith("error")
+
+
+def _log_livestream_recovery_recipe(video: dict, channel_name: str) -> None:
+    """Loud WARNING + the local-file recovery recipe (issue #120).
+
+    Mirrors the members-only 403 recipe in ``cmd_scan``: the operator gets the
+    two commands to run without leaving the scan log to read documentation.
+    """
+    log.warning(
+        "      -> Livestream VOD %s: no captions and the Gemini transcript attempt failed. "
+        "NOT spending a mindmap-from-video call against the same URI (issue #120).",
+        video.get("video_id", "?"),
+    )
+    log.warning("         To recover: save the MP4 as %s.mp4 in any folder, then run:", video.get("video_id", "?"))
+    log.warning("           python scripts/video_intel.py transcript --file <PATH> --channel %s", channel_name)
+    log.warning("           python scripts/video_intel.py mindmap    --file <PATH> --channel %s", channel_name)
 
 
 def preflight_skip_reason(status: dict) -> str | None:
@@ -3045,6 +3132,7 @@ def process_transcript(
     media_resolution=None,
     transcript_source: str = "gemini",
     transcript_timeout_seconds: int = TRANSCRIPT_TIMEOUT_DEFAULT,
+    was_livestream: bool = False,
 ):
     """Generate a fused transcript for a single video with layered JSON resilience.
 
@@ -3060,6 +3148,11 @@ def process_transcript(
     (e.g. a Gemini Files API URI for locally-uploaded MP4s) while video["url"]
     stays the canonical YouTube URL used in the transcript header and meta.json.
     When media_uri is not set, video["url"] is used for both.
+
+    ``was_livestream`` (issue #120) marks a completed livestream VOD. Those fail
+    Gemini's YouTube-URI ingestion far more often than regular uploads, so they
+    route captions-FIRST regardless of ``transcript_source``, and a captionless
+    one gets exactly ONE guarded Gemini attempt (no parse retry) instead of two.
     """
     channel_dir.mkdir(parents=True, exist_ok=True)
 
@@ -3079,6 +3172,31 @@ def process_transcript(
             return captioned
         _record_transcript_error(meta_path, "no English captions available (transcript_source=yt-captions)")
         return prefix, "error: no captions available (yt-captions)"
+
+    # Issue #120: completed-livestream VODs go to captions FIRST, whatever the
+    # channel's transcript_source says. Empirically their YouTube-URI ingestion
+    # breaks at a wholly different rate than regular uploads (10 of 22 vs 0 of
+    # 377 in the 2026-07-24 corpus sample), either hard-failing with a generic
+    # 400 INVALID_ARGUMENT or ingesting prompt=0 and confabulating. Captions
+    # cost nothing and are unaffected by whatever makes the VOD unfetchable.
+    captions_already_tried = False
+    if was_livestream:
+        captions_already_tried = True
+        captioned = _try_captions_transcript(
+            video,
+            transcript_path,
+            meta_path,
+            prefix,
+            reason=LIVESTREAM_CAPTIONS_FIRST_REASON,
+            start_offset=start_offset,
+            end_offset=end_offset,
+        )
+        if captioned is not None:
+            return captioned
+        log.info(
+            "  %s: livestream VOD with no caption track - allowing one guarded Gemini attempt",
+            prefix,
+        )
 
     effective_media_uri = media_uri if media_uri is not None else video["url"]
     # Default to LOW media resolution: same justification as process_mindmap
@@ -3108,7 +3226,13 @@ def process_transcript(
             usage_capture.clear()
             usage_capture.update(counts)
 
-    for attempt in range(1 + TRANSCRIPT_PARSE_RETRY_LIMIT):
+    # Issue #120: a livestream VOD gets exactly ONE Gemini call. The parse retry
+    # exists for stochastic JSON malformation on a healthy ingest; when the URI
+    # itself is what Gemini cannot fetch, a second call fails identically and
+    # only doubles the bill.
+    parse_retry_limit = 0 if was_livestream else TRANSCRIPT_PARSE_RETRY_LIMIT
+
+    for attempt in range(1 + parse_retry_limit):
         usage_capture.clear()
         try:
             # Issue #74: hard wall-clock cap so a hung call raises instead of
@@ -3132,7 +3256,9 @@ def process_transcript(
             )
         except Exception as e:
             # Issue #60: on auto, try the captions fallback before recording error.
-            if transcript_source == "auto":
+            # Issue #120: skipped when captions-first already proved there is no
+            # caption track - re-fetching cannot change the answer.
+            if transcript_source == "auto" and not captions_already_tried:
                 fb = _try_captions_transcript(
                     video,
                     transcript_path,
@@ -3156,7 +3282,7 @@ def process_transcript(
                 "  %s: confabulation guard tripped - Gemini reported prompt=0 (no video ingested); discarding",
                 prefix,
             )
-            if transcript_source == "auto":
+            if transcript_source == "auto" and not captions_already_tried:
                 fb = _try_captions_transcript(
                     video,
                     transcript_path,
@@ -3253,12 +3379,13 @@ def process_transcript(
             return prefix, f"partial ({speech_count} entries salvaged)"
 
         # Salvage insufficient - retry if budget remains
-        if attempt < TRANSCRIPT_PARSE_RETRY_LIMIT:
+        if attempt < parse_retry_limit:
             log.info("  %s: salvage insufficient (%d entries), retrying...", prefix, speech_count)
             continue
 
-    # All attempts exhausted. Issue #60: on auto, try captions before giving up.
-    if transcript_source == "auto":
+    # All attempts exhausted. Issue #60: on auto, try captions before giving up
+    # (unless issue #120's captions-first pass already established there are none).
+    if transcript_source == "auto" and not captions_already_tried:
         fb = _try_captions_transcript(
             video,
             transcript_path,
@@ -3661,13 +3788,23 @@ def cmd_scan(args, config):
             raise
         kept = []
         n_preflight = 0
+        n_livestream = 0
         for v in videos:
-            reason = preflight_skip_reason(statuses.get(v["video_id"], {}))
+            status = statuses.get(v["video_id"], {})
+            reason = preflight_skip_reason(status)
             if reason:
                 log.info('  Pre-flight skip "%s": %s', v.get("title", v["video_id"]), reason)
                 n_preflight += 1
             else:
+                # Issue #120: carry the completed-livestream flag on the video
+                # dict so the transcript and mindmap loops below can route on it
+                # without a second API call.
+                v["was_livestream"] = bool(status.get("was_livestream"))
+                if v["was_livestream"]:
+                    n_livestream += 1
                 kept.append(v)
+        if n_livestream:
+            log.info("  Pre-flight: %d completed livestream VOD(s) will route captions-first.", n_livestream)
         if n_preflight:
             log.info("  Pre-flight: skipped %d not-yet-aired/non-public video(s).", n_preflight)
         videos = kept
@@ -3741,6 +3878,12 @@ def cmd_scan(args, config):
         # branches and powers users who keep auto_transcript=none.
         # ----------------------------------------------------------------------
 
+        # Issue #120: per-video transcript outcome, keyed by prefix. The mindmap
+        # loop below reads it to decide whether a failed livestream VOD may still
+        # fall back to mindmap-from-video (it may not). Stays empty when the
+        # transcript loop does not run, which preserves today's routing.
+        transcript_results: dict[str, str] = {}
+
         # Auto-transcript if configured (Step 1/2 of the inverted ordering).
         auto = ch.get("auto_transcript", "none")
         if auto == "all":
@@ -3809,12 +3952,14 @@ def cmd_scan(args, config):
                             video_file_prefix(v),
                             transcript_source=transcript_source,
                             transcript_timeout_seconds=transcript_timeout_seconds,
+                            was_livestream=bool(v.get("was_livestream")),
                         ): v
                         for v in transcript_videos
                     }
                     for future in as_completed(futures):
                         v = futures[future]
                         prefix, status = future.result()
+                        transcript_results[prefix] = status
                         log.info("    %s: %s", prefix, status)
                         if status.startswith("error"):
                             errors.append((ch_name, prefix, status))
@@ -3853,6 +3998,7 @@ def cmd_scan(args, config):
                 _video_prompt_text=prompt_text,
                 _video_prompt_name=prompt_name,
                 _transcript_prompt_text=mindmap_from_transcript_prompt,
+                _transcript_results=transcript_results,
             ):
                 v_prefix = video_file_prefix(v)
                 v_transcript_path = _channel_dir / f"{v_prefix}.transcript.md"
@@ -3863,6 +4009,17 @@ def cmd_scan(args, config):
                     return v_prefix, f"error: {exc}"
                 if src == "skip":
                     return v_prefix, "skipped (mindmap_source=none)"
+                # Issue #120: a livestream VOD whose transcript attempt just
+                # failed has a URI Gemini demonstrably cannot ingest. Falling
+                # back to mindmap-from-video would hard-fail or confabulate the
+                # same way, so the call is never spent. The issue #119 prompt=0
+                # guard remains the backstop for any path that still gets here.
+                if should_skip_video_mindmap_for_livestream(
+                    was_livestream=bool(v.get("was_livestream")),
+                    resolved_source=src,
+                    transcript_status=_transcript_results.get(v_prefix),
+                ):
+                    return v_prefix, LIVESTREAM_MINDMAP_SKIP_STATUS
                 if src == "transcript":
                     return process_mindmap(
                         client,
@@ -3898,6 +4055,8 @@ def cmd_scan(args, config):
                     v = futures[future]
                     prefix, status = future.result()
                     log.info("    %s: %s", prefix, status)
+                    if status == LIVESTREAM_MINDMAP_SKIP_STATUS:
+                        _log_livestream_recovery_recipe(v, ch_name)
                     if status.startswith("error"):
                         errors.append((ch_name, prefix, status))
                         # Plan rev 4: on 403 PERMISSION_DENIED, print a recovery
@@ -4269,6 +4428,9 @@ def cmd_transcript(args, config):
     # Parse segment offsets (shared between URL and file paths)
     start_offset = parse_time_to_seconds(args.start) if args.start else None
     end_offset = parse_time_to_seconds(args.end) if args.end else None
+    # Issue #120: set on the YouTube URL branch below; a local file has no
+    # YouTube identity to classify, so it keeps today's routing.
+    was_livestream = False
 
     if args.file:
         # Local file path
@@ -4403,6 +4565,12 @@ def cmd_transcript(args, config):
         channel_dir = output_dir / channel_name
         prefix = video_file_prefix(video)
         media_uri = None  # YouTube URL path: video["url"] is the media source
+        # Issue #120: the manual path has no scan pre-flight to inherit the flag
+        # from, so classify this one id (1 quota unit, same helper as the scan).
+        # A local --file has no YouTube identity to classify, so it stays False.
+        was_livestream = _lookup_was_livestream(video["video_id"])
+        if was_livestream:
+            log.info("  Completed livestream VOD; routing captions-first (issue #120).")
         log.info("Transcribing: %s", video["url"])
 
     # Issue #50: chunked transcript path. Auto-trigger when (a) caller is the
@@ -4419,6 +4587,24 @@ def cmd_transcript(args, config):
     if use_chunking:
         duration_seconds = _lookup_video_duration_seconds(video["video_id"])
         if duration_seconds and duration_seconds > chunk_minutes * 60:
+            # Issue #120: captions-first for a completed livestream VOD, before
+            # any Gemini video call. The single-shot path gets this inside
+            # process_transcript; the chunked path has to ask here, ahead of the
+            # per-chunk calls. Same mechanism (_try_captions_transcript), same
+            # youtube_captions provenance marker.
+            if was_livestream:
+                fb = _try_captions_transcript(
+                    video,
+                    channel_dir / f"{prefix}.transcript.md",
+                    channel_dir / f"{prefix}.meta.json",
+                    prefix,
+                    reason=LIVESTREAM_CAPTIONS_FIRST_REASON,
+                )
+                if fb is not None:
+                    _, captions_status = fb
+                    log.info("  %s: %s", prefix, captions_status)
+                    log.info("  Saved: %s", channel_dir / f"{prefix}.transcript.md")
+                    return
             chunks = _build_transcript_chunks(duration_seconds, chunk_minutes)
             log.info(
                 "  %s is %s; running %d chunks of %d min each.",
@@ -4444,7 +4630,9 @@ def cmd_transcript(args, config):
             # Issue #60: on auto, fall back to captions if the whole chunked run
             # failed (all chunks unparseable). A partial keeps the higher-fidelity
             # Gemini content; only a hard error triggers the captions failover.
-            if transcript_source == "auto" and status.startswith("error"):
+            # Issue #120: skipped for a livestream VOD - captions were already
+            # tried first above and there were none.
+            if transcript_source == "auto" and not was_livestream and status.startswith("error"):
                 fb = _try_captions_transcript(
                     video,
                     out_path,
@@ -4473,6 +4661,7 @@ def cmd_transcript(args, config):
         media_uri=media_uri,
         media_resolution=media_resolution_enum,
         transcript_source=transcript_source,
+        was_livestream=was_livestream,
     )
     out_path = channel_dir / f"{prefix}.transcript.md"
     log.info("  %s: %s", prefix, status)
@@ -4622,6 +4811,11 @@ def _cmd_process_url(args, config):
     transcript_source = resolve_transcript_source(channel_cfg, getattr(args, "transcript_source", None))
 
     duration_seconds = _lookup_video_duration_seconds(video_id)
+    # Issue #120: classify this one id (1 quota unit) so the manual --url path
+    # routes a completed livestream VOD the same way the scan does.
+    was_livestream = _lookup_was_livestream(video_id)
+    if was_livestream:
+        log.info("  Completed livestream VOD; routing captions-first (issue #120).")
     transcript_path = channel_dir / f"{prefix}.transcript.md"
 
     # Step 1/3: transcript (chunked if long, per PR #51 path).
@@ -4636,39 +4830,59 @@ def _cmd_process_url(args, config):
         # Issue #60: yt-captions never chunks (caption track is whole); route it
         # to the single-shot path which builds from captions.
         if duration_seconds and duration_seconds > chunk_minutes * 60 and transcript_source != "yt-captions":
-            chunks = _build_transcript_chunks(duration_seconds, chunk_minutes)
-            log.info(
-                "    %s is %s; running %d chunks of %d min each.",
-                video_id,
-                _fmt_hms(duration_seconds),
-                len(chunks),
-                chunk_minutes,
-            )
-            transcript_status = _run_chunked_transcript_url(
-                client=client,
-                types=types,
-                video=video,
-                prompt_text=transcript_prompt,
-                model=model,
-                channel_dir=channel_dir,
-                prefix=prefix,
-                chunks=chunks,
-                duration_seconds=duration_seconds,
-                chunk_minutes=chunk_minutes,
-                force=args.force,
-            )
-            # Issue #60: on auto, fall back to captions if the chunked run failed
-            # outright (a partial keeps the higher-fidelity Gemini content).
-            if transcript_source == "auto" and transcript_status.startswith("error"):
-                fb = _try_captions_transcript(
+            # Issue #120: captions-first for a completed livestream VOD, before
+            # any Gemini video call. The chunked path has to ask here, ahead of
+            # the per-chunk calls; the single-shot branch below inherits the
+            # same behavior from process_transcript(was_livestream=...).
+            captions_first = (
+                _try_captions_transcript(
                     video,
                     transcript_path,
                     channel_dir / f"{prefix}.meta.json",
                     prefix,
-                    reason=f"chunked transcript failed: {transcript_status}",
+                    reason=LIVESTREAM_CAPTIONS_FIRST_REASON,
                 )
-                if fb is not None:
-                    _, transcript_status = fb
+                if was_livestream
+                else None
+            )
+            if captions_first is not None:
+                _, transcript_status = captions_first
+            else:
+                chunks = _build_transcript_chunks(duration_seconds, chunk_minutes)
+                log.info(
+                    "    %s is %s; running %d chunks of %d min each.",
+                    video_id,
+                    _fmt_hms(duration_seconds),
+                    len(chunks),
+                    chunk_minutes,
+                )
+                transcript_status = _run_chunked_transcript_url(
+                    client=client,
+                    types=types,
+                    video=video,
+                    prompt_text=transcript_prompt,
+                    model=model,
+                    channel_dir=channel_dir,
+                    prefix=prefix,
+                    chunks=chunks,
+                    duration_seconds=duration_seconds,
+                    chunk_minutes=chunk_minutes,
+                    force=args.force,
+                )
+                # Issue #60: on auto, fall back to captions if the chunked run
+                # failed outright (a partial keeps the higher-fidelity Gemini
+                # content). Issue #120: skipped for a livestream VOD - captions
+                # were already tried first above and there were none.
+                if transcript_source == "auto" and not was_livestream and transcript_status.startswith("error"):
+                    fb = _try_captions_transcript(
+                        video,
+                        transcript_path,
+                        channel_dir / f"{prefix}.meta.json",
+                        prefix,
+                        reason=f"chunked transcript failed: {transcript_status}",
+                    )
+                    if fb is not None:
+                        _, transcript_status = fb
         else:
             _, transcript_status = process_transcript(
                 client,
@@ -4682,6 +4896,7 @@ def _cmd_process_url(args, config):
                 media_uri=None,
                 media_resolution=media_resolution_enum,
                 transcript_source=transcript_source,
+                was_livestream=was_livestream,
             )
     except Exception as exc:
         transcript_status = f"error: {exc}"
@@ -4700,6 +4915,20 @@ def _cmd_process_url(args, config):
 
     if resolved_source == "skip":
         log.info("  Step 2/3: mindmap [skipped (mindmap_source=none)]")
+        log.info("  Step 3/3: concepts [skipped (no mindmap)]")
+        return
+
+    # Issue #120: same rule the scan applies - a livestream VOD whose transcript
+    # attempt just failed has a URI Gemini cannot ingest, so the fallback
+    # mindmap-from-video call is never spent against it. Exits 0 like the
+    # mindmap_source=none skip above: this is a deliberate skip, not a failure.
+    if should_skip_video_mindmap_for_livestream(
+        was_livestream=was_livestream,
+        resolved_source=resolved_source,
+        transcript_status=transcript_status,
+    ):
+        log.warning("  Step 2/3: mindmap [%s]", LIVESTREAM_MINDMAP_SKIP_STATUS)
+        _log_livestream_recovery_recipe(video, channel_name)
         log.info("  Step 3/3: concepts [skipped (no mindmap)]")
         return
 

@@ -51,7 +51,13 @@ class TestFetchPreflightStatus:
             ]
         )
         result = vi.fetch_preflight_status(yt, ["a", "b"])
-        assert result["a"] == {"live_broadcast_content": "none", "privacy_status": "public"}
+        # was_livestream (issue #120) rides along on the same call; neither of
+        # these items carries liveStreamingDetails, so both are False.
+        assert result["a"] == {
+            "live_broadcast_content": "none",
+            "privacy_status": "public",
+            "was_livestream": False,
+        }
         assert result["b"]["live_broadcast_content"] == "upcoming"
 
     def test_missing_id_maps_to_empty_dict(self):
