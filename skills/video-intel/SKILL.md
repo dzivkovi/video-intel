@@ -125,7 +125,7 @@ Gemini API calls read video frames and audio — they take **1-5 minutes per vid
 - **For large scans (10+ videos):** run in the background so the user isn't blocked. Check the output directory afterward for results.
 - **For single transcripts:** 1-3 minutes is typical. Wait for the "Saved:" line before proceeding.
 - **Transcripts are resilient to malformed JSON.** If Gemini returns broken JSON, the script tries to salvage partial content (speech entries, screen content) and writes a partial transcript with a visible warning. A partial transcript is useful for curiosity/search. For strategically important videos, rerun with `--model gemini-2.5-pro` or retry later.
-- **Raw Gemini responses are saved on failure** as `.transcript.raw.txt` sidecars for debugging.
+- **Raw Gemini responses are saved on failure** as `.transcript.raw.txt` sidecars for debugging, and as `.mindmap.raw.txt` when the mindmap confabulation guard discards a response.
 - **Exit 0 ≠ success on `--url` paths. Always verify.** `mindmap --url` and `transcript --url` exit 0 even when Gemini returns `403 PERMISSION_DENIED` (members-only, age-gated, region-locked, or otherwise restricted videos). The error is logged inline but not re-raised, so the script can keep going inside a `scan` batch. After any URL run, grep the captured output for `PERMISSION_DENIED` (or check that the expected `<prefix>.mindmap.md` / `<prefix>.transcript.md` actually landed on disk) before reporting success to the user. If 403 is found, jump to **"When a YouTube URL returns 403"** below.
 
 ## Interpreting User Intent
@@ -210,6 +210,7 @@ meta.json fields these reference are in [`docs/meta-json-schema.md`](../../docs/
 | `400 INVALID_ARGUMENT`, fails fast | **Token cap** on a long video | `process --url --chunk-minutes 50`, or set `transcript_source: auto` (captions failover) |
 | Transcript hangs for many minutes | **Gemini stall** | Auto-capped per transcript (`transcript_timeout_seconds`, default 600s, issue #74) -> failover under `transcript_source: auto`; `mark-skip --mode transcript` or `skip_video_ids` as backup |
 | Tiny `prompt=0` transcript that looked "complete" | **Future/scheduled premiere** confabulated | the issue #60 confab guard now discards it; delete any old stub |
+| Mindmap content is about a different video (frontmatter still looks right) | **`prompt=0` on the mindmap-from-video call** - Gemini saw no video and wrote from priors | the confab guard now discards it (raw response kept as `.mindmap.raw.txt`) and records `last_error`; regenerate any old one with `mindmap --url --channel <name> --force` |
 | Two mindmaps/metas for one video | **Title rotation** | `dedupe` |
 
 Governing principle: **the corpus indexes things that have happened, not

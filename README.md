@@ -647,7 +647,9 @@ python scripts/video_intel.py --model gemini-2.5-pro transcript \
 ```
 
 On parse failure, the raw Gemini response is saved as a `.transcript.raw.txt`
-sidecar file for debugging.
+sidecar file for debugging. A mindmap response discarded by the confabulation
+guard (Gemini reported zero ingested video tokens) is kept the same way, as a
+`.mindmap.raw.txt` sidecar, and no `.mindmap.md` is written.
 
 When a video does not process cleanly (unlisted, members-only, token-cap, hang, or a confabulated future-premiere stub), see the operator references:
 
