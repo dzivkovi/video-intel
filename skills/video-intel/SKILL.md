@@ -58,7 +58,14 @@ Three layers, designed as a narrowing funnel.
    no Gemini) or `auto` (Gemini then captions on failure/timeout, issue #60).
    Before any Gemini call, scan drops `upcoming`/`live` premieres and
    non-public videos via a pre-flight metadata check (issue #70) - the corpus
-   indexes what has aired, not what is scheduled.
+   indexes what has aired, not what is scheduled. The same pre-flight call
+   flags **completed livestream VODs** (issue #120): those route captions-first
+   unless the channel explicitly sets `transcript_source: gemini` (an explicit
+   choice is honored, and is the escape hatch if the flag ever misfires on a
+   premiered upload), get at most one guarded Gemini transcript attempt when no
+   caption track exists, and never fall back to mindmap-from-video afterwards -
+   the scan logs the local-file recovery recipe instead. Regular uploads are
+   unaffected.
 
 2. **transcript** - Generate a fused document for a single video: diarized
    speech interleaved with timestamped SCREEN sections describing what was
@@ -211,6 +218,7 @@ meta.json fields these reference are in [`docs/meta-json-schema.md`](../../docs/
 | Transcript hangs for many minutes | **Gemini stall** | Auto-capped per transcript (`transcript_timeout_seconds`, default 600s, issue #74) -> failover under `transcript_source: auto`; `mark-skip --mode transcript` or `skip_video_ids` as backup |
 | Tiny `prompt=0` transcript that looked "complete" | **Future/scheduled premiere** confabulated | the issue #60 confab guard now discards it; delete any old stub |
 | Mindmap content is about a different video (frontmatter still looks right) | **`prompt=0` on the mindmap-from-video call** - Gemini saw no video and wrote from priors | the confab guard now discards it (raw response kept as `.mindmap.raw.txt`) and records `last_error`; to clean up one already on disk you must land a transcript FIRST, delete the stale `.mindmap.md` + `.concepts.json`, then `mindmap --url --channel <name> --force` - a bare `--force` re-resolves to `video` and loops (see `docs/troubleshooting.md`) |
+| Generic `400 INVALID_ARGUMENT` or a confabulated mindmap on a **past livestream** | **Completed livestream VOD** - Gemini's URI ingestion breaks on these far more often than on regular uploads | automatic since issue #120: captions-first, one guarded Gemini attempt, then the mindmap-from-video fallback is skipped and the local-file recipe is logged. To finish it: `transcript --file <PATH> --channel <NAME>` then `mindmap --file <PATH> --channel <NAME>` |
 | Two mindmaps/metas for one video | **Title rotation** | `dedupe` |
 
 Governing principle: **the corpus indexes things that have happened, not
