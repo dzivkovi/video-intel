@@ -12,6 +12,7 @@ pytest.importorskip("reportlab", reason="PDF export needs the optional [pdf] ext
 pypdf = pytest.importorskip("pypdf", reason="link-annotation assertions need pypdf")
 
 from markdown_pdf import (  # noqa: E402
+    _build_story,
     _inline,
     render_markdown_file_to_pdf,
     render_markdown_to_pdf,
@@ -98,3 +99,50 @@ def test_markup_breaking_title_does_not_crash(tmp_path):
     out = tmp_path / "x.pdf"
     render_markdown_to_pdf("# C++ & <script> in a heading\n\nbody & more", out)
     assert out.exists() and out.stat().st_size > 0
+
+
+TABLE_SAMPLE = """# Evidence
+
+| Source | Link | Notes |
+|---|---|---|
+| A long source title that wraps in its cell | [watch at 2:07](https://www.youtube.com/watch?v=abc&t=127) | keeps the deep-link |
+| Short row | https://example.com | bare URL in a cell |
+"""
+
+
+def test_pipe_table_becomes_a_real_table_flowable():
+    """Regression for the raw-pipes rendering: a GFM table must produce a
+    reportlab Table, and no Paragraph may carry the |---| separator row."""
+    from reportlab.platypus import Paragraph, Table
+
+    story = _build_story(TABLE_SAMPLE)
+    assert any(isinstance(f, Table) for f in story), "no Table flowable emitted"
+    leaked = [f.text for f in story if isinstance(f, Paragraph) and "|" in getattr(f, "text", "")]
+    assert not leaked, f"table rows leaked into paragraphs: {leaked}"
+
+
+def test_table_cell_links_stay_clickable(tmp_path):
+    out = tmp_path / "table.pdf"
+    render_markdown_to_pdf(TABLE_SAMPLE, out)
+    reader = pypdf.PdfReader(str(out))
+    annots = sum(len(p.get("/Annots", [])) for p in reader.pages)
+    # Both the markdown link and the bare URL live inside table cells.
+    assert annots >= 2, f"expected >=2 link annotations from table cells, got {annots}"
+    text = "".join(p.extract_text() for p in reader.pages)
+    assert "|---" not in text and "| Source |" not in text
+
+
+def test_table_with_uneven_rows_pads_instead_of_crashing(tmp_path):
+    md = "| A | B | C |\n|---|---|---|\n| only one cell |\n| x | y | z |\n"
+    out = tmp_path / "uneven.pdf"
+    render_markdown_to_pdf(md, out)
+    assert out.exists() and out.stat().st_size > 0
+
+
+def test_table_without_separator_renders_headerless(tmp_path):
+    # No |---| row: still a table, just no shaded header (and no repeatRows).
+    from reportlab.platypus import Table
+
+    story = _build_story("| a | b |\n| c | d |\n")
+    tables = [f for f in story if isinstance(f, Table)]
+    assert len(tables) == 1 and tables[0].repeatRows == 0
