@@ -2266,6 +2266,13 @@ def process_mindmap(
     ``mindmap_source_status="partial"`` plus a ``<!-- source: partial transcript -->``
     HTML comment line in the markdown output so readers know.
 
+    On the ``source="video"`` path the response is subject to the ``prompt == 0``
+    confabulation guard (issue #119, the mindmap-side twin of issue #60's transcript
+    guard): a Gemini call that ingested zero video tokens produces a plausible mind
+    map about some other video, so nothing is written, the raw text is kept as
+    ``<prefix>.mindmap.raw.txt`` for forensics, and the failure is recorded in
+    meta.json via the same handler as any other error.
+
     The three keyword overrides ``prefix`` / ``channel_dir_override`` / ``media_uri``
     exist for the local-file recovery path (plan rev 4): the caller can route
     artifacts to a different folder/prefix (e.g. a canonical scan-generated prefix
@@ -2343,6 +2350,17 @@ def process_mindmap(
             effective_media_resolution = (
                 media_resolution if media_resolution is not None else types.MediaResolution.MEDIA_RESOLUTION_LOW
             )
+            # Issue #119 confabulation guard: capture the prompt-token count off
+            # the same callback that logs it, so we can refuse a prompt == 0
+            # response before anything is written to disk.
+            usage_capture: dict[str, int] = {}
+
+            def _on_resp(r: object) -> None:
+                counts = log_usage_metadata(r, "mindmap")
+                if counts is not None:
+                    usage_capture.clear()
+                    usage_capture.update(counts)
+
             result = call_gemini(
                 client,
                 types,
@@ -2351,8 +2369,31 @@ def process_mindmap(
                 model,
                 fps=fps,
                 media_resolution=effective_media_resolution,
-                on_response=lambda r: log_usage_metadata(r, "mindmap"),
+                on_response=_on_resp,
             )
+            # prompt == 0 means Gemini ingested zero video tokens (gated,
+            # unfetchable, or a future premiere) and generated a plausible
+            # mindmap from priors. The header below is built locally, so the
+            # artifact would carry the correct video/title/published stamp and
+            # pass every downstream check on its way into concepts extraction,
+            # taxonomy.json, and the vector index. Same invariant the transcript
+            # path has enforced since issue #60. Compare to 0 explicitly: the
+            # count is absent when usage_metadata was unreadable, and missing
+            # data must never be flagged as a confabulation.
+            if usage_capture.get("prompt") == 0:
+                # Keep the discarded text for forensics, mirroring the transcript
+                # path's `.transcript.raw.txt` sidecar: the fabrication is worth
+                # inspecting (it is how the failure mode was diagnosed) but must
+                # never sit under the `.mindmap.md` name that concepts, taxonomy,
+                # and the index read. No parsing - raw bytes only.
+                raw_path = resolved_channel_dir / f"{resolved_prefix}.mindmap.raw.txt"
+                raw_path.write_text(result or "", encoding="utf-8")
+                log.warning(
+                    "  %s: confabulation guard tripped - Gemini reported prompt=0 (no video ingested); discarded to %s",
+                    resolved_prefix,
+                    raw_path.name,
+                )
+                raise RuntimeError("confabulation guard: Gemini prompt=0 (no video ingested)")
             header = (
                 f"<!-- video: {video['url']} -->\n"
                 f"<!-- title: {video['title']} -->\n"
@@ -6196,6 +6237,7 @@ def cmd_dedupe(args, config):
 PRUNE_SHORTS_DELETION_PATTERNS = (
     "{prefix}.mindmap.md",
     "{prefix}.mindmap.*.md",  # knowledge / light / heavy variants
+    "{prefix}.mindmap.raw.txt",  # issue #119 confabulation-guard forensic sidecar
     "{prefix}.transcript.md",
     "{prefix}.transcript.raw.txt",
     "{prefix}.transcript.raw.*.txt",
