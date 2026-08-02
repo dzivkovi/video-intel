@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from test_skip_shorts import _make_short_artifacts, _prune_args, _prune_setup
 
 import video_intel
 from video_intel import process_mindmap
@@ -219,9 +220,31 @@ class TestGuardIsExactlyZeroNotFalsy:
         assert "scan" in meta["modes_completed"]
         assert meta["last_error"] is None
 
-    def test_sidecar_is_in_the_prune_shorts_allowlist(self):
-        """A pruned Short must not leave the guard's sidecar orphaned in the channel folder."""
-        assert "{prefix}.mindmap.raw.txt" in video_intel.PRUNE_SHORTS_DELETION_PATTERNS
+    def test_prune_shorts_deletes_the_raw_sidecar_but_spares_translate_artifacts(self, tmp_path, monkeypatch):
+        """A pruned Short must not leave the guard's sidecar orphaned in the channel folder.
+
+        Exercises the real deletion path (mirrors
+        tests/test_skip_shorts.py::test_apply_preserves_translate_bcs_sidecars) instead of
+        asserting a literal entry in PRUNE_SHORTS_DELETION_PATTERNS - a legitimate refactor
+        to a different allowlist representation should not be able to break this test while
+        silently orphaning the sidecar.
+        """
+        _prune_setup(monkeypatch)
+        ch = tmp_path / "ch1"
+        _make_short_artifacts(ch, "2026-04-15-short1", "short1")
+        (ch / "2026-04-15-short1.mindmap.raw.txt").write_text("discarded confabulation", encoding="utf-8")
+        # Sidecars from the translate-bcs workflow - operationally separate, must survive:
+        (ch / "2026-04-15-short1.en.srt").write_text("1\n00:00:00,000 --> 00:00:01,000\nhi\n", encoding="utf-8")
+        (ch / "2026-04-15-short1.translate-bcs.txt").write_text("Bosnian translation", encoding="utf-8")
+
+        config = {"output_dir": str(tmp_path), "channels": [{"name": "ch1"}]}
+        video_intel.cmd_prune_shorts(_prune_args(channel="ch1", apply=True), config)
+
+        assert not (ch / "2026-04-15-short1.mindmap.raw.txt").exists(), (
+            "the confabulation-guard sidecar must be pruned along with its Short"
+        )
+        assert (ch / "2026-04-15-short1.en.srt").exists(), "translate-bcs SRT must survive"
+        assert (ch / "2026-04-15-short1.translate-bcs.txt").exists(), "BCS translation must survive"
 
 
 class TestTranscriptSourceStaysOutOfScope:

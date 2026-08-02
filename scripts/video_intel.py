@@ -2353,9 +2353,9 @@ def process_mindmap(
             # Issue #119 confabulation guard: capture the prompt-token count off
             # the same callback that logs it, so we can refuse a prompt == 0
             # response before anything is written to disk.
-            usage_capture: dict = {}
+            usage_capture: dict[str, int] = {}
 
-            def _on_resp(r):
+            def _on_resp(r: object) -> None:
                 counts = log_usage_metadata(r, "mindmap")
                 if counts is not None:
                     usage_capture.clear()
