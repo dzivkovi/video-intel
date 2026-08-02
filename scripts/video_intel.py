@@ -2975,6 +2975,15 @@ def _write_transcript_md(
         )
     body += fused
 
+    # Ensure the destination folder exists before the atomic tmp+replace write.
+    # Every other artifact writer in this file mkdirs its own channel dir; this
+    # one used to rely on its callers having done so, which held only because a
+    # Gemini attempt (and its meta handling) always ran first. Issue #120's
+    # captions-first routing made _try_captions_transcript the FIRST writer for
+    # a channel, so a brand-new channel folder had nobody to create it and the
+    # tmp write raised FileNotFoundError. Fixed here, at the shared seam, so
+    # every caller is covered rather than just the one that surfaced it.
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(".md.tmp")
     tmp_path.write_text(header + body, encoding="utf-8")
     tmp_path.replace(path)

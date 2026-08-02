@@ -257,6 +257,68 @@ class TestLivestreamTranscriptRouting:
         assert status.startswith("error")
         assert len(fetches) == 1, f"caption track must be fetched once, got {len(fetches)}"
 
+    def test_captions_first_creates_channel_dir_when_first_writer(self, tmp_path, monkeypatch):
+        """Gate 1 real-input smoke caught this; the fixtures here had masked it.
+
+        Captions-first makes `_try_captions_transcript` the FIRST writer for a
+        channel, a position it never held on the issue #60 failover path (a
+        Gemini attempt had already created the folder by the time captions ran).
+        Every other test in this file hands `process_transcript` an existing
+        `tmp_path`, so 27 of 27 passed while the real CLI raised FileNotFoundError
+        on `<prefix>.transcript.md.tmp`. Point the writer at a directory that does
+        NOT exist - the state of the first video of any newly added channel.
+        """
+        fresh_dir = tmp_path / "brand-new-channel"
+        assert not fresh_dir.exists()
+        _stub_captions(monkeypatch, CaptionsResult([(0.0, "first video on a new channel")], True, "en"))
+        prefix = "2026-07-23-first-ever"
+        result = vi._try_captions_transcript(
+            _video(),
+            fresh_dir / f"{prefix}.transcript.md",
+            fresh_dir / f"{prefix}.meta.json",
+            prefix,
+            reason=vi.LIVESTREAM_CAPTIONS_FIRST_REASON,
+        )
+        assert result is not None
+        assert (fresh_dir / f"{prefix}.transcript.md").exists()
+        assert json.loads((fresh_dir / f"{prefix}.meta.json").read_text())["transcript_source"] == "youtube_captions"
+
+    def test_cmd_transcript_url_lands_captions_on_a_channel_with_no_folder(self, tmp_path, monkeypatch):
+        """End-to-end repro of the Gate 1 crash: `transcript --url` on a long
+        livestream VOD against an EMPTY output_dir. The chunked branch calls
+        captions-first directly, and nothing upstream of it creates the channel
+        folder on the URL path (only the `--file` path mkdirs)."""
+        calls: list[str] = []
+        monkeypatch.setenv("GEMINI_API_KEY", "test")
+        monkeypatch.setattr(vi, "require_gemini", lambda: (None, None))
+        monkeypatch.setattr(vi, "create_client", lambda *a, **kw: None)
+        monkeypatch.setattr(vi, "_lookup_was_livestream", lambda vid: True)
+        monkeypatch.setattr(vi, "_lookup_video_duration_seconds", lambda vid: 6600)  # 1h50m -> chunked
+        _stub_gemini(monkeypatch, calls=calls)
+        _stub_captions(monkeypatch, CaptionsResult([(0.0, "live qa opening")], True, "en"))
+
+        output_dir = tmp_path / "corpus"
+        args = Namespace(
+            url="https://www.youtube.com/watch?v=ihM91WWU0lE",
+            file=None,
+            channel="somechannel",
+            title="Live QA",
+            date="2026-07-23",
+            start=None,
+            end=None,
+            force=False,
+            model=None,
+            media_resolution="low",
+            transcript_source=None,
+            chunk_minutes=None,
+            video_id=None,
+        )
+        vi.cmd_transcript(args, {"output_dir": str(output_dir)})
+
+        assert calls == [], "captions-first must not spend a Gemini call"
+        landed = list((output_dir / "somechannel").glob("*.transcript.md"))
+        assert landed, "transcript must land even though the channel folder did not exist"
+
     def test_yt_captions_source_branch_is_unchanged(self, tmp_path, monkeypatch):
         # An explicit yt-captions channel keeps its own contract (error when no
         # captions), livestream or not.
