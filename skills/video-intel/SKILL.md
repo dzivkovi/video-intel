@@ -60,10 +60,12 @@ Three layers, designed as a narrowing funnel.
    non-public videos via a pre-flight metadata check (issue #70) - the corpus
    indexes what has aired, not what is scheduled. The same pre-flight call
    flags **completed livestream VODs** (issue #120): those route captions-first
-   whatever `transcript_source` says, get at most one guarded Gemini transcript
-   attempt when no caption track exists, and never fall back to
-   mindmap-from-video afterwards - the scan logs the local-file recovery
-   recipe instead. Regular uploads are unaffected.
+   unless the channel explicitly sets `transcript_source: gemini` (an explicit
+   choice is honored, and is the escape hatch if the flag ever misfires on a
+   premiered upload), get at most one guarded Gemini transcript attempt when no
+   caption track exists, and never fall back to mindmap-from-video afterwards -
+   the scan logs the local-file recovery recipe instead. Regular uploads are
+   unaffected.
 
 2. **transcript** - Generate a fused document for a single video: diarized
    speech interleaved with timestamped SCREEN sections describing what was

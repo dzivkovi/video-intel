@@ -463,6 +463,43 @@ def resolve_transcript_source(channel_config: dict, cli_override: str | None = N
     return raw
 
 
+def livestream_captions_first_applies(
+    transcript_source: str,
+    channel_config: dict | None = None,
+    cli_override: str | None = None,
+) -> bool:
+    """Whether a completed-livestream VOD goes to captions BEFORE Gemini (#120).
+
+    ``resolve_transcript_source`` collapses "the operator said gemini" and
+    "nobody said anything" into the same ``"gemini"`` string, so the decision
+    has to be made from the RAW provenance instead:
+
+    - **implicit default** (no `transcript_source` anywhere): captions-first.
+      Nobody expressed a preference, so issue #120's reliability finding wins.
+    - **explicit ``"auto"``**: captions-first. `auto` explicitly delegates the
+      ordering choice to the tool, and captions-first is that choice for a VOD.
+    - **explicit ``"gemini"``** (CLI flag or the channel dict literally carrying
+      the key): Gemini-first, exactly as before issue #120. The operator chose
+      multimodal on purpose - captions are known-garbage, the wrong language, or
+      the on-screen content is the point - and silently handing them a
+      speech-only transcript would violate the documented config contract. This
+      is also the escape hatch when the premiere heuristic misfires.
+    - **explicit ``"yt-captions"``**: irrelevant here, that branch never reaches
+      Gemini at all.
+
+    Precedence mirrors ``resolve_transcript_source``: a CLI ``--transcript-source
+    gemini`` counts as explicit even when the channel config says ``auto``.
+    """
+    if transcript_source != "gemini":
+        return transcript_source == "auto"
+    if cli_override == "gemini":
+        return False
+    # Membership test, never `.get("transcript_source", "gemini")`: the whole
+    # point is telling an ABSENT key apart from a key whose value happens to
+    # equal the default. A `.get` with a default erases exactly that difference.
+    return not (cli_override is None and channel_config is not None and "transcript_source" in channel_config)
+
+
 def resolve_mindmap_source(channel_config: dict, *, transcript_available: bool) -> str:
     """Decide which input the mindmap step should consume.
 
@@ -3154,7 +3191,7 @@ def process_transcript(
     media_resolution=None,
     transcript_source: str = "gemini",
     transcript_timeout_seconds: int = TRANSCRIPT_TIMEOUT_DEFAULT,
-    was_livestream: bool = False,
+    livestream_captions_first: bool = False,
 ):
     """Generate a fused transcript for a single video with layered JSON resilience.
 
@@ -3171,10 +3208,14 @@ def process_transcript(
     stays the canonical YouTube URL used in the transcript header and meta.json.
     When media_uri is not set, video["url"] is used for both.
 
-    ``was_livestream`` (issue #120) marks a completed livestream VOD. Those fail
-    Gemini's YouTube-URI ingestion far more often than regular uploads, so they
-    route captions-FIRST regardless of ``transcript_source``, and a captionless
-    one gets exactly ONE guarded Gemini attempt (no parse retry) instead of two.
+    ``livestream_captions_first`` (issue #120) is the ALREADY-ADJUDICATED
+    routing decision for a completed livestream VOD, not the raw classification:
+    callers combine "is this a VOD" with ``livestream_captions_first_applies``
+    (which honors an explicit ``transcript_source: gemini``) and pass the result.
+    When true, captions are tried BEFORE any Gemini call and a captionless VOD
+    gets exactly ONE guarded attempt instead of two. When false - including a
+    VOD whose operator explicitly asked for ``gemini`` - this function behaves
+    exactly as it did before issue #120, full parse-retry budget included.
     """
     channel_dir.mkdir(parents=True, exist_ok=True)
 
@@ -3202,7 +3243,7 @@ def process_transcript(
     # 400 INVALID_ARGUMENT or ingesting prompt=0 and confabulating. Captions
     # cost nothing and are unaffected by whatever makes the VOD unfetchable.
     captions_already_tried = False
-    if was_livestream:
+    if livestream_captions_first:
         captions_already_tried = True
         captioned = _try_captions_transcript(
             video,
@@ -3253,7 +3294,7 @@ def process_transcript(
     # exists for stochastic JSON malformation on a healthy ingest; when the URI
     # itself is what Gemini cannot fetch, a second call fails identically and
     # only doubles the bill.
-    parse_retry_limit = 0 if was_livestream else TRANSCRIPT_PARSE_RETRY_LIMIT
+    parse_retry_limit = 0 if livestream_captions_first else TRANSCRIPT_PARSE_RETRY_LIMIT
 
     for attempt in range(1 + parse_retry_limit):
         usage_capture.clear()
@@ -3926,6 +3967,11 @@ def cmd_scan(args, config):
             # Default "gemini" preserves current behavior; "auto" adds the captions
             # failover when Gemini fails (token-cap, 403, confabulation).
             transcript_source = resolve_transcript_source(ch)
+            # Issue #120 provenance rule: captions-first is mandatory for a VOD
+            # only when nobody asked for Gemini. An explicit
+            # `transcript_source: gemini` on the channel is honored (documented
+            # config contract), and is the escape hatch when the flag misfires.
+            vod_captions_first = livestream_captions_first_applies(transcript_source, ch)
             # Issue #74: wall-clock cap so a hung Gemini call raises (-> failover
             # under auto) instead of deadlocking the whole batch. Per-channel
             # override > top-level > default, matching every other knob.
@@ -3986,7 +4032,7 @@ def cmd_scan(args, config):
                             video_file_prefix(v),
                             transcript_source=transcript_source,
                             transcript_timeout_seconds=transcript_timeout_seconds,
-                            was_livestream=bool(v.get("was_livestream")),
+                            livestream_captions_first=(vod_captions_first and bool(v.get("was_livestream"))),
                         ): v
                         for v in transcript_videos
                     }
@@ -4463,8 +4509,11 @@ def cmd_transcript(args, config):
     start_offset = parse_time_to_seconds(args.start) if args.start else None
     end_offset = parse_time_to_seconds(args.end) if args.end else None
     # Issue #120: set on the YouTube URL branch below; a local file has no
-    # YouTube identity to classify, so it keeps today's routing.
+    # YouTube identity to classify, and no caption track to fetch, so it keeps
+    # today's routing. Both must be bound here - the --file branch skips the
+    # URL branch entirely and still reaches the shared process_transcript call.
     was_livestream = False
+    vod_captions_first = False
 
     if args.file:
         # Local file path
@@ -4610,7 +4659,16 @@ def cmd_transcript(args, config):
         else:
             was_livestream = _lookup_was_livestream(video["video_id"])
             if was_livestream:
-                log.info("  Completed livestream/premiere VOD; routing captions-first (issue #120).")
+                log.info("  Completed livestream/premiere VOD detected (issue #120).")
+        # Provenance rule: an explicit --transcript-source gemini is honored, so
+        # this manual run stays Gemini-first exactly as it did pre-#120.
+        vod_captions_first = was_livestream and livestream_captions_first_applies(
+            transcript_source, {}, getattr(args, "transcript_source", None)
+        )
+        if was_livestream and not vod_captions_first:
+            log.info("  Explicit transcript_source=gemini; keeping Gemini-first for this VOD.")
+        elif vod_captions_first:
+            log.info("  Routing captions-first for this VOD.")
         log.info("Transcribing: %s", video["url"])
 
     # Issue #50: chunked transcript path. Auto-trigger when (a) caller is the
@@ -4632,7 +4690,7 @@ def cmd_transcript(args, config):
             # process_transcript; the chunked path has to ask here, ahead of the
             # per-chunk calls. Same mechanism (_try_captions_transcript), same
             # youtube_captions provenance marker.
-            if was_livestream:
+            if vod_captions_first:
                 fb = _try_captions_transcript(
                     video,
                     channel_dir / f"{prefix}.transcript.md",
@@ -4673,7 +4731,7 @@ def cmd_transcript(args, config):
             # Gemini content; only a hard error triggers the captions failover.
             # Issue #120: skipped for a livestream VOD - captions were already
             # tried first above and there were none.
-            if transcript_source == "auto" and not was_livestream and status.startswith("error"):
+            if transcript_source == "auto" and not vod_captions_first and status.startswith("error"):
                 fb = _try_captions_transcript(
                     video,
                     out_path,
@@ -4703,7 +4761,7 @@ def cmd_transcript(args, config):
         media_uri=media_uri,
         media_resolution=media_resolution_enum,
         transcript_source=transcript_source,
-        was_livestream=was_livestream,
+        livestream_captions_first=vod_captions_first,
     )
     out_path = channel_dir / f"{prefix}.transcript.md"
     log.info("  %s: %s", prefix, status)
@@ -4865,7 +4923,18 @@ def _cmd_process_url(args, config):
     else:
         was_livestream = _lookup_was_livestream(video_id)
         if was_livestream:
-            log.info("  Completed livestream/premiere VOD; routing captions-first (issue #120).")
+            log.info("  Completed livestream/premiere VOD detected (issue #120).")
+    # Provenance rule: captions-first only when nobody explicitly asked for
+    # Gemini. Both provenances are available here - the channel dict and the
+    # CLI flag - so this is the one site that exercises the full precedence.
+    vod_captions_first = was_livestream and livestream_captions_first_applies(
+        transcript_source, channel_cfg, getattr(args, "transcript_source", None)
+    )
+    if was_livestream:
+        log.info(
+            "    VOD transcript routing: %s",
+            "captions-first" if vod_captions_first else "Gemini-first (explicit transcript_source=gemini)",
+        )
 
     # Step 1/3: transcript (chunked if long, per PR #51 path).
     # Review K1: catch any uncaught exception so the mindmap step (the AI's
@@ -4882,7 +4951,7 @@ def _cmd_process_url(args, config):
             # Issue #120: captions-first for a completed livestream VOD, before
             # any Gemini video call. The chunked path has to ask here, ahead of
             # the per-chunk calls; the single-shot branch below inherits the
-            # same behavior from process_transcript(was_livestream=...).
+            # same behavior from process_transcript(livestream_captions_first=).
             captions_first = (
                 _try_captions_transcript(
                     video,
@@ -4892,7 +4961,7 @@ def _cmd_process_url(args, config):
                     reason=LIVESTREAM_CAPTIONS_FIRST_REASON,
                     force=args.force,
                 )
-                if was_livestream
+                if vod_captions_first
                 else None
             )
             if captions_first is not None:
@@ -4923,7 +4992,7 @@ def _cmd_process_url(args, config):
                 # failed outright (a partial keeps the higher-fidelity Gemini
                 # content). Issue #120: skipped for a livestream VOD - captions
                 # were already tried first above and there were none.
-                if transcript_source == "auto" and not was_livestream and transcript_status.startswith("error"):
+                if transcript_source == "auto" and not vod_captions_first and transcript_status.startswith("error"):
                     fb = _try_captions_transcript(
                         video,
                         transcript_path,
@@ -4947,7 +5016,7 @@ def _cmd_process_url(args, config):
                 media_uri=None,
                 media_resolution=media_resolution_enum,
                 transcript_source=transcript_source,
-                was_livestream=was_livestream,
+                livestream_captions_first=vod_captions_first,
             )
     except Exception as exc:
         transcript_status = f"error: {exc}"

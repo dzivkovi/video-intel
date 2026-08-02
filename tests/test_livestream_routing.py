@@ -199,21 +199,22 @@ class TestLivestreamTranscriptRouting:
         calls: list[str] = []
         _stub_gemini(monkeypatch, calls=calls)
         _stub_captions(monkeypatch, CaptionsResult([(0.0, "livestream speech")], True, "en"))
-        (_, status), tpath, mpath = _run(tmp_path, "gemini", was_livestream=True)
+        (_, status), tpath, mpath = _run(tmp_path, "gemini", livestream_captions_first=True)
         assert "captions" in status
         assert calls == [], "Gemini video ingestion must NOT be invoked for a captioned livestream VOD"
         meta = json.loads(mpath.read_text())
         assert meta["transcript_source"] == "youtube_captions"
         assert tpath.exists()
 
-    def test_captions_first_overrides_channel_transcript_source(self, tmp_path, monkeypatch):
-        # transcript_source: gemini on the channel must not defeat captions-first.
-        for source in ("gemini", "auto"):
+    def test_captions_first_applies_to_implicit_default_and_explicit_auto(self, tmp_path, monkeypatch):
+        # Both provenances that mean "nobody asked for Gemini" route the same
+        # way. An EXPLICIT gemini does not - see TestTranscriptSourceProvenance.
+        for source in ("gemini", "auto"):  # "gemini" here is the IMPLICIT default
             calls: list[str] = []
             _stub_gemini(monkeypatch, calls=calls)
             _stub_captions(monkeypatch, CaptionsResult([(0.0, "speech")], True, "en"))
             target = tmp_path / source
-            (_, status), _, _ = _run(target, source, was_livestream=True)
+            (_, status), _, _ = _run(target, source, livestream_captions_first=True)
             assert "captions" in status
             assert calls == []
 
@@ -222,7 +223,7 @@ class TestLivestreamTranscriptRouting:
         calls: list[str] = []
         _stub_gemini(monkeypatch, calls=calls, raw_text="not json at all {{{")
         _stub_captions(monkeypatch, None)
-        (_, status), tpath, _ = _run(tmp_path, "gemini", was_livestream=True)
+        (_, status), tpath, _ = _run(tmp_path, "gemini", livestream_captions_first=True)
         assert len(calls) == 1, f"livestream VOD must get ONE Gemini attempt, got {len(calls)}"
         assert status.startswith("error")
         assert not tpath.exists()
@@ -232,7 +233,7 @@ class TestLivestreamTranscriptRouting:
         calls: list[str] = []
         _stub_gemini(monkeypatch, calls=calls, prompt_tokens=5000)
         _stub_captions(monkeypatch, None)
-        (_, status), tpath, mpath = _run(tmp_path, "gemini", was_livestream=True)
+        (_, status), tpath, mpath = _run(tmp_path, "gemini", livestream_captions_first=True)
         assert status == "done"
         assert len(calls) == 1
         assert tpath.exists()
@@ -242,7 +243,7 @@ class TestLivestreamTranscriptRouting:
         calls: list[str] = []
         _stub_gemini(monkeypatch, calls=calls, prompt_tokens=0)
         _stub_captions(monkeypatch, None)
-        (_, status), tpath, _ = _run(tmp_path, "gemini", was_livestream=True)
+        (_, status), tpath, _ = _run(tmp_path, "gemini", livestream_captions_first=True)
         assert "confabulation" in status
         assert not tpath.exists()
         assert len(calls) == 1
@@ -253,7 +254,7 @@ class TestLivestreamTranscriptRouting:
         fetches: list[str] = []
         _stub_gemini(monkeypatch, raises=RuntimeError("400 INVALID_ARGUMENT"))
         _stub_captions(monkeypatch, None, fetches=fetches)
-        (_, status), _, _ = _run(tmp_path, "auto", was_livestream=True)
+        (_, status), _, _ = _run(tmp_path, "auto", livestream_captions_first=True)
         assert status.startswith("error")
         assert len(fetches) == 1, f"caption track must be fetched once, got {len(fetches)}"
 
@@ -324,9 +325,119 @@ class TestLivestreamTranscriptRouting:
         # captions), livestream or not.
         _stub_gemini(monkeypatch)
         _stub_captions(monkeypatch, None)
-        (_, status), tpath, _ = _run(tmp_path, "yt-captions", was_livestream=True)
+        (_, status), tpath, _ = _run(tmp_path, "yt-captions", livestream_captions_first=True)
         assert "no captions" in status
         assert not tpath.exists()
+
+
+# ---------------------------------------------------------------------------
+# Provenance: an EXPLICIT transcript_source: gemini is honored (Codex P1)
+# ---------------------------------------------------------------------------
+
+
+class TestTranscriptSourceProvenance:
+    """`resolve_transcript_source` collapses implicit-default and explicit
+    `gemini` into one string, so captions-first has to read the raw provenance.
+    Silently handing a speech-only transcript to an operator who deliberately
+    chose multimodal (captions known-garbage, wrong language, or the on-screen
+    content IS the content) violates the documented config contract.
+    """
+
+    def test_implicit_default_routes_captions_first(self):
+        assert vi.livestream_captions_first_applies("gemini", {}, None) is True
+
+    def test_explicit_channel_gemini_is_honored(self):
+        assert vi.livestream_captions_first_applies("gemini", {"transcript_source": "gemini"}, None) is False
+
+    def test_explicit_cli_gemini_is_honored(self):
+        # CLI wins over a channel that says auto, exactly as resolve_transcript_source does.
+        assert vi.livestream_captions_first_applies("gemini", {"transcript_source": "auto"}, "gemini") is False
+
+    def test_explicit_auto_routes_captions_first(self):
+        # `auto` delegates the ordering choice to us, and captions-first is it.
+        assert vi.livestream_captions_first_applies("auto", {"transcript_source": "auto"}, None) is True
+
+    def test_cli_auto_overrides_explicit_channel_gemini(self):
+        assert vi.livestream_captions_first_applies("auto", {"transcript_source": "gemini"}, "auto") is True
+
+    def test_yt_captions_never_needs_the_rule(self):
+        assert vi.livestream_captions_first_applies("yt-captions", {"transcript_source": "yt-captions"}, None) is False
+
+    def test_explicit_gemini_keeps_the_full_parse_retry_budget(self, tmp_path, monkeypatch):
+        # "exactly as pre-#120" includes the retry budget. Explicit gemini has no
+        # captions fallback, so losing the retry would make that operator strictly
+        # worse off on a stochastic malformed-JSON response.
+        calls: list[str] = []
+        _stub_gemini(monkeypatch, calls=calls, raw_text="not json at all {{{")
+        _stub_captions(monkeypatch, CaptionsResult([(0.0, "speech")], True, "en"))
+        _run(tmp_path, "gemini", livestream_captions_first=False)
+        assert len(calls) == 1 + vi.TRANSCRIPT_PARSE_RETRY_LIMIT
+
+    def test_scan_honors_explicit_channel_gemini_on_a_livestream(self, tmp_path, monkeypatch):
+        """Case 2 end-to-end: Gemini is attempted, captions are NOT consulted first."""
+        videos = [{"video_id": "vod1", "title": "Live VOD", "published": "2026-06-13"}]
+        statuses = {"vod1": {"live_broadcast_content": "none", "privacy_status": "public", "was_livestream": True}}
+        captured = _scan_setup(monkeypatch, videos, statuses, {})
+        config = {
+            "output_dir": str(tmp_path),
+            "channels": [
+                {
+                    "name": "ch",
+                    "url": "https://example.com/ch",
+                    "auto_transcript": "all",
+                    "transcript_source": "gemini",  # explicit
+                }
+            ],
+        }
+        vi.cmd_scan(_scan_args(), config)
+        assert captured["transcript"] == [("vod1", False)], "explicit gemini must not be flipped to captions-first"
+
+    def test_scan_routes_captions_first_when_channel_says_nothing(self, tmp_path, monkeypatch):
+        videos = [{"video_id": "vod1", "title": "Live VOD", "published": "2026-06-13"}]
+        statuses = {"vod1": {"live_broadcast_content": "none", "privacy_status": "public", "was_livestream": True}}
+        captured = _scan_setup(monkeypatch, videos, statuses, {})
+        config = {
+            "output_dir": str(tmp_path),
+            "channels": [{"name": "ch", "url": "https://example.com/ch", "auto_transcript": "all"}],
+        }
+        vi.cmd_scan(_scan_args(), config)
+        assert captured["transcript"] == [("vod1", True)]
+
+    def test_cmd_transcript_cli_gemini_stays_gemini_first(self, tmp_path, monkeypatch):
+        """Case 3 end-to-end on the manual path: `--transcript-source gemini`
+        against a livestream VOD must reach Gemini without consulting captions."""
+        calls: list[str] = []
+        fetches: list[str] = []
+        monkeypatch.setenv("GEMINI_API_KEY", "test")
+        # Real `types` stand-in: unlike the captions-first tests, this one
+        # actually reaches Gemini, so the media-resolution enum gets resolved.
+        monkeypatch.setattr(vi, "require_gemini", lambda: (MagicMock(), MagicMock()))
+        monkeypatch.setattr(vi, "create_client", lambda *a, **kw: None)
+        monkeypatch.setattr(vi, "_lookup_was_livestream", lambda vid: True)
+        monkeypatch.setattr(vi, "_lookup_video_duration_seconds", lambda vid: 600)  # short -> single-shot
+        _stub_gemini(monkeypatch, calls=calls)
+        _stub_captions(monkeypatch, CaptionsResult([(0.0, "speech")], True, "en"), fetches=fetches)
+
+        output_dir = tmp_path / "corpus"
+        args = Namespace(
+            url="https://www.youtube.com/watch?v=ihM91WWU0lE",
+            file=None,
+            channel="somechannel",
+            title="Live QA",
+            date="2026-07-23",
+            start=None,
+            end=None,
+            force=False,
+            model=None,
+            media_resolution="low",
+            transcript_source="gemini",  # explicit CLI flag
+            chunk_minutes=None,
+            video_id=None,
+        )
+        vi.cmd_transcript(args, {"output_dir": str(output_dir)})
+
+        assert len(calls) == 1, "explicit CLI gemini must reach Gemini"
+        assert fetches == [], "and must not consult captions beforehand"
 
 
 # ---------------------------------------------------------------------------
@@ -566,7 +677,7 @@ def _scan_setup(monkeypatch, videos, statuses, transcript_result):
     def fake_process_transcript(*args, **kwargs):
         video = args[2]
         prefix = args[6]
-        captured["transcript"].append((video["video_id"], kwargs.get("was_livestream")))
+        captured["transcript"].append((video["video_id"], kwargs.get("livestream_captions_first")))
         return (prefix, transcript_result.get(video["video_id"], "done"))
 
     def fake_process_mindmap(*args, **kwargs):
