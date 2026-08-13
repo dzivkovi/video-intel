@@ -9,6 +9,26 @@ log = logging.getLogger(__name__)
 RETRYABLE_SERVER_CODES: set[int] = {408, 500, 502, 503, 504}
 RETRYABLE_RATE_CODES: set[int] = {429}
 
+#: Retries allowed for a transport-layer failure (issue #129). ONE, deliberately:
+#: far below the server-error budget, because a server error carries a verdict
+#: from Gemini while a dropped socket costs a full re-billed call with no
+#: evidence the next one will land. One retry covered every occurrence observed
+#: in the 2026-08-11/12 bulk ingest (7 drops, each fixed by a single re-run).
+#:
+#: This is a per-CALL budget on purpose - there is no run-level cap on top. A
+#: chunked transcript of N chunks can therefore spend up to N extra calls worst
+#: case, which is bounded and proportional: each chunk is an independent unit of
+#: work, and a shared run-level budget would let chunk 1's bad luck starve
+#: chunk 8 of the retry that would have saved it.
+MAX_RETRIES_TRANSPORT: int = 1
+
+#: Seconds before a transport retry (plus 0-3s jitter). Kept small ON PURPOSE.
+#: Transcript calls run inside ``_run_with_timeout``'s 600s wall-clock cap
+#: (issue #74) which wraps the whole ``call_gemini`` invocation including this
+#: sleep, so the backoff competes with the real call for that budget. The
+#: server-error ladder's 60-480s waits would consume it on their own.
+TRANSPORT_RETRY_BASE_WAIT: int = 2
+
 
 #: Rendered in the usage log line for a count the SDK did not report readably.
 #: Deliberately not "0": see _coerce_token_count for why the two must not be
@@ -236,29 +256,132 @@ def build_permissive_safety_settings(types):
 # ---------------------------------------------------------------------------
 
 
+def is_transient_transport_error(exc: Exception) -> bool:
+    """True for an httpx failure where no server verdict was ever delivered.
+
+    Issue #129. ``Server disconnected without sending a response.`` is
+    ``httpx.RemoteProtocolError``, not a ``google.genai.errors.APIError``, so
+    before this existed ``get_retry_delay`` returned ``None`` for it and one
+    dropped socket killed the whole pipeline step. The SDK does not wrap httpx
+    exceptions (``google.genai._api_client`` has no ``except httpx...`` clause),
+    so they arrive here raw.
+
+    ``httpx.TransportError`` is the right net because it is defined by the
+    request never completing: connect/write/pool timeouts, connection and
+    protocol drops, proxy failures. Three members are excluded.
+
+    Two are client-side faults, where retrying fails identically and only burns
+    time:
+
+    * ``LocalProtocolError`` - we built a malformed request.
+    * ``UnsupportedProtocol`` - the URL scheme is wrong.
+
+    The third, ``ReadTimeout``, is excluded on COST, not on correctness - and it
+    is the one exclusion that will look wrong to a future reader, so: the
+    ``read`` timeout in ``create_client`` is **1200 seconds**, orders of
+    magnitude above the other three (connect/write/pool are 30s each). A retry
+    of a read timeout therefore risks a second 20-minute wait. Transcript calls
+    are safe either way - ``_run_with_timeout``'s 600s cap (issue #74) fires
+    first and raises ``TranscriptTimeout``, which is not an httpx error and
+    never reaches this classifier - but mindmap-from-video and concepts calls
+    have no such outer deadline, so a single unreachable response could stall a
+    sequential scan stage for ~40 minutes. Before this existed it failed after
+    one 20-minute wait; making that worse is not a fix. Every failure actually
+    observed in issue #129 was ``RemoteProtocolError``, so nothing in the
+    evidence argues for retrying read timeouts. Re-admitting ``ReadTimeout``
+    means first giving mindmap/concepts a total wall-clock deadline.
+
+    ``HTTPStatusError`` is deliberately NOT here: it is not a ``TransportError``
+    at all, and a status carrying a real server verdict is the ``APIError``
+    branch's business. That separation is what keeps ``PERMISSION_DENIED`` (403)
+    and ``INVALID_ARGUMENT`` (400) failing fast.
+    """
+    try:
+        import httpx
+    except ImportError:  # pragma: no cover - httpx ships with google-genai
+        return False
+    if isinstance(exc, httpx.LocalProtocolError | httpx.UnsupportedProtocol | httpx.ReadTimeout):
+        return False
+    return isinstance(exc, httpx.TransportError)
+
+
 def get_retry_delay(
     exc: Exception,
     attempt: int,
     *,
     max_retries_rate: int = 3,
     max_retries_server: int = 8,
+    max_retries_transport: int = 0,
+    transport_attempt: int | None = None,
 ) -> tuple[str, float, int] | None:
-    """Return (kind, wait_seconds, max_for_type) for retryable Gemini API errors, or None."""
+    """Return (kind, wait_seconds, max_for_type) for retryable Gemini failures, or None.
+
+    Three disjoint classes, checked in this order:
+
+    1. ``APIError`` - the server answered. Retryable only for the 5xx/408 and
+       429 code sets; **every other code returns None from inside this branch**,
+       which is what makes ``PERMISSION_DENIED`` and ``INVALID_ARGUMENT`` fail
+       fast. That early return is load-bearing: an ``APIError`` must never fall
+       through to the transport check below (issue #129).
+    2. Transport failure - the request never completed, so there is no verdict
+       to respect. Small budget, short backoff, and **off unless the caller asks
+       for it**.
+    3. Anything else - not retryable.
+
+    ``transport_attempt`` is how many transport retries THIS call has already
+    spent, which is not the same number as ``attempt`` (ce-code-review,
+    reliability, PR #136). The callers' loop index counts every failure of every
+    class, so with a budget as small as 1 a transport drop that lands after any
+    earlier 429 or 5xx retry would arrive with ``attempt >= 1`` and be denied its
+    only chance - silently reverting to pre-#129 behavior in exactly the
+    compound-failure scenario the issue describes (7 drops under 4-way
+    concurrency, alongside rate limiting). Callers therefore track transport
+    occurrences separately and pass that count here.
+
+    It defaults to ``None``, meaning "fall back to ``attempt``". That default is
+    deliberately the CONSERVATIVE direction: a caller who enables the budget but
+    forgets to track the counter gets fewer retries than intended, never an
+    unbounded number. Do not "simplify" the default to ``0`` - that reads as
+    "no transport retry spent yet" on every single pass, so the budget would
+    never be reached and the only thing still bounding the loop would be the
+    caller's range, against the "bounded retries only" guardrail.
+
+    ``max_retries_transport`` defaults to ``0`` so this stays a pure addition:
+    ``translate_video.py`` shares this helper and is operationally separate from
+    the video-intel pipeline, so it must not inherit a new retry policy as a
+    side effect of a video-intel ticket. video-intel's call sites opt in
+    explicitly with ``MAX_RETRIES_TRANSPORT``. Enabling it for the translator
+    later is a one-argument change, and should be its own deliberate diff with
+    its own smoke test rather than a silent inheritance.
+
+    The ``prompt == 0`` confabulation guards (issues #60/#119/#123) are
+    untouched by class 2 and cannot be: they inspect usage metadata on a
+    response that arrived successfully, so they run *after* this function's
+    caller has already returned. A refusal there is not an exception this loop
+    ever sees.
+    """
     from google.genai import errors
 
-    if not isinstance(exc, errors.APIError):
+    if isinstance(exc, errors.APIError):
+        if exc.code in RETRYABLE_SERVER_CODES:
+            if attempt >= max_retries_server:
+                return None
+            base_wait = 60 * (2 ** min(attempt, 3))  # 60s, 120s, 240s, 480s cap
+            return "Server error", base_wait + random.uniform(0, 10), max_retries_server
+
+        if exc.code in RETRYABLE_RATE_CODES:
+            if attempt >= max_retries_rate:
+                return None
+            base_wait = 15 * (2**attempt)  # 15s, 30s, 60s
+            return "Rate limited (429)", base_wait + random.uniform(0, 10), max_retries_rate
+
         return None
 
-    if exc.code in RETRYABLE_SERVER_CODES:
-        if attempt >= max_retries_server:
+    if is_transient_transport_error(exc):
+        spent = attempt if transport_attempt is None else transport_attempt
+        if spent >= max_retries_transport:
             return None
-        base_wait = 60 * (2 ** min(attempt, 3))  # 60s, 120s, 240s, 480s cap
-        return "Server error", base_wait + random.uniform(0, 10), max_retries_server
-
-    if exc.code in RETRYABLE_RATE_CODES:
-        if attempt >= max_retries_rate:
-            return None
-        base_wait = 15 * (2**attempt)  # 15s, 30s, 60s
-        return "Rate limited (429)", base_wait + random.uniform(0, 10), max_retries_rate
+        base_wait = TRANSPORT_RETRY_BASE_WAIT * (2**spent)
+        return "Transport error", base_wait + random.uniform(0, 3), max_retries_transport
 
     return None

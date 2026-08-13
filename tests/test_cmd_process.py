@@ -16,7 +16,21 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from video_intel import cmd_process
+from video_intel import EXIT_PARTIAL, cmd_process
+
+
+def _write_stub_artifact_if_ok(path, status, content):
+    """Write the placeholder artifact a process_* stub claims to have produced.
+
+    Issue #129's exit-code check inspects the filesystem, not just the
+    returned status string, so a stub that reports success must also leave a
+    real (non-empty) file behind - mirroring what the actual process_transcript
+    / process_mindmap / process_concepts helpers write on disk. An error
+    status must NOT write anything; that is the failure case under test.
+    """
+    if not str(status).startswith("error"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
 
 
 def _make_args(
@@ -100,7 +114,9 @@ class TestCmdProcessHappyPath:
         def fake_transcript(*args, **kwargs):
             transcript_calls.append(kwargs)
             prefix = args[6] if len(args) > 6 else kwargs.get("prefix")
-            return prefix, "done"
+            status = "done"
+            _write_stub_artifact_if_ok(channel_dir / f"{prefix}.transcript.md", status, "# stub transcript\n")
+            return prefix, status
 
         monkeypatch.setattr("video_intel.process_transcript", fake_transcript)
 
@@ -108,12 +124,27 @@ class TestCmdProcessHappyPath:
 
         def fake_concepts(*args, **kwargs):
             concepts_calls.append(kwargs)
-            return kwargs.get("prefix") or "video", "done"
+            prefix = kwargs.get("prefix") or "video"
+            status = "done"
+            _write_stub_artifact_if_ok(channel_dir / f"{prefix}.concepts.json", status, '{"concepts": []}')
+            return prefix, status
 
         monkeypatch.setattr("video_intel.process_concepts", fake_concepts)
 
+        # Pin mindmap_source=video: this test's own assertions are about the
+        # legacy mindmap-from-video path threading the same file_uri as
+        # transcript ("both video-bearing calls"). With a faithful transcript
+        # stub now writing a real .transcript.md (issue #129), the default
+        # mindmap_source=auto resolver would route mindmap through the
+        # cheaper transcript-source path instead (issue #54) - which never
+        # receives media_uri at all, since it's a text-only call. Forcing the
+        # legacy video path here keeps this test exercising what it actually
+        # asserts, without touching the assertions themselves.
+        config = _config()
+        config["channels"][0]["mindmap_source"] = "video"
+
         args = _make_args(file=mp4, channel="everyinc")
-        cmd_process(args, _config())
+        cmd_process(args, config)
 
         assert len(upload_calls) == 1
         assert len(mindmap_calls) == 1
@@ -133,14 +164,22 @@ class TestCmdProcessHappyPath:
         mp4.write_bytes(b"fake")
 
         monkeypatch.setattr("video_intel.upload_local_video", lambda _c, _p: "files/loose")
-        monkeypatch.setattr(
-            "video_intel.process_mindmap",
-            lambda *a, **kw: (kw.get("prefix") or "random", "done"),
-        )
-        monkeypatch.setattr(
-            "video_intel.process_transcript",
-            lambda *a, **kw: (a[6] if len(a) > 6 else kw.get("prefix") or "random", "done"),
-        )
+
+        def fake_mindmap(*a, **kw):
+            prefix = kw.get("prefix") or "random"
+            status = "done"
+            _write_stub_artifact_if_ok(loose_dir / f"{prefix}.mindmap.md", status, "# stub mindmap\n")
+            return prefix, status
+
+        monkeypatch.setattr("video_intel.process_mindmap", fake_mindmap)
+
+        def fake_transcript(*a, **kw):
+            prefix = a[6] if len(a) > 6 else kw.get("prefix") or "random"
+            status = "done"
+            _write_stub_artifact_if_ok(loose_dir / f"{prefix}.transcript.md", status, "# stub transcript\n")
+            return prefix, status
+
+        monkeypatch.setattr("video_intel.process_transcript", fake_transcript)
         concepts_called = []
         monkeypatch.setattr(
             "video_intel.process_concepts",
@@ -226,14 +265,22 @@ class TestCmdProcessLazyUpload:
             "video_intel.process_mindmap",
             lambda *a, **kw: (kw.get("prefix") or "video", "skipped (exists)"),
         )
-        monkeypatch.setattr(
-            "video_intel.process_transcript",
-            lambda *a, **kw: (a[6] if len(a) > 6 else kw.get("prefix") or "video", "done"),
-        )
-        monkeypatch.setattr(
-            "video_intel.process_concepts",
-            lambda *a, **kw: (kw.get("prefix") or "video", "done"),
-        )
+
+        def fake_transcript(*a, **kw):
+            prefix = a[6] if len(a) > 6 else kw.get("prefix") or "video"
+            status = "done"
+            _write_stub_artifact_if_ok(channel_dir / f"{prefix}.transcript.md", status, "# stub transcript\n")
+            return prefix, status
+
+        monkeypatch.setattr("video_intel.process_transcript", fake_transcript)
+
+        def fake_concepts(*a, **kw):
+            prefix = kw.get("prefix") or "video"
+            status = "done"
+            _write_stub_artifact_if_ok(channel_dir / f"{prefix}.concepts.json", status, '{"concepts": []}')
+            return prefix, status
+
+        monkeypatch.setattr("video_intel.process_concepts", fake_concepts)
 
         args = _make_args(file=mp4, channel="everyinc")
         cmd_process(args, _config())
@@ -282,10 +329,14 @@ class TestCmdProcessLazyUpload:
                 or (a[6] if len(a) > 6 else kw.get("prefix") or "video", "done")
             ),
         )
-        monkeypatch.setattr(
-            "video_intel.process_concepts",
-            lambda *a, **kw: (kw.get("prefix") or "video", "done"),
-        )
+
+        def fake_concepts(*a, **kw):
+            prefix = kw.get("prefix") or "video"
+            status = "done"
+            _write_stub_artifact_if_ok(channel_dir / f"{prefix}.concepts.json", status, '{"concepts": []}')
+            return prefix, status
+
+        monkeypatch.setattr("video_intel.process_concepts", fake_concepts)
 
         args = _make_args(file=mp4, channel="everyinc")
         cmd_process(args, _config())
@@ -364,15 +415,27 @@ class TestCmdProcessExitCodeContract:
         # Concepts must NOT run when mindmap fails
         assert concepts_called == []
 
-    def test_transcript_failure_after_mindmap_exits_zero(self, stub_env, monkeypatch, tmp_path):
-        """Partial-success contract: mindmap succeeded, so exit 0 regardless of transcript outcome."""
-        mp4, _ = _prep_mp4(tmp_path)
+    def test_transcript_failure_after_mindmap_exits_partial_and_preserves_mindmap(
+        self, stub_env, monkeypatch, tmp_path
+    ):
+        """Issue #129 flipped this deliberately; it asserted exit 0 before.
+
+        The PRESERVATION half of the partial-success contract is unchanged and is
+        asserted here: a transcript failure never rolls back the mindmap. What
+        changed is the REPORTING half - the run now exits EXIT_PARTIAL instead of
+        disguising an incomplete video as success, because a batch driver reading
+        the exit code was the thing that could not see the gap.
+        """
+        mp4, channel_dir = _prep_mp4(tmp_path)
 
         monkeypatch.setattr("video_intel.upload_local_video", lambda _c, _p: "files/test")
-        monkeypatch.setattr(
-            "video_intel.process_mindmap",
-            lambda *a, **kw: (kw.get("prefix") or "video", "done"),
-        )
+
+        def fake_mindmap(*a, **kw):
+            prefix = kw.get("prefix") or "video"
+            _write_stub_artifact_if_ok(channel_dir / f"{prefix}.mindmap.md", "done", "# stub mindmap\n")
+            return prefix, "done"
+
+        monkeypatch.setattr("video_intel.process_mindmap", fake_mindmap)
         monkeypatch.setattr(
             "video_intel.process_transcript",
             lambda *a, **kw: (a[6] if len(a) > 6 else "video", "error: JSON parse failed"),
@@ -384,34 +447,52 @@ class TestCmdProcessExitCodeContract:
         )
 
         args = _make_args(file=mp4, channel="everyinc")
-        # Should NOT raise SystemExit — exit 0 implicit via normal return
-        cmd_process(args, _config())
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_process(args, _config())
 
-        # Concepts must not run when transcript failed (it'd have nothing sensible to extract from
-        # a missing transcript either way, but the mindmap exists so concepts COULD run on it).
-        # The contract: we only run concepts after transcript succeeds. If transcript failed,
-        # concepts is skipped.
+        assert exc_info.value.code == EXIT_PARTIAL
+        # Unchanged: concepts is still skipped after a transcript failure, and
+        # the mindmap artifact still survives on disk. Nothing is rolled back.
         assert concepts_called == []
+        assert (channel_dir / "video.mindmap.md").exists()
 
-    def test_concepts_failure_does_not_change_exit_code(self, stub_env, monkeypatch, tmp_path):
-        mp4, _ = _prep_mp4(tmp_path)
+    def test_concepts_failure_exits_partial(self, stub_env, monkeypatch, tmp_path):
+        """Issue #129's headline case, inverted from what this test used to assert.
+
+        A concepts step that reports an error and writes no .concepts.json used
+        to exit 0. Because is_processed() never looks at concepts, that video was
+        never re-queued and simply never reached taxonomy.json or the search
+        index - the gap was only findable by walking the filesystem.
+        """
+        mp4, channel_dir = _prep_mp4(tmp_path)
 
         monkeypatch.setattr("video_intel.upload_local_video", lambda _c, _p: "files/test")
-        monkeypatch.setattr(
-            "video_intel.process_mindmap",
-            lambda *a, **kw: (kw.get("prefix") or "video", "done"),
-        )
-        monkeypatch.setattr(
-            "video_intel.process_transcript",
-            lambda *a, **kw: (a[6] if len(a) > 6 else "video", "done"),
-        )
+
+        def fake_mindmap(*a, **kw):
+            prefix = kw.get("prefix") or "video"
+            _write_stub_artifact_if_ok(channel_dir / f"{prefix}.mindmap.md", "done", "# stub mindmap\n")
+            return prefix, "done"
+
+        def fake_transcript(*a, **kw):
+            prefix = a[6] if len(a) > 6 else "video"
+            _write_stub_artifact_if_ok(channel_dir / f"{prefix}.transcript.md", "done", "# stub\n")
+            return prefix, "done"
+
+        monkeypatch.setattr("video_intel.process_mindmap", fake_mindmap)
+        monkeypatch.setattr("video_intel.process_transcript", fake_transcript)
         monkeypatch.setattr(
             "video_intel.process_concepts",
             lambda *a, **kw: (kw.get("prefix") or "video", "error: taxonomy broken"),
         )
 
         args = _make_args(file=mp4, channel="everyinc")
-        cmd_process(args, _config())  # must not raise
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_process(args, _config())
+
+        assert exc_info.value.code == EXIT_PARTIAL
+        # The steps that DID succeed keep their artifacts.
+        assert (channel_dir / "video.mindmap.md").exists()
+        assert (channel_dir / "video.transcript.md").exists()
 
 
 class TestCmdProcessCodeReviewRegressions:
@@ -459,14 +540,23 @@ class TestCmdProcessCodeReviewRegressions:
 
         The looser prefix check must catch both 'error: ...' and 'error parsing JSON: ...'
         so concepts never runs against a missing/partial transcript.
+
+        Issue #129: a transcript step that genuinely fails (no artifact, error
+        status) now also means the run's requested artifact set is incomplete,
+        so cmd_process exits EXIT_PARTIAL instead of returning 0. The transcript
+        stub deliberately writes nothing here - that's the failure being tested.
         """
-        mp4, _ = _prep_mp4(tmp_path)
+        mp4, channel_dir = _prep_mp4(tmp_path)
 
         monkeypatch.setattr("video_intel.upload_local_video", lambda _c, _p: "files/test")
-        monkeypatch.setattr(
-            "video_intel.process_mindmap",
-            lambda *a, **kw: (kw.get("prefix") or "video", "done"),
-        )
+
+        def fake_mindmap(*a, **kw):
+            prefix = kw.get("prefix") or "video"
+            status = "done"
+            _write_stub_artifact_if_ok(channel_dir / f"{prefix}.mindmap.md", status, "# stub mindmap\n")
+            return prefix, status
+
+        monkeypatch.setattr("video_intel.process_mindmap", fake_mindmap)
         monkeypatch.setattr(
             "video_intel.process_transcript",
             lambda *a, **kw: (
@@ -481,6 +571,8 @@ class TestCmdProcessCodeReviewRegressions:
         )
 
         args = _make_args(file=mp4, channel="everyinc")
-        cmd_process(args, _config())
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_process(args, _config())
 
+        assert exc_info.value.code == EXIT_PARTIAL
         assert concepts_called == []  # error-parsing-JSON path must be recognized as failure

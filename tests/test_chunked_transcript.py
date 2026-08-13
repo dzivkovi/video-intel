@@ -567,6 +567,20 @@ class TestCmdTranscriptUrlChunking:
 # ---------------------------------------------------------------------------
 
 
+def _write_stub_artifact_if_ok(path, status, content):
+    """Write the placeholder artifact a process_* stub claims to have produced.
+
+    Issue #129's exit-code check inspects the filesystem, not just the
+    returned status string, so a stub that reports success must also leave a
+    real (non-empty) file behind - mirroring what the actual process_transcript
+    / process_mindmap / process_concepts helpers write on disk. An error
+    status must NOT write anything; that is the failure case under test.
+    """
+    if not str(status).startswith("error"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+
 def _process_url_args(url, **overrides):
     base = {
         "url": url,
@@ -619,11 +633,22 @@ class TestCmdProcessUrl:
 
         def fake_transcript(*args, **kwargs):
             calls["transcript"] += 1
-            return args[6] if len(args) > 6 else kwargs.get("prefix"), "done"
+            channel_dir = args[5] if len(args) > 5 else kwargs.get("channel_dir")
+            prefix = args[6] if len(args) > 6 else kwargs.get("prefix")
+            status = "done"
+            _write_stub_artifact_if_ok(channel_dir / f"{prefix}.transcript.md", status, "# stub transcript\n")
+            return prefix, status
 
         def fake_concepts(*args, **kwargs):
             calls["concepts"] += 1
-            return kwargs.get("prefix") or "p", "done"
+            output_dir_arg = args[6] if len(args) > 6 else kwargs.get("output_dir")
+            channel_name_arg = args[7] if len(args) > 7 else kwargs.get("channel_name")
+            prefix = kwargs.get("prefix") or "p"
+            status = "done"
+            _write_stub_artifact_if_ok(
+                output_dir_arg / channel_name_arg / f"{prefix}.concepts.json", status, '{"concepts": []}'
+            )
+            return prefix, status
 
         monkeypatch.setattr(vi, "process_mindmap", fake_mindmap)
         monkeypatch.setattr(vi, "process_transcript", fake_transcript)
@@ -665,8 +690,18 @@ class TestCmdProcessUrl:
             (tmp_path / ch / f"{prefix}.mindmap.md").write_text("# stub", encoding="utf-8")
             return prefix, "done"
 
+        def fake_concepts(*args, **kwargs):
+            output_dir_arg = args[6] if len(args) > 6 else kwargs.get("output_dir")
+            channel_name_arg = args[7] if len(args) > 7 else kwargs.get("channel_name")
+            prefix = kwargs.get("prefix") or "p"
+            status = "done"
+            _write_stub_artifact_if_ok(
+                output_dir_arg / channel_name_arg / f"{prefix}.concepts.json", status, '{"concepts": []}'
+            )
+            return prefix, status
+
         monkeypatch.setattr(vi, "process_mindmap", fake_mindmap)
-        monkeypatch.setattr(vi, "process_concepts", lambda *a, **kw: ("p", "done"))
+        monkeypatch.setattr(vi, "process_concepts", fake_concepts)
 
         chunk_response = {"transcripts": [], "speakers": [{"voice": 1, "name": "S"}], "screen_content": []}
         chunk_calls = _stub_gemini_calls(monkeypatch, [chunk_response] * 4)

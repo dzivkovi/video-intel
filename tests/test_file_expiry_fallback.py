@@ -15,6 +15,20 @@ import pytest
 from video_intel import _is_file_expiry_error_status, cmd_process
 
 
+def _write_stub_artifact_if_ok(path, status, content):
+    """Write the placeholder artifact a process_* stub claims to have produced.
+
+    Issue #129's exit-code check inspects the filesystem, not just the
+    returned status string, so a stub that reports success must also leave a
+    real (non-empty) file behind - mirroring what the actual process_transcript
+    / process_mindmap / process_concepts helpers write on disk. An error
+    status must NOT write anything; that is the failure case under test.
+    """
+    if not str(status).startswith("error"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+
 def _make_args(*, file=None, channel=None, force=False, **_):
     return argparse.Namespace(
         file=file,
@@ -112,16 +126,34 @@ class TestCmdProcessFileExpiryFallback:
             return kwargs.get("prefix") or "video", "done"
 
         monkeypatch.setattr("video_intel.process_mindmap", fake_mindmap)
-        monkeypatch.setattr(
-            "video_intel.process_transcript",
-            lambda *a, **kw: (a[6] if len(a) > 6 else "video", "done"),
-        )
-        monkeypatch.setattr(
-            "video_intel.process_concepts",
-            lambda *a, **kw: (kw.get("prefix") or "video", "done"),
-        )
 
-        cmd_process(_make_args(file=mp4, channel="everyinc"), _config())
+        def fake_transcript(*a, **kw):
+            prefix = a[6] if len(a) > 6 else "video"
+            status = "done"
+            _write_stub_artifact_if_ok(channel_dir / f"{prefix}.transcript.md", status, "# stub transcript\n")
+            return prefix, status
+
+        monkeypatch.setattr("video_intel.process_transcript", fake_transcript)
+
+        def fake_concepts(*a, **kw):
+            prefix = kw.get("prefix") or "video"
+            status = "done"
+            _write_stub_artifact_if_ok(channel_dir / f"{prefix}.concepts.json", status, '{"concepts": []}')
+            return prefix, status
+
+        monkeypatch.setattr("video_intel.process_concepts", fake_concepts)
+
+        # Pin mindmap_source=video: this test exercises the file-expiry
+        # re-upload+retry wrapper, which only wraps the legacy
+        # mindmap-from-video call (mindmap-from-transcript needs no file_uri
+        # and never re-uploads). With a faithful transcript stub now writing
+        # a real .transcript.md (issue #129), the default mindmap_source=auto
+        # resolver would otherwise route mindmap through the transcript-source
+        # path and bypass the retry wrapper entirely, defeating the test.
+        config = _config()
+        config["channels"][0]["mindmap_source"] = "video"
+
+        cmd_process(_make_args(file=mp4, channel="everyinc"), config)
 
         assert upload_count["n"] == 2  # one initial, one re-upload
         assert call_count["mindmap"] == 2  # one failure, one retry
@@ -152,14 +184,21 @@ class TestCmdProcessFileExpiryFallback:
             transcript_call["n"] += 1
             prefix = args[6] if len(args) > 6 else kwargs.get("prefix") or "video"
             if transcript_call["n"] == 1:
-                return prefix, "error: APIError: 404 File files/upload-1 not found"
-            return prefix, "done"
+                status = "error: APIError: 404 File files/upload-1 not found"
+            else:
+                status = "done"
+            _write_stub_artifact_if_ok(channel_dir / f"{prefix}.transcript.md", status, "# stub transcript\n")
+            return prefix, status
 
         monkeypatch.setattr("video_intel.process_transcript", fake_transcript)
-        monkeypatch.setattr(
-            "video_intel.process_concepts",
-            lambda *a, **kw: (kw.get("prefix") or "video", "done"),
-        )
+
+        def fake_concepts(*a, **kw):
+            prefix = kw.get("prefix") or "video"
+            status = "done"
+            _write_stub_artifact_if_ok(channel_dir / f"{prefix}.concepts.json", status, '{"concepts": []}')
+            return prefix, status
+
+        monkeypatch.setattr("video_intel.process_concepts", fake_concepts)
 
         cmd_process(_make_args(file=mp4, channel="everyinc"), _config())
 

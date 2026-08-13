@@ -375,6 +375,20 @@ def _stub_url_env(monkeypatch, tmp_path, *, duration=1800):
     monkeypatch.setattr(video_intel, "_lookup_was_livestream", lambda *_a, **_kw: False)
 
 
+def _write_stub_artifact_if_ok(path, status, content):
+    """Write the placeholder artifact a process_* stub claims to have produced.
+
+    Issue #129's exit-code check inspects the filesystem, not just the
+    returned status string, so a stub that reports success must also leave a
+    real (non-empty) file behind - mirroring what the actual process_transcript
+    / process_mindmap / process_concepts helpers write on disk. An error
+    status must NOT write anything; that is the failure case under test.
+    """
+    if not str(status).startswith("error"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+
 class TestCmdProcessUrlInversion:
     def test_transcript_runs_before_mindmap_when_auto(self, tmp_path, monkeypatch):
         """Issue #54 reordering: with default mindmap_source=auto and a transcript
@@ -406,7 +420,14 @@ class TestCmdProcessUrlInversion:
 
         def fake_concepts(*args, **kwargs):
             call_order.append("concepts")
-            return kwargs.get("prefix") or "p", "done"
+            output_dir_arg = args[6] if len(args) > 6 else kwargs.get("output_dir")
+            channel_name_arg = args[7] if len(args) > 7 else kwargs.get("channel_name")
+            prefix = kwargs.get("prefix") or "p"
+            status = "done"
+            _write_stub_artifact_if_ok(
+                output_dir_arg / channel_name_arg / f"{prefix}.concepts.json", status, '{"concepts": []}'
+            )
+            return prefix, status
 
         monkeypatch.setattr(video_intel, "process_transcript", fake_transcript)
         monkeypatch.setattr(video_intel, "process_mindmap", fake_mindmap)
@@ -427,7 +448,15 @@ class TestCmdProcessUrlInversion:
     def test_video_fallback_when_transcript_step_produced_no_file(self, tmp_path, monkeypatch):
         """If process_transcript returns 'done' but does not write a file (e.g.
         an upstream stub or a chunked-transcript-all-failed path), mindmap falls
-        back to source='video'. This is the safety net the resolver provides."""
+        back to source='video'. This is the safety net the resolver provides.
+
+        Issue #129: a transcript step that claims success but leaves no artifact
+        on disk is exactly the "requested step, no usable output" gap the new
+        exit-code check exists to catch, so the run now exits EXIT_PARTIAL
+        instead of 0 even though mindmap recovered via the video fallback. The
+        transcript stub deliberately keeps writing nothing here - that's the
+        scenario under test.
+        """
         _stub_url_env(monkeypatch, tmp_path)
 
         def fake_transcript(*args, **kwargs):
@@ -445,17 +474,98 @@ class TestCmdProcessUrlInversion:
             (tmp_path / ch / f"{prefix}.mindmap.md").write_text("# stub", encoding="utf-8")
             return prefix, "done"
 
+        def fake_concepts(*args, **kwargs):
+            output_dir_arg = args[6] if len(args) > 6 else kwargs.get("output_dir")
+            channel_name_arg = args[7] if len(args) > 7 else kwargs.get("channel_name")
+            prefix = kwargs.get("prefix") or "p"
+            status = "done"
+            _write_stub_artifact_if_ok(
+                output_dir_arg / channel_name_arg / f"{prefix}.concepts.json", status, '{"concepts": []}'
+            )
+            return prefix, status
+
         monkeypatch.setattr(video_intel, "process_transcript", fake_transcript)
         monkeypatch.setattr(video_intel, "process_mindmap", fake_mindmap)
-        monkeypatch.setattr(video_intel, "process_concepts", lambda *a, **kw: ("p", "done"))
+        monkeypatch.setattr(video_intel, "process_concepts", fake_concepts)
 
         config = {
             "output_dir": str(tmp_path),
             "channels": [{"name": "demo", "url": "https://example.com/demo"}],
         }
-        video_intel.cmd_process(_process_url_args("https://www.youtube.com/watch?v=BBBBBBBBBBB"), config)
+        with pytest.raises(SystemExit) as exc_info:
+            video_intel.cmd_process(_process_url_args("https://www.youtube.com/watch?v=BBBBBBBBBBB"), config)
 
+        assert exc_info.value.code == video_intel.EXIT_PARTIAL
         assert mindmap_kw_seen.get("source") == "video"
+
+    def test_livestream_mindmap_skip_exits_partial_when_the_transcript_failed(self, tmp_path, monkeypatch):
+        """Issue #129 x #120, integration coverage the unit tests could not give.
+
+        ce-code-review (testing), PR #136: every other test in this file pins
+        ``_lookup_was_livestream`` to False, so this explicitly-documented
+        behavior change had none. The issue #120 mindmap suppression is itself
+        a DELIBERATE skip and contributes no gap - but it only fires when the
+        transcript already failed, and that failed transcript is a requested
+        step with no artifact. So the run exits EXIT_PARTIAL. Before #129 it
+        exited 0 with neither a transcript nor a mindmap on disk, which is
+        precisely the silently-incomplete video the ticket exists to surface.
+        """
+        _stub_url_env(monkeypatch, tmp_path)
+        monkeypatch.setattr(video_intel, "_lookup_was_livestream", lambda *_a, **_kw: True)
+
+        def fake_transcript(*_args, **_kwargs):
+            return "p", "error: 400 INVALID_ARGUMENT"
+
+        mindmap_calls: list = []
+
+        def fake_mindmap(*_args, **kwargs):
+            mindmap_calls.append(kwargs)
+            return "p", "done"
+
+        monkeypatch.setattr(video_intel, "process_transcript", fake_transcript)
+        monkeypatch.setattr(video_intel, "process_mindmap", fake_mindmap)
+        monkeypatch.setattr(video_intel, "process_concepts", lambda *_a, **_kw: ("p", "done"))
+
+        config = {
+            "output_dir": str(tmp_path),
+            "channels": [{"name": "demo", "url": "https://example.com/demo"}],
+        }
+        with pytest.raises(SystemExit) as exc_info:
+            video_intel.cmd_process(_process_url_args("https://www.youtube.com/watch?v=CCCCCCCCCCC"), config)
+
+        assert exc_info.value.code == video_intel.EXIT_PARTIAL
+        # The issue #120 contract is unchanged: no mindmap-from-video call is
+        # spent against a URI Gemini has just proven it cannot ingest.
+        assert mindmap_calls == []
+
+    def test_mindmap_source_none_alone_still_exits_zero(self, tmp_path, monkeypatch):
+        """The mirror of the test above, and the more important half.
+
+        A deliberate skip must NOT manufacture a gap. With
+        ``mindmap_source: none`` and a healthy transcript, mindmap and concepts
+        are never requested, so the run exits 0 - no SystemExit at all. If this
+        ever starts raising, issue #129 has begun firing on healthy runs, which
+        is the worst possible regression for a guard whose whole job is to be
+        believed.
+        """
+        _stub_url_env(monkeypatch, tmp_path)
+
+        def fake_transcript(*args, **kwargs):
+            channel_dir = args[5]
+            prefix = args[6] if len(args) > 6 else kwargs.get("prefix")
+            _write_stub_artifact_if_ok(channel_dir / f"{prefix}.transcript.md", "done", "# stub\n")
+            return prefix, "done"
+
+        monkeypatch.setattr(video_intel, "process_transcript", fake_transcript)
+        monkeypatch.setattr(video_intel, "process_mindmap", lambda *_a, **_kw: ("p", "done"))
+        monkeypatch.setattr(video_intel, "process_concepts", lambda *_a, **_kw: ("p", "done"))
+
+        config = {
+            "output_dir": str(tmp_path),
+            "channels": [{"name": "demo", "url": "https://example.com/demo", "mindmap_source": "none"}],
+        }
+
+        video_intel.cmd_process(_process_url_args("https://www.youtube.com/watch?v=DDDDDDDDDDD"), config)
 
     def test_mindmap_source_none_skips_mindmap_and_concepts(self, tmp_path, monkeypatch):
         """Channel config mindmap_source=none -> mindmap step is skipped entirely,
@@ -503,7 +613,16 @@ class TestCmdProcessUrlInversion:
         (memory: feedback_long_video_keep_mindmap). If process_transcript raises
         an unexpected exception, the inverted ordering must NOT skip mindmap.
         Resolver falls back to source='video' since no transcript landed on
-        disk; concepts still fires off the resulting mindmap."""
+        disk; concepts still fires off the resulting mindmap.
+
+        Issue #129: the transcript step genuinely failed (raised, no artifact),
+        which is exactly the "requested step produced nothing usable" gap the
+        new exit-code check exists to surface - so the run now exits
+        EXIT_PARTIAL rather than returning 0, even though mindmap and concepts
+        both recovered via the video fallback. The K1 guarantee under test
+        (mindmap always runs, concepts still fires) is unchanged and still
+        asserted below; only the exit-code expectation is updated.
+        """
         _stub_url_env(monkeypatch, tmp_path)
 
         def fake_transcript_raises(*args, **kwargs):
@@ -523,21 +642,33 @@ class TestCmdProcessUrlInversion:
             return prefix, "done"
 
         concepts_calls: list[dict] = []
+
+        def fake_concepts(*args, **kwargs):
+            concepts_calls.append(kwargs)
+            output_dir_arg = args[6] if len(args) > 6 else kwargs.get("output_dir")
+            channel_name_arg = args[7] if len(args) > 7 else kwargs.get("channel_name")
+            prefix = kwargs.get("prefix") or "p"
+            status = "done"
+            _write_stub_artifact_if_ok(
+                output_dir_arg / channel_name_arg / f"{prefix}.concepts.json", status, '{"concepts": []}'
+            )
+            return prefix, status
+
         monkeypatch.setattr(video_intel, "process_transcript", fake_transcript_raises)
         monkeypatch.setattr(video_intel, "process_mindmap", fake_mindmap)
-        monkeypatch.setattr(
-            video_intel,
-            "process_concepts",
-            lambda *a, **kw: concepts_calls.append(kw) or ("p", "done"),
-        )
+        monkeypatch.setattr(video_intel, "process_concepts", fake_concepts)
 
         config = {
             "output_dir": str(tmp_path),
             "channels": [{"name": "demo", "url": "https://example.com/demo"}],
         }
-        # SystemExit must NOT fire here - mindmap should run with video fallback.
-        video_intel.cmd_process(_process_url_args("https://www.youtube.com/watch?v=DDDDDDDDDDD"), config)
+        # The transcript step genuinely failed, so the run now exits
+        # EXIT_PARTIAL (issue #129) - but mindmap and concepts must still have
+        # run via the video fallback before that exit fires.
+        with pytest.raises(SystemExit) as exc_info:
+            video_intel.cmd_process(_process_url_args("https://www.youtube.com/watch?v=DDDDDDDDDDD"), config)
 
+        assert exc_info.value.code == video_intel.EXIT_PARTIAL
         assert mindmap_kw_seen.get("source") == "video", (
             "transcript exception must not block mindmap; resolver should fall back to source='video'"
         )

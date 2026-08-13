@@ -40,9 +40,11 @@ from googleapiclient.errors import HttpError
 from youtube_captions import CaptionsResult, fetch_english_captions
 
 from gemini_common import (
+    MAX_RETRIES_TRANSPORT,
     build_permissive_safety_settings,
     create_client,
     get_retry_delay,
+    is_transient_transport_error,
     log_usage_metadata,
     require_gemini,
     require_youtube,
@@ -947,6 +949,37 @@ def _log_livestream_recovery_recipe(video: dict, channel_name: str) -> None:
     log.warning("         To recover: save the MP4 as %s.mp4 in any folder, then run:", video.get("video_id", "?"))
     log.warning("           python scripts/video_intel.py transcript --file <PATH> --channel %s", channel_name)
     log.warning("           python scripts/video_intel.py mindmap    --file <PATH> --channel %s", channel_name)
+
+
+def _log_chunk_recovery_recipe(video: dict, duration_seconds: int | None, chunk_minutes: int) -> None:
+    """Print the smaller-``--chunk-minutes`` recovery recipe (issue #129).
+
+    Sibling of ``_log_livestream_recovery_recipe``, for the other failure whose
+    fix the operator has to know rather than derive: a long-video transcript
+    that ended in error. Empirically (the 2026-08-11/12 bulk ingest) a serial
+    re-run with a smaller chunk size recovered every one of these cheaply,
+    because the already-transcribed prefix comes back as an implicit cache hit.
+
+    Only fires when the duration is known and above the chunk threshold -
+    suggesting a smaller chunk size for a video that was never chunked would
+    send the operator down the wrong path.
+    """
+    if not duration_seconds or duration_seconds <= chunk_minutes * 60:
+        return
+    smaller = max(5, chunk_minutes // 2)
+    log.warning(
+        "      -> %s is %s and its transcript failed at %dm chunks. "
+        "A serial re-run with smaller chunks usually recovers it (the already-ingested "
+        "prefix bills as an implicit cache hit):",
+        video.get("video_id", "?"),
+        _fmt_hms(duration_seconds),
+        chunk_minutes,
+    )
+    log.warning(
+        "         python scripts/video_intel.py process --url %s --chunk-minutes %d --force",
+        video.get("url", ""),
+        smaller,
+    )
 
 
 def preflight_skip_reason(status: dict) -> str | None:
@@ -2295,6 +2328,8 @@ def _scan_transcribe_one(
             )
             if fb is not None:
                 return fb
+        if status.startswith("error"):
+            _log_chunk_recovery_recipe(video, duration_seconds, chunk_minutes)
         return prefix, status
 
     return process_transcript(
@@ -2733,6 +2768,10 @@ def call_gemini(
 
     max_retries_rate = 3
     max_retries_server = 8
+    # Transport retries are counted SEPARATELY from `attempt` (PR #136 review):
+    # `attempt` counts failures of every class, so with a budget of 1 a drop
+    # that follows any 429/5xx retry would arrive already over budget.
+    transport_attempts = 0
     for attempt in range(max(max_retries_rate, max_retries_server) + 1):
         try:
             response = client.models.generate_content(
@@ -2752,9 +2791,13 @@ def call_gemini(
                 attempt,
                 max_retries_rate=max_retries_rate,
                 max_retries_server=max_retries_server,
+                max_retries_transport=MAX_RETRIES_TRANSPORT,
+                transport_attempt=transport_attempts,
             )
             if retry is None:
                 raise
+            if is_transient_transport_error(e):
+                transport_attempts += 1
             kind, wait, max_for_type = retry
             log.warning("%s — retry %d/%d in %.0fs...", kind, attempt + 1, max_for_type, wait)
             time.sleep(wait)
@@ -3451,6 +3494,65 @@ def _record_transcript_error(meta_path: Path, error: str) -> None:
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
 
+def _record_concepts_error(meta_path: Path, video: dict, channel_dir: Path, error: str) -> None:
+    """Persist a concepts-step failure into meta.json (issue #129).
+
+    Before this existed, ``process_concepts`` returned ``"error: ..."`` and wrote
+    NOTHING. That made a concepts failure the only pipeline failure with no
+    durable trace anywhere: no artifact, no meta field, and ``is_processed()``
+    never looks at concepts, so the video stayed "processed" forever and simply
+    never entered ``taxonomy.json`` or the search index. The transcript path has
+    had ``transcript_status``/``last_error`` for exactly this reason.
+
+    Three contracts this writer has to honor:
+
+    * **Issue #66** - stamp full identity. A meta carrying only
+      ``{concepts_status: ...}`` is one ``_load_video_id_index`` skips, which
+      re-queues the video for a full re-transcribe. The failure record must not
+      cost more than the failure did.
+    * **Issue #124** - this is an error path, so the read is
+      ``_read_meta_best_effort(..., raise_on_os_error=False)``. A corrupt or
+      unreadable meta must never raise from inside the handler that is trying to
+      preserve the error.
+    * **Not** ``update_meta``. That is the shared SUCCESS-path writer: it clears
+      ``last_error`` and appends to ``modes_completed``, so routing a failure
+      through it would erase the record it is meant to leave and mark the step
+      done.
+
+    ``concepts_status`` is the durable per-stage field. ``last_error`` is written
+    too but is best-effort only: it is a single field shared across stages, so a
+    concepts failure can overwrite a transcript failure's message.
+
+    No separate timestamp field: a later success overwrites ``concepts_status``
+    with ``"ok"`` but could not delete a ``concepts_failed_at``, and a stale
+    failure timestamp on a healthy video reads worse than no timestamp at all.
+    """
+    if not meta_path.exists():
+        # NEVER create a meta that did not exist - mirrors _record_transcript_error.
+        # ce-code-review (adversarial, PR #136) executed the alternative: callers
+        # that do not pass an explicit `prefix` (cmd_concepts) let process_concepts
+        # recompute one from the current title, so on a title-rotated video a
+        # single dropped socket wrote a SECOND meta claiming the same video_id -
+        # manufacturing a dedupe group that never existed, where a meta with no
+        # `processed` key can lose the tie-break to the phantom. Recording a
+        # cheap failure must not corrupt identity; if there is no meta to
+        # annotate, the log line is the record.
+        log.warning("  concepts failure for %s not recorded: no meta.json at %s", video.get("video_id"), meta_path)
+        return
+    meta = _read_meta_best_effort(meta_path, raise_on_os_error=False)
+    meta.update(_transcript_identity_fields(video, channel_dir))
+    meta["concepts_status"] = f"error: {error}"
+    meta["last_error"] = f"concepts: {error}"
+    try:
+        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        # An error-path writer that raises destroys the error it exists to
+        # preserve - the same principle as issue #124's read side. Uncaught,
+        # this would propagate through cmd_scan's concepts loop and abort the
+        # scan before its failure summary ever printed.
+        log.warning("  could not record concepts failure in %s (%s)", meta_path, exc)
+
+
 def _transcript_identity_fields(video: dict, channel_dir: Path) -> dict:
     """Identity fields every transcript meta.json must carry (issue #66).
 
@@ -3947,6 +4049,10 @@ def call_gemini_text(
 
     max_retries_rate = 3
     max_retries_server = 8
+    # Transport retries are counted SEPARATELY from `attempt` (PR #136 review):
+    # `attempt` counts failures of every class, so with a budget of 1 a drop
+    # that follows any 429/5xx retry would arrive already over budget.
+    transport_attempts = 0
     for attempt in range(max(max_retries_rate, max_retries_server) + 1):
         try:
             response = client.models.generate_content(
@@ -3966,9 +4072,13 @@ def call_gemini_text(
                 attempt,
                 max_retries_rate=max_retries_rate,
                 max_retries_server=max_retries_server,
+                max_retries_transport=MAX_RETRIES_TRANSPORT,
+                transport_attempt=transport_attempts,
             )
             if retry is None:
                 raise
+            if is_transient_transport_error(e):
+                transport_attempts += 1
             kind, wait, max_for_type = retry
             log.warning("%s — retry %d/%d in %.0fs...", kind, attempt + 1, max_for_type, wait)
             time.sleep(wait)
@@ -4046,9 +4156,18 @@ def process_concepts(
         # existing meta is readable; if it ever is not, this writer would
         # leave an identity-less meta that _load_video_id_index skips,
         # re-queueing the video for a full re-transcribe.
+        # "concepts_status": "ok" is not decoration - it OVERWRITES a
+        # concepts_status left by an earlier failed attempt (issue #129).
+        # update_meta resets last_error but knows nothing about per-stage
+        # fields, so without this a recovered video would carry an error
+        # record forever and read as broken in any corpus sweep.
         update_meta(
             meta_path,
-            {**_transcript_identity_fields(video, channel_dir), "processed": datetime.now(UTC).isoformat()},
+            {
+                **_transcript_identity_fields(video, channel_dir),
+                "processed": datetime.now(UTC).isoformat(),
+                "concepts_status": "ok",
+            },
             "concepts",
         )
 
@@ -4063,8 +4182,10 @@ def process_concepts(
         return prefix, summary
 
     except json.JSONDecodeError as e:
+        _record_concepts_error(meta_path, video, channel_dir, f"parsing JSON: {e}")
         return prefix, f"error parsing JSON: {e}"
     except Exception as e:
+        _record_concepts_error(meta_path, video, channel_dir, str(e))
         return prefix, f"error: {e}"
 
 
@@ -5321,6 +5442,82 @@ def _is_file_expiry_error_status(status: str) -> bool:
     return any(pos in lowered for pos in _FILE_EXPIRY_POSITIVE_MARKERS)
 
 
+#: Exit code for "the pipeline ran, some artifacts landed, and at least one step
+#: it was asked to run produced nothing usable" (issue #129).
+#:
+#: A THIRD code, not a reuse of 1, because the two states need different
+#: reactions. ``1`` stays reserved for a hard failure that stopped the run
+#: (mindmap failed, upload failed, bad config); ``3`` says the run completed but
+#: the corpus is incomplete, which is the state a batch driver has to be able to
+#: see. Before #129 that state was indistinguishable from success: a concepts
+#: step could report ``error``, write no ``.concepts.json``, and exit 0, and
+#: because ``is_processed()`` only ever looks at transcript and mindmap
+#: artifacts the video was never re-queued and simply never reached
+#: ``taxonomy.json`` or the search index.
+EXIT_PARTIAL = 3
+
+
+def missing_pipeline_artifacts(steps: list[dict]) -> list[str]:
+    """Return the labels of REQUESTED pipeline steps with no usable artifact.
+
+    Each step is ``{"label", "requested", "status", "path"}``. A step counts as
+    complete only when BOTH hold:
+
+    * its artifact exists and is non-empty (matching ``_mode_artifact_present``'s
+      existing notion of a real artifact), and
+    * its status does not start with ``"error"``.
+
+    Both halves are load-bearing. Presence alone is not enough because under
+    ``--force`` a stale artifact from an earlier successful run survives a
+    failed regeneration, so the file on disk can be real while the work this run
+    was asked to do did not happen. Status alone is not enough either, because
+    the salvage paths legitimately report a degraded status (``partial``,
+    ``truncated_output``, ``thin``) while writing a genuine artifact - those are
+    designed partial success and must stay exit 0, not become a false alarm.
+
+    ``requested=False`` steps are skipped entirely and can never contribute a
+    gap. That is what preserves every deliberate skip as a success: per-mode
+    ``skip_modes``, ``mindmap_source: none``, the issue #120 livestream mindmap
+    suppression, and concepts on an unconfigured (``_standalone``) channel. A
+    skip the operator asked for is not an incomplete corpus.
+
+    Every key is read with REQUIRED access, never ``.get()``. A ``.get("requested")``
+    would treat a missing or misspelled key as ``False`` and silently drop that
+    step from gap detection - a guard against silent incompleteness that can
+    itself be silently disabled, which is the exact failure class this function
+    exists to close. A malformed step must raise at the call site instead.
+    """
+    missing: list[str] = []
+    for step in steps:
+        if not step["requested"]:
+            continue
+        path = step["path"]
+        present = path is not None and path.exists() and path.stat().st_size > 0
+        if not present or str(step["status"] or "").startswith("error"):
+            missing.append(step["label"])
+    return missing
+
+
+def finish_pipeline_run(steps: list[dict], *, label: str) -> None:
+    """Exit ``EXIT_PARTIAL`` when a requested step left no usable artifact.
+
+    Returns normally (exit 0) when everything requested is on disk. Called at
+    every terminal point of both ``process`` orchestrators, including the
+    deliberate-skip early returns - a skip still has to prove the steps that DID
+    run left their artifacts behind.
+    """
+    gaps = missing_pipeline_artifacts(steps)
+    if not gaps:
+        return
+    log.error(
+        "Pipeline incomplete for %s: no usable artifact from %s. Exiting %d (partial); re-run to fill the gap.",
+        label,
+        ", ".join(gaps),
+        EXIT_PARTIAL,
+    )
+    sys.exit(EXIT_PARTIAL)
+
+
 def _cmd_process_url(args, config):
     """`process --url` orchestrator (issue #54 ordering): transcript first
     (chunked if long, per PR #51), then mindmap built from the on-disk
@@ -5331,8 +5528,7 @@ def _cmd_process_url(args, config):
     legacy mindmap-fps fallback for the 10800-frame video cap is preserved
     only on that fallback path because text input has no frame cap.
 
-    Mirrors process --file's exit-code contract: 0 if mindmap succeeded,
-    regardless of downstream step outcome.
+    Shares process --file's exit-code contract - see ``cmd_process``.
     """
     _, types = require_gemini()
     gemini_key = os.environ.get("GEMINI_API_KEY")
@@ -5527,6 +5723,13 @@ def _cmd_process_url(args, config):
         transcript_status = f"error: {exc}"
         log.warning("    transcript [%s] raised: %s", prefix, exc)
     log.info("    transcript [%s]: %s", prefix, transcript_status)
+    if transcript_status.startswith("error"):
+        _log_chunk_recovery_recipe(video, duration_seconds, chunk_minutes)
+    # Issue #129: accumulate what this run was asked to produce, so every exit
+    # below can tell "we are done" from "we ran and left a hole".
+    steps: list[dict] = [
+        {"label": "transcript", "requested": True, "status": transcript_status, "path": transcript_path}
+    ]
 
     # Step 2/3: mindmap. Resolver picks source based on channel config and
     # whether transcript exists on disk now (it may have been written by Step 1
@@ -5541,12 +5744,17 @@ def _cmd_process_url(args, config):
     if resolved_source == "skip":
         log.info("  Step 2/3: mindmap [skipped (mindmap_source=none)]")
         log.info("  Step 3/3: concepts [skipped (no mindmap)]")
+        finish_pipeline_run(steps, label=prefix)
         return
 
     # Issue #120: same rule the scan applies - a livestream VOD whose transcript
     # attempt just failed has a URI Gemini cannot ingest, so the fallback
-    # mindmap-from-video call is never spent against it. Exits 0 like the
-    # mindmap_source=none skip above: this is a deliberate skip, not a failure.
+    # mindmap-from-video call is never spent against it. The skip itself is
+    # deliberate and contributes no gap (requested=False, so it is never in
+    # `steps`). The exit code here is decided entirely by the transcript
+    # step, which by this branch's own precondition just failed - so this
+    # path exits EXIT_PARTIAL, not 0 (issue #129 changed that; before, a
+    # livestream VOD with no transcript and no mindmap exited 0).
     if should_skip_video_mindmap_for_livestream(
         was_livestream=was_livestream,
         resolved_source=resolved_source,
@@ -5555,6 +5763,7 @@ def _cmd_process_url(args, config):
         log.warning("  Step 2/3: mindmap [%s]", LIVESTREAM_MINDMAP_SKIP_STATUS)
         _log_livestream_recovery_recipe(video, channel_name)
         log.info("  Step 3/3: concepts [skipped (no mindmap)]")
+        finish_pipeline_run(steps, label=prefix)
         return
 
     log.info("  Step 2/3: mindmap (source=%s)", resolved_source)
@@ -5569,6 +5778,13 @@ def _cmd_process_url(args, config):
             channel_name,
             prompt_name="mindmap-from-transcript",
             force=args.force,
+            # Title rotation (ce-code-review, adversarial, PR #136): without an
+            # explicit prefix, process_mindmap recomputes it from the CURRENT
+            # title and writes under the new slug, while everything downstream
+            # - the exit-code check, find_mindmap_source, concepts - looks under
+            # the indexed prefix. The comment above already promises co-location;
+            # this is what delivers it.
+            prefix=prefix,
             source="transcript",
             transcript_path=transcript_path,
         )
@@ -5594,20 +5810,31 @@ def _cmd_process_url(args, config):
             prompt_name=prompt_name,
             force=args.force,
             fps=mindmap_fps,
+            prefix=prefix,
             source="video",
         )
     log.info("    mindmap [%s]: %s", mindmap_prefix, mindmap_status)
     if mindmap_status.startswith("error"):
         log.error("Mindmap failed; skipping concepts.")
         sys.exit(1)
+    steps.append(
+        {
+            "label": "mindmap",
+            "requested": True,
+            "status": mindmap_status,
+            "path": find_mindmap_source(channel_dir, prefix),
+        }
+    )
 
     log.info("  Step 3/3: concepts")
     if channel_name == "_standalone":
         log.warning("    No configured channel for %s; skipping concepts.", video_id)
+        finish_pipeline_run(steps, label=prefix)
         return
     mindmap_path = find_mindmap_source(channel_dir, prefix)
     if not mindmap_path or not mindmap_path.exists():
         log.warning("    Mindmap not on disk; skipping concepts.")
+        finish_pipeline_run(steps, label=prefix)
         return
     mindmap_text = mindmap_path.read_text(encoding="utf-8")
     taxonomy = load_taxonomy(output_dir)
@@ -5626,6 +5853,15 @@ def _cmd_process_url(args, config):
         prefix=prefix,
     )
     log.info("    concepts [%s]: %s", concepts_prefix, concepts_status)
+    steps.append(
+        {
+            "label": "concepts",
+            "requested": True,
+            "status": concepts_status,
+            "path": channel_dir / f"{prefix}.concepts.json",
+        }
+    )
+    finish_pipeline_run(steps, label=prefix)
 
 
 def cmd_process(args, config):
@@ -5637,9 +5873,28 @@ def cmd_process(args, config):
       --url URL: YouTube URL - chunked transcript via _run_chunked_transcript_url
         when duration exceeds chunk_minutes; otherwise single call (issue #50).
 
-    Exit-code contract: 0 if mindmap succeeded (regardless of transcript/concepts
-    outcome), non-zero if mindmap itself failed. Automation callers inspect
-    ``modes_completed`` in meta.json for finer-grained detection.
+    Exit-code contract (issue #129 made this tri-state; it was 0-or-1 before):
+
+    * ``0`` - every step this run was asked to produce left a usable artifact.
+      Deliberate skips (``skip_modes``, ``mindmap_source: none``, the issue #120
+      livestream mindmap suppression, concepts on an unconfigured channel) are
+      not "asked for" and keep exit 0. So do the degraded-but-real salvage
+      statuses (``partial``, ``truncated_output``, ``thin``).
+    * ``EXIT_PARTIAL`` (3) - the run finished but a requested step produced no
+      usable artifact. Most often a transcript that failed while the mindmap
+      succeeded, or a concepts step that failed.
+    * ``1`` - hard failure that stopped the run: mindmap failed, upload failed,
+      unresolvable config.
+
+    What changed and why: exit 0 used to mean "the mindmap succeeded", so a
+    batch driver checking the exit code could not see an incomplete video at
+    all. The preservation half of that contract is unchanged - a transcript or
+    concepts failure still leaves the mindmap on disk and never rolls anything
+    back - but "some artifacts landed" is now reported as 3 rather than
+    disguised as success. A caller that wants the old lenient behavior treats
+    ``rc in (0, 3)`` as non-fatal; ``modes_completed`` and the per-stage
+    ``transcript_status`` / ``concepts_status`` fields in meta.json remain the
+    finer-grained record.
     """
     if getattr(args, "url", None):
         return _cmd_process_url(args, config)
@@ -5906,6 +6161,17 @@ def cmd_process(args, config):
             log.warning("    transcript [%s] raised: %s", prefix, exc)
         log.info("    transcript [%s]: %s", prefix, transcript_status)
 
+    # Issue #129: a per-mode skip is `requested=False` and can never be a gap;
+    # a step that ran and left nothing can.
+    steps: list[dict] = [
+        {
+            "label": "transcript",
+            "requested": not skip_transcript,
+            "status": transcript_status,
+            "path": transcript_path,
+        }
+    ]
+
     # ============================================================================
     # Step 2/3: mindmap. Resolver picks source based on channel config and whether
     # transcript exists on disk now (it may have been written by Step 1 this run,
@@ -5968,20 +6234,41 @@ def cmd_process(args, config):
         if mindmap_status.startswith("error"):
             log.error("Mindmap failed; aborting concepts step.")
             sys.exit(1)
+    steps.append(
+        {
+            "label": "mindmap",
+            "requested": not skip_mindmap and resolved_source != "skip",
+            "status": mindmap_status,
+            "path": find_mindmap_source(channel_dir, prefix),
+        }
+    )
 
     # If transcript failed (and we're past the mindmap step which may have
     # succeeded via video fallback), abort before concepts.
+    #
+    # Issue #129 note: this skip is NOT modelled as `requested=False`. Unlike
+    # skip_modes or mindmap_source=none, nobody asked for it - it is a
+    # consequence of a failure, and the concepts artifact really is missing.
+    # The transcript step has already failed by this point so the run exits
+    # EXIT_PARTIAL regardless; what matters is that we do not relabel a
+    # failure-driven omission as a deliberate skip. (Which step to run after a
+    # transcript failure is deliberately left as-is: the --url path runs
+    # concepts here and --file does not. Changing that spends a Gemini call
+    # that was not spent before, so it belongs in its own ticket.)
     if not skip_transcript and transcript_status.startswith("error"):
         log.warning("Transcript failed; skipping concepts. Mindmap artifact preserved if any.")
+        finish_pipeline_run(steps, label=prefix)
         return
 
     # Step 3: concepts (text-only; channel must be configured).
     if not channel_name:
         log.warning("Channel not configured for %s; skipping concepts.", input_path.name)
+        finish_pipeline_run(steps, label=prefix)
         return
 
     if not mindmap_path.exists():
         log.warning("Mindmap file not on disk; skipping concepts.")
+        finish_pipeline_run(steps, label=prefix)
         return
 
     mindmap_text = mindmap_path.read_text(encoding="utf-8")
@@ -6003,7 +6290,24 @@ def cmd_process(args, config):
         )
         log.info("  concepts [%s]: %s", prefix, concepts_status)
     except Exception as e:
+        concepts_status = f"error: {e}"
         log.warning("Concepts failed for %s: %s (mindmap and transcript preserved)", prefix, e)
+        _record_concepts_error(meta_path, video, channel_dir, str(e))
+    steps.append(
+        {
+            "label": "concepts",
+            "requested": True,
+            "status": concepts_status,
+            # process_concepts hardcodes output_dir / channel_name; the
+            # sibling-meta identity branch sets channel_dir to input_path.parent,
+            # so re-deriving from channel_dir here reported a gap for an artifact
+            # that WAS written - a permanent false exit 3 on a healthy run
+            # (ce-code-review: correctness AND adversarial, both with repros).
+            # Ask for the writer's destination, never re-derive a second one.
+            "path": output_dir / channel_name / f"{prefix}.concepts.json",
+        }
+    )
+    finish_pipeline_run(steps, label=prefix)
 
 
 def cmd_concepts(args, config):
@@ -7322,6 +7626,7 @@ def cmd_nugget(args, config):
     }
     contents = genai_types.Content(parts=[genai_types.Part(text=filled_prompt)])
     max_retries = 3
+    transport_attempts = 0
     response_text = None
     for attempt in range(max_retries + 1):
         try:
@@ -7333,9 +7638,18 @@ def cmd_nugget(args, config):
             response_text = response.text
             break
         except Exception as e:
-            retry = get_retry_delay(e, attempt, max_retries_rate=max_retries, max_retries_server=max_retries)
+            retry = get_retry_delay(
+                e,
+                attempt,
+                max_retries_rate=max_retries,
+                max_retries_server=max_retries,
+                max_retries_transport=MAX_RETRIES_TRANSPORT,
+                transport_attempt=transport_attempts,
+            )
             if retry is None:
                 raise
+            if is_transient_transport_error(e):
+                transport_attempts += 1
             kind, wait, _ = retry
             log.warning("%s — retry %d/%d in %.0fs...", kind, attempt + 1, max_retries, wait)
             time.sleep(wait)
