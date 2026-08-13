@@ -42,11 +42,17 @@ def _coerce_token_count(value: object, *, absent_means_zero: bool) -> int | None
       ``absent_means_zero=False`` and get ``None``.
 
     A *wrong shape* is unreadable either way and always yields ``None``: a
-    float, a bool, a string, a negative number, or the list of
-    ``ModalityTokenCount`` submodels gemini-3 multimodal responses can return.
-    That last one matters beyond the guards - coercing a multimodal candidates
-    list to 0 would make a truncated response look like it emitted no output
-    tokens at all, blinding the output-cap check.
+    float, a bool, a string, a negative number, or a list.
+
+    On that last one, be precise about WHY. Every aggregate count here is
+    documented as ``integer | None``; the ``ModalityTokenCount`` lists live on
+    the separate ``*_tokens_details`` fields (``candidates_tokens_details``,
+    ``prompt_tokens_details``), which this helper never reads. So a list
+    arriving in an aggregate field is drift or a malformed response, NOT an
+    expected multimodal shape. Rejecting it is still the right defensive move -
+    coercing it to 0 would make a response look like it emitted no output
+    tokens at all, blinding the output-cap check - but nobody should build on
+    it as though gemini-3 routinely reports counts that way.
     """
     if value is None:
         return 0 if absent_means_zero else None

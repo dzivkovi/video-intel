@@ -21,7 +21,10 @@ from types import SimpleNamespace
 #: itself is unreadable. A wrong shape is never evidence of anything.
 UNREADABLE_SHAPES: list[tuple[str, object]] = [
     ("float", 1234.0),
-    ("modality_token_count_list", [SimpleNamespace(modality="TEXT", token_count=100)]),
+    # A list in an AGGREGATE count field is drift: the documented type is
+    # integer|None, and ModalityTokenCount lists live on the separate
+    # *_tokens_details fields the helper never reads.
+    ("drifted_list", [SimpleNamespace(modality="TEXT", token_count=100)]),
     ("empty_list", []),
     ("string", "1234"),
     ("bool_true", True),

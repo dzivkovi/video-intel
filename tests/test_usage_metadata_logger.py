@@ -72,12 +72,14 @@ class TestLogUsageMetadataEdgeCases:
         # One warning line is emitted; no info line with the usage format
         assert any(r.levelno == logging.WARNING for r in records)
 
-    def test_candidates_is_list_when_multimodal_shape_reads_as_unreadable_not_zero(self, caplog):
-        """Gemini 3+ may return candidates_token_count as a list of ModalityTokenCount.
+    def test_candidates_is_list_when_shape_drifts_reads_as_unreadable_not_zero(self, caplog):
+        """A list in the aggregate candidates_token_count field is drift, not a real shape.
 
-        The helper must not crash on this shape, and (issue #125) must not report
-        it as ``0`` either: a candidates count of zero is what a truncated or
-        blocked response looks like, so a multimodal list dressed as 0 would
+        The documented type is ``integer | None``; ``ModalityTokenCount`` lists
+        live on ``candidates_tokens_details``, which this helper never reads.
+        The helper must not crash on the drifted shape, and (issue #125) must
+        not report it as ``0`` either: a candidates count of zero is what a
+        truncated or blocked response looks like, so a list dressed as 0 would
         blind the output-cap check. It renders as ``?`` — still a well-formed,
         machine-parseable line, but an honest one.
         """

@@ -2477,7 +2477,10 @@ def process_mindmap(
             # Issue #119 confabulation guard: capture the prompt-token count off
             # the same callback that logs it, so we can refuse a prompt == 0
             # response before anything is written to disk.
-            usage_capture: dict[str, int] = {}
+            # int | None per field: log_usage_metadata reports an unreadable
+            # count as None so SDK drift cannot masquerade as a reported zero
+            # (issue #125). The guard below compares == 0 for exactly that reason.
+            usage_capture: dict[str, int | None] = {}
 
             def _on_resp(r: object) -> None:
                 counts = log_usage_metadata(r, "mindmap")
@@ -3282,7 +3285,7 @@ def process_transcript(
     transcript_thinking_config = _make_thinking_config_for_transcript(types, model)
     # Issue #60 confabulation guard: capture the prompt-token count off the usage
     # callback so we can detect prompt == 0 (Gemini ingested no video tokens).
-    usage_capture: dict = {}
+    usage_capture: dict[str, int | None] = {}
 
     def _on_resp(r):
         counts = log_usage_metadata(r, "transcript")

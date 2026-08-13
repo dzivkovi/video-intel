@@ -186,7 +186,7 @@ class TestLogUsageMetadataUnreadableCounts:
         assert counts is not None
         assert counts[field] is None
 
-    def test_multimodal_candidates_list_is_unreadable_not_zero(self):
+    def test_drifted_candidates_list_is_unreadable_not_zero(self):
         """Issue #128 needs this: a list coerced to 0 hides a truncated response."""
         counts = log_usage_metadata(
             usage_response(candidates_token_count=[SimpleNamespace(modality="TEXT", token_count=100)]),
