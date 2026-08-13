@@ -215,6 +215,7 @@ meta.json fields these reference are in [`docs/meta-json-schema.md`](../../docs/
 | Scan never finds a video that exists | **Unlisted** (not in the uploads feed - a hard YouTube Data API limit) | manual `process --url`/`--file`, or `--transcript-source yt-captions` for a cheap captions index |
 | `403 PERMISSION_DENIED` (grep every URL run for it) | **Members-only / gated** | download via membership, then `process --file` |
 | `400 INVALID_ARGUMENT`, fails fast | **Token cap** on a long video | `process --url --chunk-minutes 50`, or set `transcript_source: auto` (captions failover) |
+| Transcript lands `partial` with **no** API error, `meta.transcript_status: truncated_output` | **Output cap** on a short-but-dense video - the response hit 65536 output tokens and the JSON stopped mid-object | `process --url URL --chunk-minutes 20 --force`, or set a lower `chunk_minutes` on that channel so `scan` chunks it next time. `meta.transcript_output_tokens` / `transcript_finish_reason` record the evidence, and the salvaged text is often nearly complete - check before paying for a re-run |
 | Transcript hangs for many minutes | **Gemini stall** | Auto-capped per transcript (`transcript_timeout_seconds`, default 600s, issue #74) -> failover under `transcript_source: auto`; `mark-skip --mode transcript` or `skip_video_ids` as backup |
 | Tiny `prompt=0` transcript that looked "complete" | **Future/scheduled premiere** confabulated | the issue #60 confab guard now discards it; delete any old stub |
 | Mindmap content is about a different video (frontmatter still looks right) | **`prompt=0` on the mindmap-from-video call** - Gemini saw no video and wrote from priors | the confab guard now discards it (raw response kept as `.mindmap.raw.txt`) and records `last_error`; to clean up one already on disk you must land a transcript FIRST, delete the stale `.mindmap.md` + `.concepts.json`, then `mindmap --url --channel <name> --force` - a bare `--force` re-resolves to `video` and loops (see `docs/troubleshooting.md`) |
@@ -421,7 +422,11 @@ How `process --file` works:
   transcript can't be produced (e.g., transcript step fails entirely) fall
   back to mindmap-from-video automatically via the `mindmap_source` resolver.
 - **Long-video chunking.** Transcripts on videos longer than `--chunk-minutes`
-  (default 50) auto-chunk into uniform windows. Each chunk is a separate
+  (default 50) auto-chunk into uniform windows. `scan` chunks too, and takes the
+  size from `chunk_minutes` (per-channel, then top-level, then the default) or a
+  `--chunk-minutes` flag. Lower it for channels whose talks are *dense* rather
+  than long: density, not duration, is what blows the 65536-token OUTPUT cap, so
+  a 42-minute keynote can truncate while a 90-minute interview does not. Each chunk is a separate
   Gemini call with `VideoMetadata.start_offset/end_offset` against the SAME
   upload — implicit caching makes follow-up chunks cheap. The "one upload"
   guarantee is preserved. Without chunking, hour-long single-shot transcript
@@ -472,7 +477,11 @@ Options:
 - `--start`/`--end` - Segment time offsets (shared across both video calls).
 - `--force` - Regenerate all artifacts from scratch.
 - `--prompt NAME` - Mindmap prompt override (default from config.yaml).
-- `--chunk-minutes N` - Chunk size for the transcript step on long videos
+- `--chunk-minutes N` - Chunk size for the transcript step on long videos.
+  Available on `scan`, `transcript --url`, `process --url`, and `process --file`;
+  when the flag is not passed, per-channel then top-level `chunk_minutes` in
+  config.yaml applies on all four, then the default (50). Manual `--start`/`--end`
+  disables chunking on the file path.
   (default: 50). Auto-triggered when video duration exceeds this; disabled
   when manual `--start`/`--end` is set.
 - `--media-resolution {low,high}` - Gemini media resolution for the mindmap

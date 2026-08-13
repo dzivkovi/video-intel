@@ -1519,6 +1519,64 @@ def _fmt_hms(seconds: int) -> str:
 
 TRANSCRIPT_CHUNK_MINUTES_DEFAULT = 50
 
+#: Fraction of MAX_OUTPUT_TOKENS at or above which a response is treated as
+#: having hit the OUTPUT cap. Empirically the confirmed truncation reported
+#: candidates=65522 against a 65536 cap (99.98%), while healthy per-chunk
+#: responses in the same sessions ran 1,028-10,742 - three orders of magnitude
+#: of headroom, so the threshold is nowhere near the healthy range.
+OUTPUT_CAP_RATIO = 0.98
+
+#: meta.json transcript_status for a transcript salvaged from a response that
+#: hit the output cap. Distinct from the generic "partial" on purpose: a
+#: salvage-from-malformed-JSON and a salvage-from-output-truncation were
+#: indistinguishable in meta.json, so there was no way to sweep the corpus for
+#: the videos that a chunked re-run would actually fix (issue #128).
+TRANSCRIPT_STATUS_TRUNCATED = "truncated_output"
+
+
+def _finish_reason_of(response: object) -> str | None:
+    """Best-effort read of the first candidate's finish_reason.
+
+    Lives on ``response.candidates[0].finish_reason``, NOT on ``content.parts``.
+    Returns None when the shape is unreadable - observability must never break
+    the caller, and an unreadable reason is not evidence of anything.
+    """
+    try:
+        candidates = getattr(response, "candidates", None) or []
+        if not candidates:
+            return None
+        reason = getattr(candidates[0], "finish_reason", None)
+        if reason is None:
+            return None
+        return getattr(reason, "name", None) or str(reason)
+    except Exception:  # pragma: no cover - defensive, shape-agnostic
+        return None
+
+
+def hit_output_cap(candidates: int | None, finish_reason: str | None, *, max_output_tokens: int) -> bool:
+    """Whether a Gemini response stopped because it ran out of OUTPUT budget.
+
+    Two independent signals, either of which is sufficient:
+
+    * ``finish_reason`` says ``MAX_TOKENS``. Authoritative when present.
+    * ``candidates`` sits at or above ``OUTPUT_CAP_RATIO`` of the cap. Needed
+      because ``candidates_token_count`` can come back unreadable or absent
+      while the response really did truncate, and conversely the finish reason
+      is not always exposed.
+
+    Deliberately NOT claimed: this does not catch the *other* early-stop shape
+    observed in the same sessions, where Gemini collapses a whole window into
+    one monolithic block and stops with candidates nowhere near the cap. That
+    failure has no output-budget signature and needs its own detector; calling
+    it "truncation" here would be a false negative dressed as coverage.
+    """
+    if finish_reason and finish_reason.upper().endswith("MAX_TOKENS"):
+        return True
+    if candidates is None:
+        return False
+    return candidates >= max_output_tokens * OUTPUT_CAP_RATIO
+
+
 # Issue #74: hard wall-clock cap (seconds) on a single transcript Gemini call.
 # A hung call never returns and the httpx read timeout (1200s) only catches
 # per-byte silence, not total time - so without this a hang deadlocks scan.
@@ -1527,6 +1585,34 @@ TRANSCRIPT_CHUNK_MINUTES_DEFAULT = 50
 # Default 600s (10 min): comfortably above a legitimate hour-long transcript's
 # wall-clock, well below the 1200s httpx read timeout so this fires first.
 TRANSCRIPT_TIMEOUT_DEFAULT = 600
+
+
+def resolve_chunk_minutes(channel_config: dict, config: dict, cli_override: int | None = None) -> int:
+    """Chunk size for the transcript step, in minutes.
+
+    Precedence matches every other knob in this config (`transcript_max_duration_seconds`,
+    `transcript_timeout_seconds`, `skip_shorts`, `since`): CLI flag > per-channel >
+    top-level > `TRANSCRIPT_CHUNK_MINUTES_DEFAULT`.
+
+    Exists because `scan` could not reach chunking at all (issue #128). Duration
+    is not the predictor of an output-cap truncation - density is - so a dense
+    42-minute keynote sailed under the 50-minute chunk trigger and truncated,
+    with no way to lower the trigger for the conference channels where that
+    keeps happening.
+    """
+    for candidate in (cli_override, channel_config.get("chunk_minutes"), config.get("chunk_minutes")):
+        if candidate is None:
+            continue
+        try:
+            value = int(candidate)
+        except (TypeError, ValueError):
+            # A YAML list/dict/string here is a config typo; keep the documented
+            # ValueError contract so callers need exactly one except clause.
+            raise ValueError(f"chunk_minutes must be an integer, got {candidate!r}") from None
+        if value <= 0:
+            raise ValueError(f"chunk_minutes must be positive, got {candidate!r}")
+        return value
+    return TRANSCRIPT_CHUNK_MINUTES_DEFAULT
 
 
 def _build_transcript_chunks(
@@ -1555,6 +1641,17 @@ def _build_transcript_chunks(
         end = min(pos + chunk_seconds, duration_seconds)
         chunks.append((pos, end))
         pos = end
+    # Fold a runt tail into the previous chunk (issue #128 review). A video of
+    # chunk_seconds + 1 would otherwise produce a 1-second final chunk: one
+    # wasted Gemini call that _assess_chunk_coverage then flags as thin,
+    # forcing transcript_status: partial on a perfectly healthy video - noise
+    # poured into exactly the bucket the truncation detection exists to clean
+    # up. A tail under 20% of a chunk carries too little content to justify
+    # its own call; the merged chunk stays well under 1.2x the requested size.
+    if len(chunks) >= 2 and (chunks[-1][1] - chunks[-1][0]) < chunk_seconds * 0.2:
+        _, last_end = chunks.pop()
+        prev_start, _ = chunks.pop()
+        chunks.append((prev_start, last_end))
     return chunks
 
 
@@ -2114,6 +2211,104 @@ def _run_chunked_transcript_url(
         )
     update_meta(channel_dir / f"{prefix}.meta.json", meta_fields, mode="transcript")
     return "partial" if is_partial else "done"
+
+
+def _scan_transcribe_one(
+    *,
+    client,
+    types,
+    video: dict,
+    prompt_text: str,
+    model: str,
+    channel_dir: Path,
+    prefix: str,
+    transcript_source: str,
+    transcript_timeout_seconds: int,
+    livestream_captions_first: bool,
+    duration_seconds: int | None,
+    chunk_minutes: int,
+) -> tuple[str, str]:
+    """One video's transcript for `scan`, chunking when the duration warrants it.
+
+    Until issue #128 the scan loop called `process_transcript` single-shot for
+    every video, so chunking was reachable only from `transcript --url`,
+    `process --url` and `process --file`. A dense sub-threshold video would blow
+    the OUTPUT cap, salvage to `partial`, exit 0, and have to be found and
+    re-run by hand.
+
+    Three cases deliberately keep the single-shot path:
+
+    * **duration unknown** - fail-safe to today's behavior rather than guessing
+      a chunk layout from a duration we could not parse;
+    * **`yt-captions`** - the caption track comes back whole, so chunking it
+      would be pointless work;
+    * **a livestream VOD routed captions-first** (issue #120) - `process_transcript`
+      owns that ordering, and diverting it into the chunker here would silently
+      spend N Gemini calls on a URI we have not yet established is fetchable.
+      Its routing stays byte-identical.
+    """
+    if (
+        duration_seconds is not None
+        and duration_seconds > chunk_minutes * 60
+        and transcript_source != "yt-captions"
+        and not livestream_captions_first
+    ):
+        chunks = _build_transcript_chunks(duration_seconds, chunk_minutes)
+        log.info(
+            "    %s: %s exceeds %dm - transcribing in %d chunks",
+            prefix,
+            _fmt_hms(duration_seconds),
+            chunk_minutes,
+            len(chunks),
+        )
+        # process_transcript catches its own failures and returns an
+        # "error: ..." status; the chunked helper does not, and the scan's
+        # `future.result()` is unguarded - so an uncaught exception here would
+        # abort the ENTIRE scan, not just this video. Mirror the contract, and
+        # keep the captions failover that the single-shot path would have run.
+        try:
+            status = _run_chunked_transcript_url(
+                client=client,
+                types=types,
+                video=video,
+                prompt_text=prompt_text,
+                model=model,
+                channel_dir=channel_dir,
+                prefix=prefix,
+                chunks=chunks,
+                duration_seconds=duration_seconds,
+                chunk_minutes=chunk_minutes,
+                force=False,
+                transcript_timeout_seconds=transcript_timeout_seconds,
+            )
+        except Exception as e:
+            log.warning("    %s: chunked transcript raised: %s", prefix, e)
+            status = f"error: {e}"
+        if status.startswith("error") and transcript_source == "auto":
+            fb = _try_captions_transcript(
+                video,
+                channel_dir / f"{prefix}.transcript.md",
+                channel_dir / f"{prefix}.meta.json",
+                prefix,
+                reason=f"chunked transcript failed: {status}",
+                force=False,
+            )
+            if fb is not None:
+                return fb
+        return prefix, status
+
+    return process_transcript(
+        client,
+        types,
+        video,
+        prompt_text,
+        model,
+        channel_dir,
+        prefix,
+        transcript_source=transcript_source,
+        transcript_timeout_seconds=transcript_timeout_seconds,
+        livestream_captions_first=livestream_captions_first,
+    )
 
 
 @functools.cache
@@ -3501,12 +3696,18 @@ def process_transcript(
     # Issue #60 confabulation guard: capture the prompt-token count off the usage
     # callback so we can detect prompt == 0 (Gemini ingested no video tokens).
     usage_capture: dict[str, int | None] = {}
+    finish_capture: dict[str, str | None] = {}
 
     def _on_resp(r):
         counts = log_usage_metadata(r, "transcript")
         if counts is not None:
             usage_capture.clear()
             usage_capture.update(counts)
+        # Issue #128: the output-cap check needs the finish reason too, because
+        # candidates_token_count can be unreadable on a response that really did
+        # truncate (Gemini can also reach MAX_TOKENS with thinking consuming the
+        # budget, leaving the candidates count absent entirely).
+        finish_capture["reason"] = _finish_reason_of(r)
 
     # Issue #120: a livestream VOD gets exactly ONE Gemini call. The parse retry
     # exists for stochastic JSON malformation on a healthy ingest; when the URI
@@ -3516,6 +3717,7 @@ def process_transcript(
 
     for attempt in range(1 + parse_retry_limit):
         usage_capture.clear()
+        finish_capture.clear()
         try:
             # Issue #74: hard wall-clock cap so a hung call raises instead of
             # deadlocking. TranscriptTimeout is an Exception, so it falls into the
@@ -3646,21 +3848,39 @@ def process_transcript(
                 warning="Gemini returned malformed JSON. This transcript was salvaged from a partial response and may be incomplete.",
                 transcript_source=TRANSCRIPT_SOURCE_GEMINI,
             )
-            update_meta(
-                meta_path,
-                {
-                    **_transcript_identity_fields(video, channel_dir),
-                    "processed": datetime.now(UTC).isoformat(),
-                    "transcript_status": "partial",
-                    "transcript_source": TRANSCRIPT_SOURCE_GEMINI,
-                    "transcript_recovery": "salvaged_sections",
-                    "transcript_parse_error": parse_error,
-                    "transcript_warning": salvage_warning,
-                },
-                "transcript",
+            # Issue #128: a salvage caused by the OUTPUT cap gets its own status
+            # so the corpus is sweepable. Without it, "the JSON was malformed"
+            # and "the response ran out of output budget" look identical in
+            # meta.json, and only the second one is fixed by a chunked re-run.
+            truncated = hit_output_cap(
+                usage_capture.get("candidates"),
+                finish_capture.get("reason"),
+                max_output_tokens=MAX_OUTPUT_TOKENS,
             )
+            salvage_fields = {
+                **_transcript_identity_fields(video, channel_dir),
+                "processed": datetime.now(UTC).isoformat(),
+                "transcript_status": TRANSCRIPT_STATUS_TRUNCATED if truncated else "partial",
+                "transcript_source": TRANSCRIPT_SOURCE_GEMINI,
+                "transcript_recovery": "salvaged_sections",
+                "transcript_parse_error": parse_error,
+                "transcript_warning": salvage_warning,
+            }
+            if truncated:
+                salvage_fields["transcript_output_tokens"] = usage_capture.get("candidates")
+                salvage_fields["transcript_finish_reason"] = finish_capture.get("reason")
+                log.warning(
+                    "  %s: response hit the OUTPUT cap (candidates=%s, finish_reason=%s). "
+                    "Recover with: process --url %s --chunk-minutes 20 --force",
+                    prefix,
+                    usage_capture.get("candidates"),
+                    finish_capture.get("reason"),
+                    video.get("url", ""),
+                )
+            update_meta(meta_path, salvage_fields, "transcript")
             log.info("  %s: salvaged partial transcript (%d speech entries)", prefix, speech_count)
-            return prefix, f"partial ({speech_count} entries salvaged)"
+            status_word = TRANSCRIPT_STATUS_TRUNCATED if truncated else "partial"
+            return prefix, f"{status_word} ({speech_count} entries salvaged)"
 
         # Salvage insufficient - retry if budget remains
         if attempt < parse_retry_limit:
@@ -4221,6 +4441,18 @@ def cmd_scan(args, config):
                 "transcript_max_duration_seconds",
                 config.get("transcript_max_duration_seconds", TRANSCRIPT_MAX_DURATION_DEFAULT),
             )
+            # Issue #128: same precedence as every other knob here. Conference
+            # channels can lower this so their dense talks chunk before they hit
+            # the output cap.
+            try:
+                chunk_minutes = resolve_chunk_minutes(ch, config, getattr(args, "chunk_minutes", None))
+            except ValueError as e:
+                # Matches the defensive pattern for bad playlists/keywords a few
+                # lines up: one channel's config typo must not abort the whole
+                # scan after quota and Gemini spend are already sunk, and
+                # --dry-run returns before this point so it cannot catch it.
+                log.error("[%s] invalid chunk_minutes (%s); skipping channel", ch_name, e)
+                continue
             transcript_videos: list[dict] = []
             for v in videos:
                 if is_processed(output_dir, ch_name, v, "transcript"):
@@ -4252,17 +4484,19 @@ def cmd_scan(args, config):
                 with ThreadPoolExecutor(max_workers=max_parallel) as executor:
                     futures = {
                         executor.submit(
-                            process_transcript,
-                            client,
-                            types,
-                            v,
-                            transcript_prompt,
-                            model,
-                            output_dir / ch_name,
-                            video_file_prefix(v),
+                            _scan_transcribe_one,
+                            client=client,
+                            types=types,
+                            video=v,
+                            prompt_text=transcript_prompt,
+                            model=model,
+                            channel_dir=output_dir / ch_name,
+                            prefix=video_file_prefix(v),
                             transcript_source=transcript_source,
                             transcript_timeout_seconds=transcript_timeout_seconds,
                             livestream_captions_first=(vod_captions_first and bool(v.get("was_livestream"))),
+                            duration_seconds=_parse_iso8601_duration(v.get("duration_iso")),
+                            chunk_minutes=chunk_minutes,
                         ): v
                         for v in transcript_videos
                     }
@@ -4946,7 +5180,10 @@ def cmd_transcript(args, config):
     # YouTube URL path, (b) no manual --start/--end is set, (c) duration lookup
     # succeeds and exceeds chunk_minutes. Otherwise fall through to the
     # single-call process_transcript path that has existed since PR #48.
-    chunk_minutes = getattr(args, "chunk_minutes", None) or TRANSCRIPT_CHUNK_MINUTES_DEFAULT
+    # Issue #128 review: one resolver for all four chunking sites, so a channel
+    # that sets chunk_minutes: 20 gets 20 from scan AND from this command - the
+    # documented recovery for the exact failure the knob exists for.
+    chunk_minutes = resolve_chunk_minutes(channel_cfg, config, getattr(args, "chunk_minutes", None))
     manual_segment = start_offset is not None or end_offset is not None
     # Issue #60: yt-captions never needs chunking (the caption track is returned
     # whole regardless of length), so route it to the single-shot path which
@@ -5211,7 +5448,7 @@ def _cmd_process_url(args, config):
     # would skip mindmap entirely - breaking the user's "mindmap always
     # runs" invariant (memory: feedback_long_video_keep_mindmap).
     log.info("  Step 1/3: transcript")
-    chunk_minutes = getattr(args, "chunk_minutes", None) or TRANSCRIPT_CHUNK_MINUTES_DEFAULT
+    chunk_minutes = resolve_chunk_minutes(channel_cfg, config, getattr(args, "chunk_minutes", None))
     try:
         # Issue #60: yt-captions never chunks (caption track is whole); route it
         # to the single-shot path which builds from captions.
@@ -5585,7 +5822,7 @@ def cmd_process(args, config):
         (c for c in config.get("channels", []) if c.get("name") == channel_name),
         {},
     )
-    chunk_minutes = getattr(args, "chunk_minutes", None) or TRANSCRIPT_CHUNK_MINUTES_DEFAULT
+    chunk_minutes = resolve_chunk_minutes(channel_cfg, config, getattr(args, "chunk_minutes", None))
     mindmap_from_transcript_prompt = load_prompt("mindmap-from-transcript")
 
     # ============================================================================
@@ -8409,6 +8646,17 @@ Examples:
     scan_parser.add_argument("--since", help="Override lookback window (e.g. 14d, 2026-01-01)")
     scan_parser.add_argument("--dry-run", action="store_true", help="Preview without processing")
     scan_parser.add_argument("--force", action="store_true", help="Regenerate mindmaps even if they exist")
+    scan_parser.add_argument(
+        "--chunk-minutes",
+        type=int,
+        default=None,
+        dest="chunk_minutes",
+        help=(
+            "Split transcripts longer than this into chunks (issue #128). "
+            f"Overrides per-channel and top-level chunk_minutes; default {TRANSCRIPT_CHUNK_MINUTES_DEFAULT}. "
+            "Lower it (e.g. 20) for dense conference talks that hit the output cap."
+        ),
+    )
 
     # mindmap command
     mm_parser = subparsers.add_parser("mindmap", help="Generate mind map for a specific video")
@@ -8508,11 +8756,12 @@ Examples:
     tx_parser.add_argument(
         "--chunk-minutes",
         type=int,
-        default=TRANSCRIPT_CHUNK_MINUTES_DEFAULT,
+        default=None,
         dest="chunk_minutes",
         help=(
-            f"Chunk size in minutes for auto-splitting long videos via the YouTube URL path "
-            f"(default: {TRANSCRIPT_CHUNK_MINUTES_DEFAULT}). Manual --start/--end disables chunking."
+            f"Chunk size in minutes for auto-splitting long videos via the YouTube URL path. "
+            f"Default: per-channel/top-level chunk_minutes from config.yaml, else {TRANSCRIPT_CHUNK_MINUTES_DEFAULT}. "
+            "Manual --start/--end disables chunking."
         ),
     )
     tx_parser.add_argument(
@@ -8580,13 +8829,13 @@ Examples:
     process_parser.add_argument(
         "--chunk-minutes",
         type=int,
-        default=TRANSCRIPT_CHUNK_MINUTES_DEFAULT,
+        default=None,
         dest="chunk_minutes",
         help=(
-            f"Chunk size in minutes for the transcript step on long videos "
-            f"(default: {TRANSCRIPT_CHUNK_MINUTES_DEFAULT}). Applies to both --url and --file paths. "
-            "Auto-triggered when video duration exceeds the threshold; disabled when "
-            "manual --start/--end is set on --file."
+            f"Chunk size in minutes for the transcript step on long videos. "
+            f"Default: per-channel/top-level chunk_minutes from config.yaml, else {TRANSCRIPT_CHUNK_MINUTES_DEFAULT}. "
+            "Applies to both --url and --file paths. Auto-triggered when video duration "
+            "exceeds the threshold; disabled when manual --start/--end is set on --file."
         ),
     )
     process_parser.add_argument(
