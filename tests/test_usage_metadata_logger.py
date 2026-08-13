@@ -72,11 +72,14 @@ class TestLogUsageMetadataEdgeCases:
         # One warning line is emitted; no info line with the usage format
         assert any(r.levelno == logging.WARNING for r in records)
 
-    def test_candidates_is_list_when_multimodal_shape_coerces_to_zero_without_raising(self, caplog):
+    def test_candidates_is_list_when_multimodal_shape_reads_as_unreadable_not_zero(self, caplog):
         """Gemini 3+ may return candidates_token_count as a list of ModalityTokenCount.
 
-        The helper must not crash on this shape — coerce unusable values to 0 so the
-        log format stays machine-parseable.
+        The helper must not crash on this shape, and (issue #125) must not report
+        it as ``0`` either: a candidates count of zero is what a truncated or
+        blocked response looks like, so a multimodal list dressed as 0 would
+        blind the output-cap check. It renders as ``?`` — still a well-formed,
+        machine-parseable line, but an honest one.
         """
         multimodal_counts = [SimpleNamespace(modality="TEXT", token_count=100)]
         meta = SimpleNamespace(
@@ -91,7 +94,8 @@ class TestLogUsageMetadataEdgeCases:
 
         records = [r for r in caplog.records if r.name == "gemini_common" and r.levelno == logging.INFO]
         assert len(records) == 1
-        assert "candidates=0" in records[0].getMessage()
+        assert "candidates=?" in records[0].getMessage()
+        assert "candidates=0" not in records[0].getMessage()
         # Log line is still well-formed — machine-parseable
         assert records[0].getMessage().startswith("usage mindmap prompt=")
 
@@ -110,8 +114,15 @@ class TestLogUsageMetadataEdgeCases:
         records = [r for r in caplog.records if r.name == "gemini_common" and r.levelno == logging.WARNING]
         assert len(records) >= 1
 
-    def test_usage_metadata_attribute_error_from_property_falls_back_silently(self, caplog):
-        """AttributeError raised inside a property is swallowed by getattr (stdlib behavior)."""
+    def test_usage_metadata_attribute_error_from_property_reads_as_unreadable_prompt(self, caplog):
+        """AttributeError raised inside a property is swallowed by getattr (stdlib behavior).
+
+        Issue #125: the swallowed value must surface as ``prompt=?`` / ``None``,
+        never as ``prompt=0``. ``promptTokenCount`` is always present on a healthy
+        response, so its absence means SDK drift — and both confabulation guards
+        discard the artifact on a prompt of exactly 0. Reporting drift as a zero
+        would turn one field rename into "every video is a confabulation".
+        """
 
         class PropertyAttrErrMeta:
             @property
@@ -120,12 +131,14 @@ class TestLogUsageMetadataEdgeCases:
 
         response = SimpleNamespace(usage_metadata=PropertyAttrErrMeta())
         with caplog.at_level(logging.INFO, logger="gemini_common"):
-            log_usage_metadata(response, "mindmap")  # must not raise
+            counts = log_usage_metadata(response, "mindmap")  # must not raise
 
-        # Well-formed log line still emitted with the missing field defaulted to 0
+        # Well-formed log line still emitted, with the unreadable field marked
         records = [r for r in caplog.records if r.name == "gemini_common" and r.levelno == logging.INFO]
         assert len(records) == 1
-        assert "prompt=0" in records[0].getMessage()
+        assert "prompt=?" in records[0].getMessage()
+        assert "prompt=0" not in records[0].getMessage()
+        assert counts is not None and counts["prompt"] is None
 
     def test_response_lacks_usage_metadata_attribute_when_missing_does_not_raise(self, caplog):
         response = SimpleNamespace()  # no usage_metadata attr at all
