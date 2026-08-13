@@ -76,14 +76,18 @@ def log_usage_metadata(response: object, label: str) -> dict | None:
     Existing callers ignore the return value, so this is backward compatible.
 
     Individual dict values are ``int | None`` on the same principle (issue
-    #125): a value the SDK did not report readably comes back as ``None`` and
+    #125): a count the SDK did not report readably comes back as ``None`` and
     renders as ``?`` in the log line, never as ``0``. A guard comparing
     ``counts["prompt"] == 0`` therefore stays quiet on SDK drift and fires
-    only on a count Gemini genuinely reported as zero.
+    only on a count Gemini genuinely reported as zero. See
+    ``_coerce_token_count`` for which fields treat an omitted value as zero
+    (``cached``, ``thoughts``, ``candidates``) and which treat it as drift
+    (``prompt``, ``total``).
 
     ``thoughts_token_count`` is Gemini 3.x-specific (the thinking process);
-    legacy 2.x responses report it as ``None`` and it renders as ``?``. Per
-    Gemini usage_metadata docs (ai.google.dev/gemini-api/docs/tokens), when
+    legacy 2.x responses omit it, which reads as ``0`` here because the API
+    omits that field exactly when no thinking happened. Per Gemini
+    usage_metadata docs (ai.google.dev/gemini-api/docs/tokens), when
     thoughts > 0 the ``total_token_count`` will exceed
     ``prompt + cached + candidates``.
 
