@@ -1603,7 +1603,12 @@ def resolve_chunk_minutes(channel_config: dict, config: dict, cli_override: int 
     for candidate in (cli_override, channel_config.get("chunk_minutes"), config.get("chunk_minutes")):
         if candidate is None:
             continue
-        value = int(candidate)
+        try:
+            value = int(candidate)
+        except (TypeError, ValueError):
+            # A YAML list/dict/string here is a config typo; keep the documented
+            # ValueError contract so callers need exactly one except clause.
+            raise ValueError(f"chunk_minutes must be an integer, got {candidate!r}") from None
         if value <= 0:
             raise ValueError(f"chunk_minutes must be positive, got {candidate!r}")
         return value
@@ -1636,6 +1641,17 @@ def _build_transcript_chunks(
         end = min(pos + chunk_seconds, duration_seconds)
         chunks.append((pos, end))
         pos = end
+    # Fold a runt tail into the previous chunk (issue #128 review). A video of
+    # chunk_seconds + 1 would otherwise produce a 1-second final chunk: one
+    # wasted Gemini call that _assess_chunk_coverage then flags as thin,
+    # forcing transcript_status: partial on a perfectly healthy video - noise
+    # poured into exactly the bucket the truncation detection exists to clean
+    # up. A tail under 20% of a chunk carries too little content to justify
+    # its own call; the merged chunk stays well under 1.2x the requested size.
+    if len(chunks) >= 2 and (chunks[-1][1] - chunks[-1][0]) < chunk_seconds * 0.2:
+        _, last_end = chunks.pop()
+        prev_start, _ = chunks.pop()
+        chunks.append((prev_start, last_end))
     return chunks
 
 
@@ -3863,7 +3879,7 @@ def process_transcript(
                 )
             update_meta(meta_path, salvage_fields, "transcript")
             log.info("  %s: salvaged partial transcript (%d speech entries)", prefix, speech_count)
-            status_word = "truncated_output" if truncated else "partial"
+            status_word = TRANSCRIPT_STATUS_TRUNCATED if truncated else "partial"
             return prefix, f"{status_word} ({speech_count} entries salvaged)"
 
         # Salvage insufficient - retry if budget remains
@@ -4428,7 +4444,15 @@ def cmd_scan(args, config):
             # Issue #128: same precedence as every other knob here. Conference
             # channels can lower this so their dense talks chunk before they hit
             # the output cap.
-            chunk_minutes = resolve_chunk_minutes(ch, config, getattr(args, "chunk_minutes", None))
+            try:
+                chunk_minutes = resolve_chunk_minutes(ch, config, getattr(args, "chunk_minutes", None))
+            except ValueError as e:
+                # Matches the defensive pattern for bad playlists/keywords a few
+                # lines up: one channel's config typo must not abort the whole
+                # scan after quota and Gemini spend are already sunk, and
+                # --dry-run returns before this point so it cannot catch it.
+                log.error("[%s] invalid chunk_minutes (%s); skipping channel", ch_name, e)
+                continue
             transcript_videos: list[dict] = []
             for v in videos:
                 if is_processed(output_dir, ch_name, v, "transcript"):
@@ -5156,7 +5180,10 @@ def cmd_transcript(args, config):
     # YouTube URL path, (b) no manual --start/--end is set, (c) duration lookup
     # succeeds and exceeds chunk_minutes. Otherwise fall through to the
     # single-call process_transcript path that has existed since PR #48.
-    chunk_minutes = getattr(args, "chunk_minutes", None) or TRANSCRIPT_CHUNK_MINUTES_DEFAULT
+    # Issue #128 review: one resolver for all four chunking sites, so a channel
+    # that sets chunk_minutes: 20 gets 20 from scan AND from this command - the
+    # documented recovery for the exact failure the knob exists for.
+    chunk_minutes = resolve_chunk_minutes(channel_cfg, config, getattr(args, "chunk_minutes", None))
     manual_segment = start_offset is not None or end_offset is not None
     # Issue #60: yt-captions never needs chunking (the caption track is returned
     # whole regardless of length), so route it to the single-shot path which
@@ -5421,7 +5448,7 @@ def _cmd_process_url(args, config):
     # would skip mindmap entirely - breaking the user's "mindmap always
     # runs" invariant (memory: feedback_long_video_keep_mindmap).
     log.info("  Step 1/3: transcript")
-    chunk_minutes = getattr(args, "chunk_minutes", None) or TRANSCRIPT_CHUNK_MINUTES_DEFAULT
+    chunk_minutes = resolve_chunk_minutes(channel_cfg, config, getattr(args, "chunk_minutes", None))
     try:
         # Issue #60: yt-captions never chunks (caption track is whole); route it
         # to the single-shot path which builds from captions.
@@ -5795,7 +5822,7 @@ def cmd_process(args, config):
         (c for c in config.get("channels", []) if c.get("name") == channel_name),
         {},
     )
-    chunk_minutes = getattr(args, "chunk_minutes", None) or TRANSCRIPT_CHUNK_MINUTES_DEFAULT
+    chunk_minutes = resolve_chunk_minutes(channel_cfg, config, getattr(args, "chunk_minutes", None))
     mindmap_from_transcript_prompt = load_prompt("mindmap-from-transcript")
 
     # ============================================================================
@@ -8729,11 +8756,12 @@ Examples:
     tx_parser.add_argument(
         "--chunk-minutes",
         type=int,
-        default=TRANSCRIPT_CHUNK_MINUTES_DEFAULT,
+        default=None,
         dest="chunk_minutes",
         help=(
-            f"Chunk size in minutes for auto-splitting long videos via the YouTube URL path "
-            f"(default: {TRANSCRIPT_CHUNK_MINUTES_DEFAULT}). Manual --start/--end disables chunking."
+            f"Chunk size in minutes for auto-splitting long videos via the YouTube URL path. "
+            f"Default: per-channel/top-level chunk_minutes from config.yaml, else {TRANSCRIPT_CHUNK_MINUTES_DEFAULT}. "
+            "Manual --start/--end disables chunking."
         ),
     )
     tx_parser.add_argument(
@@ -8801,13 +8829,13 @@ Examples:
     process_parser.add_argument(
         "--chunk-minutes",
         type=int,
-        default=TRANSCRIPT_CHUNK_MINUTES_DEFAULT,
+        default=None,
         dest="chunk_minutes",
         help=(
-            f"Chunk size in minutes for the transcript step on long videos "
-            f"(default: {TRANSCRIPT_CHUNK_MINUTES_DEFAULT}). Applies to both --url and --file paths. "
-            "Auto-triggered when video duration exceeds the threshold; disabled when "
-            "manual --start/--end is set on --file."
+            f"Chunk size in minutes for the transcript step on long videos. "
+            f"Default: per-channel/top-level chunk_minutes from config.yaml, else {TRANSCRIPT_CHUNK_MINUTES_DEFAULT}. "
+            "Applies to both --url and --file paths. Auto-triggered when video duration "
+            "exceeds the threshold; disabled when manual --start/--end is set on --file."
         ),
     )
     process_parser.add_argument(

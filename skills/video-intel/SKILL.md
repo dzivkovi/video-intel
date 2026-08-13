@@ -477,9 +477,11 @@ Options:
 - `--start`/`--end` - Segment time offsets (shared across both video calls).
 - `--force` - Regenerate all artifacts from scratch.
 - `--prompt NAME` - Mindmap prompt override (default from config.yaml).
-- `--chunk-minutes N` - Chunk size for the transcript step on long videos
-  (also available on `scan`; per-channel/top-level `chunk_minutes` in config.yaml
-  sets it without a flag)
+- `--chunk-minutes N` - Chunk size for the transcript step on long videos.
+  Available on `scan`, `transcript --url`, `process --url`, and `process --file`;
+  when the flag is not passed, per-channel then top-level `chunk_minutes` in
+  config.yaml applies on all four, then the default (50). Manual `--start`/`--end`
+  disables chunking on the file path.
   (default: 50). Auto-triggered when video duration exceeds this; disabled
   when manual `--start`/`--end` is set.
 - `--media-resolution {low,high}` - Gemini media resolution for the mindmap

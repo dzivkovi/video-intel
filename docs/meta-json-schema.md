@@ -34,7 +34,7 @@ Every processed video has a `{date}-{slug}.meta.json` sidecar in its channel fol
 
 | Field | Type | Written by | Allowed values / notes |
 |---|---|---|---|
-| `transcript_status` | str | transcript writers | `ok` (chunked) / `complete` (single-shot, captions) = **healthy** (`_HEALTHY_TRANSCRIPT_STATUSES`); `partial` (salvaged / thin chunks) = degraded. Keep this set in sync with the writers. |
+| `transcript_status` | str | transcript writers | `ok` (chunked) / `complete` (single-shot, captions) = **healthy** (`_HEALTHY_TRANSCRIPT_STATUSES`); `partial` (salvaged / thin chunks) and `truncated_output` (salvage caused by the 65536 output cap, issue #128 - the sweepable "a chunked re-run would fix this" marker) = degraded. Keep this set in sync with the writers. |
 | `transcript_source` | str | transcript writers | `gemini` (multimodal, default) / `youtube_captions` (caption-derived, speech-only) / `local_file` (uploaded MP4). Issue #60. Provenance flag - fidelity is signalled here, not by degrading `transcript_status`. |
 | `captions_is_generated` | bool | captions path | `true` for auto-generated ASR captions, `false` for a manual track. Issue #60. |
 | `transcript_failover_reason` | str | captions failover | Why `auto` fell back to captions (the Gemini error / `prompt=0` / parse failure). Issue #60. |
@@ -42,6 +42,7 @@ Every processed video has a `{date}-{slug}.meta.json` sidecar in its channel fol
 | `transcript_parse_error` | str | salvage / error | The JSON parse error message. |
 | `transcript_warning` | str | salvage path | Human-readable salvage warning. |
 | `transcript_chunks` / `transcript_chunk_minutes` / `transcript_thin_chunks` | int | chunked path | Chunked-transcript bookkeeping (count, window size, count of sub-50%-coverage chunks). |
+| `transcript_output_tokens` / `transcript_finish_reason` | int / str | single-shot salvage (issue #128) | Present only when the salvage hit the output cap: the reported candidates count and the response finish_reason, so an operator can judge whether a chunked re-run is worth paying for. |
 
 ### Skip and error bookkeeping
 

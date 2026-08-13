@@ -374,3 +374,120 @@ class TestChunkedScanBranchHonorsTheFailureContract:
         _, status = self._call(tmp_path, fake_types, transcript_source="gemini")
 
         assert status == "error: boom"
+
+
+class TestResolverIsSharedByAllFourSites:
+    """One knob, one meaning (issue #128 in-family review P1).
+
+    An operator who sets `chunk_minutes: 20` on a conference channel must get 20
+    from `scan` AND from `process --url --force`, the documented recovery
+    command for the exact failure the knob exists for. The manual subparsers'
+    old `default=50` masked channel config entirely: the CLI "value" always won
+    even when the user never passed the flag.
+    """
+
+    def test_non_integer_values_raise_the_documented_valueerror(self):
+        for bad in (["a", "list"], {"a": 1}, "20m"):
+            with pytest.raises(ValueError):
+                resolve_chunk_minutes({"chunk_minutes": bad}, {})
+
+
+class TestScanSurvivesABadChunkMinutes:
+    """A config typo on one channel must not abort the whole scan (P1 #3)."""
+
+    def test_bad_chunk_minutes_skips_the_channel_and_continues(self, tmp_path, monkeypatch, caplog):
+        videos = [
+            {
+                "video_id": "v1",
+                "title": "talk",
+                "published": "2026-08-06",
+                "url": "https://www.youtube.com/watch?v=v1",
+            }
+        ]
+        monkeypatch.setenv("GEMINI_API_KEY", "test")
+        monkeypatch.setenv("YOUTUBE_API_KEY", "test")
+        monkeypatch.setattr(vi, "require_gemini", lambda: (None, None))
+        monkeypatch.setattr(vi, "require_youtube", lambda: lambda *a, **kw: None)
+        monkeypatch.setattr(vi, "create_client", lambda *a, **kw: None)
+        monkeypatch.setattr(vi, "get_channel_id", lambda yt, url: ("chid", "T"))
+        monkeypatch.setattr(vi, "fetch_channel_videos", lambda yt, cid, since: list(videos))
+        monkeypatch.setattr(vi, "enrich_with_durations", lambda _yt, ids: dict.fromkeys(ids, "PT10M"))
+        monkeypatch.setattr(vi, "fetch_preflight_status", lambda _yt, ids: {v: {} for v in ids})
+        monkeypatch.setattr(vi, "_is_youtube_short_url", lambda _v: False)
+        seen = []
+        monkeypatch.setattr(vi, "process_mindmap", lambda *a, **kw: (seen.append(a[2]["video_id"]), ("p", "done"))[1])
+        monkeypatch.setattr(vi, "process_transcript", lambda *a, **kw: ("p", "done"))
+
+        config = {
+            "output_dir": str(tmp_path),
+            "channels": [
+                {"name": "broken", "url": "u1", "auto_transcript": "all", "chunk_minutes": "20m"},
+                {"name": "healthy", "url": "u2", "auto_transcript": "all"},
+            ],
+        }
+        args = SimpleNamespace(
+            channel=None,
+            since=None,
+            dry_run=False,
+            force=False,
+            model=None,
+            prompt=None,
+            transcript_source=None,
+            chunk_minutes=None,
+        )
+
+        with caplog.at_level("ERROR", logger="video_intel"):
+            vi.cmd_scan(args, config)
+
+        assert "v1" in seen, "the HEALTHY channel must still be processed"
+        errors = [r.getMessage() for r in caplog.records if r.levelno >= 40]
+        assert any("chunk_minutes" in m and "broken" in m for m in errors), (
+            "the skipped channel must be named in the log"
+        )
+
+
+class TestRuntTailChunksAreFolded:
+    """A video one second over the boundary must not produce a 1-second chunk.
+
+    That chunk buys a wasted Gemini call and is then flagged thin, forcing
+    transcript_status: partial on a perfectly healthy video - noise poured into
+    exactly the bucket the truncation detection exists to clean up.
+    """
+
+    def test_one_second_over_the_boundary_folds_into_one_chunk(self):
+        chunks = vi._build_transcript_chunks(3001, 50)
+
+        assert chunks == [(0, 3001)], f"expected one folded chunk, got {chunks}"
+
+    def test_the_observed_shapes_fold_too(self):
+        # 50m10s and 100m30s were the review's named real cases.
+        assert vi._build_transcript_chunks(3010, 50) == [(0, 3010)]
+        assert vi._build_transcript_chunks(6030, 50) == [(0, 3000), (3000, 6030)]
+
+    def test_a_substantial_tail_keeps_its_own_chunk(self):
+        # 80 minutes at 50-minute chunks: the 30-minute tail is real content.
+        assert vi._build_transcript_chunks(4800, 50) == [(0, 3000), (3000, 4800)]
+
+    def test_uniform_multiples_are_untouched(self):
+        assert vi._build_transcript_chunks(6000, 50) == [(0, 3000), (3000, 6000)]
+
+
+class TestChunkMinutesFlagDefaultsAreNone:
+    """The subparser default is load-bearing (in-family review P1 #1).
+
+    With `default=TRANSCRIPT_CHUNK_MINUTES_DEFAULT` on the manual subparsers,
+    `getattr(args, "chunk_minutes", None)` was never None, so the CLI "value"
+    beat channel config even when the user never passed the flag - meaning
+    `chunk_minutes: 20` on a channel worked in scan and was ignored by
+    `process --url`, the documented recovery command.
+    """
+
+    def test_every_chunk_minutes_flag_defaults_to_none(self):
+        import re
+        from pathlib import Path as _P
+
+        source = _P(vi.__file__).read_text(encoding="utf-8")
+        blocks = re.findall(r'"--chunk-minutes",\s*type=int,\s*default=(\S+?),', source)
+        assert blocks, "expected --chunk-minutes definitions"
+        assert len(blocks) == 3, f"expected the scan/transcript/process flags, found {len(blocks)}"
+        assert all(d == "None" for d in blocks), f"a non-None default masks channel config at that site: {blocks}"
