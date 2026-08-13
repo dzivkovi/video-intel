@@ -11,6 +11,7 @@ This table doubles as the project's **failure-mode registry**: the **Status** co
 | Scan never finds a video that exists | **Unlisted** (not in the uploads feed) | manual `process --url`/`process --file`, or the SRT bridge below | manual (hard API limit) |
 | `403 PERMISSION_DENIED` | **Members-only / gated** | download via membership, then `process --file` | manual (needs your access) |
 | `400 INVALID_ARGUMENT`, fails fast | **Token cap** on a long video (single-shot transcript) | `transcript_source: auto` (captions fallback), or `process --url --chunk-minutes 50` | auto (#60) |
+| No API error, but `JSON parse failed` and the transcript lands as `partial` with `candidates` at/near 65536 | **Output cap on a short-but-dense video.** Duration is under every guard (2h threshold, 50-min chunk trigger) so nothing chunks it, but a dense monologue emits more structured JSON than `MAX_OUTPUT_TOKENS` allows and truncates mid-object | `process --url URL --chunk-minutes 20` (or lower). **`scan` cannot do this - it has no `--chunk-minutes` flag and never chunks**, so dense sub-50-min videos must be re-run manually | manual (#128 open) |
 | Generic `400 INVALID_ARGUMENT` (no frame-cap text), or a confabulated mindmap, on a **past livestream** | **Completed livestream VOD** - Gemini's YouTube-URI ingestion fails on these far more often than on regular uploads (10 of 22 vs 0 of 377) | scan routes VODs captions-first, allows one guarded Gemini attempt, then skips the mindmap-from-video fallback and prints the local-file recipe | auto (#120) |
 | Transcript call hangs for many minutes | **Gemini stall** on a long/dense video | per-transcript wall-clock timeout -> failover under `auto`; `mark-skip`/blocklist as backup | auto (#74) |
 | Tiny transcript, `prompt=0`, looked "complete" | **Future/scheduled premiere** confabulated | confab guard discards it; pre-flight skips it before Gemini | auto (#60, #70) for the **single-shot** path only - the **chunked** path is still unguarded (#123) |
@@ -43,6 +44,52 @@ Recovery: download via membership to `output_dir/<channel>/<videoId>.mp4`, then 
 A long video's single-shot structured-JSON transcript exceeds Gemini's input or output cap and is rejected immediately. Scan's transcript loop pre-filters videos over `transcript_max_duration_seconds` (default 2h). For manual runs:
 - **Chunk it:** `process --url URL --chunk-minutes 50` (each chunk is a separate Gemini call against the same upload, merged with offset-applied timestamps).
 - **Or fail over to captions:** set `transcript_source: auto` on the channel - on a token-cap failure it falls back to the caption track (issue #60).
+
+### Output cap on a short-but-dense video (silent truncation, no API error)
+
+This is the *output* cap, and it fails nothing like the input cap above. There is no `400`, no exception, and no failover: Gemini returns a normal `200` whose JSON simply stops mid-object because the response hit `MAX_OUTPUT_TOKENS` (65536). The pipeline then does the right thing at the wrong layer - `salvage_transcript_sections()` recovers what it can, writes the file with `transcript_status: "partial"` and an "Incomplete transcript" warning banner, and the run exits 0.
+
+**The tell is in the usage line, not the error line.** A truncated response reports `candidates` at or just under 65536:
+
+```text
+usage transcript prompt=230741 cached=0 thoughts=0 candidates=65522 total=296263
+  ...: JSON parse failed (attempt 1): Expecting ',' delimiter: line 555 column 8
+  ...: salvaged partial transcript (83 speech entries)
+```
+
+**Duration is not the predictor - density is.** Observed 2026-08-11 on `eRrc1pUY5oU` ("Garry Tan: Own Your Intelligence", 42m08s): a single-speaker keynote with continuous dense speech and frequent slide changes. Every existing guard let it through, because every existing guard measures minutes:
+
+| Guard | Threshold | Why it did not fire |
+|---|---|---|
+| `transcript_max_duration_seconds` | 7200s (2h) | 2528s is far under |
+| Chunk auto-trigger | `--chunk-minutes`, default 50 | 42m is under 50m, so single-shot |
+| Input token cap | ~1M | `prompt=230741`, comfortably under |
+
+**Recovery: chunk below the duration, not above it.** Set `--chunk-minutes` to roughly half the video length so each chunk's output fits well inside the cap:
+
+```bash
+python scripts/video_intel.py --log-level info process \
+  --url "https://www.youtube.com/watch?v=VIDEO_ID" --channel CHANNEL \
+  --chunk-minutes 20 --force
+```
+
+`--force` is required - a `partial` transcript already on disk otherwise counts as processed. After it lands, re-run `index --force` (or a plain `index`) so the search layer picks up the full text rather than the truncated version.
+
+**The scan path cannot reach this workaround.** `scan` has no `--chunk-minutes` flag and no config knob; its transcript loop calls `process_transcript` single-shot for every video under `transcript_max_duration_seconds`, so chunking exists only on `transcript --url`, `process --url`, and `process --file`. Any dense sub-50-minute video in a scanned channel will therefore truncate the same way and must be re-run by hand. Conference-keynote channels (YC's Startup School run, for one) are the recurring exposure.
+
+**Salvage quality is usually better than the banner suggests - verify before you re-run.** In the observed case the salvaged file covered 00:08 to 41:41 of a 42:08 video with no gap over 90 seconds and 21 intact `SCREEN` sections; the truncation cost the tail of the JSON, not the middle of the video. Check coverage before paying for a re-run:
+
+```bash
+python - <<'PY'
+import re
+t = open('PATH.transcript.md', encoding='utf-8').read()
+ts = sorted({int(m[0]) * 60 + int(m[1]) for m in re.findall(r'\[(\d+):(\d+)\]', t)})
+print('entries', len(ts), 'span', ts[0], '->', ts[-1], 'SCREEN', t.count('SCREEN'))
+print('gaps>90s', [(ts[i], ts[i+1] - ts[i]) for i in range(len(ts) - 1) if ts[i+1] - ts[i] > 90])
+PY
+```
+
+A file with full span and no large gaps is usable as-is; the `partial` status is then a provenance flag rather than a content defect. Re-run when the gaps are real, or when the transcript will be quoted in something you circulate.
 
 ### Transcript hang (no output for many minutes)
 
