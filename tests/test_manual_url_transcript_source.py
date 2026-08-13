@@ -10,6 +10,7 @@ two adjacent manual paths disagreed about the same config.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 
@@ -142,4 +143,96 @@ class TestLivestreamProvenanceUsesTheSameChannelView:
 
         assert wired.calls[0]["livestream_captions_first"] is True, (
             "implicit default must keep issue #120's captions-first routing"
+        )
+
+
+class TestManualSegmentKeepsTheCliOnlyAnswer:
+    """A clipped segment must not inherit a channel-level captions preference.
+
+    Under `transcript_source: auto` every Gemini failure branch falls back to
+    `_try_captions_transcript`, whose only overwrite guard is
+    `exists() and not force`. So the documented high-res segment recovery
+    (`transcript --url --force --start .. --end .. --media-resolution high`)
+    could replace a good full multimodal transcript with a segment-clipped,
+    speech-only captions one. Pre-#127 that was unreachable here because the
+    source was always "gemini"; honoring channel config on `--url` made it
+    reachable, so segments are exempted for the same reason `--file` is.
+    """
+
+    CONFIG_AUTO: ClassVar[dict] = {"channels": [{"name": "alpha", "url": "u", "transcript_source": "auto"}]}
+
+    @pytest.mark.parametrize(
+        ("start", "end"),
+        [("00:10", "05:00"), ("00:10", None), (None, "05:00")],
+        ids=["both", "start_only", "end_only"],
+    )
+    def test_segment_run_does_not_pick_up_channel_auto(self, wired, start, end):
+        vi.cmd_transcript(_args(start=start, end=end, force=True), self.CONFIG_AUTO)
+
+        assert wired.calls[0]["transcript_source"] == "gemini", (
+            "an auto channel must not redirect a clipped segment into the captions failover"
+        )
+
+    def test_unclipped_run_on_the_same_channel_still_honors_auto(self, wired):
+        """The exemption is scoped to segments, not a blanket opt-out."""
+        vi.cmd_transcript(_args(), self.CONFIG_AUTO)
+
+        assert wired.calls[0]["transcript_source"] == "auto"
+
+    def test_cli_flag_still_wins_on_a_segment(self, wired):
+        vi.cmd_transcript(_args(start="00:10", end="05:00", transcript_source="yt-captions"), self.CONFIG_AUTO)
+
+        assert wired.calls[0]["transcript_source"] == "yt-captions"
+
+
+class TestAutoChannelIsTheLiveCase:
+    """Every channel configured in the live config uses `auto`; cover it."""
+
+    CONFIG_AUTO: ClassVar[dict] = {"channels": [{"name": "alpha", "url": "u", "transcript_source": "auto"}]}
+
+    def test_auto_reaches_process_transcript(self, wired):
+        vi.cmd_transcript(_args(), self.CONFIG_AUTO)
+
+        assert wired.calls[0]["transcript_source"] == "auto"
+
+    def test_auto_survives_the_chunked_branch(self, wired, monkeypatch):
+        """A long video routes through the chunker; the resolution must precede it."""
+        chunked = []
+        monkeypatch.setattr(vi, "_lookup_video_duration_seconds", lambda _v: 7000)
+        monkeypatch.setattr(vi, "_run_chunked_transcript_url", lambda **kw: chunked.append(kw) or "done")
+
+        vi.cmd_transcript(_args(), self.CONFIG_AUTO)
+
+        assert chunked, "a 7000s video must take the chunked path"
+        assert not wired.calls, "and must not also take the single-shot path"
+
+
+class TestFileBranchScopeIsEnforced:
+    """The --url-only scope is load-bearing, so a test must fail if it is hoisted."""
+
+    def test_local_file_ignores_a_channel_captions_preference(self, wired, monkeypatch, tmp_path):
+        mp4 = tmp_path / "talk.mp4"
+        mp4.write_bytes(b"\x00" * 32)
+        monkeypatch.setattr(vi, "upload_local_video", lambda _c, _p: "files/xyz")
+        monkeypatch.setattr(vi, "require_channels_config", lambda _c: None)
+        monkeypatch.setattr(
+            vi,
+            "resolve_local_file_identity",
+            lambda *a, **kw: {
+                "video_id": "vid",
+                "url": "https://www.youtube.com/watch?v=vid",
+                "title": "T",
+                "published": "2026-08-12",
+                "published_source": "flag",
+                "channel": "alpha",
+                "channel_dir": tmp_path / "alpha",
+                "prefix": "2026-08-12-t",
+                "meta_path": tmp_path / "alpha" / "2026-08-12-t.meta.json",
+            },
+        )
+
+        vi.cmd_transcript(_args(url=None, file=str(mp4)), CONFIG_CAPTIONS)
+
+        assert wired.calls[0]["transcript_source"] == "gemini", (
+            "a local file is an explicit instruction; a channel captions preference cannot apply to it"
         )

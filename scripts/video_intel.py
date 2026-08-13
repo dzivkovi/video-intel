@@ -620,11 +620,15 @@ def livestream_captions_first_applies(
     return not (cli_override is None and channel_config is not None and "transcript_source" in channel_config)
 
 
+STANDALONE_CHANNEL = "_standalone"
+
+
 def channel_config_by_name(config: dict, channel_name: str | None) -> dict:
     """Look up a channel's config dict by name, or ``{}`` when there is none.
 
     ``{}`` is the correct answer for an unconfigured or sentinel channel
-    (``_standalone``, a slugified channel title that is not on the watchlist):
+    (``_standalone`` is matched explicitly, not merely assumed absent from the
+    watchlist; also a slugified channel title nobody configured):
     every resolver that takes a channel dict already treats an empty one as
     "no preference expressed", and `livestream_captions_first_applies` in
     particular distinguishes an ABSENT key from a present one, so an empty dict
@@ -634,9 +638,9 @@ def channel_config_by_name(config: dict, channel_name: str | None) -> dict:
     (issue #127): `cmd_transcript` used to hand the resolver a literal ``{}``
     and silently ignore a channel's configured `transcript_source`.
     """
-    if not channel_name:
+    if not channel_name or channel_name == STANDALONE_CHANNEL:
         return {}
-    return next((c for c in config.get("channels", []) if c.get("name") == channel_name), {})
+    return next((c for c in (config.get("channels") or []) if c.get("name") == channel_name), {})
 
 
 def resolve_mindmap_source(channel_config: dict, *, transcript_available: bool) -> str:
@@ -4876,7 +4880,29 @@ def cmd_transcript(args, config):
         # An unconfigured or _standalone channel resolves to {} and behaves
         # exactly as before.
         channel_cfg = channel_config_by_name(config, channel_name)
-        transcript_source = resolve_transcript_source(channel_cfg, cli_transcript_source)
+        # A manually clipped segment keeps the CLI-only answer, for the same
+        # reason --file does: it is an explicit, targeted instruction. This is
+        # not cosmetic. Under `transcript_source: auto` every Gemini failure
+        # branch falls back to _try_captions_transcript, whose only overwrite
+        # guard is `exists() and not force` - so the documented high-res segment
+        # recovery (transcript --url --force --start .. --end .. --media-resolution
+        # high) could replace a good full multimodal transcript with a
+        # segment-clipped, speech-only captions one. Pre-#127 that was
+        # unreachable here because the source was always "gemini".
+        manual_segment_requested = start_offset is not None or end_offset is not None
+        if manual_segment_requested:
+            log.info(
+                "  Manual --start/--end: keeping transcript_source=%s (channel config not applied to a clipped segment).",
+                transcript_source,
+            )
+        else:
+            transcript_source = resolve_transcript_source(channel_cfg, cli_transcript_source)
+            origin = (
+                "CLI flag"
+                if cli_transcript_source is not None
+                else ("channel config" if "transcript_source" in channel_cfg else "default")
+            )
+            log.info("  transcript_source=%s (from %s)", transcript_source, origin)
 
         video = {
             "video_id": video_id,
@@ -4908,10 +4934,12 @@ def cmd_transcript(args, config):
         vod_captions_first = was_livestream and livestream_captions_first_applies(
             transcript_source, channel_cfg, cli_transcript_source
         )
-        if was_livestream and not vod_captions_first:
-            log.info("  Explicit transcript_source=gemini; keeping Gemini-first for this VOD.")
-        elif vod_captions_first:
-            log.info("  Routing captions-first for this VOD.")
+        if was_livestream:
+            log.info(
+                "    VOD transcript routing: %s (transcript_source=%s)",
+                "captions-first" if vod_captions_first else "Gemini-first",
+                transcript_source,
+            )
         log.info("Transcribing: %s", video["url"])
 
     # Issue #50: chunked transcript path. Auto-trigger when (a) caller is the
