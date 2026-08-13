@@ -620,6 +620,29 @@ def livestream_captions_first_applies(
     return not (cli_override is None and channel_config is not None and "transcript_source" in channel_config)
 
 
+STANDALONE_CHANNEL = "_standalone"
+
+
+def channel_config_by_name(config: dict, channel_name: str | None) -> dict:
+    """Look up a channel's config dict by name, or ``{}`` when there is none.
+
+    ``{}`` is the correct answer for an unconfigured or sentinel channel
+    (``_standalone`` is matched explicitly, not merely assumed absent from the
+    watchlist; also a slugified channel title nobody configured):
+    every resolver that takes a channel dict already treats an empty one as
+    "no preference expressed", and `livestream_captions_first_applies` in
+    particular distinguishes an ABSENT key from a present one, so an empty dict
+    must never be faked into carrying defaults.
+
+    Exists so the manual `--url` commands resolve the channel dict the same way
+    (issue #127): `cmd_transcript` used to hand the resolver a literal ``{}``
+    and silently ignore a channel's configured `transcript_source`.
+    """
+    if not channel_name or channel_name == STANDALONE_CHANNEL:
+        return {}
+    return next((c for c in (config.get("channels") or []) if c.get("name") == channel_name), {})
+
+
 def resolve_mindmap_source(channel_config: dict, *, transcript_available: bool) -> str:
     """Decide which input the mindmap step should consume.
 
@@ -4704,10 +4727,16 @@ def cmd_transcript(args, config):
     media_resolution_enum = (
         _resolve_media_resolution(types, getattr(args, "media_resolution", "low")) if types is not None else None
     )
-    # Issue #60: transcript source from the CLI flag (defaults to gemini). This
-    # manual one-off command is controlled by the flag; the per-channel
-    # transcript_source config knob is honored by the automated scan path.
-    transcript_source = resolve_transcript_source({}, getattr(args, "transcript_source", None))
+    # Issue #60/#127: the channel dict is not known until the branches below
+    # resolve it, so bind the CLI-only answer here and let the --url branch
+    # re-resolve once it has a channel. Precedence is unchanged either way:
+    # CLI flag > channel config > "gemini".
+    cli_transcript_source = getattr(args, "transcript_source", None)
+    transcript_source = resolve_transcript_source({}, cli_transcript_source)
+    # Raw channel dict, kept alongside the resolved string because
+    # livestream_captions_first_applies needs the PROVENANCE (was the key
+    # present?), which the resolved string collapses away.
+    channel_cfg: dict = {}
 
     # Parse segment offsets (shared between URL and file paths)
     start_offset = parse_time_to_seconds(args.start) if args.start else None
@@ -4840,6 +4869,41 @@ def cmd_transcript(args, config):
 
         channel_name = channel_name or "_standalone"
 
+        # Issue #127: honor the channel's configured transcript_source on manual
+        # --url runs. This path used to hand the resolver a literal {}, so an
+        # operator who set transcript_source: yt-captions on a channel for cost
+        # control still paid for a full Gemini call on a one-off transcript.
+        # Scoped to --url on purpose: a local --file is an explicit instruction
+        # to transcribe THAT file, and a channel-level captions preference
+        # cannot be honored for it (there may be no corresponding caption track
+        # at all), so the --file branch keeps the CLI-only answer above.
+        # An unconfigured or _standalone channel resolves to {} and behaves
+        # exactly as before.
+        channel_cfg = channel_config_by_name(config, channel_name)
+        # A manually clipped segment keeps the CLI-only answer, for the same
+        # reason --file does: it is an explicit, targeted instruction. This is
+        # not cosmetic. Under `transcript_source: auto` every Gemini failure
+        # branch falls back to _try_captions_transcript, whose only overwrite
+        # guard is `exists() and not force` - so the documented high-res segment
+        # recovery (transcript --url --force --start .. --end .. --media-resolution
+        # high) could replace a good full multimodal transcript with a
+        # segment-clipped, speech-only captions one. Pre-#127 that was
+        # unreachable here because the source was always "gemini".
+        manual_segment_requested = start_offset is not None or end_offset is not None
+        if manual_segment_requested:
+            log.info(
+                "  Manual --start/--end: keeping transcript_source=%s (channel config not applied to a clipped segment).",
+                transcript_source,
+            )
+        else:
+            transcript_source = resolve_transcript_source(channel_cfg, cli_transcript_source)
+            origin = (
+                "CLI flag"
+                if cli_transcript_source is not None
+                else ("channel config" if "transcript_source" in channel_cfg else "default")
+            )
+            log.info("  transcript_source=%s (from %s)", transcript_source, origin)
+
         video = {
             "video_id": video_id,
             "url": f"https://www.youtube.com/watch?v={video_id}",
@@ -4861,15 +4925,21 @@ def cmd_transcript(args, config):
             was_livestream = _lookup_was_livestream(video["video_id"])
             if was_livestream:
                 log.info("  Completed livestream/premiere VOD detected (issue #120).")
-        # Provenance rule: an explicit --transcript-source gemini is honored, so
-        # this manual run stays Gemini-first exactly as it did pre-#120.
+        # Provenance rule: an explicit transcript_source=gemini is honored, so
+        # this manual run stays Gemini-first exactly as it did pre-#120. Issue
+        # #127: the channel dict is passed now instead of {}, so "explicit"
+        # covers a channel-level gemini too - the same view _cmd_process_url
+        # has always had. Two adjacent decisions on one invocation must not
+        # read different views of the same config.
         vod_captions_first = was_livestream and livestream_captions_first_applies(
-            transcript_source, {}, getattr(args, "transcript_source", None)
+            transcript_source, channel_cfg, cli_transcript_source
         )
-        if was_livestream and not vod_captions_first:
-            log.info("  Explicit transcript_source=gemini; keeping Gemini-first for this VOD.")
-        elif vod_captions_first:
-            log.info("  Routing captions-first for this VOD.")
+        if was_livestream:
+            log.info(
+                "    VOD transcript routing: %s (transcript_source=%s)",
+                "captions-first" if vod_captions_first else "Gemini-first",
+                transcript_source,
+            )
         log.info("Transcribing: %s", video["url"])
 
     # Issue #50: chunked transcript path. Auto-trigger when (a) caller is the
@@ -5104,10 +5174,7 @@ def _cmd_process_url(args, config):
     log.info("[process --url] %s", video["url"])
 
     # Resolve mindmap source from the channel config (default "auto").
-    channel_cfg: dict = next(
-        (c for c in config.get("channels", []) if c.get("name") == channel_name),
-        {},
-    )
+    channel_cfg: dict = channel_config_by_name(config, channel_name)
     # Issue #60: transcript source - CLI flag overrides the per-channel knob.
     transcript_source = resolve_transcript_source(channel_cfg, getattr(args, "transcript_source", None))
 
