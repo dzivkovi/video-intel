@@ -163,7 +163,7 @@ def _scan_setup_with_transcript(monkeypatch, videos, durations=None):
     monkeypatch.setattr(vi, "fetch_preflight_status", lambda _yt, ids: {vid: {} for vid in ids})
     monkeypatch.setattr(vi, "_is_youtube_short_url", lambda video_id: False)
 
-    captured = {"mindmaps": [], "transcripts": []}
+    captured = {"mindmaps": [], "transcripts": [], "chunked": []}
 
     def fake_process_mindmap(*args, **kwargs):
         video = args[2] if len(args) > 2 else kwargs.get("video")
@@ -175,8 +175,20 @@ def _scan_setup_with_transcript(monkeypatch, videos, durations=None):
         captured["transcripts"].append(video)
         return (video.get("video_id", "prefix"), "done")
 
+    def fake_chunked(**kwargs):
+        """Issue #128: the scan can now route a long video through the chunker.
+
+        These tests are about the `transcript_max_duration_seconds` guard - "was
+        this video kept for transcription" - not about which transcription path
+        it took, so both paths record into the same list.
+        """
+        captured["transcripts"].append(kwargs["video"])
+        captured["chunked"].append(kwargs["video"])
+        return "done"
+
     monkeypatch.setattr(vi, "process_mindmap", fake_process_mindmap)
     monkeypatch.setattr(vi, "process_transcript", fake_process_transcript)
+    monkeypatch.setattr(vi, "_run_chunked_transcript_url", fake_chunked)
     return captured
 
 
