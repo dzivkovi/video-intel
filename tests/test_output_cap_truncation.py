@@ -224,8 +224,14 @@ class TestScanCanChunk:
         config.update(top_level or {})
 
         args = SimpleNamespace(
-            channel=None, since=None, dry_run=False, force=False, model=None,
-            prompt=None, transcript_source=None, chunk_minutes=cli_chunk_minutes,
+            channel=None,
+            since=None,
+            dry_run=False,
+            force=False,
+            model=None,
+            prompt=None,
+            transcript_source=None,
+            chunk_minutes=cli_chunk_minutes,
         )
         vi.cmd_scan(args, config)
         return seen
@@ -297,3 +303,74 @@ class TestScanChunkingRespectsExistingRouting:
 
         assert not chunked
         assert len(single) == 1
+
+
+class TestChunkedScanBranchHonorsTheFailureContract:
+    """Codex cross-model finding on PR #134.
+
+    `process_transcript` catches its own failures and returns an `error: ...`
+    status. `_run_chunked_transcript_url` does not, and the scan's
+    `future.result()` is unguarded - so routing long videos through the chunker
+    made an uncaught exception able to abort the ENTIRE scan rather than fail
+    one video.
+    """
+
+    @staticmethod
+    def _call(tmp_path, fake_types, transcript_source="gemini"):
+        return vi._scan_transcribe_one(
+            client=object(),
+            types=fake_types,
+            video={
+                "video_id": "v",
+                "url": "https://www.youtube.com/watch?v=v",
+                "title": "t",
+                "published": "2026-08-12",
+            },
+            prompt_text="P",
+            model="m",
+            channel_dir=tmp_path / "demo",
+            prefix="p",
+            transcript_source=transcript_source,
+            transcript_timeout_seconds=600,
+            livestream_captions_first=False,
+            duration_seconds=99999,
+            chunk_minutes=50,
+        )
+
+    def test_a_raised_exception_becomes_an_error_status(self, tmp_path, monkeypatch, fake_types):
+        def boom(**_kw):
+            raise RuntimeError("400 INVALID_ARGUMENT")
+
+        monkeypatch.setattr(vi, "_run_chunked_transcript_url", boom)
+
+        prefix, status = self._call(tmp_path, fake_types)
+
+        assert prefix == "p"
+        assert status.startswith("error:"), "an exception here would otherwise abort the whole scan"
+        assert "400 INVALID_ARGUMENT" in status
+
+    def test_auto_still_gets_the_captions_failover_after_a_chunked_failure(self, tmp_path, monkeypatch, fake_types):
+        """The single-shot path would have tried captions; the chunked path must too."""
+        monkeypatch.setattr(vi, "_run_chunked_transcript_url", lambda **_kw: "error: all chunks failed parsing")
+        called = {}
+
+        def fake_failover(video, tpath, mpath, prefix, **kw):
+            called["reason"] = kw.get("reason")
+            return (prefix, "done (captions)")
+
+        monkeypatch.setattr(vi, "_try_captions_transcript", fake_failover)
+
+        _, status = self._call(tmp_path, fake_types, transcript_source="auto")
+
+        assert status == "done (captions)"
+        assert "chunked transcript failed" in called["reason"]
+
+    def test_gemini_source_does_not_get_a_failover(self, tmp_path, monkeypatch, fake_types):
+        monkeypatch.setattr(vi, "_run_chunked_transcript_url", lambda **_kw: "error: boom")
+        monkeypatch.setattr(
+            vi, "_try_captions_transcript", lambda *a, **kw: pytest.fail("must not run under transcript_source=gemini")
+        )
+
+        _, status = self._call(tmp_path, fake_types, transcript_source="gemini")
+
+        assert status == "error: boom"

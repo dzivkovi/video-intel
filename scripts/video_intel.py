@@ -2245,20 +2245,40 @@ def _scan_transcribe_one(
             chunk_minutes,
             len(chunks),
         )
-        status = _run_chunked_transcript_url(
-            client=client,
-            types=types,
-            video=video,
-            prompt_text=prompt_text,
-            model=model,
-            channel_dir=channel_dir,
-            prefix=prefix,
-            chunks=chunks,
-            duration_seconds=duration_seconds,
-            chunk_minutes=chunk_minutes,
-            force=False,
-            transcript_timeout_seconds=transcript_timeout_seconds,
-        )
+        # process_transcript catches its own failures and returns an
+        # "error: ..." status; the chunked helper does not, and the scan's
+        # `future.result()` is unguarded - so an uncaught exception here would
+        # abort the ENTIRE scan, not just this video. Mirror the contract, and
+        # keep the captions failover that the single-shot path would have run.
+        try:
+            status = _run_chunked_transcript_url(
+                client=client,
+                types=types,
+                video=video,
+                prompt_text=prompt_text,
+                model=model,
+                channel_dir=channel_dir,
+                prefix=prefix,
+                chunks=chunks,
+                duration_seconds=duration_seconds,
+                chunk_minutes=chunk_minutes,
+                force=False,
+                transcript_timeout_seconds=transcript_timeout_seconds,
+            )
+        except Exception as e:
+            log.warning("    %s: chunked transcript raised: %s", prefix, e)
+            status = f"error: {e}"
+        if status.startswith("error") and transcript_source == "auto":
+            fb = _try_captions_transcript(
+                video,
+                channel_dir / f"{prefix}.transcript.md",
+                channel_dir / f"{prefix}.meta.json",
+                prefix,
+                reason=f"chunked transcript failed: {status}",
+                force=False,
+            )
+            if fb is not None:
+                return fb
         return prefix, status
 
     return process_transcript(
