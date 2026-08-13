@@ -1763,13 +1763,30 @@ def _run_chunked_transcript_url(
         # deduplicated the URL prefix; cached=0 means each chunk paid full
         # input tokens. The label includes chunk index so multiple-call
         # observability stays readable.
+        # Issue #123: capture the per-chunk counts off the same callback that
+        # logs them, so the prompt == 0 confabulation guard can run here too.
+        # Until now this path only LOGGED the usage, so a fabricated chunk was
+        # parsed and stitched into the final transcript with status "ok".
+        usage_capture: dict[str, int | None] = {}
+
+        # Both loop variables are bound as defaults rather than closed over. The
+        # dict is fresh per iteration, so a late-firing callback can only ever
+        # write to its OWN chunk's capture - chunk N must never inherit chunk
+        # N-1's counts, which is how a guard silently starts judging the wrong
+        # window.
+        def _on_chunk_resp(r, _idx=chunk_idx, _capture=usage_capture):
+            counts = log_usage_metadata(r, f"transcript-chunk{_idx}")
+            if counts is not None:
+                _capture.clear()
+                _capture.update(counts)
+
         try:
             # Issue #74: wall-clock cap per chunk. A hung chunk raises
             # TranscriptTimeout, which we treat as a per-chunk failure (mark it
             # FAILED and continue) so one hang loses a single chunk, not the whole
             # video, and never deadlocks the scan.
             raw = _run_with_timeout(
-                lambda _s=gemini_start, _e=gemini_end, _i=chunk_idx: call_gemini(
+                lambda _s=gemini_start, _e=gemini_end: call_gemini(
                     client,
                     types,
                     media_uri,
@@ -1778,7 +1795,7 @@ def _run_chunked_transcript_url(
                     response_json=True,
                     start_offset=_s,
                     end_offset=_e,
-                    on_response=lambda r, _idx=_i: log_usage_metadata(r, f"transcript-chunk{_idx}"),
+                    on_response=_on_chunk_resp,
                     thinking_config=thinking_config,
                     media_resolution=media_resolution_low,
                 ),
@@ -1791,6 +1808,33 @@ def _run_chunked_transcript_url(
                 {
                     "range": _format_chunk_range_label(start_secs, end_secs or duration_seconds),
                     "status": "FAILED (timeout)",
+                    "speakers": [],
+                }
+            )
+            continue
+
+        # Issue #123 confabulation guard, the chunked member of the family that
+        # #60 (single-shot transcript) and #119 (video mindmap) already closed.
+        # prompt == 0 means Gemini ingested no video for this window and wrote
+        # from priors. Discarding one chunk is cheap; the alternative is a
+        # fabricated 50-minute stretch sitting inside an otherwise real
+        # transcript, invisible because the neighbouring chunks are genuine and
+        # the coverage table shows the window as present.
+        #
+        # The comparison is `== 0` exactly, never falsy: log_usage_metadata
+        # returns None for a count it could not read, and unreadable is not
+        # proof of confabulation (issue #125 makes both encodings of a genuine
+        # zero - a literal 0 and one omitted on the wire - arrive here as 0).
+        if usage_capture.get("prompt") == 0:
+            log.warning(
+                "    chunk %s: confabulation guard tripped - Gemini reported prompt=0 (no video ingested); discarding",
+                chunk_label_for_log,
+            )
+            failed_chunks.append((start_secs, end_secs, raw or ""))
+            segment_rows.append(
+                {
+                    "range": _format_chunk_range_label(start_secs, end_secs or duration_seconds),
+                    "status": "FAILED (confabulation: prompt=0)",
                     "speakers": [],
                 }
             )
