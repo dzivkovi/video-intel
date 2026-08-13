@@ -1751,6 +1751,7 @@ def _run_chunked_transcript_url(
     segment_rows: list[dict] = []
     failed_chunks: list[tuple[int, int, str]] = []
     thin_chunk_count = 0
+    confabulated_chunks = 0
 
     for chunk_idx, (start_secs, end_secs) in enumerate(chunks, start=1):
         gemini_start: int | None = None if (start_secs == 0 and end_secs == 0) else start_secs
@@ -1786,7 +1787,7 @@ def _run_chunked_transcript_url(
             # FAILED and continue) so one hang loses a single chunk, not the whole
             # video, and never deadlocks the scan.
             raw = _run_with_timeout(
-                lambda _s=gemini_start, _e=gemini_end: call_gemini(
+                lambda _s=gemini_start, _e=gemini_end, _cb=_on_chunk_resp: call_gemini(
                     client,
                     types,
                     media_uri,
@@ -1795,7 +1796,7 @@ def _run_chunked_transcript_url(
                     response_json=True,
                     start_offset=_s,
                     end_offset=_e,
-                    on_response=_on_chunk_resp,
+                    on_response=_cb,
                     thinking_config=thinking_config,
                     media_resolution=media_resolution_low,
                 ),
@@ -1826,9 +1827,22 @@ def _run_chunked_transcript_url(
         # proof of confabulation (issue #125 makes both encodings of a genuine
         # zero - a literal 0 and one omitted on the wire - arrive here as 0).
         if usage_capture.get("prompt") == 0:
+            confabulated_chunks += 1
             log.warning(
                 "    chunk %s: confabulation guard tripped - Gemini reported prompt=0 (no video ingested); discarding",
                 chunk_label_for_log,
+            )
+            # Every comparable guard in this file logs how to recover. Without
+            # it, discarding a fabricated window converts fabrication into
+            # permanently MISSING content: the video is still marked processed,
+            # is_processed() skips it on every future scan, and the captions
+            # failover never fires because it keys on a status starting "error".
+            log.warning(
+                "      Recover this window with: transcript --url %s --start %d --end %d --force"
+                "  (clobbers the canonical file - back it up and merge by absolute timestamp)",
+                video.get("url", ""),
+                start_secs,
+                end_secs or duration_seconds,
             )
             failed_chunks.append((start_secs, end_secs, raw or ""))
             segment_rows.append(
@@ -1884,6 +1898,11 @@ def _run_chunked_transcript_url(
         for i, (sstart, send, raw) in enumerate(failed_chunks, start=1):
             sidecar = channel_dir / f"{prefix}.transcript.raw.chunk{i}-{sstart}-{send}.txt"
             sidecar.write_text(raw, encoding="utf-8")
+        if confabulated_chunks == len(chunks):
+            # This string is persisted as transcript_failover_reason by the
+            # captions failover, so it routes a future operator to a
+            # troubleshooting row. "parse failure" would be the wrong one.
+            return "error: all chunks confabulated (prompt=0; raw sidecars saved)"
         return "error: all chunks failed parsing (raw sidecars saved)"
 
     chunk_duration = chunk_minutes * 60
@@ -1939,7 +1958,17 @@ def _run_chunked_transcript_url(
         "transcript_chunks": len(chunks),
         "transcript_chunk_minutes": chunk_minutes,
         "transcript_thin_chunks": thin_chunk_count,
+        "transcript_confabulated_chunks": confabulated_chunks,
     }
+    if confabulated_chunks:
+        # A dedicated field, NOT last_error: update_meta resets last_error to
+        # None after merging, so anything written there would be silently
+        # dropped. This is what makes "which transcripts have a fabricated
+        # hole?" answerable from meta.json instead of by grepping run logs -
+        # the generic `partial` alone is byte-identical to a parse failure.
+        meta_fields["transcript_confabulation_note"] = (
+            f"{confabulated_chunks} of {len(chunks)} chunks reported prompt=0 and were discarded"
+        )
     update_meta(channel_dir / f"{prefix}.meta.json", meta_fields, mode="transcript")
     return "partial" if is_partial else "done"
 

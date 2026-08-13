@@ -212,3 +212,63 @@ class TestGuardDoesNotOverreach:
 
         assert status.startswith("error:")
         assert not (channel_dir / "2026-08-12-a-long-talk.transcript.md").exists()
+
+
+class TestDiscardedWindowsAreRecoverableAndAuditable:
+    """Discarding a fabrication must not silently become missing content.
+
+    The video stays marked processed, `is_processed()` skips it on every future
+    scan, and the captions failover never fires (it keys on a status starting
+    "error"). So the affordance - a recipe and a queryable marker - is the whole
+    difference between "we caught it" and "we lost it".
+    """
+
+    def test_the_recovery_recipe_names_the_exact_window(self, tmp_path, video, fake_types, monkeypatch, caplog):
+        with caplog.at_level("WARNING", logger="video_intel"):
+            _run(tmp_path, video, fake_types, monkeypatch, [250000, 0, 260000])
+
+        warnings = " ".join(r.getMessage() for r in caplog.records)
+        assert "transcript --url" in warnings
+        assert "--start 3000 --end 6000" in warnings, "the recipe must target the lost window, not the whole video"
+        assert "--force" in warnings
+        assert "back it up" in warnings, "the clobber caveat matters; --force overwrites the canonical file"
+
+    def test_meta_records_how_many_windows_were_discarded(self, tmp_path, video, fake_types, monkeypatch):
+        _, _, meta, _ = _run(tmp_path, video, fake_types, monkeypatch, [250000, 0, 260000])
+
+        assert meta["transcript_confabulated_chunks"] == 1
+        assert "1 of 3" in meta["transcript_confabulation_note"]
+
+    def test_a_clean_run_records_zero_and_no_note(self, tmp_path, video, fake_types, monkeypatch):
+        _, _, meta, _ = _run(tmp_path, video, fake_types, monkeypatch, [250000, 240000, 260000])
+
+        assert meta["transcript_confabulated_chunks"] == 0
+        assert "transcript_confabulation_note" not in meta
+
+    def test_all_confabulated_is_not_reported_as_a_parse_failure(self, tmp_path, video, fake_types, monkeypatch):
+        """That string is persisted as transcript_failover_reason by the captions failover."""
+        channel_dir = tmp_path / "demo"
+
+        def fake_call_gemini(client, types, media_uri, prompt_text, model, response_json=False, **kw):
+            kw["on_response"](_usage(0))
+            return _payload("FAKE", 0, 3000)
+
+        monkeypatch.setattr(vi, "call_gemini", fake_call_gemini)
+        monkeypatch.setattr(vi, "_make_thinking_config_for_transcript", lambda types, model: None)
+
+        status = vi._run_chunked_transcript_url(
+            client=object(),
+            types=fake_types,
+            video=video,
+            prompt_text="P",
+            model="m",
+            channel_dir=channel_dir,
+            prefix="2026-08-12-a-long-talk",
+            chunks=[(0, 3000), (3000, 6000)],
+            duration_seconds=6000,
+            chunk_minutes=50,
+            force=False,
+        )
+
+        assert "confabulated" in status
+        assert "parsing" not in status, "a future operator must not be routed to the parse-failure row"
