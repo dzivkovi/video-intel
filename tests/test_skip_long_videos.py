@@ -766,6 +766,20 @@ def _prep_process_env(monkeypatch, tmp_path, channel="everyinc"):
     return output_dir, channel_dir
 
 
+def _write_stub_artifact_if_ok(path, status, content):
+    """Write the placeholder artifact a process_* stub claims to have produced.
+
+    Issue #129's exit-code check inspects the filesystem, not just the
+    returned status string, so a stub that reports success must also leave a
+    real (non-empty) file behind - mirroring what the actual process_transcript
+    / process_mindmap / process_concepts helpers write on disk. An error
+    status must NOT write anything; that is the failure case under test.
+    """
+    if not str(status).startswith("error"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+
 class TestCmdProcessPerModeSkip:
     def _wire_pipeline_recorders(self, monkeypatch, channel_dir):
         upload_calls: list = []
@@ -781,17 +795,23 @@ class TestCmdProcessPerModeSkip:
         def fake_mindmap(*args, **kwargs):
             mindmap_calls.append(kwargs)
             prefix = kwargs.get("prefix") or "video"
-            (channel_dir / f"{prefix}.mindmap.md").write_text("# mm", encoding="utf-8")
-            return prefix, "done"
+            status = "done"
+            _write_stub_artifact_if_ok(channel_dir / f"{prefix}.mindmap.md", status, "# mm")
+            return prefix, status
 
         def fake_transcript(*args, **kwargs):
             transcript_calls.append(kwargs)
             prefix = args[6] if len(args) > 6 else kwargs.get("prefix")
-            return prefix, "done"
+            status = "done"
+            _write_stub_artifact_if_ok(channel_dir / f"{prefix}.transcript.md", status, "# stub transcript\n")
+            return prefix, status
 
         def fake_concepts(*args, **kwargs):
             concepts_calls.append(kwargs)
-            return kwargs.get("prefix") or "video", "done"
+            prefix = kwargs.get("prefix") or "video"
+            status = "done"
+            _write_stub_artifact_if_ok(channel_dir / f"{prefix}.concepts.json", status, '{"concepts": []}')
+            return prefix, status
 
         monkeypatch.setattr("video_intel.process_mindmap", fake_mindmap)
         monkeypatch.setattr("video_intel.process_transcript", fake_transcript)
