@@ -44,6 +44,7 @@ from gemini_common import (
     build_permissive_safety_settings,
     create_client,
     get_retry_delay,
+    is_transient_transport_error,
     log_usage_metadata,
     require_gemini,
     require_youtube,
@@ -2767,6 +2768,10 @@ def call_gemini(
 
     max_retries_rate = 3
     max_retries_server = 8
+    # Transport retries are counted SEPARATELY from `attempt` (PR #136 review):
+    # `attempt` counts failures of every class, so with a budget of 1 a drop
+    # that follows any 429/5xx retry would arrive already over budget.
+    transport_attempts = 0
     for attempt in range(max(max_retries_rate, max_retries_server) + 1):
         try:
             response = client.models.generate_content(
@@ -2787,9 +2792,12 @@ def call_gemini(
                 max_retries_rate=max_retries_rate,
                 max_retries_server=max_retries_server,
                 max_retries_transport=MAX_RETRIES_TRANSPORT,
+                transport_attempt=transport_attempts,
             )
             if retry is None:
                 raise
+            if is_transient_transport_error(e):
+                transport_attempts += 1
             kind, wait, max_for_type = retry
             log.warning("%s — retry %d/%d in %.0fs...", kind, attempt + 1, max_for_type, wait)
             time.sleep(wait)
@@ -3519,12 +3527,30 @@ def _record_concepts_error(meta_path: Path, video: dict, channel_dir: Path, erro
     with ``"ok"`` but could not delete a ``concepts_failed_at``, and a stale
     failure timestamp on a healthy video reads worse than no timestamp at all.
     """
-    meta = _read_meta_best_effort(meta_path, raise_on_os_error=False) if meta_path.exists() else {}
+    if not meta_path.exists():
+        # NEVER create a meta that did not exist - mirrors _record_transcript_error.
+        # ce-code-review (adversarial, PR #136) executed the alternative: callers
+        # that do not pass an explicit `prefix` (cmd_concepts) let process_concepts
+        # recompute one from the current title, so on a title-rotated video a
+        # single dropped socket wrote a SECOND meta claiming the same video_id -
+        # manufacturing a dedupe group that never existed, where a meta with no
+        # `processed` key can lose the tie-break to the phantom. Recording a
+        # cheap failure must not corrupt identity; if there is no meta to
+        # annotate, the log line is the record.
+        log.warning("  concepts failure for %s not recorded: no meta.json at %s", video.get("video_id"), meta_path)
+        return
+    meta = _read_meta_best_effort(meta_path, raise_on_os_error=False)
     meta.update(_transcript_identity_fields(video, channel_dir))
     meta["concepts_status"] = f"error: {error}"
     meta["last_error"] = f"concepts: {error}"
-    meta_path.parent.mkdir(parents=True, exist_ok=True)
-    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    try:
+        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        # An error-path writer that raises destroys the error it exists to
+        # preserve - the same principle as issue #124's read side. Uncaught,
+        # this would propagate through cmd_scan's concepts loop and abort the
+        # scan before its failure summary ever printed.
+        log.warning("  could not record concepts failure in %s (%s)", meta_path, exc)
 
 
 def _transcript_identity_fields(video: dict, channel_dir: Path) -> dict:
@@ -4023,6 +4049,10 @@ def call_gemini_text(
 
     max_retries_rate = 3
     max_retries_server = 8
+    # Transport retries are counted SEPARATELY from `attempt` (PR #136 review):
+    # `attempt` counts failures of every class, so with a budget of 1 a drop
+    # that follows any 429/5xx retry would arrive already over budget.
+    transport_attempts = 0
     for attempt in range(max(max_retries_rate, max_retries_server) + 1):
         try:
             response = client.models.generate_content(
@@ -4043,9 +4073,12 @@ def call_gemini_text(
                 max_retries_rate=max_retries_rate,
                 max_retries_server=max_retries_server,
                 max_retries_transport=MAX_RETRIES_TRANSPORT,
+                transport_attempt=transport_attempts,
             )
             if retry is None:
                 raise
+            if is_transient_transport_error(e):
+                transport_attempts += 1
             kind, wait, max_for_type = retry
             log.warning("%s — retry %d/%d in %.0fs...", kind, attempt + 1, max_for_type, wait)
             time.sleep(wait)
@@ -5447,14 +5480,20 @@ def missing_pipeline_artifacts(steps: list[dict]) -> list[str]:
     ``skip_modes``, ``mindmap_source: none``, the issue #120 livestream mindmap
     suppression, and concepts on an unconfigured (``_standalone``) channel. A
     skip the operator asked for is not an incomplete corpus.
+
+    Every key is read with REQUIRED access, never ``.get()``. A ``.get("requested")``
+    would treat a missing or misspelled key as ``False`` and silently drop that
+    step from gap detection - a guard against silent incompleteness that can
+    itself be silently disabled, which is the exact failure class this function
+    exists to close. A malformed step must raise at the call site instead.
     """
     missing: list[str] = []
     for step in steps:
-        if not step.get("requested"):
+        if not step["requested"]:
             continue
-        path = step.get("path")
+        path = step["path"]
         present = path is not None and path.exists() and path.stat().st_size > 0
-        if not present or str(step.get("status") or "").startswith("error"):
+        if not present or str(step["status"] or "").startswith("error"):
             missing.append(step["label"])
     return missing
 
@@ -5739,6 +5778,13 @@ def _cmd_process_url(args, config):
             channel_name,
             prompt_name="mindmap-from-transcript",
             force=args.force,
+            # Title rotation (ce-code-review, adversarial, PR #136): without an
+            # explicit prefix, process_mindmap recomputes it from the CURRENT
+            # title and writes under the new slug, while everything downstream
+            # - the exit-code check, find_mindmap_source, concepts - looks under
+            # the indexed prefix. The comment above already promises co-location;
+            # this is what delivers it.
+            prefix=prefix,
             source="transcript",
             transcript_path=transcript_path,
         )
@@ -5764,6 +5810,7 @@ def _cmd_process_url(args, config):
             prompt_name=prompt_name,
             force=args.force,
             fps=mindmap_fps,
+            prefix=prefix,
             source="video",
         )
     log.info("    mindmap [%s]: %s", mindmap_prefix, mindmap_status)
@@ -6251,7 +6298,13 @@ def cmd_process(args, config):
             "label": "concepts",
             "requested": True,
             "status": concepts_status,
-            "path": channel_dir / f"{prefix}.concepts.json",
+            # process_concepts hardcodes output_dir / channel_name; the
+            # sibling-meta identity branch sets channel_dir to input_path.parent,
+            # so re-deriving from channel_dir here reported a gap for an artifact
+            # that WAS written - a permanent false exit 3 on a healthy run
+            # (ce-code-review: correctness AND adversarial, both with repros).
+            # Ask for the writer's destination, never re-derive a second one.
+            "path": output_dir / channel_name / f"{prefix}.concepts.json",
         }
     )
     finish_pipeline_run(steps, label=prefix)
@@ -7573,6 +7626,7 @@ def cmd_nugget(args, config):
     }
     contents = genai_types.Content(parts=[genai_types.Part(text=filled_prompt)])
     max_retries = 3
+    transport_attempts = 0
     response_text = None
     for attempt in range(max_retries + 1):
         try:
@@ -7590,9 +7644,12 @@ def cmd_nugget(args, config):
                 max_retries_rate=max_retries,
                 max_retries_server=max_retries,
                 max_retries_transport=MAX_RETRIES_TRANSPORT,
+                transport_attempt=transport_attempts,
             )
             if retry is None:
                 raise
+            if is_transient_transport_error(e):
+                transport_attempts += 1
             kind, wait, _ = retry
             log.warning("%s — retry %d/%d in %.0fs...", kind, attempt + 1, max_retries, wait)
             time.sleep(wait)

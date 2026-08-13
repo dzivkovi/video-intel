@@ -267,12 +267,29 @@ def is_transient_transport_error(exc: Exception) -> bool:
     so they arrive here raw.
 
     ``httpx.TransportError`` is the right net because it is defined by the
-    request never completing: connect/read/write/pool timeouts, connection and
-    protocol drops, proxy failures. Its two client-side members are excluded,
-    because retrying either fails identically and only burns time:
+    request never completing: connect/write/pool timeouts, connection and
+    protocol drops, proxy failures. Three members are excluded.
+
+    Two are client-side faults, where retrying fails identically and only burns
+    time:
 
     * ``LocalProtocolError`` - we built a malformed request.
     * ``UnsupportedProtocol`` - the URL scheme is wrong.
+
+    The third, ``ReadTimeout``, is excluded on COST, not on correctness - and it
+    is the one exclusion that will look wrong to a future reader, so: the
+    ``read`` timeout in ``create_client`` is **1200 seconds**, orders of
+    magnitude above the other three (connect/write/pool are 30s each). A retry
+    of a read timeout therefore risks a second 20-minute wait. Transcript calls
+    are safe either way - ``_run_with_timeout``'s 600s cap (issue #74) fires
+    first and raises ``TranscriptTimeout``, which is not an httpx error and
+    never reaches this classifier - but mindmap-from-video and concepts calls
+    have no such outer deadline, so a single unreachable response could stall a
+    sequential scan stage for ~40 minutes. Before this existed it failed after
+    one 20-minute wait; making that worse is not a fix. Every failure actually
+    observed in issue #129 was ``RemoteProtocolError``, so nothing in the
+    evidence argues for retrying read timeouts. Re-admitting ``ReadTimeout``
+    means first giving mindmap/concepts a total wall-clock deadline.
 
     ``HTTPStatusError`` is deliberately NOT here: it is not a ``TransportError``
     at all, and a status carrying a real server verdict is the ``APIError``
@@ -283,7 +300,7 @@ def is_transient_transport_error(exc: Exception) -> bool:
         import httpx
     except ImportError:  # pragma: no cover - httpx ships with google-genai
         return False
-    if isinstance(exc, httpx.LocalProtocolError | httpx.UnsupportedProtocol):
+    if isinstance(exc, httpx.LocalProtocolError | httpx.UnsupportedProtocol | httpx.ReadTimeout):
         return False
     return isinstance(exc, httpx.TransportError)
 
@@ -295,6 +312,7 @@ def get_retry_delay(
     max_retries_rate: int = 3,
     max_retries_server: int = 8,
     max_retries_transport: int = 0,
+    transport_attempt: int | None = None,
 ) -> tuple[str, float, int] | None:
     """Return (kind, wait_seconds, max_for_type) for retryable Gemini failures, or None.
 
@@ -309,6 +327,24 @@ def get_retry_delay(
        to respect. Small budget, short backoff, and **off unless the caller asks
        for it**.
     3. Anything else - not retryable.
+
+    ``transport_attempt`` is how many transport retries THIS call has already
+    spent, which is not the same number as ``attempt`` (ce-code-review,
+    reliability, PR #136). The callers' loop index counts every failure of every
+    class, so with a budget as small as 1 a transport drop that lands after any
+    earlier 429 or 5xx retry would arrive with ``attempt >= 1`` and be denied its
+    only chance - silently reverting to pre-#129 behavior in exactly the
+    compound-failure scenario the issue describes (7 drops under 4-way
+    concurrency, alongside rate limiting). Callers therefore track transport
+    occurrences separately and pass that count here.
+
+    It defaults to ``None``, meaning "fall back to ``attempt``". That default is
+    deliberately the CONSERVATIVE direction: a caller who enables the budget but
+    forgets to track the counter gets fewer retries than intended, never an
+    unbounded number. Do not "simplify" the default to ``0`` - that reads as
+    "no transport retry spent yet" on every single pass, so the budget would
+    never be reached and the only thing still bounding the loop would be the
+    caller's range, against the "bounded retries only" guardrail.
 
     ``max_retries_transport`` defaults to ``0`` so this stays a pure addition:
     ``translate_video.py`` shares this helper and is operationally separate from
@@ -342,9 +378,10 @@ def get_retry_delay(
         return None
 
     if is_transient_transport_error(exc):
-        if attempt >= max_retries_transport:
+        spent = attempt if transport_attempt is None else transport_attempt
+        if spent >= max_retries_transport:
             return None
-        base_wait = TRANSPORT_RETRY_BASE_WAIT * (2**attempt)
+        base_wait = TRANSPORT_RETRY_BASE_WAIT * (2**spent)
         return "Transport error", base_wait + random.uniform(0, 3), max_retries_transport
 
     return None

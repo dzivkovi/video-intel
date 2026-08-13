@@ -450,9 +450,18 @@ How `process --file` works:
   SDK did not report that count in a readable shape - not that it was zero.
   A `prompt=?` is worth attention: it is followed by a warning, and it means
   the `prompt == 0` confabulation guard could not run for that call.
-- **Exit-code contract.** Exit 0 if mindmap succeeded, regardless of
-  transcript / concepts outcome. Automation callers that need partial-success
-  detail inspect `modes_completed` in the resulting meta.json.
+- **Exit-code contract (tri-state).** `0` = every step the run was asked to
+  produce left a usable artifact. `3` = the run finished but a requested step
+  produced nothing (most often a failed transcript or concepts step); the
+  artifacts that did land are still on disk and nothing is rolled back. `1` =
+  a hard failure that stopped the run (mindmap failed, upload failed, bad
+  config). Deliberate skips (`skip_modes`, `mindmap_source: none`, the
+  livestream mindmap suppression, concepts on an unconfigured channel) keep
+  exit 0, and so do the degraded-but-real salvage statuses (`partial`,
+  `truncated_output`, `thin`). A caller that wants the old lenient behavior
+  treats `rc in (0, 3)` as non-fatal. Automation that needs per-step detail
+  inspects `modes_completed`, `transcript_status`, and `concepts_status` in
+  the resulting meta.json.
 - **LOW media resolution by default.** The mindmap-from-video fallback
   step (and the chunked-transcript step) use Gemini's LOW media resolution
   by default (~70 tokens/frame) instead of the API default HIGH

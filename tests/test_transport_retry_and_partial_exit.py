@@ -39,7 +39,6 @@ class TestTransportErrorClassification:
         [
             httpx.ConnectError("connection refused"),
             httpx.ConnectTimeout("timed out connecting"),
-            httpx.ReadTimeout("timed out reading"),
             httpx.WriteTimeout("timed out writing"),
             httpx.PoolTimeout("no connection available"),
             httpx.ReadError("socket read failed"),
@@ -47,7 +46,7 @@ class TestTransportErrorClassification:
             httpx.ProxyError("proxy refused"),
         ],
     )
-    def test_whole_transport_class_is_retryable(self, exc):
+    def test_transport_class_is_retryable(self, exc):
         assert is_transient_transport_error(exc) is True
 
     @pytest.mark.parametrize(
@@ -61,9 +60,41 @@ class TestTransportErrorClassification:
         """Retrying either of these fails identically and only burns time."""
         assert is_transient_transport_error(exc) is False
 
+    def test_read_timeout_is_excluded_on_cost(self):
+        """Codex peer review, PR #136.
+
+        The ``read`` timeout in ``create_client`` is 1200s - 40x the other
+        three. Retrying it risks a second 20-minute wait on the mindmap and
+        concepts paths, which have no outer deadline (transcript calls are
+        capped at 600s by ``_run_with_timeout``). Pre-#129 those failed after
+        one 20-minute wait; doubling that is not a fix. Every failure actually
+        observed in the issue was ``RemoteProtocolError``.
+        """
+        assert is_transient_transport_error(httpx.ReadTimeout("timed out reading")) is False
+        # ...while the three SHORT timeouts (30s each) stay retryable.
+        assert is_transient_transport_error(httpx.ConnectTimeout("x")) is True
+        assert is_transient_transport_error(httpx.WriteTimeout("x")) is True
+        assert is_transient_transport_error(httpx.PoolTimeout("x")) is True
+
     def test_plain_exceptions_are_not_transport_errors(self):
         assert is_transient_transport_error(RuntimeError("Server disconnected")) is False
         assert is_transient_transport_error(ValueError("timeout")) is False
+
+    def test_http_status_error_is_not_a_transport_error(self):
+        """ce-code-review (testing), PR #136: a named invariant nothing proved.
+
+        ``HTTPStatusError`` carries a real server verdict, so it belongs to the
+        ``APIError`` branch. If it ever landed in the transport net, a 403 or
+        400 surfaced this way would be retried - the exact refusal-retry the
+        issue forbids. Both the docstring and the CLAUDE.md guardrail name this
+        exclusion, so it deserves a test rather than prose.
+        """
+        request = httpx.Request("POST", "https://example.invalid/v1")
+        response = httpx.Response(403, request=request)
+        exc = httpx.HTTPStatusError("permission denied", request=request, response=response)
+
+        assert is_transient_transport_error(exc) is False
+        assert get_retry_delay(exc, 0, max_retries_transport=99) is None
 
 
 class TestRefusalsStillFailFast:
@@ -80,14 +111,17 @@ class TestRefusalsStillFailFast:
 
         assert get_retry_delay(exc, 0, max_retries_transport=MAX_RETRIES_TRANSPORT) is None
 
-    def test_an_api_error_never_falls_through_to_the_transport_branch(self):
-        """The APIError branch must return from inside itself.
+    def test_no_non_retryable_api_error_code_is_ever_retried(self):
+        """Sweeps the non-retryable code space, rather than just 400/403.
 
-        This is the structural invariant behind the two tests above. If the
-        non-retryable APIError path ever stopped returning early, a 403 would
-        reach the transport check - and since the SDK's APIError carries an
-        httpx response, a future refactor could easily make it look transport-ish.
-        Assert it across the whole non-retryable code space, not just 400/403.
+        Scope note (ce-code-review, testing, PR #136): this does NOT prove the
+        ``APIError`` branch's early ``return None`` is load-bearing today.
+        ``errors.APIError`` subclasses no httpx exception, so deleting that
+        return currently changes nothing observable - verified by running it.
+        The early return is defense against a future refactor that widens the
+        transport net; what this test actually guarantees is the outcome
+        (no non-retryable code is ever retried), which is the property worth
+        locking regardless of which line enforces it.
         """
         for code in (400, 401, 403, 404, 409, 422):
             exc = errors.APIError(code, {"error": {"message": "no", "status": "X"}})
@@ -226,6 +260,63 @@ class TestCallGeminiRetriesTransportErrors:
 
         assert calls["n"] == MAX_RETRIES_TRANSPORT + 1
 
+    def test_transport_retry_survives_an_earlier_retry_of_another_class(self, monkeypatch):
+        """ce-code-review (reliability), PR #136 - the budget must be per-CLASS.
+
+        The loop index counts failures of every class. With a transport budget
+        of 1, a drop that lands after any earlier 429/5xx retry would arrive
+        with ``attempt >= 1`` and be denied its only chance - silently
+        reverting to pre-#129 behavior in exactly the compound-failure
+        scenario the issue describes (7 drops under 4-way concurrency,
+        alongside rate limiting). The regression is invisible to any
+        single-exception-type test.
+        """
+        monkeypatch.setattr("video_intel.time.sleep", lambda _s: None)
+        seq = [
+            errors.APIError(503, {"error": {"message": "overloaded", "status": "UNAVAILABLE"}}),
+            httpx.RemoteProtocolError("Server disconnected without sending a response."),
+        ]
+        calls = {"n": 0}
+
+        class _Models:
+            @staticmethod
+            def generate_content(**_kw):
+                i = calls["n"]
+                calls["n"] += 1
+                if i < len(seq):
+                    raise seq[i]
+                return type("R", (), {"text": "OK", "usage_metadata": None})()
+
+        client = type("C", (), {"models": _Models})()
+
+        result = video_intel.call_gemini(client, self._types_stub(), "https://y/w", "prompt", "m")
+
+        assert result == "OK"
+        assert calls["n"] == 3  # 503 -> retry, drop -> retry, success
+
+    def test_transport_budget_is_still_bounded_after_another_class_retried(self, monkeypatch):
+        """The per-class counter must not become an unbounded transport loop."""
+        monkeypatch.setattr("video_intel.time.sleep", lambda _s: None)
+        server = errors.APIError(503, {"error": {"message": "overloaded", "status": "UNAVAILABLE"}})
+        drop = httpx.RemoteProtocolError("Server disconnected without sending a response.")
+        seq = [server, drop, drop, drop]
+        calls = {"n": 0}
+
+        class _Models:
+            @staticmethod
+            def generate_content(**_kw):
+                i = calls["n"]
+                calls["n"] += 1
+                raise seq[i] if i < len(seq) else drop
+
+        client = type("C", (), {"models": _Models})()
+
+        with pytest.raises(httpx.RemoteProtocolError):
+            video_intel.call_gemini(client, self._types_stub(), "https://y/w", "prompt", "m")
+
+        # 503 (retried) + one drop (retried) + one drop (over budget, raises).
+        assert calls["n"] == 3
+
     def test_permission_denied_is_not_retried_through_call_gemini(self, monkeypatch):
         """End-to-end proof of the refusal rule at the seam, not just the classifier."""
         monkeypatch.setattr("video_intel.time.sleep", lambda _s: None)
@@ -339,6 +430,89 @@ class TestFinishPipelineRun:
         assert video_intel.finish_pipeline_run(steps, label="vid") is None
 
 
+class TestCheckerAndWriterAgreeOnPaths:
+    """The blind spot the rest of this file has by construction.
+
+    ce-code-review (adversarial), PR #136: every stub-based test hands the
+    artifact path to the stub, so the writer and the exit-code checker agree
+    automatically and three real path-mismatch defects sat live under a green
+    suite. These tests assert the two independently and compare, which is the
+    only shape that can catch a checker that re-derives a path the writer never
+    used. A mismatch here is a permanent false exit 3 on a healthy run - the
+    worst failure mode for a guard whose whole value is being believed.
+    """
+
+    def test_concepts_artifact_lands_where_the_orchestrator_looks(self, tmp_path, monkeypatch):
+        """`process_concepts` hardcodes ``output_dir / channel_name``.
+
+        The `--file` orchestrator's identity resolver can set ``channel_dir`` to
+        the source file's parent instead, so the step entry must be built from
+        the writer's rule, not from ``channel_dir``.
+        """
+        output_dir = tmp_path / "corpus"
+        channel = "demo"
+        prefix = "2026-08-01-a-talk"
+        video = {"video_id": "abc12345678", "url": "u", "title": "A Talk", "published": "2026-08-01"}
+
+        monkeypatch.setattr(video_intel, "load_prompt", lambda _n: "prompt {{taxonomy}}")
+        monkeypatch.setattr(video_intel, "call_gemini_text", lambda *_a, **_kw: '{"concepts": []}')
+
+        written_prefix, status = video_intel.process_concepts(
+            None, None, video, "# mindmap", {"concepts": {}}, "m", output_dir, channel, prefix=prefix
+        )
+
+        assert not status.startswith("error")
+        # What the orchestrator's step entry claims the path is:
+        claimed = output_dir / channel / f"{written_prefix}.concepts.json"
+        assert claimed.exists(), f"writer and checker disagree; tree = {sorted(output_dir.rglob('*'))}"
+        assert (
+            video_intel.missing_pipeline_artifacts(
+                [{"label": "concepts", "requested": True, "status": status, "path": claimed}]
+            )
+            == []
+        )
+
+    def test_mindmap_artifact_lands_under_the_prefix_the_orchestrator_indexed(self, tmp_path, monkeypatch):
+        """Title rotation: the indexed prefix and the title-computed prefix differ.
+
+        `_cmd_process_url` looks up an existing prefix from the video_id index,
+        then must pass it to `process_mindmap`. Without that, the mindmap lands
+        under the CURRENT title's slug while the checker looks under the indexed
+        one, and the run exits 3 forever on a video whose mindmap is on disk.
+        """
+        output_dir = tmp_path / "corpus"
+        channel = "demo"
+        indexed_prefix = "2026-01-01-old-seo-title"
+        video = {
+            "video_id": "abc12345678",
+            "url": "u",
+            "title": "New Rotated Title",  # would compute a DIFFERENT slug
+            "published": "2026-01-01",
+        }
+        assert video_intel.video_file_prefix(video) != indexed_prefix
+
+        transcript_path = output_dir / channel / f"{indexed_prefix}.transcript.md"
+        transcript_path.parent.mkdir(parents=True)
+        transcript_path.write_text("# Transcript\n\n[00:00] hello\n", encoding="utf-8")
+        monkeypatch.setattr(video_intel, "call_gemini_text", lambda *_a, **_kw: "# Mind map\n\n- a branch\n")
+
+        video_intel.process_mindmap(
+            None,
+            None,
+            video,
+            "prompt",
+            "m",
+            output_dir,
+            channel,
+            prefix=indexed_prefix,
+            source="transcript",
+            transcript_path=transcript_path,
+        )
+
+        found = video_intel.find_mindmap_source(output_dir / channel, indexed_prefix)
+        assert found is not None, f"mindmap not under the indexed prefix; tree = {sorted(output_dir.rglob('*'))}"
+
+
 class TestConceptsFailureIsRecorded:
     """A concepts failure used to leave no trace anywhere - no artifact, no meta."""
 
@@ -372,6 +546,7 @@ class TestConceptsFailureIsRecorded:
         cheap failure must not cost an expensive re-run."""
         meta_path = tmp_path / "chan" / "v.meta.json"
         meta_path.parent.mkdir(parents=True)
+        meta_path.write_text("{}", encoding="utf-8")
 
         video_intel._record_concepts_error(meta_path, self._video(), meta_path.parent, "boom")
 
@@ -382,6 +557,42 @@ class TestConceptsFailureIsRecorded:
         assert meta["channel"] == "chan"
         assert meta["title"] == "A Talk"
         assert meta["published"] == "2026-08-01"
+
+    def test_never_creates_a_meta_that_did_not_exist(self, tmp_path):
+        """ce-code-review (adversarial), PR #136 - recovery must not corrupt.
+
+        A caller that does not pass an explicit ``prefix`` lets
+        ``process_concepts`` recompute one from the current title, so on a
+        title-rotated video a single dropped socket used to write a SECOND meta
+        claiming the same ``video_id`` - manufacturing a dedupe group that never
+        existed. Mirrors ``_record_transcript_error``: no meta, no write.
+        """
+        channel_dir = tmp_path / "chan"
+        channel_dir.mkdir()
+        absent = channel_dir / "2026-08-01-a-rotated-title.meta.json"
+
+        video_intel._record_concepts_error(absent, self._video(), channel_dir, "Server disconnected")
+
+        assert not absent.exists()
+        assert list(channel_dir.iterdir()) == []
+
+    def test_a_failing_write_never_raises_out_of_the_error_path(self, tmp_path, monkeypatch):
+        """An error-path writer that raises destroys the error it preserves.
+
+        Uncaught, this propagates through cmd_scan's concepts loop and aborts
+        the whole scan before its failure summary prints - the same principle
+        as issue #124's read side.
+        """
+        meta_path = tmp_path / "chan" / "v.meta.json"
+        meta_path.parent.mkdir(parents=True)
+        meta_path.write_text("{}", encoding="utf-8")
+
+        def boom(*_a, **_kw):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(type(meta_path), "write_text", boom)
+
+        video_intel._record_concepts_error(meta_path, self._video(), meta_path.parent, "boom")
 
     def test_corrupt_meta_does_not_mask_the_error_it_is_recording(self, tmp_path):
         """Issue #124: this is an error path, so the read is best-effort.

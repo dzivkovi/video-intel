@@ -498,6 +498,75 @@ class TestCmdProcessUrlInversion:
         assert exc_info.value.code == video_intel.EXIT_PARTIAL
         assert mindmap_kw_seen.get("source") == "video"
 
+    def test_livestream_mindmap_skip_exits_partial_when_the_transcript_failed(self, tmp_path, monkeypatch):
+        """Issue #129 x #120, integration coverage the unit tests could not give.
+
+        ce-code-review (testing), PR #136: every other test in this file pins
+        ``_lookup_was_livestream`` to False, so this explicitly-documented
+        behavior change had none. The issue #120 mindmap suppression is itself
+        a DELIBERATE skip and contributes no gap - but it only fires when the
+        transcript already failed, and that failed transcript is a requested
+        step with no artifact. So the run exits EXIT_PARTIAL. Before #129 it
+        exited 0 with neither a transcript nor a mindmap on disk, which is
+        precisely the silently-incomplete video the ticket exists to surface.
+        """
+        _stub_url_env(monkeypatch, tmp_path)
+        monkeypatch.setattr(video_intel, "_lookup_was_livestream", lambda *_a, **_kw: True)
+
+        def fake_transcript(*_args, **_kwargs):
+            return "p", "error: 400 INVALID_ARGUMENT"
+
+        mindmap_calls: list = []
+
+        def fake_mindmap(*_args, **kwargs):
+            mindmap_calls.append(kwargs)
+            return "p", "done"
+
+        monkeypatch.setattr(video_intel, "process_transcript", fake_transcript)
+        monkeypatch.setattr(video_intel, "process_mindmap", fake_mindmap)
+        monkeypatch.setattr(video_intel, "process_concepts", lambda *_a, **_kw: ("p", "done"))
+
+        config = {
+            "output_dir": str(tmp_path),
+            "channels": [{"name": "demo", "url": "https://example.com/demo"}],
+        }
+        with pytest.raises(SystemExit) as exc_info:
+            video_intel.cmd_process(_process_url_args("https://www.youtube.com/watch?v=CCCCCCCCCCC"), config)
+
+        assert exc_info.value.code == video_intel.EXIT_PARTIAL
+        # The issue #120 contract is unchanged: no mindmap-from-video call is
+        # spent against a URI Gemini has just proven it cannot ingest.
+        assert mindmap_calls == []
+
+    def test_mindmap_source_none_alone_still_exits_zero(self, tmp_path, monkeypatch):
+        """The mirror of the test above, and the more important half.
+
+        A deliberate skip must NOT manufacture a gap. With
+        ``mindmap_source: none`` and a healthy transcript, mindmap and concepts
+        are never requested, so the run exits 0 - no SystemExit at all. If this
+        ever starts raising, issue #129 has begun firing on healthy runs, which
+        is the worst possible regression for a guard whose whole job is to be
+        believed.
+        """
+        _stub_url_env(monkeypatch, tmp_path)
+
+        def fake_transcript(*args, **kwargs):
+            channel_dir = args[5]
+            prefix = args[6] if len(args) > 6 else kwargs.get("prefix")
+            _write_stub_artifact_if_ok(channel_dir / f"{prefix}.transcript.md", "done", "# stub\n")
+            return prefix, "done"
+
+        monkeypatch.setattr(video_intel, "process_transcript", fake_transcript)
+        monkeypatch.setattr(video_intel, "process_mindmap", lambda *_a, **_kw: ("p", "done"))
+        monkeypatch.setattr(video_intel, "process_concepts", lambda *_a, **_kw: ("p", "done"))
+
+        config = {
+            "output_dir": str(tmp_path),
+            "channels": [{"name": "demo", "url": "https://example.com/demo", "mindmap_source": "none"}],
+        }
+
+        video_intel.cmd_process(_process_url_args("https://www.youtube.com/watch?v=DDDDDDDDDDD"), config)
+
     def test_mindmap_source_none_skips_mindmap_and_concepts(self, tmp_path, monkeypatch):
         """Channel config mindmap_source=none -> mindmap step is skipped entirely,
         concepts is also skipped because there is no mindmap to extract from."""

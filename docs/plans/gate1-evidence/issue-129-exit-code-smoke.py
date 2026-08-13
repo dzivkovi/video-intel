@@ -108,6 +108,28 @@ def main() -> int:
 
     concepts_path = channel_dir / f"{prefix}.concepts.json"
     meta_path = channel_dir / f"{prefix}.meta.json"
+    # The real flow reaches the concepts step with a meta already on disk (the
+    # transcript and mindmap writers put it there). Model that, otherwise the
+    # smoke silently tests the no-meta case: _record_concepts_error refuses to
+    # CREATE a meta that never existed, so a fixture without one would show no
+    # concepts_status and misrepresent the fix.
+    import json as _json
+
+    meta_path.write_text(
+        _json.dumps(
+            {
+                "video_id": VIDEO_ID,
+                "video_url": f"https://www.youtube.com/watch?v={VIDEO_ID}",
+                "channel": CHANNEL,
+                "title": TITLE,
+                "published": DATE,
+                "modes_completed": ["transcript", "scan"],
+                "transcript_status": "ok",
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
     sys.argv = [
         "video_intel.py",
