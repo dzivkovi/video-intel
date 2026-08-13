@@ -285,18 +285,27 @@ def normalize_prompt_name(name: str) -> str:
 CORRUPT_META_SUFFIX = ".meta.corrupt.json"
 
 
-def _quarantine_corrupt_meta(meta_path: Path) -> Path | None:
-    """Copy an unusable meta.json aside so a rewrite is never a silent loss.
+def _quarantine_corrupt_meta(meta_path: Path, raw_bytes: bytes) -> Path | None:
+    """Save the unusable bytes aside so a rewrite is never a silent loss.
 
-    Best-effort by construction: this runs on paths that are already handling a
-    failure, so it must never raise. Returns the sidecar path, or ``None`` when
-    the bytes could not be copied (in which case there was nothing readable to
-    save anyway).
+    Takes the bytes the caller ALREADY read rather than re-reading the file.
+    Re-reading would open a race: a concurrent healthy writer landing between
+    the two reads would get its fresh bytes quarantined and then overwritten by
+    the caller, turning a recovery mechanism into the data loss it exists to
+    prevent.
+
+    Never overwrites an existing quarantine - a second corruption must not erase
+    the evidence from the first - and never raises, because every caller is
+    already handling a failure.
     """
+    stem = meta_path.name.replace(".meta.json", "")
     try:
-        sidecar = meta_path.with_name(meta_path.name.replace(".meta.json", "") + CORRUPT_META_SUFFIX)
-        sidecar.write_bytes(meta_path.read_bytes())
-        return sidecar
+        for suffix in ("", *(f".{n}" for n in range(2, 10))):
+            sidecar = meta_path.with_name(f"{stem}{suffix}{CORRUPT_META_SUFFIX}")
+            if not sidecar.exists():
+                sidecar.write_bytes(raw_bytes)
+                return sidecar
+        return None
     except OSError:
         return None
 
@@ -355,7 +364,7 @@ def _read_meta_best_effort(meta_path: Path, *, raise_on_os_error: bool) -> dict:
     try:
         data = json.loads(raw_bytes.decode("utf-8"))
     except ValueError as exc:  # JSONDecodeError and UnicodeDecodeError both land here
-        sidecar = _quarantine_corrupt_meta(meta_path)
+        sidecar = _quarantine_corrupt_meta(meta_path, raw_bytes)
         log.warning(
             "  %s: unusable meta.json (%s); discarding it%s",
             meta_path.name,
@@ -364,7 +373,7 @@ def _read_meta_best_effort(meta_path: Path, *, raise_on_os_error: bool) -> dict:
         )
         return {}
     if not isinstance(data, dict):
-        sidecar = _quarantine_corrupt_meta(meta_path)
+        sidecar = _quarantine_corrupt_meta(meta_path, raw_bytes)
         log.warning(
             "  %s: meta.json is a JSON %s, not an object; discarding it%s",
             meta_path.name,
@@ -4480,10 +4489,7 @@ def cmd_mindmap(args, config):
 
             # F7: honor skip flag from existing meta.json before any Gemini work.
             if identity["meta_path"].exists():
-                try:
-                    existing = json.loads(identity["meta_path"].read_text(encoding="utf-8"))
-                except json.JSONDecodeError:
-                    existing = {}
+                existing = _read_meta_best_effort(identity["meta_path"], raise_on_os_error=False)
                 if is_skipped_meta(existing, mode="mindmap"):
                     log.info("Skipping %s (skip flag in meta.json blocks mindmap)", identity["prefix"])
                     return
@@ -4760,10 +4766,7 @@ def cmd_transcript(args, config):
 
             # F7: honor skip flag from existing meta.json before any Gemini work.
             if identity["meta_path"].exists():
-                try:
-                    existing = json.loads(identity["meta_path"].read_text(encoding="utf-8"))
-                except json.JSONDecodeError:
-                    existing = {}
+                existing = _read_meta_best_effort(identity["meta_path"], raise_on_os_error=False)
                 if is_skipped_meta(existing, mode="transcript"):
                     log.info("Skipping %s (skip flag in meta.json blocks transcript)", prefix)
                     return
@@ -5403,10 +5406,7 @@ def cmd_process(args, config):
         meta_path = identity["meta_path"]
 
         if meta_path.exists():
-            try:
-                existing_meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                existing_meta = {}
+            existing_meta = _read_meta_best_effort(meta_path, raise_on_os_error=False)
             # Issue #42: legacy `skip: true` still hard-exits; `skip_modes` is
             # honored per-mode below by gating needs_mindmap / needs_transcript.
             if existing_meta.get("skip") is True and "skip_modes" not in existing_meta:
@@ -5426,10 +5426,7 @@ def cmd_process(args, config):
         prefix = input_path.stem
         meta_path = channel_dir / f"{prefix}.meta.json"
         if meta_path.exists():
-            try:
-                existing_meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                existing_meta = {}
+            existing_meta = _read_meta_best_effort(meta_path, raise_on_os_error=False)
         else:
             existing_meta = {}
 
@@ -5848,7 +5845,7 @@ def cmd_mark_skip(args, config) -> None:
 
     new_modes = list(args.mode or [])
     for meta_path in found:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta = _read_meta_best_effort(meta_path, raise_on_os_error=False)
         existing = meta.get("skip_modes")
         existing_list = list(existing) if isinstance(existing, list) else []
         merged = list(existing_list)

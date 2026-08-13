@@ -360,3 +360,50 @@ class TestConceptsWriterStampsIdentity:
         written = json.loads((channel_dir / f"{prefix}.meta.json").read_text(encoding="utf-8"))
         assert written["video_id"] == "abc123"
         assert "concepts" in written["modes_completed"]
+
+
+class TestQuarantineIsRaceSafeAndNonClobbering:
+    """Codex cross-model finding on PR #131.
+
+    The first version re-read the live file instead of using the bytes it had
+    already captured. A concurrent healthy writer landing between the two reads
+    would get its fresh bytes quarantined and then overwritten by the caller -
+    turning the recovery mechanism into the data loss it exists to prevent.
+    """
+
+    def test_quarantine_saves_the_bytes_that_were_actually_read(self, tmp_path: Path, monkeypatch):
+        meta_path = tmp_path / "v.meta.json"
+        meta_path.write_text('{"video_id": "abc123", "trunc', encoding="utf-8")
+
+        real_read_bytes = Path.read_bytes
+        healthy = json.dumps({"video_id": "abc123", "alt_titles": ["Recovered"]}).encode()
+        state = {"n": 0}
+
+        def racing_read(self, *a, **kw):
+            if self == meta_path:
+                state["n"] += 1
+                if state["n"] > 1:
+                    return healthy  # a concurrent writer landed after our first read
+            return real_read_bytes(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "read_bytes", racing_read)
+        _read_meta_best_effort(meta_path, raise_on_os_error=False)
+        monkeypatch.undo()
+
+        sidecar = tmp_path / "v.meta.corrupt.json"
+        assert sidecar.exists()
+        assert "Recovered" not in sidecar.read_text(encoding="utf-8"), (
+            "the quarantine must hold the CORRUPT bytes we rejected, never a concurrent healthy write"
+        )
+
+    def test_a_second_corruption_does_not_erase_the_first_quarantine(self, tmp_path: Path):
+        meta_path = tmp_path / "v.meta.json"
+
+        meta_path.write_text('{"first": "corruption', encoding="utf-8")
+        _read_meta_best_effort(meta_path, raise_on_os_error=False)
+        meta_path.write_text('{"second": "corruption', encoding="utf-8")
+        _read_meta_best_effort(meta_path, raise_on_os_error=False)
+
+        first = (tmp_path / "v.meta.corrupt.json").read_text(encoding="utf-8")
+        assert "first" in first, "the original evidence must survive"
+        assert (tmp_path / "v.2.meta.corrupt.json").exists(), "the second goes to its own sidecar"
