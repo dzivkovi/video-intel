@@ -279,19 +279,139 @@ def normalize_prompt_name(name: str) -> str:
     return Path(name).stem
 
 
+#: Quarantine copy of a meta.json we could read but not use. Mirrors the
+#: `.transcript.raw.txt` / `.mindmap.raw.txt` forensic-sidecar convention: the
+#: bytes we discarded stay recoverable by hand instead of being overwritten.
+CORRUPT_META_SUFFIX = ".meta.corrupt.json"
+
+
+def _quarantine_corrupt_meta(meta_path: Path, raw_bytes: bytes) -> Path | None:
+    """Save the unusable bytes aside so a rewrite is never a silent loss.
+
+    Takes the bytes the caller ALREADY read rather than re-reading the file.
+    Re-reading would open a race: a concurrent healthy writer landing between
+    the two reads would get its fresh bytes quarantined and then overwritten by
+    the caller, turning a recovery mechanism into the data loss it exists to
+    prevent.
+
+    Never overwrites an existing quarantine - a second corruption must not erase
+    the evidence from the first - and never raises, because every caller is
+    already handling a failure.
+    """
+    stem = meta_path.name.replace(".meta.json", "")
+    try:
+        for suffix in ("", *(f".{n}" for n in range(2, 10))):
+            sidecar = meta_path.with_name(f"{stem}{suffix}{CORRUPT_META_SUFFIX}")
+            if not sidecar.exists():
+                sidecar.write_bytes(raw_bytes)
+                return sidecar
+        return None
+    except OSError:
+        return None
+
+
+def _read_meta_best_effort(meta_path: Path, *, raise_on_os_error: bool) -> dict:
+    """Read a meta.json for merging, returning ``{}`` when its content is unusable.
+
+    Writer-side callers use this instead of a bare ``json.loads`` because they
+    run inside - or feed - exception handlers whose entire job is to RECORD a
+    failure. A torn meta.json raising from inside such a handler propagates out
+    of the writer and masks the original error, which is the one piece of
+    information the handler existed to preserve (issue #124). The cost is
+    diagnostic blindness at exactly the moment something else has gone wrong.
+
+    Two failure classes are NOT the same thing, and conflating them trades one
+    bug for a worse one:
+
+    * **Content we read but cannot use** - unparseable JSON, invalid UTF-8, or
+      a value that parses to something other than an object. The bytes are on
+      disk and they are garbage; merging is impossible. We quarantine them to a
+      ``.meta.corrupt.json`` sidecar, log a WARNING, and return ``{}``.
+    * **A read that never happened** (``OSError``). The bytes may be perfectly
+      intact; we just could not get at them, which is a live hazard on the
+      cloud-synced mount the production ``output_dir`` uses. Returning ``{}``
+      here would make the caller OVERWRITE a healthy file with whatever handful
+      of fields it happens to re-supply, destroying ``alt_titles`` (title-
+      rotation history exists nowhere else) and ``skip_modes`` (the operator's
+      deliberate stage suppression, issue #42). Callers on a success path pass
+      ``raise_on_os_error=True`` and get the pre-issue-#124 behavior: loud, and
+      the file survives. Callers inside an error handler pass ``False``,
+      because there the alternative is destroying the error being recorded.
+
+    The exception tuple is ``(ValueError, OSError)`` deliberately.
+    ``UnicodeDecodeError`` subclasses ``ValueError``, NOT ``OSError``, and a
+    write torn mid-multibyte-character is the normal shape of a truncated write
+    on a corpus with Cyrillic/BCS titles. This file has already been bitten by
+    that twice (see ``_load_video_id_index`` and ``load_interest_model``);
+    narrowing this back to ``json.JSONDecodeError`` reopens the bug.
+
+    Reader-side consumers that WANT strictness (``_load_video_id_index``, which
+    must not invent identity from a damaged file) deliberately do not use this.
+    """
+    if not meta_path.exists():
+        return {}
+    # Read BYTES, then decode+parse separately. read_text() would fold the two
+    # failure classes back together: it raises UnicodeDecodeError for bad bytes,
+    # which is a content problem surfacing from the call that is supposed to
+    # only be able to fail at the I/O layer.
+    try:
+        raw_bytes = meta_path.read_bytes()
+    except OSError as exc:
+        if raise_on_os_error:
+            raise
+        log.warning("  %s: could not be read (%s); proceeding without it", meta_path.name, exc)
+        return {}
+    try:
+        data = json.loads(raw_bytes.decode("utf-8"))
+    except ValueError as exc:  # JSONDecodeError and UnicodeDecodeError both land here
+        sidecar = _quarantine_corrupt_meta(meta_path, raw_bytes)
+        log.warning(
+            "  %s: unusable meta.json (%s); discarding it%s",
+            meta_path.name,
+            exc,
+            f" (saved to {sidecar.name})" if sidecar else "",
+        )
+        return {}
+    if not isinstance(data, dict):
+        sidecar = _quarantine_corrupt_meta(meta_path, raw_bytes)
+        log.warning(
+            "  %s: meta.json is a JSON %s, not an object; discarding it%s",
+            meta_path.name,
+            type(data).__name__,
+            f" (saved to {sidecar.name})" if sidecar else "",
+        )
+        return {}
+    return data
+
+
 def update_meta(meta_path: Path, fields: dict, mode: str) -> None:
     """Read existing meta.json, merge fields, ensure mode in modes_completed, write back.
 
     The sentinel mode="identity" is a no-op for modes_completed: identity is metadata
     bootstrap (filling video_id, title, etc.) before a processing stage runs, not a
     stage itself. See plan rev 4 F11 and technical approach section 6.
+
+    Unusable CONTENT is survivable here (quarantined and replaced), but an
+    ``OSError`` propagates: this is the shared success-path writer, and
+    overwriting a file we merely failed to read would destroy `alt_titles` and
+    `skip_modes`, which exist nowhere else. See `_read_meta_best_effort`.
     """
-    meta: dict = {}
-    if meta_path.exists():
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta: dict = _read_meta_best_effort(meta_path, raise_on_os_error=True)
     meta.update(fields)
     if mode != "identity":
         modes = meta.get("modes_completed", [])
+        if not isinstance(modes, list):
+            # Hand-editing meta.json is this project's documented skip_modes
+            # recovery flow, so a scalar here is a realistic typo - and
+            # `.append` on a str raises AttributeError straight out of the
+            # writer, which is the same masking failure the read guard above
+            # exists to stop. is_skipped_meta defends the same way.
+            log.warning(
+                "  %s: modes_completed was a %s, not a list; rebuilding it",
+                meta_path.name,
+                type(modes).__name__,
+            )
+            modes = []
         if mode not in modes:
             modes.append(mode)
         meta["modes_completed"] = modes
@@ -2511,11 +2631,13 @@ def process_mindmap(
             # the upstream had to recover and the mindmap inherits the gap.
             transcript_status = "ok"
             if meta_path.exists():
-                try:
-                    src_meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                    transcript_status = src_meta.get("transcript_status", "ok")
-                except json.JSONDecodeError:
-                    pass
+                # Best-effort: an unreadable meta leaves the healthy default in
+                # place rather than raising. Routed through the shared helper
+                # (issue #124) so an OSError - not just a JSONDecodeError - is
+                # survivable too, and so the corrupt file gets named in the log.
+                transcript_status = _read_meta_best_effort(meta_path, raise_on_os_error=False).get(
+                    "transcript_status", "ok"
+                )
 
             result = call_gemini_text(
                 client,
@@ -2630,11 +2752,11 @@ def process_mindmap(
         return resolved_prefix, "done"
 
     except Exception as e:
-        # Record failure in meta.json (also merge-safe)
+        # Record failure in meta.json (also merge-safe). The read is best-effort
+        # (issue #124): a corrupt meta raising here would propagate out of this
+        # handler and mask `e`, the failure this block exists to record.
         resolved_channel_dir.mkdir(parents=True, exist_ok=True)
-        meta: dict = {}
-        if meta_path.exists():
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta: dict = _read_meta_best_effort(meta_path, raise_on_os_error=False)
         meta.update(
             {
                 "video_url": video["url"],
@@ -3106,10 +3228,7 @@ def _record_transcript_error(meta_path: Path, error: str) -> None:
     """Record last_error on an existing meta.json without clobbering other fields."""
     if not meta_path.exists():
         return
-    try:
-        meta = json.loads(meta_path.read_text())
-    except (json.JSONDecodeError, OSError):
-        meta = {}
+    meta = _read_meta_best_effort(meta_path, raise_on_os_error=False)
     meta["last_error"] = error
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
@@ -3541,7 +3660,10 @@ def process_transcript(
         if fb is not None:
             return fb
     if meta_path.exists():
-        meta = json.loads(meta_path.read_text())
+        # Best-effort read (issue #124): this branch is recording a parse
+        # failure, so a second parse failure - on the meta file this time - must
+        # not throw away the first one.
+        meta = _read_meta_best_effort(meta_path, raise_on_os_error=False)
         meta["last_error"] = f"JSON parse error: {parse_error}"
         meta["transcript_parse_error"] = parse_error
         meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -3676,7 +3798,16 @@ def process_concepts(
         tmp_path = concepts_path.with_suffix(".json.tmp")
         tmp_path.write_text(json.dumps(output, indent=2), encoding="utf-8")
         tmp_path.replace(concepts_path)
-        update_meta(meta_path, {"processed": datetime.now(UTC).isoformat()}, "concepts")
+        # Stamp identity alongside the timestamp (issue #66 contract). A
+        # fields dict of {"processed": ...} alone is only safe while the
+        # existing meta is readable; if it ever is not, this writer would
+        # leave an identity-less meta that _load_video_id_index skips,
+        # re-queueing the video for a full re-transcribe.
+        update_meta(
+            meta_path,
+            {**_transcript_identity_fields(video, channel_dir), "processed": datetime.now(UTC).isoformat()},
+            "concepts",
+        )
 
         n_new = sum(1 for c in result["concepts"] if c.get("status") == "new")
         n_uncertain = sum(1 for c in result["concepts"] if c.get("status") == "uncertain")
@@ -4358,10 +4489,7 @@ def cmd_mindmap(args, config):
 
             # F7: honor skip flag from existing meta.json before any Gemini work.
             if identity["meta_path"].exists():
-                try:
-                    existing = json.loads(identity["meta_path"].read_text(encoding="utf-8"))
-                except json.JSONDecodeError:
-                    existing = {}
+                existing = _read_meta_best_effort(identity["meta_path"], raise_on_os_error=False)
                 if is_skipped_meta(existing, mode="mindmap"):
                     log.info("Skipping %s (skip flag in meta.json blocks mindmap)", identity["prefix"])
                     return
@@ -4638,10 +4766,7 @@ def cmd_transcript(args, config):
 
             # F7: honor skip flag from existing meta.json before any Gemini work.
             if identity["meta_path"].exists():
-                try:
-                    existing = json.loads(identity["meta_path"].read_text(encoding="utf-8"))
-                except json.JSONDecodeError:
-                    existing = {}
+                existing = _read_meta_best_effort(identity["meta_path"], raise_on_os_error=False)
                 if is_skipped_meta(existing, mode="transcript"):
                     log.info("Skipping %s (skip flag in meta.json blocks transcript)", prefix)
                     return
@@ -5281,10 +5406,7 @@ def cmd_process(args, config):
         meta_path = identity["meta_path"]
 
         if meta_path.exists():
-            try:
-                existing_meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                existing_meta = {}
+            existing_meta = _read_meta_best_effort(meta_path, raise_on_os_error=False)
             # Issue #42: legacy `skip: true` still hard-exits; `skip_modes` is
             # honored per-mode below by gating needs_mindmap / needs_transcript.
             if existing_meta.get("skip") is True and "skip_modes" not in existing_meta:
@@ -5304,10 +5426,7 @@ def cmd_process(args, config):
         prefix = input_path.stem
         meta_path = channel_dir / f"{prefix}.meta.json"
         if meta_path.exists():
-            try:
-                existing_meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                existing_meta = {}
+            existing_meta = _read_meta_best_effort(meta_path, raise_on_os_error=False)
         else:
             existing_meta = {}
 
@@ -5357,11 +5476,12 @@ def cmd_process(args, config):
         except Exception as e:
             log.error("Upload failed: %s", e)
             # update_meta resets last_error to None at the end, so write directly
-            # to persist the failure marker for later runs / dashboards. Mirror
-            # process_mindmap's error-recording pattern at scripts/video_intel.py:1131.
-            meta: dict = {}
-            if meta_path.exists():
-                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            # to persist the failure marker for later runs / dashboards. Mirrors
+            # process_mindmap's error-recording pattern.
+            # Best-effort read (issue #124): a corrupt meta here would mask the
+            # upload error AND skip the sys.exit(1) below, silently changing the
+            # exit code after a multi-minute upload.
+            meta: dict = _read_meta_best_effort(meta_path, raise_on_os_error=False)
             meta["last_error"] = f"upload: {e}"
             meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
             sys.exit(1)
@@ -5725,14 +5845,19 @@ def cmd_mark_skip(args, config) -> None:
 
     new_modes = list(args.mode or [])
     for meta_path in found:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta = _read_meta_best_effort(meta_path, raise_on_os_error=False)
         existing = meta.get("skip_modes")
         existing_list = list(existing) if isinstance(existing, list) else []
         merged = list(existing_list)
         for mode in new_modes:
             if mode not in merged:
                 merged.append(mode)
+        # Carry video_id forward: update_meta re-reads the file, and if that
+        # read comes back unusable this writer would otherwise persist a meta
+        # with no identity - destroying the very key the lookup above used.
         update_fields: dict = {"skip_modes": merged}
+        if meta.get("video_id"):
+            update_fields["video_id"] = meta["video_id"]
         if args.reason:
             update_fields["skip_reason"] = args.reason
         update_meta(meta_path, update_fields, mode="identity")
@@ -6668,6 +6793,7 @@ PRUNE_SHORTS_DELETION_PATTERNS = (
     "{prefix}.transcript.raw.*.txt",
     "{prefix}.concepts.json",
     "{prefix}.meta.json",
+    "{prefix}.meta.corrupt.json",  # issue #124 quarantine copy of an unusable meta
 )
 
 
