@@ -5,8 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 from usage_shapes import (
-    ABSENT_MEANS_UNREADABLE_FIELDS,
-    ABSENT_MEANS_ZERO_FIELDS,
+    CONFABULATION_PROMPT_VALUES,
     READABLE_SHAPES,
     UNREADABLE_SHAPES,
     AttrErrorProperty,
@@ -14,7 +13,7 @@ from usage_shapes import (
     usage_response,
 )
 
-from gemini_common import _coerce_token_count, get_retry_delay, log_usage_metadata
+from gemini_common import _MISSING, _coerce_token_count, get_retry_delay, log_usage_metadata
 
 
 class TestGetRetryDelay:
@@ -116,47 +115,46 @@ class TestBuildPermissiveSafetySettings:
 
 
 class TestCoerceTokenCount:
-    """Issue #125: unreadable shapes must read as None, never as a reported zero.
+    """Issue #125: the split is on ATTRIBUTE PRESENCE, not on which field it is.
 
     Both ``prompt == 0`` confabulation guards discard the artifact when they see
-    an integer zero. If an unreadable shape coerced to 0, one SDK field rename
-    would read as "every video is a confabulation" and destroy healthy output.
+    an integer zero, so the helper has to get two opposite things right at once:
+    an SDK rename must NOT read as "every video is a confabulation", and a
+    genuine zero must still trip the guard however Gemini chose to encode it.
     """
 
-    @pytest.mark.parametrize(
-        "value",
-        [pytest.param(v, id=name) for name, v in UNREADABLE_SHAPES],
-    )
-    @pytest.mark.parametrize("absent_means_zero", [True, False], ids=["omit_is_zero", "omit_is_drift"])
-    def test_unreadable_shape_coerces_to_none_for_every_field(self, value, absent_means_zero):
-        """A wrong shape is never evidence, regardless of what absence means for that field."""
-        assert _coerce_token_count(value, absent_means_zero=absent_means_zero) is None
+    @pytest.mark.parametrize("value", [pytest.param(v, id=name) for name, v in UNREADABLE_SHAPES])
+    def test_unreadable_shape_coerces_to_none(self, value):
+        """A wrong shape is never evidence of anything."""
+        assert _coerce_token_count(value) is None
 
     @pytest.mark.parametrize(
         ("value", "expected"),
         [pytest.param(v, exp, id=name) for name, v, exp in READABLE_SHAPES],
     )
-    @pytest.mark.parametrize("absent_means_zero", [True, False], ids=["omit_is_zero", "omit_is_drift"])
-    def test_sdk_reported_int_coerces_to_itself(self, value, expected, absent_means_zero):
-        assert _coerce_token_count(value, absent_means_zero=absent_means_zero) == expected
+    def test_sdk_reported_int_coerces_to_itself(self, value, expected):
+        assert _coerce_token_count(value) == expected
 
-    def test_sdk_reported_zero_is_not_none(self):
-        """The distinction the guards depend on: a real 0 is evidence, None is not."""
-        assert _coerce_token_count(0, absent_means_zero=False) == 0
-        assert _coerce_token_count(0, absent_means_zero=False) is not None
+    def test_absent_attribute_is_unreadable(self):
+        """The rename case: the guard must stay quiet, not fire on everything."""
+        assert _coerce_token_count(_MISSING) is None
 
-    def test_absent_value_is_zero_only_where_the_api_omits_to_mean_zero(self):
-        assert _coerce_token_count(None, absent_means_zero=True) == 0
-        assert _coerce_token_count(None, absent_means_zero=False) is None
+    def test_present_but_none_is_a_reported_zero(self):
+        """The wire omits an implicit-presence integer exactly when it is zero.
+
+        Reading this as unreadable would silently switch OFF the confabulation
+        guard in precisely the case it exists for.
+        """
+        assert _coerce_token_count(None) == 0
+
+    def test_the_two_absences_are_not_the_same_value(self):
+        assert _coerce_token_count(_MISSING) is not _coerce_token_count(None)
 
 
 class TestLogUsageMetadataUnreadableCounts:
-    """The dict values, and the log line, both carry the None-vs-zero split."""
+    """The dict values, and the log line, both carry the presence split."""
 
-    @pytest.mark.parametrize(
-        "value",
-        [pytest.param(v, id=name) for name, v in UNREADABLE_SHAPES] + [pytest.param(None, id="none")],
-    )
+    @pytest.mark.parametrize("value", [pytest.param(v, id=name) for name, v in UNREADABLE_SHAPES])
     def test_unreadable_prompt_returns_none_so_guards_do_not_trip(self, value):
         counts = log_usage_metadata(usage_response(prompt_token_count=value), "transcript")
 
@@ -164,30 +162,52 @@ class TestLogUsageMetadataUnreadableCounts:
         assert counts["prompt"] is None
         assert counts["prompt"] != 0, "an unreadable prompt must never compare equal to a reported zero"
 
-    @pytest.mark.parametrize("field", ABSENT_MEANS_ZERO_FIELDS)
-    def test_omitted_observability_field_still_reads_as_zero(self, field):
+    @pytest.mark.parametrize("meta_cls", [MissingAttr, AttrErrorProperty], ids=["missing_attr", "attr_error_property"])
+    def test_absent_prompt_attribute_reads_as_unreadable_not_zero(self, meta_cls):
+        """An SDK rename must not masquerade as 'Gemini ingested nothing'."""
+        counts = log_usage_metadata(SimpleNamespace(usage_metadata=meta_cls()), "mindmap")
+
+        assert counts is not None
+        assert counts["prompt"] is None
+
+    def test_unreadable_prompt_warns_that_the_guard_cannot_run(self, caplog):
+        """A guard that stops guarding must never do it silently."""
+        with caplog.at_level(logging.WARNING, logger="gemini_common"):
+            log_usage_metadata(SimpleNamespace(usage_metadata=MissingAttr()), "mindmap")
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("confabulation guard cannot run" in m for m in warnings)
+
+    @pytest.mark.parametrize("value", CONFABULATION_PROMPT_VALUES)
+    def test_both_encodings_of_zero_prompt_still_trip_the_guard(self, value):
+        """A literal 0 and an omitted-because-zero None must be indistinguishable here.
+
+        This is the whole reason the split is on attribute presence: the guard
+        stays correct without anyone having to settle which encoding Gemini uses.
+        """
+        counts = log_usage_metadata(usage_response(prompt_token_count=value), "transcript")
+
+        assert counts is not None
+        assert counts["prompt"] == 0
+
+    @pytest.mark.parametrize(
+        "field",
+        ["cached", "thoughts", "candidates", "total"],
+    )
+    def test_omitted_observability_field_reads_as_zero(self, field):
         """Live-verified: an uncached call reports cached_content_token_count=None.
 
-        Rendering that as ? would print on nearly every call and destroy the
-        cached=0 vs cached>0 signal the chunked path relies on.
+        Rendering that as ? would print on nearly every line and destroy the
+        cached=0 vs cached>0 signal the chunked path tells operators to read.
         """
-        attr = {"cached": "cached_content_token_count", "thoughts": "thoughts_token_count"}.get(
-            field, f"{field}_token_count"
-        )
+        attr = {"cached": "cached_content_token_count"}.get(field, f"{field}_token_count")
         counts = log_usage_metadata(usage_response(**{attr: None}), "transcript")
 
         assert counts is not None
         assert counts[field] == 0
 
-    @pytest.mark.parametrize("field", ABSENT_MEANS_UNREADABLE_FIELDS)
-    def test_omitted_always_present_field_reads_as_unreadable(self, field):
-        counts = log_usage_metadata(usage_response(**{f"{field}_token_count": None}), "transcript")
-
-        assert counts is not None
-        assert counts[field] is None
-
     def test_drifted_candidates_list_is_unreadable_not_zero(self):
-        """Issue #128 needs this: a list coerced to 0 hides a truncated response."""
+        """A list coerced to 0 would look exactly like a truncated response."""
         counts = log_usage_metadata(
             usage_response(candidates_token_count=[SimpleNamespace(modality="TEXT", token_count=100)]),
             "transcript",
@@ -196,35 +216,17 @@ class TestLogUsageMetadataUnreadableCounts:
         assert counts is not None
         assert counts["candidates"] is None
 
-    def test_sdk_reported_zero_prompt_survives_as_zero(self):
-        counts = log_usage_metadata(usage_response(prompt_token_count=0), "transcript")
-
-        assert counts is not None
-        assert counts["prompt"] == 0
-
-    @pytest.mark.parametrize("meta_cls", [MissingAttr, AttrErrorProperty], ids=["missing_attr", "attr_error_property"])
-    def test_absent_prompt_attribute_reads_as_unreadable_not_zero(self, meta_cls):
-        """An SDK rename must not masquerade as 'Gemini ingested nothing'."""
-        response = SimpleNamespace(usage_metadata=meta_cls())
-
-        counts = log_usage_metadata(response, "mindmap")
-
-        assert counts is not None
-        assert counts["prompt"] is None
-
     def test_unreadable_counts_render_as_question_mark_in_the_log_line(self, caplog):
-        response = usage_response(prompt_token_count=None, candidates_token_count=1204)
-
         with caplog.at_level(logging.INFO, logger="gemini_common"):
-            log_usage_metadata(response, "mindmap")
+            log_usage_metadata(usage_response(prompt_token_count="oops", candidates_token_count=1204), "mindmap")
 
         line = [r for r in caplog.records if r.name == "gemini_common" and r.levelno == logging.INFO][0].getMessage()
         assert "prompt=?" in line
         assert "candidates=1204" in line, "readable neighbours still render as numbers"
 
-    def test_candidates_stays_readable_for_the_output_cap_check(self):
-        """Issue #128 compares candidates against MAX_OUTPUT_TOKENS; it needs a real int."""
-        counts = log_usage_metadata(usage_response(candidates_token_count=65522), "transcript")
+    def test_healthy_line_is_all_numbers(self):
+        """No churn on the common case."""
+        counts = log_usage_metadata(usage_response(), "transcript")
 
         assert counts is not None
-        assert counts["candidates"] == 65522
+        assert all(v is not None for v in counts.values())

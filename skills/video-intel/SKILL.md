@@ -438,10 +438,13 @@ How `process --file` works:
   (rare), `process` detects the expiry error, re-uploads once, retries
   once, then fails cleanly.
 - **Observability.** Each Gemini call emits a
-  `usage <label> prompt=N cached=N candidates=N total=N` log line at info
-  level. `cached>0` on follow-up calls (chunks 2..N, or the mindmap step
-  when it falls back to source=video) means implicit caching fired and you
-  got a token discount.
+  `usage <label> prompt=N cached=N thoughts=N candidates=N total=N` log line
+  at info level. `cached>0` on follow-up calls (chunks 2..N, or the mindmap
+  step when it falls back to source=video) means implicit caching fired and
+  you got a token discount. A field can also render as `?`, which means the
+  SDK did not report that count in a readable shape - not that it was zero.
+  A `prompt=?` is worth attention: it is followed by a warning, and it means
+  the `prompt == 0` confabulation guard could not run for that call.
 - **Exit-code contract.** Exit 0 if mindmap succeeded, regardless of
   transcript / concepts outcome. Automation callers that need partial-success
   detail inspect `modes_completed` in the resulting meta.json.
