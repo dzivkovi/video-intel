@@ -95,10 +95,11 @@ def log_usage_metadata(response: object, label: str) -> dict | None:
     #125): a count the SDK did not report readably comes back as ``None`` and
     renders as ``?`` in the log line, never as ``0``. A guard comparing
     ``counts["prompt"] == 0`` therefore stays quiet on SDK drift and fires
-    only on a count Gemini genuinely reported as zero. See
-    ``_coerce_token_count`` for which fields treat an omitted value as zero
-    (``cached``, ``thoughts``, ``candidates``) and which treat it as drift
-    (``prompt``, ``total``).
+    only on a count Gemini genuinely reported as zero. The split is on
+    ATTRIBUTE PRESENCE and is identical for all five fields: a missing
+    attribute is drift (``None``), an attribute holding ``None`` is a zero the
+    wire omitted (``0``). See ``_coerce_token_count`` - and do not reintroduce
+    a per-field rule, which would mute the confabulation guards.
 
     ``thoughts_token_count`` is Gemini 3.x-specific (the thinking process);
     legacy 2.x responses omit it, which reads as ``0`` here because the API

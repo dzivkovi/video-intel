@@ -161,3 +161,62 @@ class TestTranscriptGuardMatchesTheSeam:
         _, status = self._run(tmp_path, fake_types)
 
         assert "confabulation" in status, f"a zero-token prompt must be refused, got {status!r}"
+
+
+class TestChunkedTranscriptGuardMatchesTheSeam:
+    """The third guard (issue #123) reads the same seam and must agree with it.
+
+    Added because this harness's own reason for existing - "otherwise the seam
+    can be changed and the guard suites keep passing while the guards silently
+    stop guarding" - applied to it too, and it was exempt.
+    """
+
+    @staticmethod
+    def _run_one_chunk(tmp_path, fake_types, monkeypatch, response):
+        payload = json.dumps(
+            {
+                "transcripts": [
+                    {"start": f"00:{m:02d}:00", "voice": 1, "text": f"line {m}"} for m in (1, 12, 25, 38, 49)
+                ],
+                "screen_content": [],
+                "speakers": [{"voice": 1, "name": "Host"}],
+            }
+        )
+
+        def fake_call_gemini(client, types, media_uri, prompt_text, model, response_json=False, **kw):
+            kw["on_response"](response)
+            return payload
+
+        monkeypatch.setattr(vi, "call_gemini", fake_call_gemini)
+        monkeypatch.setattr(vi, "_make_thinking_config_for_transcript", lambda types, model: None)
+
+        return vi._run_chunked_transcript_url(
+            client=object(),
+            types=fake_types,
+            video={
+                "video_id": "vid123",
+                "url": "https://www.youtube.com/watch?v=vid123",
+                "title": "T",
+                "published": "2026-08-12",
+            },
+            prompt_text="P",
+            model="m",
+            channel_dir=tmp_path / "demo",
+            prefix="p",
+            chunks=[(0, 3000)],
+            duration_seconds=3000,
+            chunk_minutes=50,
+            force=False,
+        )
+
+    @pytest.mark.parametrize("response", QUIET_SHAPES)
+    def test_unreadable_prompt_does_not_discard_a_real_chunk(self, response, tmp_path, fake_types, monkeypatch):
+        status = self._run_one_chunk(tmp_path, fake_types, monkeypatch, response)
+
+        assert "confabulated" not in status, "unreadable is not proof of confabulation"
+
+    @pytest.mark.parametrize("response", TRIP_SHAPES)
+    def test_every_encoding_of_zero_discards_the_chunk(self, response, tmp_path, fake_types, monkeypatch):
+        status = self._run_one_chunk(tmp_path, fake_types, monkeypatch, response)
+
+        assert "confabulated" in status, f"a zero-token prompt must be refused, got {status!r}"
