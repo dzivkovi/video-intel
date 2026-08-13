@@ -279,16 +279,59 @@ def normalize_prompt_name(name: str) -> str:
     return Path(name).stem
 
 
+def _read_meta_best_effort(meta_path: Path) -> dict:
+    """Read a meta.json for merging, returning ``{}`` when it cannot be read.
+
+    Writer-side callers use this instead of a bare ``json.loads`` because they
+    run inside - or feed - exception handlers whose entire job is to RECORD a
+    failure. A torn or truncated meta.json raising ``JSONDecodeError`` from
+    inside such a handler propagates out of the writer and masks the original
+    error, which is the one piece of information the handler existed to
+    preserve (issue #124). The cost is diagnostic blindness at exactly the
+    moment something else has already gone wrong.
+
+    That is not theoretical on the production layout: ``output_dir`` lives on a
+    cloud-synced mount, and docs/troubleshooting.md already documents stale and
+    partial meta reads there.
+
+    Returns ``{}`` on ``JSONDecodeError``/``OSError``, and also when the file
+    parses but is not a JSON object - a bare list or ``null`` would sail past
+    ``json.loads`` and then blow up on ``.update()``, which is the same masking
+    failure wearing a different exception. Every rejection logs a WARNING naming
+    the file so the corrupt content is replaced loudly, never silently.
+
+    Reader-side consumers that WANT strictness (``_load_video_id_index``, which
+    must not invent identity from a damaged file) deliberately do not use this.
+    """
+    if not meta_path.exists():
+        return {}
+    try:
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        log.warning("  %s: unreadable meta.json (%s); rewriting it from scratch", meta_path.name, exc)
+        return {}
+    if not isinstance(data, dict):
+        log.warning(
+            "  %s: meta.json is a JSON %s, not an object; rewriting it from scratch",
+            meta_path.name,
+            type(data).__name__,
+        )
+        return {}
+    return data
+
+
 def update_meta(meta_path: Path, fields: dict, mode: str) -> None:
     """Read existing meta.json, merge fields, ensure mode in modes_completed, write back.
 
     The sentinel mode="identity" is a no-op for modes_completed: identity is metadata
     bootstrap (filling video_id, title, etc.) before a processing stage runs, not a
     stage itself. See plan rev 4 F11 and technical approach section 6.
+
+    The read is best-effort (issue #124): this is the shared writer, reached from
+    success and failure paths alike, so a corrupt meta must not raise out of it
+    and destroy the error a caller's handler was in the middle of recording.
     """
-    meta: dict = {}
-    if meta_path.exists():
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta: dict = _read_meta_best_effort(meta_path)
     meta.update(fields)
     if mode != "identity":
         modes = meta.get("modes_completed", [])
@@ -2511,11 +2554,11 @@ def process_mindmap(
             # the upstream had to recover and the mindmap inherits the gap.
             transcript_status = "ok"
             if meta_path.exists():
-                try:
-                    src_meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                    transcript_status = src_meta.get("transcript_status", "ok")
-                except json.JSONDecodeError:
-                    pass
+                # Best-effort: an unreadable meta leaves the healthy default in
+                # place rather than raising. Routed through the shared helper
+                # (issue #124) so an OSError - not just a JSONDecodeError - is
+                # survivable too, and so the corrupt file gets named in the log.
+                transcript_status = _read_meta_best_effort(meta_path).get("transcript_status", "ok")
 
             result = call_gemini_text(
                 client,
@@ -2630,11 +2673,11 @@ def process_mindmap(
         return resolved_prefix, "done"
 
     except Exception as e:
-        # Record failure in meta.json (also merge-safe)
+        # Record failure in meta.json (also merge-safe). The read is best-effort
+        # (issue #124): a corrupt meta raising here would propagate out of this
+        # handler and mask `e`, the failure this block exists to record.
         resolved_channel_dir.mkdir(parents=True, exist_ok=True)
-        meta: dict = {}
-        if meta_path.exists():
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta: dict = _read_meta_best_effort(meta_path)
         meta.update(
             {
                 "video_url": video["url"],
@@ -3106,10 +3149,7 @@ def _record_transcript_error(meta_path: Path, error: str) -> None:
     """Record last_error on an existing meta.json without clobbering other fields."""
     if not meta_path.exists():
         return
-    try:
-        meta = json.loads(meta_path.read_text())
-    except (json.JSONDecodeError, OSError):
-        meta = {}
+    meta = _read_meta_best_effort(meta_path)
     meta["last_error"] = error
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
@@ -3541,7 +3581,10 @@ def process_transcript(
         if fb is not None:
             return fb
     if meta_path.exists():
-        meta = json.loads(meta_path.read_text())
+        # Best-effort read (issue #124): this branch is recording a parse
+        # failure, so a second parse failure - on the meta file this time - must
+        # not throw away the first one.
+        meta = _read_meta_best_effort(meta_path)
         meta["last_error"] = f"JSON parse error: {parse_error}"
         meta["transcript_parse_error"] = parse_error
         meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
