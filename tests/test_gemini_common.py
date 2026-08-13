@@ -1,6 +1,19 @@
 """Tests for gemini_common.py — shared Gemini API utilities."""
 
-from gemini_common import get_retry_delay
+import logging
+from types import SimpleNamespace
+
+import pytest
+from usage_shapes import (
+    CONFABULATION_PROMPT_VALUES,
+    READABLE_SHAPES,
+    UNREADABLE_SHAPES,
+    AttrErrorProperty,
+    MissingAttr,
+    usage_response,
+)
+
+from gemini_common import _MISSING, _coerce_token_count, get_retry_delay, log_usage_metadata
 
 
 class TestGetRetryDelay:
@@ -99,3 +112,121 @@ class TestBuildPermissiveSafetySettings:
         settings = build_permissive_safety_settings(types)
         categories = {str(s.category) for s in settings}
         assert not any("CIVIC_INTEGRITY" in c for c in categories)
+
+
+class TestCoerceTokenCount:
+    """Issue #125: the split is on ATTRIBUTE PRESENCE, not on which field it is.
+
+    Both ``prompt == 0`` confabulation guards discard the artifact when they see
+    an integer zero, so the helper has to get two opposite things right at once:
+    an SDK rename must NOT read as "every video is a confabulation", and a
+    genuine zero must still trip the guard however Gemini chose to encode it.
+    """
+
+    @pytest.mark.parametrize("value", [pytest.param(v, id=name) for name, v in UNREADABLE_SHAPES])
+    def test_unreadable_shape_coerces_to_none(self, value):
+        """A wrong shape is never evidence of anything."""
+        assert _coerce_token_count(value) is None
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [pytest.param(v, exp, id=name) for name, v, exp in READABLE_SHAPES],
+    )
+    def test_sdk_reported_int_coerces_to_itself(self, value, expected):
+        assert _coerce_token_count(value) == expected
+
+    def test_absent_attribute_is_unreadable(self):
+        """The rename case: the guard must stay quiet, not fire on everything."""
+        assert _coerce_token_count(_MISSING) is None
+
+    def test_present_but_none_is_a_reported_zero(self):
+        """The wire omits an implicit-presence integer exactly when it is zero.
+
+        Reading this as unreadable would silently switch OFF the confabulation
+        guard in precisely the case it exists for.
+        """
+        assert _coerce_token_count(None) == 0
+
+    def test_the_two_absences_are_not_the_same_value(self):
+        assert _coerce_token_count(_MISSING) is not _coerce_token_count(None)
+
+
+class TestLogUsageMetadataUnreadableCounts:
+    """The dict values, and the log line, both carry the presence split."""
+
+    @pytest.mark.parametrize("value", [pytest.param(v, id=name) for name, v in UNREADABLE_SHAPES])
+    def test_unreadable_prompt_returns_none_so_guards_do_not_trip(self, value):
+        counts = log_usage_metadata(usage_response(prompt_token_count=value), "transcript")
+
+        assert counts is not None, "the call itself still succeeded"
+        assert counts["prompt"] is None
+        assert counts["prompt"] != 0, "an unreadable prompt must never compare equal to a reported zero"
+
+    @pytest.mark.parametrize("meta_cls", [MissingAttr, AttrErrorProperty], ids=["missing_attr", "attr_error_property"])
+    def test_absent_prompt_attribute_reads_as_unreadable_not_zero(self, meta_cls):
+        """An SDK rename must not masquerade as 'Gemini ingested nothing'."""
+        counts = log_usage_metadata(SimpleNamespace(usage_metadata=meta_cls()), "mindmap")
+
+        assert counts is not None
+        assert counts["prompt"] is None
+
+    def test_unreadable_prompt_warns_that_the_guard_cannot_run(self, caplog):
+        """A guard that stops guarding must never do it silently."""
+        with caplog.at_level(logging.WARNING, logger="gemini_common"):
+            log_usage_metadata(SimpleNamespace(usage_metadata=MissingAttr()), "mindmap")
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("confabulation guard cannot run" in m for m in warnings)
+
+    @pytest.mark.parametrize("value", CONFABULATION_PROMPT_VALUES)
+    def test_both_encodings_of_zero_prompt_still_trip_the_guard(self, value):
+        """A literal 0 and an omitted-because-zero None must be indistinguishable here.
+
+        This is the whole reason the split is on attribute presence: the guard
+        stays correct without anyone having to settle which encoding Gemini uses.
+        """
+        counts = log_usage_metadata(usage_response(prompt_token_count=value), "transcript")
+
+        assert counts is not None
+        assert counts["prompt"] == 0
+
+    @pytest.mark.parametrize(
+        "field",
+        ["cached", "thoughts", "candidates", "total"],
+    )
+    def test_omitted_observability_field_reads_as_zero(self, field):
+        """Live-verified: an uncached call reports cached_content_token_count=None.
+
+        Rendering that as ? would print on nearly every line and destroy the
+        cached=0 vs cached>0 signal the chunked path tells operators to read.
+        """
+        attr = {"cached": "cached_content_token_count"}.get(field, f"{field}_token_count")
+        counts = log_usage_metadata(usage_response(**{attr: None}), "transcript")
+
+        assert counts is not None
+        assert counts[field] == 0
+
+    def test_drifted_candidates_list_is_unreadable_not_zero(self):
+        """A list coerced to 0 would look exactly like a truncated response."""
+        counts = log_usage_metadata(
+            usage_response(candidates_token_count=[SimpleNamespace(modality="TEXT", token_count=100)]),
+            "transcript",
+        )
+
+        assert counts is not None
+        assert counts["candidates"] is None
+
+    def test_unreadable_counts_render_as_question_mark_in_the_log_line(self, caplog):
+        with caplog.at_level(logging.INFO, logger="gemini_common"):
+            log_usage_metadata(usage_response(prompt_token_count="oops", candidates_token_count=1204), "mindmap")
+
+        line = [r for r in caplog.records if r.name == "gemini_common" and r.levelno == logging.INFO][0].getMessage()
+        assert "prompt=?" in line
+        assert "candidates=1204" in line, "readable neighbours still render as numbers"
+
+    def test_healthy_line_is_all_numbers(self):
+        """No churn on the common case."""
+        counts = log_usage_metadata(usage_response(), "transcript")
+
+        assert counts is not None
+        assert all(v is not None for v in counts.values())

@@ -10,19 +10,72 @@ RETRYABLE_SERVER_CODES: set[int] = {408, 500, 502, 503, 504}
 RETRYABLE_RATE_CODES: set[int] = {429}
 
 
-def _coerce_token_count(value: object) -> int:
-    """Coerce a Gemini usage_metadata field to a non-negative int.
+#: Rendered in the usage log line for a count the SDK did not report readably.
+#: Deliberately not "0": see _coerce_token_count for why the two must not be
+#: confused, and issue #128 for the operator who reads these lines by eye.
+UNREADABLE_COUNT_DISPLAY = "?"
 
-    Gemini SDK may return a bare int, None, or (on gemini-3 multimodal
-    responses) a list of ModalityTokenCount submodels. Anything that
-    isn't a plain numeric int is treated as 0 so the log format stays
-    machine-parseable across SDK shape drift.
+
+#: Sentinel for "this attribute is not on the usage object at all", which is a
+#: different thing from an attribute that exists and holds ``None``.
+_MISSING = object()
+
+
+def _coerce_token_count(value: object) -> int | None:
+    """Coerce a Gemini usage_metadata field to a non-negative int, or None.
+
+    ``None`` means "the SDK did not report a readable count, draw no
+    conclusions". The split is load-bearing, not cosmetic (issue #125): both
+    ``prompt == 0`` confabulation guards treat an integer zero as proof that
+    Gemini ingested no video and DISCARD the artifact, so a shape they cannot
+    read must never arrive dressed as a reported zero.
+
+    The decisive distinction is **attribute presence**, not which field it is:
+
+    * **Attribute absent** (``_MISSING`` - the name is gone from the object, or
+      accessing it raised ``AttributeError``) means SDK drift: a rename, a
+      restructure. Yields ``None``, so a guard reading ``== 0`` stays quiet
+      rather than declaring every video a confabulation. This is what issue
+      #125 exists to fix.
+    * **Attribute present, value ``None``** means the count was omitted on the
+      wire, and protobuf-JSON omits an implicit-presence integer exactly when
+      it is **zero**. Yields ``0``. Verified live: an uncached
+      ``gemini-2.5-flash`` call returns ``cached_content_token_count=None``
+      while genuinely having cached nothing.
+
+    Splitting on presence rather than on a per-field guess is what makes this
+    safe. An earlier revision hard-coded "``promptTokenCount`` is always sent,
+    so its absence is drift" - but the SDK declares all five counts identically
+    (``Optional[int]``, default ``None``), and if the serializer omits zeros
+    then a genuine ``prompt == 0`` confabulation would arrive as ``None`` and
+    SILENTLY MUTE both guards. Under the presence rule the guard fires whether
+    Gemini sends a literal ``0`` or omits the field, so the behavior is correct
+    without needing to settle which one it does.
+
+    A *wrong shape* always yields ``None``: a float, a bool, a string, a
+    negative number, or a list. On the list, be precise about why. Every
+    aggregate count here is documented ``integer | None``; the
+    ``ModalityTokenCount`` lists live on the separate ``*_tokens_details``
+    fields, which this helper never reads. A list in an aggregate field is
+    drift or a malformed response, not an expected multimodal shape. Rejecting
+    it is still right - coercing it to 0 would make a response look like it
+    emitted no output tokens at all - but nobody should build on it as though
+    gemini-3 routinely reports counts that way.
     """
-    if isinstance(value, bool):  # bool is a subclass of int; reject it
+    if value is _MISSING:
+        return None
+    if value is None:
         return 0
+    if isinstance(value, bool):  # bool is a subclass of int; not a token count
+        return None
     if isinstance(value, int):
-        return max(value, 0)
-    return 0
+        return value if value >= 0 else None
+    return None
+
+
+def _fmt_token_count(value: int | None) -> str:
+    """Render a coerced count for the usage log line."""
+    return UNREADABLE_COUNT_DISPLAY if value is None else str(value)
 
 
 def log_usage_metadata(response: object, label: str) -> dict | None:
@@ -38,10 +91,21 @@ def log_usage_metadata(response: object, label: str) -> dict | None:
     means "could not confirm" (never flag a confabulation on missing data).
     Existing callers ignore the return value, so this is backward compatible.
 
+    Individual dict values are ``int | None`` on the same principle (issue
+    #125): a count the SDK did not report readably comes back as ``None`` and
+    renders as ``?`` in the log line, never as ``0``. A guard comparing
+    ``counts["prompt"] == 0`` therefore stays quiet on SDK drift and fires
+    only on a count Gemini genuinely reported as zero. See
+    ``_coerce_token_count`` for which fields treat an omitted value as zero
+    (``cached``, ``thoughts``, ``candidates``) and which treat it as drift
+    (``prompt``, ``total``).
+
     ``thoughts_token_count`` is Gemini 3.x-specific (the thinking process);
-    legacy 2.x responses omit it and we default to 0. Per Gemini usage_metadata
-    docs (ai.google.dev/gemini-api/docs/tokens), when thoughts > 0 the
-    ``total_token_count`` will exceed ``prompt + cached + candidates``.
+    legacy 2.x responses omit it, which reads as ``0`` here because the API
+    omits that field exactly when no thinking happened. Per Gemini
+    usage_metadata docs (ai.google.dev/gemini-api/docs/tokens), when
+    thoughts > 0 the ``total_token_count`` will exceed
+    ``prompt + cached + candidates``.
 
     Observability must never break the caller. Any unexpected shape
     produces a warning log and returns ``None`` — it does not raise.
@@ -51,19 +115,30 @@ def log_usage_metadata(response: object, label: str) -> dict | None:
         if usage is None:
             log.warning("usage %s: response.usage_metadata missing or None", label)
             return None
-        prompt = _coerce_token_count(getattr(usage, "prompt_token_count", 0))
-        cached = _coerce_token_count(getattr(usage, "cached_content_token_count", 0))
-        thoughts = _coerce_token_count(getattr(usage, "thoughts_token_count", 0))
-        candidates = _coerce_token_count(getattr(usage, "candidates_token_count", 0))
-        total = _coerce_token_count(getattr(usage, "total_token_count", 0))
+        # The getattr default is the _MISSING sentinel, never 0 and never None:
+        # the coercion step has to be able to tell "the SDK renamed this away"
+        # from "the wire omitted a zero" (issue #125).
+        prompt = _coerce_token_count(getattr(usage, "prompt_token_count", _MISSING))
+        total = _coerce_token_count(getattr(usage, "total_token_count", _MISSING))
+        cached = _coerce_token_count(getattr(usage, "cached_content_token_count", _MISSING))
+        thoughts = _coerce_token_count(getattr(usage, "thoughts_token_count", _MISSING))
+        candidates = _coerce_token_count(getattr(usage, "candidates_token_count", _MISSING))
+        if prompt is None:
+            # The confabulation guards read this field and can only fail open.
+            # Say so out loud: a silent fail-open is how a guard stops guarding
+            # without anyone noticing.
+            log.warning(
+                "usage %s: prompt_token_count is unreadable - the prompt==0 confabulation guard cannot run",
+                label,
+            )
         log.info(
-            "usage %s prompt=%d cached=%d thoughts=%d candidates=%d total=%d",
+            "usage %s prompt=%s cached=%s thoughts=%s candidates=%s total=%s",
             label,
-            prompt,
-            cached,
-            thoughts,
-            candidates,
-            total,
+            _fmt_token_count(prompt),
+            _fmt_token_count(cached),
+            _fmt_token_count(thoughts),
+            _fmt_token_count(candidates),
+            _fmt_token_count(total),
         )
         return {
             "prompt": prompt,

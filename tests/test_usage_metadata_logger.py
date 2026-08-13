@@ -9,13 +9,27 @@ from gemini_common import log_usage_metadata
 def _meta(
     prompt: int | None = 77312,
     cached: int | None = 0,
+    thoughts: int | None = None,
     candidates: int | None = 1204,
     total: int | None = 78516,
 ):
-    """Build a SimpleNamespace that mimics Gemini's usage_metadata shape."""
+    """Build a SimpleNamespace that mimics Gemini's usage_metadata shape.
+
+    All five counts are DECLARED even when their value is None, because that is
+    what the real SDK does: GenerateContentResponseUsageMetadata is a pydantic
+    model whose fields all exist as Optional[int]. Verified against a live
+    gemini-2.5-flash call, where an uncached request returns
+    `cached_content_token_count=None` with the attribute present.
+
+    The distinction matters since issue #125: a field that EXISTS holding None
+    is a zero omitted on the wire (renders 0), while a field that is genuinely
+    ABSENT is SDK drift (renders ?). Omitting an attribute here to mean "the API
+    did not report it" would model the SDK wrong and assert the wrong branch.
+    """
     return SimpleNamespace(
         prompt_token_count=prompt,
         cached_content_token_count=cached,
+        thoughts_token_count=thoughts,
         candidates_token_count=candidates,
         total_token_count=total,
     )
@@ -48,9 +62,12 @@ class TestLogUsageMetadataHappyPath:
 
 
 class TestLogUsageMetadataEdgeCases:
-    def test_missing_cached_field_when_small_prompt_falls_back_to_zero(self, caplog):
+    def test_cached_omitted_on_the_wire_falls_back_to_zero(self, caplog):
+        """An uncached call reports cached_content_token_count=None (live-verified)."""
         meta = SimpleNamespace(
             prompt_token_count=500,
+            cached_content_token_count=None,
+            thoughts_token_count=None,
             candidates_token_count=200,
             total_token_count=700,
         )
@@ -72,11 +89,16 @@ class TestLogUsageMetadataEdgeCases:
         # One warning line is emitted; no info line with the usage format
         assert any(r.levelno == logging.WARNING for r in records)
 
-    def test_candidates_is_list_when_multimodal_shape_coerces_to_zero_without_raising(self, caplog):
-        """Gemini 3+ may return candidates_token_count as a list of ModalityTokenCount.
+    def test_candidates_is_list_when_shape_drifts_reads_as_unreadable_not_zero(self, caplog):
+        """A list in the aggregate candidates_token_count field is drift, not a real shape.
 
-        The helper must not crash on this shape — coerce unusable values to 0 so the
-        log format stays machine-parseable.
+        The documented type is ``integer | None``; ``ModalityTokenCount`` lists
+        live on ``candidates_tokens_details``, which this helper never reads.
+        The helper must not crash on the drifted shape, and (issue #125) must
+        not report it as ``0`` either: a candidates count of zero is what a
+        truncated or blocked response looks like, so a list dressed as 0 would
+        blind an output-cap check. It renders as ``?``: still a well-formed,
+        machine-parseable line, but an honest one.
         """
         multimodal_counts = [SimpleNamespace(modality="TEXT", token_count=100)]
         meta = SimpleNamespace(
@@ -91,8 +113,9 @@ class TestLogUsageMetadataEdgeCases:
 
         records = [r for r in caplog.records if r.name == "gemini_common" and r.levelno == logging.INFO]
         assert len(records) == 1
-        assert "candidates=0" in records[0].getMessage()
-        # Log line is still well-formed — machine-parseable
+        assert "candidates=?" in records[0].getMessage()
+        assert "candidates=0" not in records[0].getMessage()
+        # Log line is still well-formed and machine-parseable
         assert records[0].getMessage().startswith("usage mindmap prompt=")
 
     def test_usage_metadata_attribute_access_raises_non_attribute_error_does_not_propagate(self, caplog):
@@ -110,8 +133,17 @@ class TestLogUsageMetadataEdgeCases:
         records = [r for r in caplog.records if r.name == "gemini_common" and r.levelno == logging.WARNING]
         assert len(records) >= 1
 
-    def test_usage_metadata_attribute_error_from_property_falls_back_silently(self, caplog):
-        """AttributeError raised inside a property is swallowed by getattr (stdlib behavior)."""
+    def test_usage_metadata_attribute_error_from_property_reads_as_unreadable_prompt(self, caplog):
+        """AttributeError raised inside a property is swallowed by getattr (stdlib behavior).
+
+        Issue #125: the swallowed value must surface as ``prompt=?`` / ``None``,
+        never as ``prompt=0``. The ATTRIBUTE is gone here, which can only mean
+        SDK drift, and both confabulation guards discard the artifact on a
+        prompt of exactly 0 - so reporting drift as a zero would turn one field
+        rename into "every video is a confabulation". Note the contrast with an
+        attribute that EXISTS and holds ``None``: that is a zero omitted on the
+        wire, and it must still read as 0 so the guard keeps firing.
+        """
 
         class PropertyAttrErrMeta:
             @property
@@ -120,12 +152,14 @@ class TestLogUsageMetadataEdgeCases:
 
         response = SimpleNamespace(usage_metadata=PropertyAttrErrMeta())
         with caplog.at_level(logging.INFO, logger="gemini_common"):
-            log_usage_metadata(response, "mindmap")  # must not raise
+            counts = log_usage_metadata(response, "mindmap")  # must not raise
 
-        # Well-formed log line still emitted with the missing field defaulted to 0
+        # Well-formed log line still emitted, with the unreadable field marked
         records = [r for r in caplog.records if r.name == "gemini_common" and r.levelno == logging.INFO]
         assert len(records) == 1
-        assert "prompt=0" in records[0].getMessage()
+        assert "prompt=?" in records[0].getMessage()
+        assert "prompt=0" not in records[0].getMessage()
+        assert counts is not None and counts["prompt"] is None
 
     def test_response_lacks_usage_metadata_attribute_when_missing_does_not_raise(self, caplog):
         response = SimpleNamespace()  # no usage_metadata attr at all
@@ -155,14 +189,14 @@ class TestLogUsageMetadataGemini3Thoughts:
         assert len(records) == 1
         assert "thoughts=3200" in records[0].getMessage()
 
-    def test_thoughts_field_missing_when_legacy_gemini_2_response_defaults_to_zero(self, caplog):
-        """Gemini 2.x responses have no thoughts_token_count attr — must default to 0, not crash."""
+    def test_thoughts_omitted_on_a_non_thinking_response_defaults_to_zero(self, caplog):
+        """A non-thinking response reports thoughts_token_count=None, not a missing attr."""
         meta = SimpleNamespace(
             prompt_token_count=1000,
             cached_content_token_count=0,
+            thoughts_token_count=None,
             candidates_token_count=200,
             total_token_count=1200,
-            # thoughts_token_count intentionally absent
         )
         response = SimpleNamespace(usage_metadata=meta)
         with caplog.at_level(logging.INFO, logger="gemini_common"):
