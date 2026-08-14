@@ -866,6 +866,37 @@ class TestCmdProcessPerModeSkip:
         assert len(mm_calls) == 0, "process_mindmap MUST NOT be called when skip_modes=['mindmap']"
         assert len(tx_calls) == 1, "Transcript step must still run"
 
+    def test_skip_modes_concepts_blocks_process_concepts_call(self, monkeypatch, tmp_path):
+        """The third mode, which the contract always documented but nothing gated.
+
+        Issue #42 defines skip_modes as any subset of mindmap|transcript|concepts,
+        and `cmd_scan` honors all three - but `cmd_process` only ever gated the
+        first two, so `skip_modes: ["concepts"]` silently ran the step anyway and
+        billed a Gemini call the operator had explicitly suppressed. Found by the
+        ce-code-review correctness pass on PR #136.
+        """
+        _output_dir, channel_dir = _prep_process_env(monkeypatch, tmp_path)
+        mp4 = channel_dir / "test.mp4"
+        mp4.write_bytes(b"fake mp4")
+        meta_path = channel_dir / "test.meta.json"
+        meta_path.write_text(
+            json.dumps({"video_id": "test", "skip_modes": ["concepts"]}),
+            encoding="utf-8",
+        )
+
+        _, mm_calls, tx_calls, concepts_calls = self._wire_pipeline_recorders(monkeypatch, channel_dir)
+
+        from video_intel import cmd_process
+
+        config = {"channels": [{"name": "everyinc", "url": "https://youtube.com/@x"}]}
+        # Must NOT raise: a suppressed step is a deliberate skip, never a gap,
+        # so the issue #129 exit code stays 0 (requested=False).
+        cmd_process(_make_process_args(mp4, channel="everyinc"), config)
+
+        assert len(concepts_calls) == 0, "process_concepts MUST NOT be called when skip_modes=['concepts']"
+        assert len(mm_calls) == 1, "Mindmap must still run"
+        assert len(tx_calls) == 1, "Transcript must still run"
+
     def test_legacy_skip_true_still_hard_exits_cmd_process(self, monkeypatch, tmp_path):
         """Backward compat: legacy `skip: true` (no skip_modes) keeps the old
         whole-video hard-exit semantics that pre-issue-42 callers depend on."""

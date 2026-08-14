@@ -5999,6 +5999,11 @@ def cmd_process(args, config):
     # step. Legacy `skip: true` was hard-exited above and never reaches here.
     skip_mindmap = is_skipped_meta(existing_meta, mode="mindmap")
     skip_transcript = is_skipped_meta(existing_meta, mode="transcript")
+    # The issue #42 contract accepts any subset of mindmap|transcript|concepts,
+    # but only the first two were ever gated here, so `skip_modes: ["concepts"]`
+    # silently did nothing and the step ran anyway. A documented mode that does
+    # nothing is the same class of lie as a finished ticket left open.
+    skip_concepts = is_skipped_meta(existing_meta, mode="concepts")
     needs_mindmap = not skip_mindmap and (args.force or "scan" not in modes_done or not mindmap_path.exists())
     needs_transcript = not skip_transcript and (
         args.force or "transcript" not in modes_done or not transcript_path.exists() or raw_sidecar.exists()
@@ -6261,6 +6266,12 @@ def cmd_process(args, config):
         return
 
     # Step 3: concepts (text-only; channel must be configured).
+    if skip_concepts:
+        log.info("  Step 3/3: concepts [%s]: skipped (skip_modes)", prefix)
+        steps.append({"label": "concepts", "requested": False, "status": "skipped (skip_modes)", "path": None})
+        finish_pipeline_run(steps, label=prefix)
+        return
+
     if not channel_name:
         log.warning("Channel not configured for %s; skipping concepts.", input_path.name)
         finish_pipeline_run(steps, label=prefix)

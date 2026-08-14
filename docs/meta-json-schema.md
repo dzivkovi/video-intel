@@ -44,6 +44,12 @@ Every processed video has a `{date}-{slug}.meta.json` sidecar in its channel fol
 | `transcript_chunks` / `transcript_chunk_minutes` / `transcript_thin_chunks` | int | chunked path | Chunked-transcript bookkeeping (count, window size, count of sub-50%-coverage chunks). |
 | `transcript_output_tokens` / `transcript_finish_reason` | int / str | single-shot salvage (issue #128) | Present only when the salvage hit the output cap: the reported candidates count and the response finish_reason, so an operator can judge whether a chunked re-run is worth paying for. |
 
+### Concepts
+
+| Field | Type | Written by | Allowed values / notes |
+|---|---|---|---|
+| `concepts_status` | str | concepts success writer + `_record_concepts_error` | `ok` on success; `error: <message>` when the step failed (issue #129). Before #129 a concepts failure wrote **nothing at all** - no artifact and no field - so a video could be missing from `taxonomy.json` and the search index with no trace anywhere. The success path writes `ok` explicitly so a recovered video does not keep an old error forever. The failure writer never CREATES a meta that did not exist, because a caller that did not pass an explicit `prefix` could otherwise write a second meta claiming the same `video_id` and manufacture a dedupe group. |
+
 ### Skip and error bookkeeping
 
 | Field | Type | Written by | Notes |
@@ -55,6 +61,10 @@ Every processed video has a `{date}-{slug}.meta.json` sidecar in its channel fol
 
 ## Minimal vs full meta
 
-The transcript-first writer creates a **minimal** meta (only `processed`, `transcript_status`, `modes_completed`, `last_error`) before the scan loop fills in identity. A confabulation stub or a transcript-only run can therefore leave an **identity-less** meta with no `video_id`/`title`/`video_url`. This quietly conflicts with the "video_id is identity" rule and makes cleanup harder.
+This section used to describe a live defect and end in a recommendation. **That recommendation shipped as an enforced contract in issue #66** - it is history now, kept because legacy files on disk still show the old shape.
 
-**Recommendation:** writers should populate `video_id`, `video_url`, `title`, and `published` on first write. Code that looks a video up by identity must tolerate a legacy minimal meta (fall back to the slug) but should not produce new ones.
+**What used to happen.** The transcript-first writer (inverted ordering, issue #54) created a **minimal** meta carrying only `processed`, `transcript_status`, `modes_completed`, and `last_error`, before the scan loop filled in identity. A confabulation stub or a transcript-only run therefore left an **identity-less** meta with no `video_id`/`title`/`video_url`. `_load_video_id_index` skips such a file, so the video was re-transcribed on every scan.
+
+**What happens now.** Every meta writer stamps identity on first write by merging `_transcript_identity_fields(video, channel_dir)` - `video_url`, `video_id`, `channel`, `title`, `published`. That covers the three transcript writers (single-shot success, salvage, captions failover), the concepts writers on both the success and failure paths (issue #129), and `cmd_mark_skip`. Falsy values are dropped so a re-stamp can only ADD identity, never downgrade a good field to empty.
+
+**Reading old files.** Code that looks a video up by identity must still tolerate a legacy minimal meta and fall back to the slug, but must not produce new ones. `repair-metas --apply` backfills pre-#66 files from the `.transcript.md` header (Source URL to `video_id`); it never overwrites an existing field and never fabricates identity for a non-YouTube source.
