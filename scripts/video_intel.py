@@ -3787,6 +3787,39 @@ def _transcript_identity_fields(video: dict, channel_dir: Path) -> dict:
     return {k: v for k, v in fields.items() if v}
 
 
+def _identity_from_mindmap_header(mindmap_path: Path) -> dict | None:
+    """Reconstruct identity from a ``.mindmap.md`` HTML-comment header.
+
+    Both mindmap paths write the same three comments (see process_mindmap):
+    ``<!-- video: {url} -->``, ``<!-- title: ... -->``, ``<!-- published: ... -->``.
+    Used only as a FALLBACK when no sibling transcript exists - the transcript
+    header is preferred because it also records status and source.
+
+    Returns None when no Source URL with a parseable 11-char video id is
+    present, matching _identity_from_transcript_header's contract: a caller
+    must never be handed a partial identity it would then persist (issue #66).
+    """
+    try:
+        text = mindmap_path.read_text(encoding="utf-8")[:4000]
+    except (OSError, UnicodeDecodeError):
+        return None
+    url_m = re.search(r"<!--\s*video:\s*(\S+?)\s*-->", text)
+    if not url_m:
+        return None
+    url = url_m.group(1).strip()
+    vid_m = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])", url)
+    if not vid_m:
+        return None
+    fields = {"video_url": url, "video_id": vid_m.group(1), "channel": mindmap_path.parent.name}
+    title_m = re.search(r"<!--\s*title:\s*(.+?)\s*-->", text)
+    if title_m:
+        fields["title"] = title_m.group(1).strip()
+    pub_m = re.search(r"<!--\s*published:\s*(\S+?)\s*-->", text)
+    if pub_m:
+        fields["published"] = pub_m.group(1).strip()
+    return fields
+
+
 def _identity_from_transcript_header(transcript_path: Path) -> dict | None:
     """Reconstruct identity fields from a ``.transcript.md`` header (issue #66 backfill).
 
@@ -7936,14 +7969,83 @@ def cmd_repair_metas(args, config):
             meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
             applied += 1
         repaired += 1
-    if applied:
+    # Second pass: artifacts with NO meta.json at all. The first pass only walks
+    # existing metas, so these are invisible to it - and to every other command.
+    # A stranded pair is worse than an identity-less meta: `scan` sees the
+    # .transcript.md/.mindmap.md on disk and calls the video processed, while
+    # `concepts` iterates *.meta.json and cannot see it, so the video silently
+    # never reaches taxonomy.json or the search index. Observed on 7 artifacts
+    # from a single failed batch run.
+    orphans, orphans_applied, orphans_unrepairable = 0, 0, 0
+    for channel_dir in sorted(p for p in output_dir.iterdir() if p.is_dir() and not p.name.startswith((".", "_"))):
+        if only and channel_dir.name != only:
+            continue
+        stems = {p.name[: -len(".transcript.md")] for p in channel_dir.glob("*.transcript.md")}
+        stems |= {p.name[: -len(".mindmap.md")] for p in channel_dir.glob("*.mindmap.md")}
+        for prefix in sorted(stems):
+            meta_path = channel_dir / f"{prefix}.meta.json"
+            if meta_path.exists():
+                continue
+            transcript_path = channel_dir / f"{prefix}.transcript.md"
+            mindmap_path = channel_dir / f"{prefix}.mindmap.md"
+            identity = _identity_from_transcript_header(transcript_path) if transcript_path.exists() else None
+            identity_src = "transcript_header" if identity else None
+            if not identity and mindmap_path.exists():
+                identity = _identity_from_mindmap_header(mindmap_path)
+                identity_src = "mindmap_header" if identity else None
+            # Identity is the whole point (issue #66): a meta without video_id is
+            # skipped by _load_video_id_index, so writing one would re-create the
+            # invisibility this pass exists to cure.
+            if not identity or not identity.get("video_id"):
+                orphans_unrepairable += 1
+                log.warning(
+                    "  [%s] %s: artifacts present but no meta and no recoverable identity in their headers",
+                    channel_dir.name,
+                    prefix,
+                )
+                continue
+            # Claim only what is actually on disk. Never assert a mode we cannot see.
+            modes = [
+                m
+                for m, p in (
+                    ("transcript", transcript_path),
+                    ("mindmap", mindmap_path),
+                    ("concepts", channel_dir / f"{prefix}.concepts.json"),
+                )
+                if p.exists()
+            ]
+            meta = dict(identity)
+            meta["modes_completed"] = modes
+            # Auditable provenance: this meta was reconstructed from artifact
+            # headers, not written by the pipeline that produced the artifacts.
+            meta["meta_reconstructed"] = True
+            meta["meta_reconstructed_from"] = identity_src
+            log.info(
+                "  [%s] %s: rebuild meta (video_id=%s, modes=%s)",
+                channel_dir.name,
+                prefix,
+                identity["video_id"],
+                ",".join(modes) or "none",
+            )
+            if args.apply:
+                meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+                orphans_applied += 1
+            orphans += 1
+
+    if applied or orphans_applied:
         # A backfilled meta now carries video_id; drop the process-global index
         # cache so a later step in this process sees it (mirrors dedupe).
         _invalidate_video_id_cache()
     verb = "Repaired" if args.apply else "Would repair"
     log.info("%s %d identity-less meta(s); %d unrepairable (no usable header).", verb, repaired, unrepairable)
-    if not args.apply and repaired:
-        log.info("Re-run with --apply to write. After applying, run 'index --force' if idempotency was affected.")
+    log.info(
+        "%s %d artifact(s) with no meta at all; %d unrepairable (no recoverable identity).",
+        "Rebuilt" if args.apply else "Would rebuild",
+        orphans,
+        orphans_unrepairable,
+    )
+    if not args.apply and (repaired or orphans):
+        log.info("Re-run with --apply to write. After applying, run 'taxonomy-build' and 'index --force'.")
 
 
 # ---------------------------------------------------------------------------
