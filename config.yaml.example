@@ -17,7 +17,22 @@ output_dir: ~/video-intel
 
 default_since: 10d
 default_prompt: mindmap-knowledge
-model: gemini-3-flash-preview
+# Gemini model for every step. Chosen by measurement, not spec sheet: run
+# `python scripts/model_eval.py --candidate <new> --incumbent <current>` and read
+# the scorecard in tests/evals/model-cards/ before changing this. The dimension
+# that decides it here is timestamped-segment granularity, because that sets the
+# precision of the `&t=<seconds>` deep links the corpus exists to produce - not
+# throughput, and not the vendor's benchmark table.
+model: gemini-3.7-flash
+
+# Optional per-step overrides (transcript / mindmap / concepts). Precedence:
+#   --model flag > models.<step> > model > DEFAULT_MODEL
+# An explicit --model suppresses this whole block, so the "force Pro when Flash
+# struggles" recovery still applies to the entire run. Empty by default.
+# models:
+#   mindmap: <model>
+#   concepts: <model>
+
 max_parallel: 10
 auto_concepts: true
 

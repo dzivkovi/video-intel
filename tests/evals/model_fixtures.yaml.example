@@ -1,0 +1,58 @@
+# TEMPLATE for `tests/evals/model_fixtures.yaml` (gitignored).
+# Copy to model_fixtures.yaml and point each fixture at a real video from
+# YOUR corpus. The real file stays private: which videos a maintainer indexes,
+# annotated with the defect each one exposes, is a curated watchlist extract -
+# more revealing than the bare URLs. Same split as config.yaml / config.yaml.example.
+#
+# Fixture set for `python scripts/model_eval.py` - the model A/B matrix.
+#
+# Each fixture names ONE facet the pipeline can fail on. The point is coverage of
+# failure modes, not statistical power: a model that looks great on a clean
+# talking-head monologue can still collapse a screen-share demo into one
+# undifferentiated block, and only a fixture that PROBES that will show it.
+#
+# Segments are short (default 10 min) and deliberately not from the start of the
+# video where an intro can flatter a model. Everything is read-only: the harness
+# calls Gemini against the YouTube URL and writes only into its own scratch dir.
+#
+# Adding a fixture is cheap and encouraged. Removing one needs a reason - each is
+# here because it represents a way the transcript step has actually degraded.
+
+defaults:
+  segment_seconds: 600
+  media_resolution: low
+
+fixtures:
+  - id: screenshare-demo
+    facet: >-
+      Screen-share with live terminal/editor output. Probes on-screen text capture
+      and the monolithic-collapse failure: the shape where a model transcribes the
+      words correctly but stamps minutes of content as one block, destroying the
+      &t= deep-link precision the corpus exists for.
+    url: https://www.youtube.com/watch?v=REPLACE_ME
+    channel: your_channel
+    start: 0
+
+  - id: multi-speaker-podcast
+    facet: >-
+      Two-plus speakers with interruption and crosstalk. Probes diarization: whether
+      distinct voices are separated or merged into one speaker.
+    url: https://www.youtube.com/watch?v=REPLACE_ME
+    channel: your_channel
+    start: 1200
+
+  - id: talking-head-monologue
+    facet: >-
+      Single presenter, minimal visual aid, dense continuous speech. The easy case -
+      a model that degrades HERE is disqualified outright.
+    url: https://www.youtube.com/watch?v=REPLACE_ME
+    channel: your_channel
+    start: 900
+
+  - id: long-form-midpoint
+    facet: >-
+      Deep inside a 90-min+ video, away from any intro. Probes whether quality holds
+      at a chunk boundary rather than only in the opening minutes.
+    url: https://www.youtube.com/watch?v=REPLACE_ME
+    channel: your_channel
+    start: 3000
