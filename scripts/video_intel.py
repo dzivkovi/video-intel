@@ -58,7 +58,18 @@ log = logging.getLogger("video_intel")
 # ---------------------------------------------------------------------------
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
-DEFAULT_MODEL = "gemini-3-flash-preview"
+# The transcript model must have an EXPLICITLY BOUNDED thinking config - never
+# the SDK default. That is the real issue #58 Gate 2 invariant: the 15,013
+# thinking tokens that truncated Tucker chunk 2 came from Gemini's DYNAMIC
+# default, not from a bounded level. "minimal" and "low" both satisfy it.
+#
+# An earlier revision of this comment demanded a model that could reach ZERO
+# thinking. Measurement retired that: on video input, thinking tokens were 0 for
+# every model tested (see tests/evals/model-cards/), so zero-vs-bounded was never
+# the live variable - it was an artifact of a synthetic TEXT benchmark. What the
+# A/B did show is that "minimal" degrades timestamp granularity badly, collapsing
+# minutes of video into one stamped block and wrecking &t= deep-link precision.
+DEFAULT_MODEL = "gemini-3.7-flash"
 MAX_OUTPUT_TOKENS = 65536
 TRANSCRIPT_PARSE_RETRY_LIMIT = 1
 SALVAGE_MIN_SPEECH_ENTRIES = 5
@@ -84,6 +95,11 @@ def _user_config_path() -> Path:
 
 _USER_CONFIG_SUPPORTED_KEYS = frozenset({"output_dir", "vector_db_dir"})
 _LAST_RESOLVED_SOURCE: str | None = None
+# The actual Path of the config file that won resolution, or None when the
+# winning source was the env var (which names a directory, not a config file).
+# _LAST_RESOLVED_SOURCE is a human-readable display string and deliberately
+# stays that way; backup_config_if_changed needs real bytes to copy.
+_LAST_RESOLVED_PATH: Path | None = None
 
 
 def load_config() -> dict[str, Any]:
@@ -107,7 +123,8 @@ def load_config() -> dict[str, Any]:
     stored in module-level :data:`_LAST_RESOLVED_SOURCE` for downstream
     helpers (e.g. ``require_channels_config``) that surface diagnostics.
     """
-    global _LAST_RESOLVED_SOURCE
+    global _LAST_RESOLVED_SOURCE, _LAST_RESOLVED_PATH
+    _LAST_RESOLVED_PATH = None
 
     # Step 1: plugin-local config
     skill_config = SKILL_DIR / "config.yaml"
@@ -115,6 +132,7 @@ def load_config() -> dict[str, Any]:
         with open(skill_config) as f:
             config = yaml.safe_load(f) or {}
         _LAST_RESOLVED_SOURCE = f"SKILL_DIR/config.yaml ({skill_config})"
+        _LAST_RESOLVED_PATH = skill_config
         log.info("Config resolved from %s", _LAST_RESOLVED_SOURCE)
         return config
 
@@ -153,6 +171,7 @@ def load_config() -> dict[str, Any]:
                 ", ".join(extras),
             )
         _LAST_RESOLVED_SOURCE = "~/.video-intel/config.yaml"
+        _LAST_RESOLVED_PATH = user_config
         log.info("Config resolved from %s", _LAST_RESOLVED_SOURCE)
         return supported
 
@@ -205,6 +224,116 @@ def resolve_output_dir(config, *, create: bool = True):
     if create:
         output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
+
+
+CONFIG_BACKUP_DIR_NAME = "_config-backups"
+
+# Commands that mutate the corpus and therefore must snapshot the config first.
+# Deliberately EXCLUDES the read-only surface (search, nugget, status, profile -
+# `profile show` promises zero filesystem side effects and `profile init` writes
+# only into _briefings, not the corpus channels). Adding a new corpus-mutating
+# subcommand means adding it here; `tests/test_config_backup.py` compares this
+# set against the live dispatch table so a new command cannot silently opt out.
+CONFIG_BACKUP_COMMANDS = frozenset(
+    {
+        "scan",
+        "mindmap",
+        "transcript",
+        "process",
+        "concepts",
+        "taxonomy-build",
+        "index",
+        "repair-metas",
+        "dedupe",
+        "prune-shorts",
+        "mark-skip",
+    }
+)
+
+
+def backup_config_if_changed(output_dir: Path, *, config_path: Path | None = None) -> Path | None:
+    """Mirror the resolved config into ``output_dir/_config-backups/`` when it changed.
+
+    Called automatically before any corpus-mutating command touches the corpus,
+    so the channel list that produced a given corpus state is always recoverable.
+    Returns the dated snapshot Path when one was written, else None.
+
+    This exists because the manual routine FAILED: the corpus went from
+    2026-07-22 to 2026-08-17 with no snapshot while the channel list was edited
+    (YC Shorts curation, blocklists, a headline_digest flag). Anything that
+    relies on an operator or an agent remembering to run a copy is not a backup
+    routine, it is a habit - and habits lapse silently. Per the durability
+    ladder in CLAUDE.md, a failure a future run can hit with nobody noticing
+    must become code.
+
+    Five behaviours are load-bearing:
+
+    1. **Content-compared, not time-based.** It writes only when the config
+       differs from ``config.latest.yaml``, so running scan ten times a day
+       does not litter ten snapshots, and a snapshot's existence genuinely
+       means "the config changed here".
+    2. **Dated snapshots are immutable.** A second, different edit on the same
+       day gets ``config.<date>-2.yaml`` rather than clobbering the morning's
+       snapshot - the same non-clobbering rule the briefings writer uses.
+       Only ``config.latest.yaml`` is ever overwritten.
+    3. **It never aborts the caller.** A backup failure logs a WARNING and
+       returns None. If ``output_dir`` is unreachable (unmounted cloud drive)
+       the scan is doomed regardless and must surface THAT error, not a
+       confusing failure inside the backup helper.
+    4. **A failure is never silent.** Every non-write path that is not "nothing
+       changed" logs a WARNING, because a backup that quietly stops backing up
+       reproduces the exact month-long gap this function exists to prevent.
+    5. **Env-var-resolved configs are skipped, loudly.** ``VIDEO_INTEL_OUTPUT_DIR``
+       names a directory, not a config file, so there are no bytes to copy.
+    """
+    source = config_path if config_path is not None else _LAST_RESOLVED_PATH
+    if source is None:
+        log.warning(
+            "Config backup skipped: the resolved config source is not a file (%s). Nothing to snapshot.",
+            _LAST_RESOLVED_SOURCE or "unknown",
+        )
+        return None
+    try:
+        current = Path(source).read_bytes()
+    except OSError as e:
+        log.warning("Config backup skipped: cannot read %s (%s).", source, e)
+        return None
+
+    backup_dir = Path(output_dir) / CONFIG_BACKUP_DIR_NAME
+    latest = backup_dir / "config.latest.yaml"
+    try:
+        if latest.exists() and latest.read_bytes() == current:
+            log.debug("Config unchanged since %s; no new snapshot.", latest.name)
+            return None
+    except OSError as e:
+        # Unreadable latest is not proof the config is unchanged, so fall
+        # through and write a fresh snapshot rather than assume safety.
+        log.warning("Config backup: cannot read %s (%s); writing a new snapshot.", latest, e)
+
+    stamp = datetime.now(UTC).strftime("%Y-%m-%d")
+    try:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        dated = backup_dir / f"config.{stamp}.yaml"
+        n = 2
+        # Never clobber an earlier snapshot from the same day; an identical one
+        # is already the snapshot we want and needs no duplicate.
+        while dated.exists() and dated.read_bytes() != current:
+            dated = backup_dir / f"config.{stamp}-{n}.yaml"
+            n += 1
+        dated.write_bytes(current)
+        latest.write_bytes(current)
+    except OSError as e:
+        log.warning(
+            "Config backup FAILED for %s -> %s (%s). Continuing; the command "
+            "itself will surface any real corpus-access error.",
+            source,
+            backup_dir,
+            e,
+        )
+        return None
+
+    log.info("Config backed up: %s (and config.latest.yaml)", dated.name)
+    return dated
 
 
 def resolve_vector_db_dir(config: dict[str, Any], output_dir: Path) -> Path:
@@ -270,6 +399,62 @@ def probe_atomic_writes(path: Path) -> tuple[bool, str | None]:
 def resolve_model(args: argparse.Namespace, config: dict[str, Any]) -> str:
     """Resolve Gemini model: --model flag > config.yaml > DEFAULT_MODEL."""
     return args.model or config.get("model") or DEFAULT_MODEL
+
+
+# Per-step Gemini model overrides, from config.yaml's optional `models:` block.
+#
+# The step is a property of the FUNCTION, not the call site - process_transcript
+# is always the transcript step - so the override is applied once at the top of
+# each step function instead of being threaded through ~25 positional call
+# sites, where a single missed argument would silently bill the wrong model.
+#
+# Populated once in main() from args+config, read-only thereafter. An empty
+# mapping (the default, and what every direct-import test and library caller
+# sees) makes _effective_model a no-op, so single-model behavior is unchanged.
+STEP_MODEL_KEYS = ("transcript", "mindmap", "concepts")
+_STEP_MODELS: dict[str, str] = {}
+
+
+def resolve_step_models(args: argparse.Namespace, config: dict[str, Any]) -> dict[str, str]:
+    """Resolve per-step model overrides from config.yaml's `models:` block.
+
+    Precedence is unchanged and simply gains one level:
+    ``--model`` flag > ``models.<step>`` > ``model`` > ``DEFAULT_MODEL``.
+
+    An explicit ``--model`` suppresses the per-step map ENTIRELY rather than
+    applying to only some steps. That flag is the operator's documented escape
+    hatch for forcing Pro across a whole run when Flash struggles; honoring it
+    for two steps out of three would make the recovery silently partial.
+
+    A malformed block is ignored with a warning rather than raising - a typo in
+    an optional personalization knob must not take down a scan.
+    """
+    if getattr(args, "model", None):
+        return {}
+    raw = config.get("models") or {}
+    if not isinstance(raw, dict):
+        log.warning("config `models:` is not a mapping; ignoring per-step model overrides")
+        return {}
+    resolved: dict[str, str] = {}
+    for step in STEP_MODEL_KEYS:
+        value = raw.get(step)
+        if isinstance(value, str) and value.strip():
+            resolved[step] = value.strip()
+        elif value is not None:
+            log.warning("config models.%s is not a model name; ignoring it", step)
+    unknown = sorted(set(raw) - set(STEP_MODEL_KEYS))
+    if unknown:
+        log.warning(
+            "ignoring unknown key(s) in config `models:`: %s (valid: %s)",
+            ", ".join(unknown),
+            ", ".join(STEP_MODEL_KEYS),
+        )
+    return resolved
+
+
+def _effective_model(model: str, step: str) -> str:
+    """Return the per-step override for ``step``, else the caller's ``model``."""
+    return _STEP_MODELS.get(step) or model
 
 
 def normalize_prompt_name(name: str) -> str:
@@ -2007,6 +2192,7 @@ def _run_chunked_transcript_url(
     All chunks succeeded -> "done".
     Some chunks failed -> "partial" with raw sidecars for failed chunks.
     """
+    model = _effective_model(model, "transcript")
     channel_dir.mkdir(parents=True, exist_ok=True)
     transcript_path = channel_dir / f"{prefix}.transcript.md"
     if transcript_path.exists() and not force:
@@ -2540,6 +2726,23 @@ def is_skipped(output_dir, channel_name, video, mode: str | None = None) -> bool
 # ---------------------------------------------------------------------------
 
 
+# Any Gemini 3.x Flash id, dot-versioned or not: gemini-3-flash-preview,
+# gemini-3.1-flash-lite, gemini-3.5-flash, gemini-3.7-flash. The original
+# check was the literal substring "gemini-3-flash", which matches ONLY the
+# hyphenated 3.0 id - every dot-versioned Flash fell through to the Pro
+# branch and silently ran at thinking_level="low" instead of "minimal",
+# re-opening the issue #58 Gate 2 truncation vector on those models.
+_GEMINI_3_FLASH_RE = re.compile(r"gemini-3(?:\.\d+)?-flash")
+
+# Gemini 3.x Flash ids that reject thinking_level="minimal" with a 400.
+# 3.7 Flash launched with low/medium/high only (medium default); Google has
+# said minimal is a planned fast-follow. Kept as a denylist, not an allowlist,
+# so a future Flash that DOES support minimal needs no edit here - and so a
+# model that does not is a loud 400 at call time rather than a silent
+# fall-through to a costlier level.
+_NO_MINIMAL_THINKING_LEVEL = ("gemini-3.7-flash",)
+
+
 def _make_thinking_config_for_transcript(types, model: str):
     """Build a minimum-thinking ThinkingConfig for chunked transcription.
 
@@ -2553,7 +2756,13 @@ def _make_thinking_config_for_transcript(types, model: str):
     thinking_level. Returns None for unknown models so the SDK default
     applies and we don't 400 on a model we don't recognize.
     """
-    if "gemini-3-flash" in model:
+    if _GEMINI_3_FLASH_RE.search(model):
+        if any(m in model for m in _NO_MINIMAL_THINKING_LEVEL):
+            # LOW is the floor on this model. Verified against the live API
+            # 2026-08-17: MINIMAL returns 400 INVALID_ARGUMENT, and
+            # thinking_budget=0 is accepted but IGNORED (911 thinking tokens
+            # still billed), so there is no way to reach zero thinking here.
+            return types.ThinkingConfig(thinking_level="low")
         # Flash-exclusive level: lower than LOW. Confirmed in official docs at
         # ai.google.dev/gemini-api/docs/thinking and Firebase AI Logic guide.
         return types.ThinkingConfig(thinking_level="minimal")
@@ -2860,6 +3069,7 @@ def process_mindmap(
     if source not in ("video", "transcript"):
         raise ValueError(f"Invalid source={source!r}. Expected 'video' or 'transcript'.")
 
+    model = _effective_model(model, "mindmap")
     resolved_prefix = prefix if prefix is not None else video_file_prefix(video)
     resolved_channel_dir = channel_dir_override if channel_dir_override is not None else output_dir / channel_name
     resolved_channel_dir.mkdir(parents=True, exist_ok=True)
@@ -3732,6 +3942,7 @@ def process_transcript(
     VOD whose operator explicitly asked for ``gemini`` - this function behaves
     exactly as it did before issue #120, full parse-retry budget included.
     """
+    model = _effective_model(model, "transcript")
     channel_dir.mkdir(parents=True, exist_ok=True)
 
     transcript_path = channel_dir / f"{prefix}.transcript.md"
@@ -4105,6 +4316,7 @@ def process_concepts(
     determining artifact filenames. Used by the local-recovery path where the
     meta.json filename stem is the authoritative prefix (plan rev 4 F12).
     """
+    model = _effective_model(model, "concepts")
     resolved_prefix = prefix if prefix is not None else video_file_prefix(video)
     channel_dir = output_dir / channel_name
     channel_dir.mkdir(parents=True, exist_ok=True)
@@ -4281,6 +4493,11 @@ def cmd_scan(args, config):
     client = create_client(gemini_key)
     youtube = yt_build("youtube", "v3", developerKey=yt_key)
     output_dir = resolve_output_dir(config)
+    # Snapshot the channel list BEFORE the scan touches anything. This is the
+    # point of record: whatever config produced this run's corpus changes is
+    # now recoverable. Placed above every fetch and every write on purpose -
+    # a backup taken after a scan mutated the corpus documents the wrong state.
+    backup_config_if_changed(output_dir)
     model = resolve_model(args, config)
     max_parallel = config.get("max_parallel", 10)
 
@@ -9406,6 +9623,28 @@ Examples:
     # the cached= / prompt= / total= token counts.
     logging.getLogger("gemini_common").setLevel(configured_level)
     config = load_config()
+    # Mandatory config snapshot before any corpus-mutating command runs. `scan`
+    # also calls this itself (immediately before its first fetch, which is the
+    # precise point of record); the content compare makes the second call a
+    # no-op. Two call sites is deliberate belt-and-braces: a library caller
+    # invoking cmd_scan directly still gets the snapshot, and a config edit
+    # followed by `process --url` instead of a scan is still captured.
+    # Read-only commands (search, nugget, status, profile show) are excluded so
+    # they keep their zero-side-effect promise.
+    if args.command in CONFIG_BACKUP_COMMANDS:
+        try:
+            backup_config_if_changed(resolve_output_dir(config))
+        except Exception as e:  # never let the snapshot block real work
+            log.warning("Config backup skipped (%s: %s).", type(e).__name__, e)
+    # Resolve per-step model overrides once, before any command dispatch, so
+    # every Gemini-calling step in this run reads one consistent decision.
+    _STEP_MODELS.update(resolve_step_models(args, config))
+    if _STEP_MODELS:
+        log.info(
+            "Per-step models: %s (base: %s)",
+            ", ".join(f"{k}={v}" for k, v in sorted(_STEP_MODELS.items())),
+            resolve_model(args, config),
+        )
 
     if args.command == "scan":
         cmd_scan(args, config)

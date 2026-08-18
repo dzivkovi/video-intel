@@ -71,3 +71,11 @@ skill-eval-workspace/**
 .worktrees
 .playwright-mcp/
 
+# Raw Gemini responses cached by scripts/model_eval.py. Regenerable and bulky;
+# the committed evidence is the scorecard (.md/.json), not the raw payloads.
+tests/evals/model-cards/_raw/
+
+# Real A/B fixtures point at videos from the maintainer's private corpus and
+# annotate each with the defect it exposes - a curated-watchlist extract.
+# The committed template is model_fixtures.yaml.example (mirrors config.yaml).
+tests/evals/model_fixtures.yaml

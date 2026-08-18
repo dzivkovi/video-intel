@@ -45,7 +45,14 @@ Multimodal video scanning and transcription powered by Gemini.
 
 Three layers, designed as a narrowing funnel.
 
-1. **scan** - Fetch new videos from configured YouTube channels. For each
+1. **scan** - Fetch new videos from configured YouTube channels. Before any
+   fetch or write, scan snapshots the resolved config into
+   `<output_dir>/_config-backups/` as `config.<date>.yaml` plus
+   `config.latest.yaml`, so the channel list that produced a given corpus
+   state is always recoverable. It is automatic and content-compared: nothing
+   is written when the config has not changed, and a dated snapshot is never
+   overwritten. Do NOT hand-copy the config as a separate step; that habit is
+   what this replaces. Every other corpus-mutating command does the same. For each
    video, in this order: (a) Gemini multimodal transcript reading frames +
    audio + on-screen text; (b) mindmap built from that transcript via a
    text-only Gemini call (~10× cheaper than reading video, no 10800-frame
