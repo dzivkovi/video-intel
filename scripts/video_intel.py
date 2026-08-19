@@ -6617,7 +6617,12 @@ def cmd_concepts(args, config):
                 "published": meta.get("published", ""),
             }
 
-            to_process.append((ch_name, video, mindmap_path, meta.get("prompt")))
+            # Carry the ON-DISK prefix. process_concepts otherwise recomputes it
+            # from the video's current title, which diverges from the filename stem
+            # on every locally-recovered artifact - writing the concepts file (and a
+            # stub meta) under a prefix none of its siblings use. cmd_scan's concepts
+            # loop already threads this through; see issue #144.
+            to_process.append((ch_name, video, mindmap_path, meta.get("prompt"), prefix))
 
     if not to_process:
         log.info("All concepts up to date.")
@@ -6627,12 +6632,12 @@ def cmd_concepts(args, config):
     log.info("Extracting concepts from %d mindmaps...", total)
 
     if args.dry_run:
-        for ch_name, video, _mindmap_path, _ in to_process:
+        for ch_name, video, _mindmap_path, _, _disk_prefix in to_process:
             log.info("  [%s] %s - %s", ch_name, video["published"], video["title"])
         return
 
     t0 = time.monotonic()
-    for i, (ch_name, video, mindmap_path, source_prompt) in enumerate(to_process, 1):
+    for i, (ch_name, video, mindmap_path, source_prompt, disk_prefix) in enumerate(to_process, 1):
         mindmap_text = mindmap_path.read_text(encoding="utf-8")
         source_file = mindmap_path.name
 
@@ -6648,6 +6653,7 @@ def cmd_concepts(args, config):
             source_file=source_file,
             source_prompt=source_prompt,
             force=args.force,
+            prefix=disk_prefix,
         )
         log.info("[%d/%d] [%s] %s: %s", i, total, ch_name, prefix, status)
 
