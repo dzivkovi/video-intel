@@ -273,6 +273,33 @@ def build_mentions(records: list[tuple[VideoRecord, list[dict]]]) -> dict[str, l
     return by_concept
 
 
+def canonical_channel_by_video(mentions: list[Mention]) -> dict[str, str]:
+    """One canonical channel per video_id, chosen deterministically as the
+    lexicographically smallest channel among all mentions of that video
+    (issue #150 second review round, FIX10).
+
+    Shared by every consumer that groups or counts by channel - stability
+    selection (`select_stable_concepts`), the per-concept page
+    (`_concept_page`), and the MOC (`_index`) - so a video mis-filed under
+    two or more channel-folder names (a title-rotation duplicate not yet
+    cleaned by `dedupe --apply`) is counted, selected, AND rendered under
+    exactly ONE channel everywhere. Before this helper existed, selection
+    deduped by video_id but rendering did not: a duplicated video inflated
+    "N videos across M channels" on the concept page and the MOC, and the
+    video itself was listed twice - once under each channel heading. Picking
+    the smallest channel name (rather than, say, "first encountered") keeps
+    the result independent of iteration/insertion order, so any caller gets
+    the same answer regardless of which subset or ordering of mentions it
+    holds.
+    """
+    canon: dict[str, str] = {}
+    for m in mentions:
+        vid = m.video.video_id
+        if vid not in canon or m.video.channel < canon[vid]:
+            canon[vid] = m.video.channel
+    return canon
+
+
 def select_stable_concepts(
     mentions_by_concept: dict[str, list[Mention]],
     top_n: int = DEFAULT_TOP_N,
@@ -283,18 +310,17 @@ def select_stable_concepts(
     not claim a page even at high count). Deterministic tie-break on
     concept_id so a rerun with unchanged inputs orders identically.
 
-    Channel membership is deduped by video_id first (issue #150 FIX8b): a
-    title-rotation duplicate not yet cleaned by `dedupe` can leave the same
-    video_id filed under two channel-folder names, and counting each
-    occurrence's own `channel` directly would let that corpus-housekeeping
-    debt spoof cross-channel stability for what is really one video from one
-    creator - exactly what this filter exists to prevent.
+    Channel membership is deduped by video_id first (issue #150 FIX8b) via
+    `canonical_channel_by_video` - a title-rotation duplicate not yet
+    cleaned by `dedupe` can leave the same video_id filed under two
+    channel-folder names, and counting each occurrence's own `channel`
+    directly would let that corpus-housekeeping debt spoof cross-channel
+    stability for what is really one video from one creator - exactly what
+    this filter exists to prevent.
     """
     scored: list[tuple[str, int]] = []
     for cid, mentions in mentions_by_concept.items():
-        channel_by_video: dict[str, str] = {}
-        for m in mentions:
-            channel_by_video.setdefault(m.video.video_id, m.video.channel)
+        channel_by_video = canonical_channel_by_video(mentions)
         channels = set(channel_by_video.values())
         if len(channels) < min_channels:
             continue
@@ -468,8 +494,12 @@ def _concept_page(
     label = tax_entry.get("preferred_label") or mentions[0].preferred_label
     aliases = tax_entry.get("aliases") or []
     domain = tax_entry.get("domain") or ""
-    video_ids = sorted({m.video.video_id for m in mentions})
-    channels = sorted({m.video.channel for m in mentions})
+    # video_id-normalized (issue #150 FIX10): a video mis-filed under two
+    # channel-folder names must be counted once and rendered under exactly
+    # one channel heading below - see `canonical_channel_by_video`.
+    channel_by_video = canonical_channel_by_video(mentions)
+    video_ids = sorted(channel_by_video)
+    channels = sorted(set(channel_by_video.values()))
 
     lines = [
         "---",
@@ -499,9 +529,14 @@ def _concept_page(
         lines.append("")
 
     lines += [f"## Member videos ({len(video_ids)} across {len(channels)} channels)", ""]
+    # Grouped by CANONICAL channel, not each mention's raw `m.video.channel`
+    # (issue #150 FIX10): a video mis-filed under two channel-folder names
+    # would otherwise land in both groups and be listed under both headings.
+    # `seen_videos` below still guards within a group in case of duplicate
+    # Mention rows for the same video_id.
     by_channel: dict[str, list[Mention]] = {}
     for m in mentions:
-        by_channel.setdefault(m.video.channel, []).append(m)
+        by_channel.setdefault(channel_by_video[m.video.video_id], []).append(m)
     for channel in sorted(by_channel):
         lines += [f"### {channel}", "", "| Date | Video | As mentioned |", "|---|---|---|"]
         rows = sorted(by_channel[channel], key=lambda m: (m.video.published, m.video.title, m.video.video_id))
@@ -562,8 +597,12 @@ def _index(
     ]
     for i, cid in enumerate(selected_ids, start=1):
         mentions = mentions_by_concept[cid]
-        video_ids = {m.video.video_id for m in mentions}
-        channels = {m.video.channel for m in mentions}
+        # video_id-normalized (issue #150 FIX10), same helper and same
+        # policy as `_concept_page` and `select_stable_concepts` - the MOC
+        # count must agree with the concept page's own header.
+        channel_by_video = canonical_channel_by_video(mentions)
+        video_ids = set(channel_by_video)
+        channels = set(channel_by_video.values())
         label = taxonomy.get(cid, {}).get("preferred_label") or mentions[0].preferred_label
         lines.append(
             f"{i}. [[{slug_for[cid]}]] - {label} - {len(video_ids)} videos across "
@@ -646,17 +685,25 @@ def write_pages(pages: dict[str, str], out_dir: Path) -> None:
     Two namespace-collision guards (issue #150 FIX1), both scoped to
     `out_dir` only - this generator never looks outside its own `--out`:
 
-    - **Foreign-generator refusal.** Before overwriting ANY existing file,
-      its frontmatter is checked for a `generator:` value. A present value
-      that differs from `GENERATOR_NAME` aborts the whole run (nothing is
-      written) rather than silently clobbering another generator's page -
-      this is what protects a misconfigured `--out` that happens to point
-      at, say, `wiki_atlas.py`'s output directory.
+    - **Fail-closed ownership (issue #150 second review round, FIX9).** An
+      existing file is overwritten ONLY when its frontmatter's `generator:`
+      value is EXACTLY `GENERATOR_NAME`. Every other state - no frontmatter,
+      empty or malformed frontmatter, a foreign generator's stamp, or a
+      file that cannot be read at all - aborts the whole run (nothing is
+      written) rather than falling through to an overwrite. The prior
+      revision only refused when it could positively identify a *different*
+      generator's stamp; an unreadable file or missing/malformed
+      frontmatter fell through that check and was silently overwritten -
+      exactly the failure `_frontmatter_generator`'s own docstring warns
+      against, and the vector by which a same-named hand-authored note
+      would be destroyed by a routine rerun.
     - **Own-stale pruning.** After writing, files already in `out_dir` that
       this SAME generator wrote in a prior run but that are absent from the
       current page set are deleted. Foreign files, and files with no
       readable `generator:` stamp at all, are never touched - pruning only
-      ever removes pages this generator is sure it owns.
+      ever removes pages this generator is sure it owns. This half was
+      already fail-closed (`== GENERATOR_NAME`, not `!=`) before this pass;
+      it is unchanged here.
     """
     root = out_dir.resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -674,16 +721,23 @@ def write_pages(pages: dict[str, str], out_dir: Path) -> None:
             try:
                 existing_text = path.read_text(encoding="utf-8")
             except OSError as exc:
-                log.warning("could not read existing page %s to check its generator stamp: %s", path, exc)
-                existing_text = None
-            if existing_text is not None:
-                foreign_generator = _frontmatter_generator(existing_text)
-                if foreign_generator and foreign_generator != GENERATOR_NAME:
-                    raise SystemExit(
-                        f"refusing to overwrite {path}: it was generated by "
-                        f"'{foreign_generator}', not {GENERATOR_NAME}. Point --out at "
-                        "a directory not shared with another generator's pages."
-                    )
+                raise SystemExit(
+                    f"refusing to overwrite {path}: could not read it to verify "
+                    f"ownership ({exc}). Move the file aside or point --out at a "
+                    "different directory."
+                ) from exc
+            owner = _frontmatter_generator(existing_text)
+            if owner != GENERATOR_NAME:
+                reason = (
+                    f"generated by '{owner}'"
+                    if owner
+                    else "not stamped by any generator (missing, empty, or malformed frontmatter)"
+                )
+                raise SystemExit(
+                    f"refusing to overwrite {path}: it is {reason}, not {GENERATOR_NAME}. "
+                    "Move the file aside, or point --out at a directory not shared with "
+                    "another generator's pages or hand-authored notes."
+                )
         resolved[rel] = path
 
     for rel, path in resolved.items():

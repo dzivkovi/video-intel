@@ -571,6 +571,61 @@ class TestNamespaceCollisionGuards:
 
 
 # ---------------------------------------------------------------------------
+# Second review round FIX9: ownership is FAIL CLOSED - overwrite only on an
+# exact GENERATOR_NAME match; every other ownership state (absent, empty,
+# malformed, foreign, or unreadable frontmatter) refuses instead of falling
+# through to a silent overwrite.
+# ---------------------------------------------------------------------------
+
+
+class TestFailClosedOwnership:
+    def test_unstamped_human_file_colliding_with_current_page_refuses_and_preserves_bytes(self, tmp_path):
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        original = "# My own hand-written note\n\nDo not touch this, please.\n"
+        (out_dir / "some-concept.md").write_text(original, encoding="utf-8")
+
+        with pytest.raises(SystemExit):
+            write_pages({"some-concept.md": "generator-produced content"}, out_dir)
+
+        assert (out_dir / "some-concept.md").read_text(encoding="utf-8") == original
+
+    def test_malformed_unterminated_frontmatter_refuses_and_preserves_bytes(self, tmp_path):
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        # Opens a frontmatter block but never closes it - `_frontmatter_generator`
+        # cannot find the closing `---` and returns None, the same "no signal"
+        # outcome as no frontmatter at all.
+        malformed = "---\ngenerator: wiki_concepts.py\n\n# No closing delimiter above\n"
+        (out_dir / "some-concept.md").write_text(malformed, encoding="utf-8")
+
+        with pytest.raises(SystemExit):
+            write_pages({"some-concept.md": "generator-produced content"}, out_dir)
+
+        assert (out_dir / "some-concept.md").read_text(encoding="utf-8") == malformed
+
+    def test_empty_generator_value_refuses(self, tmp_path):
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        malformed = "---\ngenerator:\n---\n\n# Page\n"
+        (out_dir / "some-concept.md").write_text(malformed, encoding="utf-8")
+
+        with pytest.raises(SystemExit):
+            write_pages({"some-concept.md": "generator-produced content"}, out_dir)
+
+        assert (out_dir / "some-concept.md").read_text(encoding="utf-8") == malformed
+
+    def test_own_stamped_existing_page_is_overwritten_normally(self, tmp_path):
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        (out_dir / "some-concept.md").write_text(_frontmatter(wc.GENERATOR_NAME), encoding="utf-8")
+
+        write_pages({"some-concept.md": "brand new content"}, out_dir)
+
+        assert (out_dir / "some-concept.md").read_text(encoding="utf-8") == "brand new content"
+
+
+# ---------------------------------------------------------------------------
 # FIX3: as_mentioned fallback requires a whole-token match, not a substring
 # ---------------------------------------------------------------------------
 
@@ -761,3 +816,80 @@ class TestGeneratedFromPrivacy:
             assert f"generated_from: {corpus.name}" in content
             assert str(corpus) not in content
             assert str(tmp_path) not in content
+
+
+# ---------------------------------------------------------------------------
+# Second review round FIX10: rendering (concept page + MOC) is
+# video_id-normalized, mirroring the dedup `select_stable_concepts` already
+# applies. A video mis-filed under two channel-folder names (a
+# title-rotation duplicate not yet cleaned by `dedupe --apply`) must be
+# counted once, and rendered under exactly one channel heading, everywhere.
+# ---------------------------------------------------------------------------
+
+
+def _build_corpus_with_video_misfiled_under_two_channels(tmp_path: Path) -> Path:
+    """One video_id ('dup-vid') present under BOTH 'alpha' and 'zulu'
+    channel-folder names (title-rotation residue), plus two more genuinely
+    distinct videos in 'beta' and 'gamma' carrying the same concept - so the
+    concept clears the 3-channel stability bar via {alpha, beta, gamma}
+    (the canonical channel for 'dup-vid' is 'alpha', the lexicographically
+    smaller of {alpha, zulu}) while still exercising the duplicate-video
+    rendering path."""
+    corpus = tmp_path / "corpus"
+    _write_video(
+        corpus / "alpha",
+        "2026-01-01-dup",
+        concepts=[_concept("shared.thing", "Shared Thing", branch="Shared Topic")],
+        meta=_meta("dup-vid", "Duplicated Video", "2026-01-01", "alpha"),
+        mindmap_text=MINDMAP_A,
+    )
+    _write_video(
+        corpus / "zulu",
+        "2026-01-02-dup-retitled",
+        concepts=[_concept("shared.thing", "Shared Thing", branch="Shared Topic")],
+        meta=_meta("dup-vid", "Duplicated Video (retitled)", "2026-01-02", "zulu"),
+        mindmap_text=MINDMAP_A,
+    )
+    for i, channel in enumerate(["beta", "gamma"], start=1):
+        _write_video(
+            corpus / channel,
+            f"2026-0{i}-05-video",
+            concepts=[_concept("shared.thing", "Shared Thing", branch="Shared Topic")],
+            meta=_meta(f"vid-{channel}", f"Video {channel}", f"2026-0{i}-05", channel),
+            mindmap_text=MINDMAP_A,
+        )
+    return corpus
+
+
+class TestRenderingIsVideoIdNormalized:
+    def test_concept_page_header_and_moc_agree_on_deduped_counts(self, tmp_path):
+        corpus = _build_corpus_with_video_misfiled_under_two_channels(tmp_path)
+        pages = build_pages(corpus, top_n=20)
+        concept_page = next(content for name, content in pages.items() if name != f"{MOC_BASENAME}.md")
+        index = pages[f"{MOC_BASENAME}.md"]
+
+        # 3 distinct videos (dup-vid counted once) across 3 distinct
+        # channels (alpha, beta, gamma - "zulu" collapses into "alpha").
+        assert "## Member videos (3 across 3 channels)" in concept_page
+        assert "3 videos across 3 channels" in index
+
+    def test_duplicated_video_appears_under_exactly_one_channel_heading(self, tmp_path):
+        corpus = _build_corpus_with_video_misfiled_under_two_channels(tmp_path)
+        pages = build_pages(corpus, top_n=20)
+        concept_page = next(content for name, content in pages.items() if name != f"{MOC_BASENAME}.md")
+
+        assert concept_page.count("Duplicated Video") == 1
+        # canonical channel is "alpha" (lexicographically smaller than "zulu")
+        assert "### alpha" in concept_page
+        assert "### zulu" not in concept_page
+
+    def test_select_stable_concepts_and_rendering_agree_on_video_count(self, tmp_path):
+        corpus = _build_corpus_with_video_misfiled_under_two_channels(tmp_path)
+        records = collect_corpus_videos(corpus)
+        mentions = build_mentions(records)
+        selected = select_stable_concepts(mentions, top_n=20)
+        assert selected == ["shared.thing"]
+
+        canonical = wc.canonical_channel_by_video(mentions["shared.thing"])
+        assert len(canonical) == 3
+        assert canonical["dup-vid"] == "alpha"
