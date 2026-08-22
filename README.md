@@ -517,6 +517,17 @@ See [ADR-0012](docs/adr/ADR-0012-vector-search-lancedb-voyage.md) for
 embedding choices and [ADR-0013](docs/adr/ADR-0013-hybrid-search-rrf-fusion.md)
 for the hybrid search decision. Evaluation queries in `evals/`.
 
+## Knowledge compounding (wiki layer)
+
+Retrieval finds a passage; this layer files what you learn back into the corpus so it compounds instead of being re-paid every time.
+
+- **Nugget briefs persist.** `nugget "query"` now writes its cross-creator synthesis to `_briefings/nuggets/<date>-<query-slug>.md` by default, in addition to printing it as before. Same-day reruns get `-2`, `-3` suffixes rather than overwriting. Pass `--no-save` for the old stdout-only, fully write-free behavior.
+- **Citation isn't curation.** A nugget's front matter uses `cited_video_ids`, never `video_ids` — a video cited as evidence stays eligible for a future catch-up briefing rather than being silently marked "seen."
+- **Concept pages.** `python scripts/wiki_concepts.py --corpus <output_dir>` renders one browsable Obsidian page per taxonomy concept that is stable across three or more channels, with timestamped deep links and cross-links between related concepts — a human-readable atlas on top of `taxonomy.json`.
+- Both are derived, additive, and fully rebuildable — deleting `_briefings/nuggets/` or `_wiki/concept-pages/` loses nothing that can't be regenerated.
+
+See **[docs/wiki-layer.md](docs/wiki-layer.md)** for full usage, the safety rules around overwriting pages, and troubleshooting.
+
 ## The intelligence layer (optional)
 
 Beyond search, the repo can build a small **DuckDB analytics store** from your corpus and ask it harder questions: who covered an idea first, what is suddenly spiking, and how ideas connect. It is entirely optional - the scan/transcript/search pipeline above never touches it.
