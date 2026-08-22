@@ -9,8 +9,10 @@ description: >
   grounded in indexed evidence; ask about corpus status (last scan,
   video counts); summarize a specific video that is already in the corpus;
   decide if a video is worth watching based on its indexed content. This
-  skill is read-only against an existing corpus - it does not scan, index,
-  or transcribe. Safe to install globally and invoke from any project.
+  skill queries an existing corpus - it does not scan, index, or transcribe.
+  `nugget` is the one command that also writes: by default it persists its
+  synthesized brief back into the corpus under `_briefings/nuggets/` (pass
+  `--no-save` to skip that). Safe to install globally and invoke from any project.
   Trigger phrases: "find videos about [X]", "search my videos for [X]",
   "what videos cover [X]", "what did [creator] say about [Y]", "evidence
   for [claim]", "when did [creator] mention [Z]", "nugget brief on [X]",
@@ -31,7 +33,7 @@ description: >
   prints the resolved interest model and the paths of the two files
   that produce it, and writes nothing. For scanning new
   videos, transcribing, generating mindmaps, rebuilding the index,
-  persisting or initializing the profile, or any write operation on the
+  persisting or initializing the profile, or any other write operation on the
   corpus, use the video-intel skill
   from the plugin repo instead - those operations require channels
   configured and API keys the search skill does not need.
@@ -39,21 +41,28 @@ description: >
 
 # Video Intel Search
 
-Read-only query access to the video corpus. Pairs with the `video-intel` curate
-skill, which builds and maintains the corpus from the plugin repo.
+Query access to the video corpus. Pairs with the `video-intel` curate
+skill, which builds and maintains the corpus from the plugin repo. Three of
+the four commands here are read-only; `nugget` additionally persists its
+synthesis back into the corpus (see below) - it never scans, indexes, or
+transcribes.
 
 ## What This Skill Does
 
-Four read-only commands against the pre-built corpus:
+Four commands against the pre-built corpus:
 
 1. **`search`** - find videos and transcript passages by concept, keyword, or
    semantic similarity. Two modes: concept (fast, no API calls, returns video
    matches) and `--vector` (hybrid BM25 + vector + RRF, returns transcript
-   passages with timestamps).
+   passages with timestamps). Read-only.
 
 2. **`nugget`** - synthesize a consultant-grade cross-creator brief on a topic.
    Retrieves top-K evidence via hybrid search, feeds it through a Gemini-backed
-   synthesis prompt, returns attributed insights with timestamps.
+   synthesis prompt, returns attributed insights with timestamps. By default
+   also persists the brief as a corpus artifact under
+   `_briefings/nuggets/<date>-<query-slug>.md` so the same synthesis compounds
+   instead of being re-paid every time it's asked; pass `--no-save` to skip
+   the write and keep the old stdout-only behavior.
 
 3. **`status`** - report on corpus freshness (last scan per channel, video
    counts, taxonomy size). No API calls.
@@ -150,8 +159,12 @@ python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" nugget "context engine
 # Restrict to specific creators
 python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" nugget "graph RAG" --channel engineerprompt
 
-# Save the briefing to a file
+# Save the printed brief to a file of your own choosing, in addition to the
+# corpus artifact below
 python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" nugget "second brain patterns" --output brief.md
+
+# Skip persisting a corpus artifact - stdout only, old behavior
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" nugget "second brain patterns" --no-save
 ```
 
 Output structure: Query in Focus -> Creators Surveyed -> Consensus -> Divergence
@@ -159,10 +172,20 @@ Output structure: Query in Focus -> Creators Surveyed -> Consensus -> Divergence
 Emergent Synthesis (1+1=3) -> Follow-Up Questions. Every claim cites the creator
 and timestamp.
 
+**Persistence:** by default, the brief is also written to
+`_briefings/nuggets/<date>-<query-slug>.md` with front matter (`title`, `date`,
+`query`, `generator`, `cited_video_ids`). A same-day re-run of the same query
+gets a `-2`, `-3`, ... suffix rather than overwriting the earlier file. The
+persisted file's `cited_video_ids` field is deliberately distinct from a
+briefing's `video_ids` field: a video a nugget cites as evidence is not marked
+"seen" and stays eligible to surface in a future catch-up briefing - citation
+is weaker than curation.
+
 Options:
 - `--limit N` - max excerpts feeding synthesis (default 15)
 - `--channel X` - restrict to one creator
 - `--since Nd` - time-window filter (`Nd` or `YYYY-MM-DD`)
+- `--no-save` - skip persisting the corpus artifact (stdout only)
 - `--min-relevance F` - minimum RRF relevance score
 - `--no-expand` - disable Stage-1 taxonomy query expansion
 - `--output PATH` - write briefing to file instead of stdout
