@@ -231,13 +231,21 @@ CONFIG_BACKUP_DIR_NAME = "_config-backups"
 # Commands that mutate the corpus and therefore must snapshot the config first.
 # Deliberately EXCLUDES the remaining read-only surface (search, status, profile -
 # `profile show` promises zero filesystem side effects and `profile init` writes
-# only into _briefings, not the corpus channels). `nugget` moved INTO this set
-# in issue #147: once it persists a brief under `output_dir/_briefings/nuggets/`
-# it is corpus-mutating too, even though it never touches channel config or scan
-# state - conservative classification per the config-backup guardrail. Adding a
-# new corpus-mutating subcommand means adding it here; `tests/test_config_backup.py`
-# compares this set against the live dispatch table so a new command cannot
-# silently opt out.
+# only into _briefings, not the corpus channels). Adding a new corpus-mutating
+# subcommand means adding it here; `tests/test_config_backup.py` compares this
+# set against the live dispatch table so a new command cannot silently opt out.
+#
+# `nugget` is deliberately NOT here despite writing a file (issue #147
+# guardrail 3, `tests/test_config_backup.py`'s `WRITES_BUT_EXEMPT`). It writes
+# only an additive brief under `output_dir/_briefings/nuggets/` - never
+# channel config or scan state - so there is nothing here for a snapshot to
+# protect. Worse, snapshotting is actively harmful for `nugget` specifically:
+# it is reachable from the globally installed search skill, where the
+# resolved config is the channel-less user-level `~/.video-intel/config.yaml`
+# (step 3 of `load_config`'s precedence chain). Snapshotting THAT would
+# overwrite `config.latest.yaml` - the record of the channel list that
+# produced the corpus - with a config that has no channels at all, and would
+# churn a dated snapshot on every nugget query from outside the plugin repo.
 CONFIG_BACKUP_COMMANDS = frozenset(
     {
         "scan",
@@ -251,7 +259,6 @@ CONFIG_BACKUP_COMMANDS = frozenset(
         "dedupe",
         "prune-shorts",
         "mark-skip",
-        "nugget",
     }
 )
 
@@ -7888,7 +7895,7 @@ def _render_nugget_sources(hits: list[dict]) -> list[str]:
     return lines
 
 
-def render_nugget_brief_markdown(query: str, response_text: str, hits: list[dict], *, today=None) -> str:
+def render_nugget_brief_markdown(query: str, response_text: str, hits: list[dict], *, today: date | None = None) -> str:
     """Render a nugget brief as a persistable corpus artifact.
 
     Front matter uses `cited_video_ids` (NOT `video_ids`): `load_seen_video_ids`
@@ -7901,9 +7908,15 @@ def render_nugget_brief_markdown(query: str, response_text: str, hits: list[dict
 
     Body is the brief exactly as printed to stdout, plus a deterministic
     Sources section (see `_render_nugget_sources`). Pure function - no I/O.
+
+    `query`'s internal whitespace is collapsed to single spaces once here
+    (front matter, H1, and slug all use this collapsed form) so a
+    multi-line or oddly-spaced query can never break the YAML front matter
+    block or produce a ragged heading.
     """
     if today is None:
         today = datetime.now(UTC).date()
+    query = " ".join(query.split())
     cited_video_ids = sorted({h["video_id"] for h in hits if h.get("video_id")})
     front_matter = {
         "artifact_type": "nugget_brief",
@@ -7938,15 +7951,22 @@ def nugget_brief_slug(query: str) -> str:
     return slugify(query, max_len=60) or "query"
 
 
-def write_nugget_brief(output_dir: Path, query: str, response_text: str, hits: list[dict], *, today=None) -> Path:
+def write_nugget_brief(
+    output_dir: Path, query: str, response_text: str, hits: list[dict], *, today: date | None = None
+) -> Path:
     """Persist a nugget brief under `_briefings/nuggets/`, never clobbering same-day re-runs.
 
     Mirrors `cmd_briefings`'s suffix convention (`-2`, `-3`, ...) exactly:
     a same-day re-run of the same query gets a fresh file, not an overwrite,
     because overwriting would silently discard the earlier file's citations.
+
+    `query`'s internal whitespace is collapsed here too, so the filename slug
+    is built from the same one-liner that `render_nugget_brief_markdown`
+    stores in front matter.
     """
     if today is None:
         today = datetime.now(UTC).date()
+    query = " ".join(query.split())
     nuggets_dir = output_dir / BRIEFINGS_DIR_NAME / NUGGETS_SUBDIR_NAME
     nuggets_dir.mkdir(parents=True, exist_ok=True)
     base_name = f"{today.isoformat()}-{nugget_brief_slug(query)}"
@@ -8045,13 +8065,23 @@ def cmd_nugget(args, config):
     # Persist as a corpus artifact by default (issue #147) - filing the
     # synthesis back is the compounding move; --no-save opts out. This is a
     # log line (not print), so stdout stays exactly what it was pre-#147.
+    # Persistence failure must never swallow the synthesis: the brief the user
+    # paid a Gemini call for still reaches stdout/--output even when the disk
+    # write fails (permissions, unmounted cloud drive, disk full).
     if not getattr(args, "no_save", False):
-        saved_path = write_nugget_brief(output_dir, args.query, response_text, strong)
-        log.info(
-            "Nugget brief persisted: %s (cited_video_ids: %d)",
-            saved_path,
-            len({h["video_id"] for h in strong if h.get("video_id")}),
-        )
+        try:
+            saved_path = write_nugget_brief(output_dir, args.query, response_text, strong)
+            log.info(
+                "Nugget brief persisted: %s (cited_video_ids: %d)",
+                saved_path,
+                len({h["video_id"] for h in strong if h.get("video_id")}),
+            )
+        except OSError as e:
+            log.warning(
+                "Nugget brief persistence failed (%s: %s) - brief still printed below.",
+                type(e).__name__,
+                e,
+            )
 
     if getattr(args, "output", None):
         out_path = Path(args.output)
@@ -9872,8 +9902,12 @@ Examples:
     # invoking cmd_scan directly still gets the snapshot, and a config edit
     # followed by `process --url` instead of a scan is still captured.
     # Read-only commands (search, status, profile show) are excluded so they
-    # keep their zero-side-effect promise. `nugget` moved into
-    # CONFIG_BACKUP_COMMANDS in issue #147 once it started persisting briefs.
+    # keep their zero-side-effect promise. `nugget` is also excluded despite
+    # persisting a brief (issue #147 guardrail 3) - its write is additive-only
+    # under `_briefings/nuggets/` and never touches channel config or scan
+    # state, and it is reachable from the globally installed search skill
+    # where the resolved config is channel-less; see the comment on
+    # CONFIG_BACKUP_COMMANDS for why snapshotting it would be actively harmful.
     if args.command in CONFIG_BACKUP_COMMANDS:
         try:
             backup_config_if_changed(resolve_output_dir(config))

@@ -179,20 +179,29 @@ class TestEveryMutatingCommandSnapshots:
     read-only allowlist fails this test until someone classifies it.
     """
 
-    # `nugget` moved OUT of this set in issue #147: once it persists a brief
-    # under output_dir/_briefings/nuggets/ it is corpus-mutating, and belongs
-    # in CONFIG_BACKUP_COMMANDS instead.
     READ_ONLY = frozenset({"search", "status", "briefings", "profile"})
+
+    # `nugget` writes a file (a brief under output_dir/_briefings/nuggets/) so
+    # it is not READ_ONLY, but it is deliberately exempt from
+    # CONFIG_BACKUP_COMMANDS (issue #147 guardrail 3): the write is
+    # additive-only and never touches channel config or scan state, and
+    # nugget is reachable from the globally installed search skill where the
+    # resolved config is the channel-less user-level ~/.video-intel/config.yaml
+    # - snapshotting THAT would overwrite config.latest.yaml (the record of
+    # the channel list that produced the corpus) with a config that has no
+    # channels at all, and would churn a dated snapshot on every query.
+    WRITES_BUT_EXEMPT = frozenset({"nugget"})
 
     def test_all_dispatch_commands_are_classified(self):
         src = inspect.getsource(video_intel.main)
         dispatched = set(re.findall(r'args\.command == "([^"]+)"', src))
         assert dispatched, "could not parse the dispatch table"
-        unclassified = dispatched - CONFIG_BACKUP_COMMANDS - self.READ_ONLY
+        unclassified = dispatched - CONFIG_BACKUP_COMMANDS - self.READ_ONLY - self.WRITES_BUT_EXEMPT
         assert not unclassified, (
             f"subcommand(s) {sorted(unclassified)} are neither in "
-            "CONFIG_BACKUP_COMMANDS nor the read-only allowlist. Classify them: "
-            "if the command can mutate the corpus it MUST snapshot the config first."
+            "CONFIG_BACKUP_COMMANDS, the read-only allowlist, nor WRITES_BUT_EXEMPT. "
+            "Classify them: if the command can mutate the corpus it MUST snapshot "
+            "the config first, unless it has a documented exemption."
         )
 
     def test_backup_set_contains_no_phantom_commands(self):
@@ -204,10 +213,18 @@ class TestEveryMutatingCommandSnapshots:
     def test_scan_is_in_the_set(self):
         assert "scan" in CONFIG_BACKUP_COMMANDS
 
-    def test_nugget_is_in_the_set(self):
-        """Issue #147: nugget now writes into output_dir/_briefings/nuggets/,
-        so it is corpus-mutating and must snapshot the config first."""
-        assert "nugget" in CONFIG_BACKUP_COMMANDS
+    def test_nugget_is_exempt_from_config_backup(self):
+        """Issue #147 guardrail 3: nugget writes only its own brief under
+        output_dir/_briefings/nuggets/, never channel config or scan state, so
+        it does not need a config snapshot. Snapshotting it would actively
+        harm the corpus: nugget is reachable from the globally installed
+        search skill, where the resolved config is the channel-less
+        user-level ~/.video-intel/config.yaml - snapshotting THAT would
+        overwrite config.latest.yaml (the record of the channel list that
+        produced the corpus) and churn a dated snapshot on every query.
+        It is not READ_ONLY either, because it genuinely writes a file."""
+        assert "nugget" in self.WRITES_BUT_EXEMPT
+        assert "nugget" not in CONFIG_BACKUP_COMMANDS
         assert "nugget" not in self.READ_ONLY
 
 

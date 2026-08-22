@@ -73,7 +73,7 @@ video-intel/                          ← plugin root (git repo root)
 ├── .claude-plugin/plugin.json        ← plugin manifest (name, version, skill list)
 ├── skills/
 │   ├── video-intel/SKILL.md          ← curate: scan / transcript / mindmap / process / index / dedupe / concepts / taxonomy-build
-│   ├── video-intel-search/SKILL.md   ← read-only query: search / nugget / status / profile show (globally installable)
+│   ├── video-intel-search/SKILL.md   ← query: search / nugget (writes only its own brief) / status / profile show (globally installable)
 │   └── translate-bcs/SKILL.md        ← BCS subtitle translation
 ├── scripts/                          ← shared by all skills
 ├── prompts/                          ← shared by all skills
@@ -97,7 +97,7 @@ Each `SKILL.md` has its own frontmatter description and is independently trigger
 
 One INFO log line per invocation names the winning source (e.g. `"Config resolved from VIDEO_INTEL_OUTPUT_DIR=/foo"`).
 
-**Curate guard:** curate commands (`scan`, `concepts`, `dedupe`, and the `--channel` branch of `mindmap` / `transcript` / `process`) require `channels:` in the resolved config. Running them with the user-level minimal config (no channels) fails fast with an actionable message. Read-only commands (`search`, `nugget`, `status`, `index`, `taxonomy-build`, `profile show`) do not require `channels:`. `profile init` does not either - it stays curate-routed because it WRITES, not because it needs channels (issue #117).
+**Curate guard:** curate commands (`scan`, `concepts`, `dedupe`, and the `--channel` branch of `mindmap` / `transcript` / `process`) require `channels:` in the resolved config. Running them with the user-level minimal config (no channels) fails fast with an actionable message. Read-only commands (`search`, `status`, `index`, `taxonomy-build`, `profile show`) do not require `channels:`, and neither does `nugget` - it writes only an additive brief under `_briefings/nuggets/` and stays exempt from config snapshots (a channel-less config must never overwrite `config.latest.yaml`, the record of the channel list that produced the corpus). `profile init` does not require `channels:` either - it stays curate-routed because it WRITES, not because it needs channels (issue #117).
 
 ### User-level install (`video-intel-search` skill anywhere)
 
@@ -126,7 +126,8 @@ the user happens to be working, and the command writes nothing. `profile init`
 stays curate-only. The split is by **write scope, not by topic** - both
 commands concern the same two files, so a future edit that moves `init` into
 the search skill "to keep personalization together" would break that skill's
-read-only guarantee. Test contract: `tests/test_skill_descriptions.py::TestPersonalizationRoutingSplit`,
+no-curate-writes guarantee (nugget persists only its own brief under
+`_briefings/nuggets/`). Test contract: `tests/test_skill_descriptions.py::TestPersonalizationRoutingSplit`,
 `tests/test_curate_guard.py::TestProfileNeedsNoChannels`.
 
 **Shared utilities:** `scripts/gemini_common.py` — Gemini retry logic (`get_retry_delay`), client factory with httpx timeouts (`create_client`), lazy imports (`require_gemini`, `require_youtube`). Used by both scripts; kept minimal.

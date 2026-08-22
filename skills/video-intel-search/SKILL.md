@@ -62,7 +62,8 @@ Four commands against the pre-built corpus:
    also persists the brief as a corpus artifact under
    `_briefings/nuggets/<date>-<query-slug>.md` so the same synthesis compounds
    instead of being re-paid every time it's asked; pass `--no-save` to skip
-   the write and keep the old stdout-only behavior.
+   the write and keep the old stdout-only behavior. `--no-save` runs are
+   fully write-free (no config snapshot either).
 
 3. **`status`** - report on corpus freshness (last scan per channel, video
    counts, taxonomy size). No API calls.

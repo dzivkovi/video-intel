@@ -179,6 +179,36 @@ class TestWriteNuggetBrief:
         p2 = write_nugget_brief(out_dir, "q", "b2", [_hit()], today=date(2026, 8, 23))
         assert p2 == out_dir / "_briefings" / "nuggets" / "2026-08-23-q.md"
 
+    def test_query_that_slugifies_empty_falls_back_to_query_literal(self, tmp_path):
+        out_dir = tmp_path / "corpus"
+        path = write_nugget_brief(out_dir, "???", "body", [_hit()], today=date(2026, 8, 22))
+        assert path == out_dir / "_briefings" / "nuggets" / "2026-08-22-query.md"
+
+
+# ---------------------------------------------------------------------------
+# Query whitespace collapse (P3) - a multi-line or ragged query must never
+# break the YAML front matter block or the H1/slug.
+# ---------------------------------------------------------------------------
+
+
+class TestQueryWhitespaceCollapse:
+    def test_render_collapses_internal_whitespace_and_round_trips_through_parse_front_matter(self):
+        from video_intel import parse_front_matter
+
+        query = "line one\n---\nline two"
+        content = render_nugget_brief_markdown(query, "body", [_hit(video_id="v1")], today=date(2026, 8, 22))
+
+        front_matter, _ = parse_front_matter(content)
+        assert front_matter["artifact_type"] == "nugget_brief"
+        assert front_matter["cited_video_ids"] == ["v1"]
+        assert front_matter["query"] == "line one --- line two"
+        assert "# Nugget brief - line one --- line two" in content
+
+    def test_write_nugget_brief_slug_uses_collapsed_query(self, tmp_path):
+        out_dir = tmp_path / "corpus"
+        path = write_nugget_brief(out_dir, "line one\nline two", "body", [_hit()], today=date(2026, 8, 22))
+        assert path == out_dir / "_briefings" / "nuggets" / "2026-08-22-line-one-line-two.md"
+
 
 # ---------------------------------------------------------------------------
 # load_seen_video_ids must be unaffected by nugget artifacts (issue #80/#88)
@@ -286,12 +316,19 @@ class TestCmdNuggetPersistence:
 
     def test_no_save_writes_nothing(self, nugget_env, capsys):
         vi, config, output_dir = nugget_env
+        # Snapshot the ENTIRE output_dir tree, not just _briefings/nuggets/, so
+        # --no-save's zero-write promise is checked everywhere, not only in the
+        # one place the writer under test happens to write.
+        before = sorted(str(p.relative_to(output_dir)) for p in output_dir.rglob("*"))
+
         vi.cmd_nugget(_args(no_save=True), config)
 
         out = capsys.readouterr().out
         assert "They agree." in out  # stdout still unchanged
-        nuggets_dir = output_dir / "_briefings" / "nuggets"
-        assert not nuggets_dir.exists() or not list(nuggets_dir.glob("*.md"))
+        after = sorted(str(p.relative_to(output_dir)) for p in output_dir.rglob("*"))
+        assert after == before, (
+            f"--no-save must write nothing anywhere under output_dir; new: {sorted(set(after) - set(before))}"
+        )
 
     def test_two_runs_same_day_do_not_clobber(self, nugget_env):
         vi, config, output_dir = nugget_env
@@ -302,3 +339,49 @@ class TestCmdNuggetPersistence:
         files = sorted(p.name for p in nuggets_dir.glob("*.md"))
         assert len(files) == 2
         assert any(name.endswith("-2.md") for name in files)
+
+    def test_output_flag_combined_with_default_persistence_writes_both_files(self, nugget_env, tmp_path):
+        vi, config, output_dir = nugget_env
+        out_file = tmp_path / "manual-output.md"
+        vi.cmd_nugget(_args(output=str(out_file)), config)
+
+        assert out_file.exists()
+        assert "They agree." in out_file.read_text(encoding="utf-8")
+
+        nuggets_dir = output_dir / "_briefings" / "nuggets"
+        files = list(nuggets_dir.glob("*.md"))
+        assert len(files) == 1, "the default persistence must still fire when --output is also given"
+
+
+class TestCmdNuggetPersistenceFailureIsNonFatal:
+    """Issue #147 review finding P1: a disk-write failure while persisting the
+    brief must not swallow the synthesis. The user already paid for the
+    Gemini call; the brief must still reach stdout, and the command must not
+    raise/exit."""
+
+    def test_persist_failure_still_prints_brief_and_does_not_raise(self, nugget_env, capsys, monkeypatch):
+        vi, config, _output_dir = nugget_env
+
+        def boom(*a, **kw):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(vi, "write_nugget_brief", boom)
+        vi.cmd_nugget(_args(), config)  # must not raise / SystemExit
+
+        out = capsys.readouterr().out
+        assert "They agree." in out
+
+
+class TestCmdNuggetEmptyResponse:
+    """An empty/falsy `response.text` must exit cleanly with nothing persisted,
+    matching the pre-existing `if not response_text: sys.exit(1)` branch."""
+
+    def test_empty_response_exits_and_persists_nothing(self, nugget_env, monkeypatch):
+        vi, config, output_dir = nugget_env
+        monkeypatch.setattr(vi, "create_client", lambda *a, **k: _FakeClient(""))
+
+        with pytest.raises(SystemExit):
+            vi.cmd_nugget(_args(), config)
+
+        nuggets_dir = output_dir / "_briefings" / "nuggets"
+        assert not nuggets_dir.exists() or not list(nuggets_dir.glob("*.md"))
