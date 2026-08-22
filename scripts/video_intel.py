@@ -229,11 +229,15 @@ def resolve_output_dir(config, *, create: bool = True):
 CONFIG_BACKUP_DIR_NAME = "_config-backups"
 
 # Commands that mutate the corpus and therefore must snapshot the config first.
-# Deliberately EXCLUDES the read-only surface (search, nugget, status, profile -
+# Deliberately EXCLUDES the remaining read-only surface (search, status, profile -
 # `profile show` promises zero filesystem side effects and `profile init` writes
-# only into _briefings, not the corpus channels). Adding a new corpus-mutating
-# subcommand means adding it here; `tests/test_config_backup.py` compares this
-# set against the live dispatch table so a new command cannot silently opt out.
+# only into _briefings, not the corpus channels). `nugget` moved INTO this set
+# in issue #147: once it persists a brief under `output_dir/_briefings/nuggets/`
+# it is corpus-mutating too, even though it never touches channel config or scan
+# state - conservative classification per the config-backup guardrail. Adding a
+# new corpus-mutating subcommand means adding it here; `tests/test_config_backup.py`
+# compares this set against the live dispatch table so a new command cannot
+# silently opt out.
 CONFIG_BACKUP_COMMANDS = frozenset(
     {
         "scan",
@@ -247,6 +251,7 @@ CONFIG_BACKUP_COMMANDS = frozenset(
         "dedupe",
         "prune-shorts",
         "mark-skip",
+        "nugget",
     }
 )
 
@@ -7843,6 +7848,118 @@ def build_nugget_prompt(template: str, query: str, hits: list[dict]) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# nugget brief persistence (issue #147) - filing query results back into the
+# corpus is the wiki pattern's compounding move: the same cross-creator
+# synthesis is otherwise re-paid every time it's asked (ADR-0018).
+# ---------------------------------------------------------------------------
+
+NUGGETS_SUBDIR_NAME = "nuggets"
+
+
+def _render_nugget_sources(hits: list[dict]) -> list[str]:
+    """Deterministic "Sources" section preserving every `&t=` deep link.
+
+    The synthesized brief cites creators as `[creator @ HH:MM]` per the
+    nugget-brief prompt's format spec, which is not guaranteed to be a
+    clickable link. This section is the guaranteed click-through record -
+    timestamps are data, not decoration (existing guardrail). Built straight
+    from the same hits fed to the prompt, not re-derived from the brief text.
+    """
+    lines = ["## Sources", ""]
+    seen_urls: set[str] = set()
+    for hit in hits:
+        video_id = hit.get("video_id")
+        if not video_id:
+            continue  # never fabricate a link we can't ground
+        vid_url = f"https://www.youtube.com/watch?v={video_id}"
+        ts_secs = hit.get("timestamp_seconds", 0)
+        if ts_secs:
+            vid_url += f"&t={ts_secs}"
+        if vid_url in seen_urls:
+            continue
+        seen_urls.add(vid_url)
+        safe_title = str(hit.get("title", "")).replace("[", "\\[").replace("]", "\\]")
+        channel = hit.get("channel", "")
+        timestamp = hit.get("timestamp", "")
+        lines.append(f"- [{safe_title}]({vid_url}) - {channel} @ {timestamp}")
+    if len(lines) == 2:
+        return []  # no groundable links at all - omit the section entirely
+    return lines
+
+
+def render_nugget_brief_markdown(query: str, response_text: str, hits: list[dict], *, today=None) -> str:
+    """Render a nugget brief as a persistable corpus artifact.
+
+    Front matter uses `cited_video_ids` (NOT `video_ids`): `load_seen_video_ids`
+    unions `video_ids` across every `_briefings/**/*.md` to decide what a
+    catch-up briefing may skip (issue #80/#88). A nugget citing a video as
+    evidence must NOT silently mark it "seen" and suppress it from future
+    catch-up briefings - citation is weaker than curation. Promoting nugget
+    citations into the seen set is a deliberate future change with its own
+    ticket, not a side effect of this one.
+
+    Body is the brief exactly as printed to stdout, plus a deterministic
+    Sources section (see `_render_nugget_sources`). Pure function - no I/O.
+    """
+    if today is None:
+        today = datetime.now(UTC).date()
+    cited_video_ids = sorted({h["video_id"] for h in hits if h.get("video_id")})
+    front_matter = {
+        "artifact_type": "nugget_brief",
+        "schema_version": 1,
+        "title": f"Nugget brief - {query}",
+        "date": today.isoformat(),
+        "query": query,
+        "generator": {"name": "nugget", "version": 1},
+        "cited_video_ids": cited_video_ids,
+    }
+    lines = [
+        "---",
+        yaml.safe_dump(front_matter, sort_keys=False, allow_unicode=True).rstrip(),
+        "---",
+        "",
+        f"# Nugget brief - {query}",
+        "",
+        response_text.strip(),
+        "",
+    ]
+    sources = _render_nugget_sources(hits)
+    if sources:
+        lines.append("---")
+        lines.append("")
+        lines.extend(sources)
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def nugget_brief_slug(query: str) -> str:
+    """Filesystem-safe slug for a nugget query, mirroring the briefings convention."""
+    return slugify(query, max_len=60) or "query"
+
+
+def write_nugget_brief(output_dir: Path, query: str, response_text: str, hits: list[dict], *, today=None) -> Path:
+    """Persist a nugget brief under `_briefings/nuggets/`, never clobbering same-day re-runs.
+
+    Mirrors `cmd_briefings`'s suffix convention (`-2`, `-3`, ...) exactly:
+    a same-day re-run of the same query gets a fresh file, not an overwrite,
+    because overwriting would silently discard the earlier file's citations.
+    """
+    if today is None:
+        today = datetime.now(UTC).date()
+    nuggets_dir = output_dir / BRIEFINGS_DIR_NAME / NUGGETS_SUBDIR_NAME
+    nuggets_dir.mkdir(parents=True, exist_ok=True)
+    base_name = f"{today.isoformat()}-{nugget_brief_slug(query)}"
+    out_path = nuggets_dir / f"{base_name}.md"
+    counter = 2
+    while out_path.exists():
+        out_path = nuggets_dir / f"{base_name}-{counter}.md"
+        counter += 1
+    content = render_nugget_brief_markdown(query, response_text, hits, today=today)
+    out_path.write_text(content, encoding="utf-8")
+    return out_path
+
+
 def cmd_nugget(args, config):
     """Synthesize a consultant-grade multi-creator nugget brief for a query."""
     output_dir = resolve_output_dir(config)
@@ -7924,6 +8041,17 @@ def cmd_nugget(args, config):
     if not response_text:
         log.error("No response from Gemini after %d retries.", max_retries)
         sys.exit(1)
+
+    # Persist as a corpus artifact by default (issue #147) - filing the
+    # synthesis back is the compounding move; --no-save opts out. This is a
+    # log line (not print), so stdout stays exactly what it was pre-#147.
+    if not getattr(args, "no_save", False):
+        saved_path = write_nugget_brief(output_dir, args.query, response_text, strong)
+        log.info(
+            "Nugget brief persisted: %s (cited_video_ids: %d)",
+            saved_path,
+            len({h["video_id"] for h in strong if h.get("video_id")}),
+        )
 
     if getattr(args, "output", None):
         out_path = Path(args.output)
@@ -9597,6 +9725,12 @@ Examples:
         "--output",
         help="Write briefing to this file instead of stdout",
     )
+    nugget_parser.add_argument(
+        "--no-save",
+        action="store_true",
+        dest="no_save",
+        help="Skip persisting the brief to _briefings/nuggets/ (default: saves)",
+    )
 
     # status command
     subparsers.add_parser("status", help="Show corpus status: output dir, channels, artifact counts")
@@ -9737,8 +9871,9 @@ Examples:
     # no-op. Two call sites is deliberate belt-and-braces: a library caller
     # invoking cmd_scan directly still gets the snapshot, and a config edit
     # followed by `process --url` instead of a scan is still captured.
-    # Read-only commands (search, nugget, status, profile show) are excluded so
-    # they keep their zero-side-effect promise.
+    # Read-only commands (search, status, profile show) are excluded so they
+    # keep their zero-side-effect promise. `nugget` moved into
+    # CONFIG_BACKUP_COMMANDS in issue #147 once it started persisting briefs.
     if args.command in CONFIG_BACKUP_COMMANDS:
         try:
             backup_config_if_changed(resolve_output_dir(config))

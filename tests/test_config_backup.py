@@ -179,7 +179,10 @@ class TestEveryMutatingCommandSnapshots:
     read-only allowlist fails this test until someone classifies it.
     """
 
-    READ_ONLY = frozenset({"search", "nugget", "status", "briefings", "profile"})
+    # `nugget` moved OUT of this set in issue #147: once it persists a brief
+    # under output_dir/_briefings/nuggets/ it is corpus-mutating, and belongs
+    # in CONFIG_BACKUP_COMMANDS instead.
+    READ_ONLY = frozenset({"search", "status", "briefings", "profile"})
 
     def test_all_dispatch_commands_are_classified(self):
         src = inspect.getsource(video_intel.main)
@@ -200,6 +203,12 @@ class TestEveryMutatingCommandSnapshots:
 
     def test_scan_is_in_the_set(self):
         assert "scan" in CONFIG_BACKUP_COMMANDS
+
+    def test_nugget_is_in_the_set(self):
+        """Issue #147: nugget now writes into output_dir/_briefings/nuggets/,
+        so it is corpus-mutating and must snapshot the config first."""
+        assert "nugget" in CONFIG_BACKUP_COMMANDS
+        assert "nugget" not in self.READ_ONLY
 
 
 class TestScanSnapshotsBeforeMutating:
