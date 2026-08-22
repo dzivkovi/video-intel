@@ -1,4 +1,4 @@
-"""Tests for scripts/wiki_concepts.py (issue #148).
+"""Tests for scripts/wiki_concepts.py (issue #148, hardened for PR #150).
 
 Contract under test:
 - stability filter excludes single-channel concepts even at high video count;
@@ -7,17 +7,36 @@ Contract under test:
 - identical inputs produce byte-identical output across two runs;
 - index links are checked against an INDEPENDENTLY derived expected path
   (never by calling the writer's own slugify), per the PR #136
-  checker-uses-writer-path guardrail.
+  checker-uses-writer-path guardrail;
+- write_pages refuses to overwrite a foreign generator's page and prunes
+  only its own stale pages (issue #150 FIX1);
+- the as_mentioned timestamp fallback requires a whole-token match, not a
+  substring (issue #150 FIX3);
+- creator-authored text is escaped before landing in a table row or link
+  (issue #150 FIX4);
+- sibling discovery survives prefixes containing glob metacharacters
+  (issue #150 FIX5);
+- unreadable/unparseable files are logged and counted, never silent
+  (issue #150 FIX6);
+- slug collisions are disambiguated, and the MOC basename is reserved
+  (issue #150 FIX7);
+- --top rejects non-positive values, co-occurrence and channel-membership
+  counting dedup by video_id, and generated_from stores only the corpus
+  directory name (issue #150 FIX8).
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import re
+import sys
 from pathlib import Path
 
 import pytest
+import wiki_concepts as wc
 from wiki_concepts import (
+    MOC_BASENAME,
     build_co_occurrence,
     build_mentions,
     build_pages,
@@ -25,8 +44,10 @@ from wiki_concepts import (
     find_timestamp,
     mention_link,
     parse_mindmap_timestamps,
+    reset_skip_tracking,
     select_stable_concepts,
     sibling_artifacts,
+    skipped_file_count,
     write_pages,
 )
 
@@ -416,18 +437,327 @@ def _independently_computed_slug(concept_id: str) -> str:
     return slug or "concept"
 
 
+def _independently_assign_slugs(selected_ids: list[str]) -> dict[str, str]:
+    """Second, independently written collision-disambiguation pass (issue
+    #150 FIX7): does NOT call `wiki_concepts._assign_slugs`, so a bug in the
+    writer's own disambiguation algorithm would surface as a mismatch here
+    instead of trivially agreeing with itself - the same spirit as PR #136's
+    checker-uses-writer's-path lesson, applied to an algorithm instead of a
+    path. Reserves the MOC basename exactly like the writer does."""
+    used: set[str] = {MOC_BASENAME}
+    slug_for: dict[str, str] = {}
+    for cid in selected_ids:
+        base = slug = _independently_computed_slug(cid)
+        n = 2
+        while slug in used:
+            slug = f"{base}-{n}"
+            n += 1
+        used.add(slug)
+        slug_for[cid] = slug
+    return slug_for
+
+
+def _build_corpus_with_colliding_concept_ids(tmp_path: Path) -> Path:
+    """Two distinct concept_ids that slugify to the same base ('topic.one'
+    and 'topic_one' both -> 'topic-one'), each stable across 3 channels, so
+    the collision-disambiguation path is actually exercised end-to-end."""
+    corpus = tmp_path / "corpus"
+    for i, channel in enumerate(["alpha", "beta", "gamma"], start=1):
+        _write_video(
+            corpus / channel,
+            f"2026-0{i}-01-video-a",
+            concepts=[_concept("topic.one", "Topic One")],
+            meta=_meta(f"vid-a-{channel}", f"Video A {channel}", f"2026-0{i}-01", channel),
+        )
+        _write_video(
+            corpus / channel,
+            f"2026-0{i}-02-video-b",
+            concepts=[_concept("topic_one", "Topic One Alt")],
+            meta=_meta(f"vid-b-{channel}", f"Video B {channel}", f"2026-0{i}-02", channel),
+        )
+    return corpus
+
+
 class TestIndexLinksMatchWriterPaths:
     def test_index_links_resolve_to_pages_that_actually_exist_by_independent_slug(self, tmp_path):
         corpus = _build_corpus_with_related_concepts(tmp_path)
         pages = build_pages(corpus, top_n=20)
-        index = pages["index.md"]
+        index = pages[f"{MOC_BASENAME}.md"]
 
         records = collect_corpus_videos(corpus)
         mentions = build_mentions(records)
         selected = select_stable_concepts(mentions, top_n=20)
         assert selected, "fixture must produce at least one stable concept"
 
+        expected_slugs = _independently_assign_slugs(selected)
         for cid in selected:
-            expected_slug = _independently_computed_slug(cid)
+            expected_slug = expected_slugs[cid]
             assert f"[[{expected_slug}]]" in index
             assert f"{expected_slug}.md" in pages
+
+    def test_index_links_resolve_correctly_even_with_a_slug_collision(self, tmp_path):
+        corpus = _build_corpus_with_colliding_concept_ids(tmp_path)
+        pages = build_pages(corpus, top_n=20)
+        index = pages[f"{MOC_BASENAME}.md"]
+
+        records = collect_corpus_videos(corpus)
+        mentions = build_mentions(records)
+        selected = select_stable_concepts(mentions, top_n=20)
+        assert len(selected) >= 2, "fixture must produce a real collision to disambiguate"
+
+        expected_slugs = _independently_assign_slugs(selected)
+        seen_slugs: set[str] = set()
+        for cid in selected:
+            slug = expected_slugs[cid]
+            assert slug not in seen_slugs, "collision disambiguation must yield distinct slugs"
+            seen_slugs.add(slug)
+            assert f"[[{slug}]]" in index
+            assert f"{slug}.md" in pages
+
+
+# ---------------------------------------------------------------------------
+# FIX1: namespace collision with wiki_atlas - foreign-generator refusal and
+# own-stale-only pruning
+# ---------------------------------------------------------------------------
+
+
+def _frontmatter(generator: str | None) -> str:
+    lines = ["---"]
+    if generator is not None:
+        lines.append(f"generator: {generator}")
+    lines.append("---")
+    lines.append("")
+    lines.append("# Page")
+    lines.append("")
+    return "\n".join(line for line in lines if line is not None)
+
+
+class TestNamespaceCollisionGuards:
+    def test_refuses_to_overwrite_a_foreign_generators_page(self, tmp_path):
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        (out_dir / "some-concept.md").write_text(_frontmatter("wiki_atlas.py"), encoding="utf-8")
+
+        with pytest.raises(SystemExit, match=r"wiki_atlas\.py"):
+            write_pages({"some-concept.md": "new content"}, out_dir)
+
+        # nothing was overwritten by the aborted run
+        assert "wiki_atlas.py" in (out_dir / "some-concept.md").read_text(encoding="utf-8")
+
+    def test_prunes_only_its_own_stale_pages(self, tmp_path):
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        # own-stale: our generator wrote it, but it is not in this run's set
+        (out_dir / "stale-own.md").write_text(_frontmatter(wc.GENERATOR_NAME), encoding="utf-8")
+        # foreign: a different generator's page, must survive untouched
+        (out_dir / "foreign.md").write_text(_frontmatter("wiki_atlas.py"), encoding="utf-8")
+        # current: part of this run's page set, gets (re)written
+        current_content = _frontmatter(wc.GENERATOR_NAME)
+
+        write_pages({"current.md": current_content}, out_dir)
+
+        assert not (out_dir / "stale-own.md").exists()
+        assert (out_dir / "foreign.md").exists()
+        assert (out_dir / "current.md").exists()
+
+    def test_never_touches_a_page_with_no_readable_generator_stamp(self, tmp_path):
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        (out_dir / "hand-written.md").write_text("# Just a note\n", encoding="utf-8")
+
+        write_pages({"current.md": _frontmatter(wc.GENERATOR_NAME)}, out_dir)
+
+        assert (out_dir / "hand-written.md").exists()
+
+
+# ---------------------------------------------------------------------------
+# FIX3: as_mentioned fallback requires a whole-token match, not a substring
+# ---------------------------------------------------------------------------
+
+
+class TestAsMentionedWholeTokenFallback:
+    def test_short_substring_inside_an_unrelated_word_does_not_match(self):
+        text = "## H\n\n* **S**\n  - they said maintain discipline (3:00)\n"
+        entries = parse_mindmap_timestamps(text)
+        # "AI" is a substring of "maintain" and "said" but must not anchor here
+        assert find_timestamp(entries, branch="Nope", as_mentioned="AI") is None
+
+    def test_genuine_whole_token_still_resolves(self):
+        text = "## H\n\n* **S**\n  - they discussed context engineering deeply (4:15)\n"
+        entries = parse_mindmap_timestamps(text)
+        assert find_timestamp(entries, branch="Nope", as_mentioned="context") == 255
+
+    def test_boundary_rejects_a_substring_even_at_minimum_length(self):
+        # "test" (4 chars, meets the length floor) is a substring of
+        # "contest" but not a whole token there.
+        text = "## H\n\n* **S**\n  - the contest result surprised everyone (1:00)\n"
+        entries = parse_mindmap_timestamps(text)
+        assert find_timestamp(entries, branch="Nope", as_mentioned="test") is None
+
+
+# ---------------------------------------------------------------------------
+# FIX4: markdown escaping for creator-authored text
+# ---------------------------------------------------------------------------
+
+
+class TestMarkdownEscaping:
+    def test_title_with_pipe_and_brackets_renders_one_intact_row_and_a_working_link(self, tmp_path):
+        corpus = tmp_path / "corpus"
+        title = "GPT-5 | Full Breakdown [2026]"
+        _write_video(
+            corpus / "alpha",
+            "2026-01-01-video",
+            concepts=[_concept("shared.thing", "Shared Thing")],
+            meta=_meta("vid-a", title, "2026-01-01", "alpha"),
+            mindmap_text=MINDMAP_A,
+        )
+        for i, channel in enumerate(["beta", "gamma"], start=2):
+            _write_video(
+                corpus / channel,
+                f"2026-0{i}-01-video",
+                concepts=[_concept("shared.thing", "Shared Thing")],
+                meta=_meta(f"vid-{channel}", f"Video {channel}", f"2026-0{i}-01", channel),
+                mindmap_text=MINDMAP_A,
+            )
+        pages = build_pages(corpus, top_n=20)
+        concept_page = next(content for name, content in pages.items() if name != f"{MOC_BASENAME}.md")
+
+        table_rows = [line for line in concept_page.splitlines() if line.startswith("| 2026-01-01")]
+        assert len(table_rows) == 1, "the escaped title must not split into extra table cells/rows"
+        row = table_rows[0]
+        assert "GPT-5 \\| Full Breakdown \\[2026\\]" in row
+        # 4 structural separators (leading/trailing + 2 interior) plus the
+        # one escaped pipe from the title - the escaping keeps it a literal
+        # character, it does not remove it.
+        assert row.count("|") == 5
+        assert "](https://www.youtube.com/watch?v=vid-a" in row
+
+
+# ---------------------------------------------------------------------------
+# FIX5: sibling discovery survives glob metacharacters in the prefix
+# ---------------------------------------------------------------------------
+
+
+class TestSiblingDiscoveryWithGlobMetacharacters:
+    def test_bracketed_prefix_finds_meta_and_mindmap_siblings(self, tmp_path):
+        corpus = tmp_path / "corpus"
+        channel_dir = corpus / "alpha"
+        channel_dir.mkdir(parents=True)
+        prefix = "talk [final]"
+        _write_video(
+            channel_dir,
+            prefix,
+            concepts=[_concept("x.y", "X Y")],
+            meta=_meta("v1", "T", "2026-01-01", "alpha"),
+            mindmap_text=MINDMAP_A,
+        )
+        cpath = channel_dir / f"{prefix}.concepts.json"
+        sibs = sibling_artifacts(cpath)
+        assert sibs[".meta.json"] == channel_dir / f"{prefix}.meta.json"
+        assert sibs[".mindmap.md"] == channel_dir / f"{prefix}.mindmap.md"
+
+
+# ---------------------------------------------------------------------------
+# FIX6: unreadable/unparseable files are logged and counted
+# ---------------------------------------------------------------------------
+
+
+class TestSkippedFileTracking:
+    def test_corrupt_concepts_json_logs_a_warning_and_is_counted(self, tmp_path, caplog):
+        reset_skip_tracking()
+        channel_dir = tmp_path / "corpus" / "alpha"
+        channel_dir.mkdir(parents=True)
+        bad = channel_dir / "2026-01-01-broken.concepts.json"
+        bad.write_text("{not json", encoding="utf-8")
+
+        with caplog.at_level(logging.WARNING, logger="wiki_concepts"):
+            records = collect_corpus_videos(channel_dir.parent)
+
+        assert records == []
+        assert skipped_file_count() == 1
+        assert any(str(bad) in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# FIX7: slug collisions and the reserved MOC basename
+# ---------------------------------------------------------------------------
+
+
+class TestSlugCollisionsAndReservedMocBasename:
+    def test_colliding_concept_ids_get_disambiguated_slugs_in_rank_order(self):
+        slug_for = wc._assign_slugs(["dom.pact", "dom_pact"])
+        assert slug_for["dom.pact"] == "dom-pact"
+        assert slug_for["dom_pact"] == "dom-pact-2"
+
+    def test_moc_basename_cannot_be_claimed_by_a_concept(self):
+        slug_for = wc._assign_slugs(["concept.pages"])
+        assert slug_for["concept.pages"] != MOC_BASENAME
+        assert slug_for["concept.pages"] == f"{MOC_BASENAME}-2"
+
+
+# ---------------------------------------------------------------------------
+# FIX8: --top validation, video_id dedup, generated_from privacy
+# ---------------------------------------------------------------------------
+
+
+class TestTopValidation:
+    def test_top_zero_refuses(self, monkeypatch, tmp_path, capsys):
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        monkeypatch.setattr(sys, "argv", ["wiki_concepts.py", "--corpus", str(corpus), "--top", "0"])
+        with pytest.raises(SystemExit):
+            wc.main()
+        assert "--top" in capsys.readouterr().err
+
+    def test_top_negative_refuses(self, monkeypatch, tmp_path, capsys):
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        monkeypatch.setattr(sys, "argv", ["wiki_concepts.py", "--corpus", str(corpus), "--top", "-1"])
+        with pytest.raises(SystemExit):
+            wc.main()
+        assert "--top" in capsys.readouterr().err
+
+
+class TestDuplicateVideoDedup:
+    def test_co_occurrence_counts_a_title_rotation_duplicate_once(self, tmp_path):
+        corpus = tmp_path / "corpus"
+        # same video_id, two concepts.json files (title-rotation duplicate,
+        # pre-`dedupe --apply`), both listing the same concept pair
+        _write_video(
+            corpus / "alpha",
+            "2026-01-01-old-title",
+            concepts=[_concept("a.one", "A One"), _concept("a.two", "A Two")],
+            meta=_meta("dup-vid", "Old Title", "2026-01-01", "alpha"),
+        )
+        _write_video(
+            corpus / "alpha",
+            "2026-02-01-new-title",
+            concepts=[_concept("a.one", "A One"), _concept("a.two", "A Two")],
+            meta=_meta("dup-vid", "New Title", "2026-02-01", "alpha"),
+        )
+        records = collect_corpus_videos(corpus)
+        co = build_co_occurrence(records, {"a.one", "a.two"})
+        assert co["a.one"]["a.two"] == 1  # one real video, not two
+
+    def test_select_stable_concepts_dedups_channel_membership_by_video_id(self):
+        # A single video mis-filed under three channel-folder names (the
+        # residual state before `dedupe --apply` runs) must not spoof
+        # cross-channel stability - it is still ONE video.
+        mentions_by_concept = {
+            "solo.spoof": [
+                _fake_mention("solo.spoof", channel="alpha", video_id="dup-vid"),
+                _fake_mention("solo.spoof", channel="beta", video_id="dup-vid"),
+                _fake_mention("solo.spoof", channel="gamma", video_id="dup-vid"),
+            ],
+        }
+        assert select_stable_concepts(mentions_by_concept, min_channels=3) == []
+
+
+class TestGeneratedFromPrivacy:
+    def test_generated_from_stores_only_the_corpus_directory_name(self, tmp_path):
+        corpus = _build_corpus_with_related_concepts(tmp_path / "my-private-corpus-name")
+        pages = build_pages(corpus, top_n=20)
+        for content in pages.values():
+            assert f"generated_from: {corpus.name}" in content
+            assert str(corpus) not in content
+            assert str(tmp_path) not in content
