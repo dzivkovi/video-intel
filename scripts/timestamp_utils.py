@@ -7,16 +7,21 @@ firebreak that lets the standalone read-only analytics scripts
 `burst_report`) import without dragging in the curate stack. Adding a
 third-party import here re-couples all of them.
 
-Three groups live here:
+Four groups live here, and they do NOT share a calling convention - check the
+group before assuming an argument shape:
 
-* **Normalization** - `normalize_timestamp`, `normalize_mm_ss_zero_timestamp`,
-  `should_reinterpret_part_as_mm_ss_zero`, `timestamp_tolerance`. These fix
-  Gemini's known timestamp malformations before chunk-offset classification,
-  and keeping that Gemini-quirk knowledge in one place is what issue #58
-  motivated. **These four, and only these four, expect bracketed input**
-  (`[HH:MM:SS] ...` or `[MM:SS] ...`) at the start of `line`; a bare timestamp
-  without surrounding brackets passes through unchanged, so callers holding a
-  bare string must wrap it before calling.
+* **Line normalization** - `normalize_timestamp`, `normalize_mm_ss_zero_timestamp`.
+  These two, and only these two, take a single `line` string and expect
+  bracketed input (`[HH:MM:SS] ...` or `[MM:SS] ...`) at its start; a bare
+  timestamp without surrounding brackets passes through unchanged, so a caller
+  holding a bare string must wrap it before calling. They fix Gemini's known
+  timestamp malformations before chunk-offset classification, and keeping that
+  Gemini-quirk knowledge in one place is what issue #58 motivated.
+* **Classification support** - `should_reinterpret_part_as_mm_ss_zero(lines,
+  offset_seconds, chunk_duration_seconds)` takes a LIST of lines plus two
+  integers, and `timestamp_tolerance(chunk_duration_seconds)` takes a single
+  integer. Neither takes a `line`, and neither is interchangeable with the two
+  above.
 * **Parsing** - `parse_time_to_seconds`, which takes a BARE time string
   (`MM:SS`, `HH:MM:SS`, or raw seconds) and raises on anything else. Moved
   here from `video_intel.py`, which re-exports it.

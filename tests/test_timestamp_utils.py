@@ -1,5 +1,6 @@
 """Tests for timestamp_utils.py - pure functions, no API calls."""
 
+import ast
 import pathlib
 import subprocess
 import sys
@@ -186,8 +187,38 @@ class TestTimestampUtilsStaysStdlibOnly:
     """CLAUDE.md states in bold that this module must never gain a dependency
     beyond the standard library, because that is what lets the five standalone
     analytics scripts import without the curate stack. Prose asserting an
-    invariant is not the invariant, so enforce it: import the module in a
-    subprocess with every non-stdlib top-level package blocked."""
+    invariant is not the invariant, so enforce it two ways.
+
+    Two checks, because neither alone is sufficient:
+
+    * The **runtime** check imports the module in a subprocess with non-stdlib
+      top-level packages blocked. Its known limit: `sys.meta_path` is consulted
+      only AFTER `sys.modules`, so a package already loaded during interpreter
+      startup (a `.pth` hook, for instance) would import without the blocker
+      ever running. The child runs with `-S` to shrink that window, but the
+      hole cannot be fully closed from inside the interpreter, so this check
+      does not prove "every" non-stdlib import is blocked.
+    * The **static** check reads the module's own AST and asserts every
+      top-level import names a stdlib module. This has no `sys.modules` blind
+      spot at all, and it is what actually enforces the documented rule.
+    """
+
+    def test_no_import_statement_names_a_non_stdlib_module(self):
+        source = (pathlib.Path(__file__).resolve().parent.parent / "scripts" / "timestamp_utils.py").read_text(
+            encoding="utf-8"
+        )
+        roots: set[str] = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Import):
+                roots.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                roots.add(node.module.split(".")[0])
+        offenders = sorted(r for r in roots if r not in sys.stdlib_module_names and r not in sys.builtin_module_names)
+        assert not offenders, (
+            f"timestamp_utils imports non-stdlib module(s) {offenders}. That breaks the "
+            "import-weight firebreak documented in CLAUDE.md: the five standalone analytics "
+            "scripts import this module precisely because it is stdlib-only."
+        )
 
     def test_import_succeeds_with_all_third_party_packages_blocked(self):
         child_script = textwrap.dedent("""
@@ -208,7 +239,9 @@ class TestTimestampUtilsStaysStdlibOnly:
             print('OK')
             """)
         result = subprocess.run(
-            [sys.executable, "-c", child_script],
+            # -S skips site processing, shrinking the set of packages already in
+            # sys.modules before our finder is installed (see the class docstring).
+            [sys.executable, "-S", "-c", child_script],
             cwd=str(pathlib.Path(__file__).resolve().parent.parent / "scripts"),
             capture_output=True,
             text=True,
