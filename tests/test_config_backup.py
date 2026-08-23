@@ -15,9 +15,11 @@ silently opt out of snapshotting.
 
 from __future__ import annotations
 
+import ast
 import inspect
 import pathlib
 import re
+import textwrap
 
 import pytest
 
@@ -30,6 +32,134 @@ from video_intel import (
 
 CFG_A = b"model: gemini-3.5-flash\nchannels:\n  - name: alpha\n"
 CFG_B = b"model: gemini-3.5-flash\nchannels:\n  - name: alpha\n  - name: beta\n"
+
+
+def _is_args_command(node: ast.AST) -> bool:
+    """True for the attribute access `args.command`, either side of a Compare."""
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "command"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "args"
+    )
+
+
+def _str_constants(node: ast.AST) -> list[str]:
+    """Collect string literals out of a single comparator.
+
+    A plain `ast.Constant` covers `== "scan"`; a `Tuple`/`List`/`Set` covers the
+    `in ("a", "b")` membership form. Non-str constants (True, None, 1, ...) are
+    dropped on purpose - they cannot be dispatch command names.
+    """
+    if isinstance(node, ast.Constant):
+        return [node.value] if isinstance(node.value, str) else []
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return [elt.value for elt in node.elts if isinstance(elt, ast.Constant) and isinstance(elt.value, str)]
+    return []
+
+
+def _case_str_constants(pattern: ast.AST) -> list[str]:
+    """Collect string literals out of a `case` pattern.
+
+    `case "scan":` is a MatchValue wrapping a Constant; `case "a" | "b":` is a
+    MatchOr of those. Anything else (a capture name, a class pattern, a guard)
+    names no literal command and contributes nothing.
+    """
+    if isinstance(pattern, ast.MatchValue):
+        return _str_constants(pattern.value)
+    if isinstance(pattern, ast.MatchOr):
+        out: list[str] = []
+        for sub in pattern.patterns:
+            out.extend(_case_str_constants(sub))
+        return out
+    return []
+
+
+def _dispatch_commands(src: str) -> set[str]:
+    """Extract dispatch command names from source text via the AST, not regex.
+
+    Why AST and not `re.findall(r'args\\.command == "([^"]+)"', src)`: the regex
+    is quote-sensitive. A future branch written `args.command == 'x'` (single
+    quotes) would be silently dropped from the inventory while the test's
+    `assert dispatched` guard still passes - the test would keep passing while
+    quietly losing its ability to catch a subcommand that dodges
+    classification. The regex is also blind to `in (...)` membership dispatch
+    and can match text inside a string literal or a comment. Walking `Compare`
+    nodes sidesteps all three: it sees exactly the comparisons Python itself
+    will evaluate, regardless of quoting style, comparison shape, or where the
+    text `args.command == "..."` happens to appear as a substring. A
+    `match args.command:` statement is inventoried through its `case` patterns
+    for the same reason.
+    """
+    tree = ast.parse(textwrap.dedent(src))
+    commands: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Match) and _is_args_command(node.subject):
+            # `match args.command:` / `case "scan":`. A 16-branch if/elif chain is
+            # the single most likely thing a future refactor rewrites as a match
+            # statement, and a PARTIAL conversion is the exact silent-drop this
+            # helper exists to prevent: the un-converted branches keep the
+            # inventory non-empty, so `assert dispatched` still passes while the
+            # converted subcommands vanish from classification.
+            for case in node.cases:
+                commands.update(_case_str_constants(case.pattern))
+            continue
+        if not isinstance(node, ast.Compare):
+            continue
+        # Comparison chaining (`a == b == c`) puts several ops/comparators on
+        # one Compare node; zip them instead of only looking at index 0 so a
+        # chained dispatch condition is not silently truncated.
+        left = node.left
+        # ast.Compare structurally guarantees len(ops) == len(comparators);
+        # strict=True documents that expectation rather than defending
+        # against a real case (the branch it would guard is unreachable).
+        for op, comparator in zip(node.ops, node.comparators, strict=True):
+            if isinstance(op, ast.Eq):
+                if _is_args_command(left):
+                    commands.update(_str_constants(comparator))
+                elif _is_args_command(comparator):
+                    # Reversed form, e.g. `"scan" == args.command`.
+                    commands.update(_str_constants(left))
+            elif isinstance(op, ast.In) and _is_args_command(left):
+                commands.update(_str_constants(comparator))
+            left = comparator
+    return commands
+
+
+def _registered_commands(module_src: str) -> set[str]:
+    """Extract every top-level subcommand name registered via `subparsers.add_parser(...)`.
+
+    Anchored to the argparse registry rather than to any dispatch shape,
+    because the registry is undodgeable: a subcommand cannot exist without
+    being registered here, whereas `_dispatch_commands` can only see the
+    comparison shapes it knows about (a future `args.command == CMD_CONST`,
+    a dict dispatch, or a chain moved into a helper function would silently
+    vanish from that inventory while `assert dispatched` stays green).
+
+    The receiver filter (bare `ast.Name` with `id == "subparsers"`) is
+    load-bearing and was verified empirically: `scripts/video_intel.py` also
+    contains `profile_actions.add_parser("init")` / `add_parser("show")`,
+    which are sub-actions of the `profile` subcommand, not top-level
+    subcommands. Selecting by receiver name excludes them correctly. Do NOT
+    select by "whichever receiver has the most add_parser calls" - that is
+    a hack that would silently pick the wrong receiver if the code changed.
+    """
+    tree = ast.parse(textwrap.dedent(module_src))
+    commands: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "add_parser"):
+            continue
+        if not (isinstance(func.value, ast.Name) and func.value.id == "subparsers"):
+            continue
+        if not node.args:
+            continue
+        first = node.args[0]
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            commands.add(first.value)
+    return commands
 
 
 @pytest.fixture
@@ -193,10 +323,17 @@ class TestEveryMutatingCommandSnapshots:
     WRITES_BUT_EXEMPT = frozenset({"nugget"})
 
     def test_all_dispatch_commands_are_classified(self):
-        src = inspect.getsource(video_intel.main)
-        dispatched = set(re.findall(r'args\.command == "([^"]+)"', src))
-        assert dispatched, "could not parse the dispatch table"
-        unclassified = dispatched - CONFIG_BACKUP_COMMANDS - self.READ_ONLY - self.WRITES_BUT_EXEMPT
+        """Inventory is the UNION of the argparse registry and the dispatch table.
+
+        Union, not either alone: a registered-but-undispatched command and a
+        dispatched-but-unregistered command must both still be forced through
+        classification.
+        """
+        main_src = inspect.getsource(video_intel.main)
+        module_src = inspect.getsource(video_intel)
+        inventory = _registered_commands(module_src) | _dispatch_commands(main_src)
+        assert inventory, "could not parse the dispatch table or the argparse registry"
+        unclassified = inventory - CONFIG_BACKUP_COMMANDS - self.READ_ONLY - self.WRITES_BUT_EXEMPT
         assert not unclassified, (
             f"subcommand(s) {sorted(unclassified)} are neither in "
             "CONFIG_BACKUP_COMMANDS, the read-only allowlist, nor WRITES_BUT_EXEMPT. "
@@ -205,10 +342,42 @@ class TestEveryMutatingCommandSnapshots:
         )
 
     def test_backup_set_contains_no_phantom_commands(self):
-        src = inspect.getsource(video_intel.main)
-        dispatched = set(re.findall(r'args\.command == "([^"]+)"', src))
-        phantom = CONFIG_BACKUP_COMMANDS - dispatched
+        """Inventory is the argparse registry ALONE, not the union and not the dispatch table.
+
+        Now that the extractor supports `in (...)`, any unrelated
+        `args.command in (...)` guard inside main() would ADD a name to the
+        dispatch inventory and could mask a genuinely stale entry in
+        CONFIG_BACKUP_COMMANDS, making this phantom check vacuous (a real
+        example: `if args.command in CONFIG_BACKUP_COMMANDS:` near the top of
+        main() is exactly such a guard). The argparse registry cannot be
+        polluted by an in-function guard, so it is the only safe source for
+        this particular check.
+        """
+        module_src = inspect.getsource(video_intel)
+        registered = _registered_commands(module_src)
+        assert registered, "could not parse the argparse registry"
+        phantom = CONFIG_BACKUP_COMMANDS - registered
         assert not phantom, f"CONFIG_BACKUP_COMMANDS names non-existent command(s): {sorted(phantom)}"
+
+    def test_dispatch_inventory_matches_the_argparse_registry(self):
+        """The loud failure that catches an unrecognized dispatch shape.
+
+        The AST extractor recognizes `==`, `in (...)`, and `match`/`case`
+        forms; any OTHER dispatch shape (a constant comparand, a dict
+        dispatch, a chain moved into a helper function) makes THIS test fail
+        loudly instead of silently shrinking the inventory that
+        test_all_dispatch_commands_are_classified relies on.
+        """
+        main_src = inspect.getsource(video_intel.main)
+        module_src = inspect.getsource(video_intel)
+        registered = _registered_commands(module_src)
+        dispatched = _dispatch_commands(main_src)
+        assert registered == dispatched, (
+            "registered but not dispatched (dead subcommand, or a dispatch "
+            f"shape the AST extractor does not recognize): {sorted(registered - dispatched)}; "
+            "dispatched but not registered (dispatch table names a command "
+            f"argparse never registers): {sorted(dispatched - registered)}"
+        )
 
     def test_scan_is_in_the_set(self):
         assert "scan" in CONFIG_BACKUP_COMMANDS
@@ -249,3 +418,111 @@ class TestScanSnapshotsBeforeMutating:
         assert backup_at < min(fetch_positions), (
             "backup_config_if_changed must run BEFORE cmd_scan's first fetch/mutation"
         )
+
+
+class TestDispatchExtractor:
+    r"""Coverage for `_dispatch_commands` itself, per issue #151.
+
+    The regex it replaces (`re.findall(r'args\.command == "([^"]+)"', src)`)
+    worked only by accident of every existing branch happening to use double
+    quotes. A future branch written with single quotes would have been
+    silently dropped from the inventory while `assert dispatched` kept
+    passing - the drift risk this class exists to close off.
+    """
+
+    def test_mixed_quoting_is_collected(self):
+        src = "if args.command == \"alpha\":\n    pass\nelif args.command == 'beta':\n    pass\n"
+        assert _dispatch_commands(src) == {"alpha", "beta"}
+
+    def test_membership_form_is_collected(self):
+        src = 'if args.command in ("gamma", "delta"):\n    pass\n'
+        assert _dispatch_commands(src) == {"gamma", "delta"}
+
+    def test_occurrences_inside_strings_and_comments_are_ignored(self):
+        src = (
+            '"""a docstring mentioning args.command == "phantom" as prose"""\n'
+            '# args.command == "ghost"\n'
+            'if args.command == "real":\n'
+            "    pass\n"
+        )
+        assert _dispatch_commands(src) == {"real"}
+
+    def test_reversed_form_is_collected(self):
+        src = 'if "epsilon" == args.command:\n    pass\n'
+        assert _dispatch_commands(src) == {"epsilon"}
+
+    def test_non_str_comparand_is_ignored(self):
+        src = (
+            "if args.command == True:\n    pass\nif args.command == 1:\n    pass\nif args.command is None:\n    pass\n"
+        )
+        assert _dispatch_commands(src) == set()
+
+    def test_never_drops_what_the_old_regex_found(self):
+        """No regression against the regex it replaces - not parity.
+
+        An `==` assertion here would go RED the moment anyone writes the
+        single-quoted or `in (...)` branch this refactor exists to support,
+        which is exactly the outcome the refactor is FOR. The AST extractor
+        must never DROP a name the regex found; it is expected and intended
+        to find MORE (membership forms, single quotes, match/case).
+        """
+        src = inspect.getsource(video_intel.main)
+        old_regex_result = set(re.findall(r'args\.command == "([^"]+)"', src))
+        assert old_regex_result, "the old regex found nothing; this guard is vacuous without a baseline"
+        assert old_regex_result <= _dispatch_commands(src)
+
+    def test_chained_comparison_is_collected(self):
+        """Direct test for the `left = comparator` / `zip(ops, comparators)` multi-op path.
+
+        Reverting to `node.ops[0]` / `node.comparators[0]` keeps every other
+        test in this class green, which means that code path was untested
+        before this test existed.
+        """
+        src = 'if "zeta" == args.command == "eta":\n    pass\n'
+        assert _dispatch_commands(src) == {"zeta", "eta"}
+
+    def test_list_literal_membership_is_collected(self):
+        src = 'if args.command in ["theta"]:\n    pass\n'
+        assert _dispatch_commands(src) == {"theta"}
+
+    def test_set_literal_membership_is_collected(self):
+        src = 'if args.command in {"iota"}:\n    pass\n'
+        assert _dispatch_commands(src) == {"iota"}
+
+    def test_match_statement_is_collected(self):
+        src = (
+            "match args.command:\n"
+            '    case "alpha":\n'
+            "        pass\n"
+            '    case "beta" | "gamma":\n'
+            "        pass\n"
+            "    case _:\n"
+            "        pass\n"
+        )
+        assert _dispatch_commands(src) == {"alpha", "beta", "gamma"}
+
+    def test_match_on_different_subject_is_ignored(self):
+        src = 'match args.other:\n    case "nope":\n        pass\n'
+        assert _dispatch_commands(src) == set()
+
+    def test_non_str_element_inside_membership_collection_is_dropped(self):
+        src = 'if args.command in ("ok", 1, None):\n    pass\n'
+        assert _dispatch_commands(src) == {"ok"}
+
+    def test_name_comparand_is_a_known_blind_spot(self):
+        """KNOWN and accepted limitation, not a bug to fix here.
+
+        `args.command == CMD_CONST` compares against a Name, not a string
+        literal, so `_str_constants` cannot resolve it and this extractor
+        correctly (if silently) sees nothing. In practice this class of gap
+        is caught by test_dispatch_inventory_matches_the_argparse_registry,
+        which cross-checks against the argparse registry and fails loudly
+        when a registered command never shows up here. The next reader
+        should not assume this AST walk is exhaustive on its own.
+        """
+        src = 'CMD_SCAN = "scan"\nif args.command == CMD_SCAN:\n    pass\n'
+        assert _dispatch_commands(src) == set()
+
+    def test_registered_commands_excludes_a_nested_sub_action_parser(self):
+        src = 'top_parser = subparsers.add_parser("top")\nnested_parser = profile_actions.add_parser("nested")\n'
+        assert _registered_commands(src) == {"top"}
