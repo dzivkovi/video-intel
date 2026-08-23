@@ -254,6 +254,7 @@ CONFIG_BACKUP_COMMANDS = frozenset(
         "process",
         "concepts",
         "taxonomy-build",
+        "topics-build",
         "index",
         "repair-metas",
         "dedupe",
@@ -3757,8 +3758,13 @@ def _record_concepts_error(meta_path: Path, video: dict, channel_dir: Path, erro
         log.warning("  could not record concepts failure in %s (%s)", meta_path, exc)
 
 
-def _transcript_identity_fields(video: dict, channel_dir: Path) -> dict:
+def _transcript_identity_fields(video: dict, channel_dir: Path | None, *, channel_name: str | None = None) -> dict:
     """Identity fields every transcript meta.json must carry (issue #66).
+
+    ``channel_name`` overrides the folder-derived name for the one caller whose
+    output folder is not the channel: the loose local-file path writes beside
+    the source video, where ``channel_dir.name`` is some arbitrary directory
+    while the meta's channel is ``_standalone``.
 
     The single-shot and captions transcript writers used to persist a meta with
     only ``{processed, transcript_status, ...}`` - no ``video_id`` - so when the
@@ -3771,7 +3777,7 @@ def _transcript_identity_fields(video: dict, channel_dir: Path) -> dict:
     fields = {
         "video_url": video.get("url"),
         "video_id": video.get("video_id"),
-        "channel": channel_dir.name,
+        "channel": channel_name if channel_name else (channel_dir.name if channel_dir is not None else None),
         "title": video.get("title"),
         "published": video.get("published"),
     }
@@ -3779,6 +3785,16 @@ def _transcript_identity_fields(video: dict, channel_dir: Path) -> dict:
     # previously-good field to None/"" - e.g. local-file flows where video["url"]
     # may be empty (ce-data-integrity review, #66). channel is always truthy.
     return {k: v for k, v in fields.items() if v}
+
+
+def usable_video_id(value: Any) -> bool:
+    """True when ``value`` can serve as the join key between corpus artifacts.
+
+    A YouTube video id is always a string; anything else on disk is malformed
+    data, and coercing it with ``str()`` would silently merge a hypothetical
+    ``123`` and ``"123"`` into one identity. Callers skip-with-WARNING instead.
+    """
+    return isinstance(value, str) and bool(value.strip())
 
 
 def _identity_from_mindmap_header(mindmap_path: Path) -> dict | None:
@@ -5063,6 +5079,23 @@ def cmd_scan(args, config):
 
 
 def cmd_mindmap(args, config):
+    """Generate a mind map for a single video (YouTube URL or local MP4).
+
+    Issue #146 C1: `_cmd_mindmap_impl` can register a pending --topic stamp
+    (a brand-new video whose meta.json does not exist yet) and only main()'s
+    finally used to flush it. A caller that invokes this command directly -
+    a test, or library use - bypasses main() and silently loses the stamp.
+    The `finally` here covers that gap; main()'s own flush stays as the
+    backstop for early exits and sys.exit paths, and is a no-op the second
+    time because flush_topic_stamps() drains the pending list.
+    """
+    try:
+        return _cmd_mindmap_impl(args, config)
+    finally:
+        flush_topic_stamps()
+
+
+def _cmd_mindmap_impl(args, config):
     """Generate a mind map for a single video (YouTube URL or local MP4)."""
     _, types = require_gemini()
 
@@ -5109,6 +5142,18 @@ def cmd_mindmap(args, config):
                 input_path, channel_name=channel_name, channel_dir=channel_dir_hint, args=args
             )
 
+            video = {
+                "video_id": identity["video_id"],
+                "url": identity["url"],
+                "title": identity["title"],
+                "published": identity["published"],
+            }
+            # Issue #146: provenance first. Registered with the WRITER's own
+            # (channel_dir, prefix) pair, and ahead of the skip return, because
+            # a --topic stamp is a curation fact about the video, not a report
+            # on whether this run did any work.
+            register_topic_stamp_target(args, video, identity["channel_dir"], identity["prefix"], identity["channel"])
+
             # F7: honor skip flag from existing meta.json before any Gemini work.
             if identity["meta_path"].exists():
                 existing = _read_meta_best_effort(identity["meta_path"], raise_on_os_error=False)
@@ -5116,12 +5161,6 @@ def cmd_mindmap(args, config):
                     log.info("Skipping %s (skip flag in meta.json blocks mindmap)", identity["prefix"])
                     return
 
-            video = {
-                "video_id": identity["video_id"],
-                "url": identity["url"],
-                "title": identity["title"],
-                "published": identity["published"],
-            }
             file_uri = upload_local_video(client, input_path)
             log.info("Generating mind map (%s, channel=%s): %s", prompt_name, channel_name, input_path.name)
             prefix, status = process_mindmap(
@@ -5152,6 +5191,7 @@ def cmd_mindmap(args, config):
             "title": input_path.stem,
             "published": datetime.fromtimestamp(input_path.stat().st_mtime).strftime("%Y-%m-%d"),
         }
+        register_topic_stamp_target(args, video, input_path.parent, input_path.stem, STANDALONE_CHANNEL)
         log.info("Generating mind map (%s): %s", prompt_name, input_path.name)
         prefix, status = process_mindmap(
             client,
@@ -5237,6 +5277,7 @@ def cmd_mindmap(args, config):
             indexed_prefix,
             computed_prefix,
         )
+    register_topic_stamp_target(args, video, channel_dir, prefix_for_lookup, channel_name)
     transcript_path = channel_dir / f"{prefix_for_lookup}.transcript.md"
     transcript_available = transcript_path.exists()
     channel_cfg: dict = next(
@@ -5308,6 +5349,18 @@ def cmd_mindmap(args, config):
 
 
 def cmd_transcript(args, config):
+    """Generate a transcript for a single video (YouTube URL or local MP4).
+
+    Issue #146 C1: see `cmd_mindmap`'s docstring for why this flush exists
+    here as well as in main()'s finally.
+    """
+    try:
+        return _cmd_transcript_impl(args, config)
+    finally:
+        flush_topic_stamps()
+
+
+def _cmd_transcript_impl(args, config):
     """Generate a transcript for a single video (YouTube URL or local MP4)."""
     _, types = require_gemini()
 
@@ -5391,6 +5444,7 @@ def cmd_transcript(args, config):
             }
             channel_dir = identity["channel_dir"]
             prefix = identity["prefix"]
+            register_topic_stamp_target(args, video, channel_dir, prefix, identity["channel"])
 
             # F7: honor skip flag from existing meta.json before any Gemini work.
             if identity["meta_path"].exists():
@@ -5430,6 +5484,7 @@ def cmd_transcript(args, config):
             }
             channel_dir = input_path.parent
             prefix = input_path.stem
+            register_topic_stamp_target(args, video, channel_dir, prefix, STANDALONE_CHANNEL)
             log.info("Transcribing local file: %s", input_path.name)
     else:
         # YouTube URL path
@@ -5511,6 +5566,15 @@ def cmd_transcript(args, config):
         }
         channel_dir = output_dir / channel_name
         prefix = video_file_prefix(video)
+        # Title-rotation safety net for the topic stamp only (issue #146): the
+        # meta on disk is named after the title at write time, so on a rotated
+        # video `video_file_prefix` names a path that does not exist and the
+        # stamp would defer and then fail. video_id is the identity, slug is
+        # decoration - same lookup `cmd_mindmap` and `_cmd_process_url` make.
+        # The transcript writers below deliberately keep using `prefix`: routing
+        # THEIR output through the index is a separate behavior change.
+        indexed_prefix = _load_video_id_index(channel_dir).get(video_id)
+        register_topic_stamp_target(args, video, channel_dir, indexed_prefix or prefix, channel_name)
         media_uri = None  # YouTube URL path: video["url"] is the media source
         # Issue #120: the manual path has no scan pre-flight to inherit the flag
         # from, so classify this one id (1 quota unit, same helper as the scan).
@@ -5841,6 +5905,8 @@ def _cmd_process_url(args, config):
             computed_prefix,
         )
 
+    register_topic_stamp_target(args, video, channel_dir, prefix, channel_name)
+
     prompt_name = normalize_prompt_name(
         getattr(args, "prompt", None) or config.get("default_prompt", "mindmap-knowledge")
     )
@@ -6111,6 +6177,20 @@ def _cmd_process_url(args, config):
 def cmd_process(args, config):
     """Run the full pipeline (mindmap + transcript + concepts) on a single video.
 
+    Issue #146 C1: see `cmd_mindmap`'s docstring for why this flush exists
+    here as well as in main()'s finally - covers both the --url delegate
+    (`_cmd_process_url`, called from `_cmd_process_impl` below) and the
+    --file branch, since both run inside this try.
+    """
+    try:
+        return _cmd_process_impl(args, config)
+    finally:
+        flush_topic_stamps()
+
+
+def _cmd_process_impl(args, config):
+    """Run the full pipeline (mindmap + transcript + concepts) on a single video.
+
     Two input modes:
       --file PATH: local MP4 - one Gemini upload, lazy-skipped when meta records
         all modes complete and artifacts exist (legacy local-file path).
@@ -6207,6 +6287,7 @@ def cmd_process(args, config):
         channel_dir = identity["channel_dir"]
         prefix = identity["prefix"]
         meta_path = identity["meta_path"]
+        register_topic_stamp_target(args, video, channel_dir, prefix, identity["channel"])
 
         if meta_path.exists():
             existing_meta = _read_meta_best_effort(meta_path, raise_on_os_error=False)
@@ -6228,6 +6309,7 @@ def cmd_process(args, config):
         channel_dir = input_path.parent
         prefix = input_path.stem
         meta_path = channel_dir / f"{prefix}.meta.json"
+        register_topic_stamp_target(args, video, channel_dir, prefix, STANDALONE_CHANNEL)
         if meta_path.exists():
             existing_meta = _read_meta_best_effort(meta_path, raise_on_os_error=False)
         else:
@@ -6746,9 +6828,32 @@ def cmd_status(args, config):
     else:
         print("Taxonomy: not yet built (run 'taxonomy-build')")
 
+    # Issue #146: the per-channel topics rollup answers "why is this channel
+    # in my corpus". It reads ONLY the derived artifact and fails soft with
+    # one actionable message (contract C8) - a missing index and a corpus
+    # with no topics look identical otherwise, and only one of those is
+    # fixed by a rebuild.
+    topics_data, topics_problem = load_topics_artifact(output_dir)
+    channel_topics: dict[str, list[str]] = {}
+    if topics_problem:
+        print(topics_problem)
+    else:
+        summary = topics_data.get("summary", {})
+        raw_channels = topics_data.get("channels", {})
+        if isinstance(raw_channels, dict):
+            channel_topics = {k: v for k, v in raw_channels.items() if isinstance(v, list)}
+        print(
+            f"Topics: {summary.get('topics', len(topics_data['topics']))} topics, "
+            f"{summary.get('memberships', 0)} memberships "
+            f"({summary.get('unresolved', 0)} unresolved)"
+        )
+        print(f"Topics path: {output_dir / TOPICS_FILENAME}")
+
     print("\nChannels:")
+    configured_names: set[str] = set()
     for ch in config.get("channels", []):
         ch_name = ch["name"]
+        configured_names.add(ch_name)
         ch_dir = output_dir / ch_name
         if ch_dir.exists():
             mindmaps = len(list(ch_dir.glob("*.mindmap*.md")))
@@ -6757,6 +6862,18 @@ def cmd_status(args, config):
             print(f"  {ch_name}: {mindmaps} mindmaps, {transcripts} transcripts, {concepts} concepts")
         else:
             print(f"  {ch_name}: not yet scanned")
+        if channel_topics.get(ch_name):
+            print(f"    topics: {', '.join(sorted(channel_topics[ch_name]))}")
+
+    # A channel can hold topic-tagged videos without being in the CURRENT
+    # config (a removed entry, or a corpus opened with the channel-less
+    # user-level config). Printing it rather than dropping it keeps the
+    # rollup an answer about the corpus, not about config.yaml.
+    orphan_channels = sorted(set(channel_topics) - configured_names)
+    if orphan_channels:
+        print("\nChannels with topics but no config entry:")
+        for ch_name in orphan_channels:
+            print(f"  {ch_name}: {', '.join(sorted(channel_topics[ch_name]))}")
 
 
 # ---------------------------------------------------------------------------
@@ -7336,6 +7453,32 @@ def cmd_search(args, config):
     since_raw = getattr(args, "since", None)
     since_iso = parse_since(since_raw).date().isoformat() if since_raw else None
 
+    # Issue #146: --topic narrows both modes to one topic's video set. It reads
+    # ONLY the derived topics.json and fails soft with one actionable message
+    # naming topics-build (contract C8). Composable with --channel, --since and
+    # --vector; it never reorders, it only filters.
+    topic_slug = getattr(args, "topic", None)
+    topic_ids: set[str] | None = None
+    fetch_limit = args.limit
+    if topic_slug:
+        topics_data, topics_problem = load_topics_artifact(output_dir)
+        if topics_problem:
+            print(topics_problem)
+            return
+        topic_ids = topic_video_ids(topics_data, topic_slug)
+        if topic_ids is None:
+            known = ", ".join(sorted(topics_data.get("topics", {}))) or "(none)"
+            print(
+                f"No topic '{topic_slug}' in {output_dir / TOPICS_FILENAME} "
+                f"(known: {known}). Re-run 'topics-build' after adding a briefing folder."
+            )
+            return
+        # Over-fetch before post-filtering, so a topic whose videos rank below
+        # the requested limit is not reported as empty. Both modes rank first
+        # and filter after (same shape as concept mode's --since filter), so
+        # without this the filter would silently truncate the topic.
+        fetch_limit = args.limit * TOPIC_FILTER_OVERFETCH
+
     # Hybrid search mode (BM25 + vector + RRF)
     if getattr(args, "vector", False):
         hits = hybrid_search(
@@ -7343,12 +7486,16 @@ def cmd_search(args, config):
             args.query,
             channel_filter=args.channel,
             since_iso=since_iso,
-            limit=args.limit,
+            limit=fetch_limit,
             config=config,
             expand=not getattr(args, "no_expand", False),
         )
+        ranked_before_topic_filter = len(hits)
+        if topic_ids is not None:
+            hits = [h for h in hits if h.get("video_id") in topic_ids][: args.limit]
         if not hits:
-            print(f'No results for "{args.query}". Is the index built? Run: video_intel.py index')
+            emptied = topic_filter_emptied_message(args.query, topic_slug, ranked_before_topic_filter)
+            print(emptied or f'No results for "{args.query}". Is the index built? Run: video_intel.py index')
             return
 
         # Filter out weak matches below relevance threshold
@@ -7393,8 +7540,12 @@ def cmd_search(args, config):
         args.query,
         channel_filter=args.channel,
         since_iso=since_iso,
-        limit=args.limit,
+        limit=fetch_limit,
     )
+    ranked_before_topic_filter = len(results["videos"])
+    if topic_ids is not None:
+        results["videos"] = [v for v in results["videos"] if v.get("video_id") in topic_ids][: args.limit]
+        results["concepts"] = results["concepts"][: args.limit]
 
     if not results["concepts"]:
         print(f'No concepts matching "{args.query}".')
@@ -7412,7 +7563,8 @@ def cmd_search(args, config):
         print()
 
     if not results["videos"]:
-        print("No videos found with these concepts.")
+        emptied = topic_filter_emptied_message(args.query, topic_slug, ranked_before_topic_filter)
+        print(emptied or "No videos found with these concepts.")
         return
 
     print(f"Videos ({len(results['videos'])}):")
@@ -7545,6 +7697,20 @@ def _apply_dedupe_group(
     merged_alts = _merge_alt_titles(canonical_data, metas, canonical_path)
     if merged_alts:
         canonical_data["alt_titles"] = merged_alts
+
+    # Union `topics` across the group (issue #146). An operator can stamp
+    # --topic before a retitle, leaving the membership on the meta that later
+    # loses the canonical tie-break; without this the loser is deleted below and
+    # the curation fact is gone permanently. Each source goes through
+    # `normalize_meta_topics` so a malformed value degrades here exactly the way
+    # it does on every read surface rather than reaching disk unnormalized.
+    merged_topics = set(normalize_meta_topics(canonical_data.get("topics"), label=canonical_path.name))
+    for loser_path, loser_data in metas:
+        if loser_path == canonical_path:
+            continue
+        merged_topics |= set(normalize_meta_topics(loser_data.get("topics"), label=loser_path.name))
+    if merged_topics:
+        canonical_data["topics"] = sorted(merged_topics)
 
     canonical_path.write_text(json.dumps(canonical_data, indent=2), encoding="utf-8")
 
@@ -8286,12 +8452,43 @@ def collect_corpus_videos(output_dir: Path) -> list[dict]:
     for channel_dir in sorted(channel_dirs):
         for meta_path in sorted(channel_dir.glob("*.meta.json")):
             try:
-                meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
+                # Bytes first, then decode+parse (issue #124). `read_text` folds
+                # a CONTENT problem into the call that should only be able to
+                # fail at the I/O layer, and `UnicodeDecodeError` subclasses
+                # ValueError, not OSError - so a meta torn mid-multibyte-character
+                # (the normal shape of a truncated write on a corpus carrying
+                # Cyrillic/BCS titles) escaped the narrower handler and killed
+                # every caller of this walker, `topics-build` included.
+                meta = json.loads(meta_path.read_bytes().decode("utf-8"))
+            except (ValueError, OSError):
                 continue
             video_id = meta.get("video_id")
             if not video_id:
                 continue
+            if not usable_video_id(video_id):
+                # A non-string id is malformed data, and it poisons every
+                # `sorted()` downstream that mixes it with real ids (Python
+                # refuses to order an int against a str), so one bad meta used
+                # to abort a whole `topics-build`. Skip it, name the file, and
+                # do NOT coerce: `str(123)` would merge it with a real "123".
+                log.warning(
+                    "  %s: `video_id` is a %s, not a string; skipping this meta",
+                    meta_path.name,
+                    type(video_id).__name__,
+                )
+                continue
+            channel = meta.get("channel") or channel_dir.name
+            if not isinstance(channel, str):
+                # `channels` is sorted and rolled up per topic, so a non-string
+                # here breaks the same ordering. The folder the meta actually
+                # lives in is the accurate fallback, not an invented label.
+                log.warning(
+                    "  %s: `channel` is a %s, not a string; using the folder name %s",
+                    meta_path.name,
+                    type(channel).__name__,
+                    channel_dir.name,
+                )
+                channel = channel_dir.name
             prefix = meta_path.name[: -len(".meta.json")]
             mindmap_path = channel_dir / f"{prefix}.mindmap.md"
             concepts_path = channel_dir / f"{prefix}.concepts.json"
@@ -8299,17 +8496,32 @@ def collect_corpus_videos(output_dir: Path) -> list[dict]:
                 "video_id": video_id,
                 "title": meta.get("title", prefix),
                 "published": meta.get("published", ""),
-                "channel": meta.get("channel", channel_dir.name),
+                "channel": channel,
                 "url": meta.get("video_url") or f"https://www.youtube.com/watch?v={video_id}",
                 "mindmap_path": mindmap_path if mindmap_path.exists() else None,
                 "concepts_path": concepts_path if concepts_path.exists() else None,
+                "processed": meta.get("processed", ""),
+                # Issue #146: the topic layer joins through this same video_id
+                # identity (contract C9), so the meta-asserted topics ride along
+                # on the record instead of forcing a second walk of every
+                # meta.json under a different - and driftable - join rule.
+                "topics": normalize_meta_topics(meta.get("topics"), label=meta_path.name),
             }
             # Dedupe by video_id - title-rotation can leave >1 meta per id, and a
             # set-difference against prior briefings won't catch a same-corpus dup.
             # Keep the most complete record so ranking has concepts to work with.
             existing = by_id.get(video_id)
             if existing is None or _artifact_count(record) > _artifact_count(existing):
+                if existing is not None:
+                    # Topics are UNIONed across duplicate metas rather than
+                    # inherited from the completeness winner. An operator can
+                    # stamp --topic before a title rotation, leaving the tag on
+                    # the meta that later loses the tie-break; taking only the
+                    # winner's list would silently delete that membership.
+                    record["topics"] = sorted(set(record["topics"]) | set(existing["topics"]))
                 by_id[video_id] = record
+            elif record["topics"]:
+                existing["topics"] = sorted(set(existing["topics"]) | set(record["topics"]))
     return list(by_id.values())
 
 
@@ -9385,6 +9597,607 @@ def cmd_profile(args, config):
 
 
 # ---------------------------------------------------------------------------
+# Topic-following metadata layer (issue #146)
+# ---------------------------------------------------------------------------
+#
+# Two assertion sources, one derived join artifact. A topic membership is a
+# VIDEO-level curation fact ("why did the operator pull this in"), deliberately
+# kept apart from `taxonomy.json`, which is bottom-up ("what does the video
+# say"). Nothing moves on disk: membership is a tag, never a location.
+
+TOPICS_FILENAME = "topics.json"
+TOPICS_SCHEMA_VERSION = 1
+
+# Briefing subfolders that are NOT topics. `nuggets` holds `nugget` command
+# output (`artifact_type: nugget_brief`, keyed by `cited_video_ids`, not
+# `video_ids`): a synthesis artifact, not a curation decision. Treating it as a
+# topic would manufacture a phantom topic named after a command.
+RESERVED_BRIEFING_DIRS = frozenset({"nuggets"})
+
+# How many extra results to pull before applying a `--topic` post-filter, so a
+# topic whose videos rank below the requested limit is not silently empty.
+# A probability reduction, NOT a guarantee: a member ranked below
+# `limit * TOPIC_FILTER_OVERFETCH` is still lost to the filter. Making the
+# filter exact would mean pushing the topic id set into the ranking itself,
+# which v1 does not do; the compensation is that an emptied-by-filter result
+# says so and names `--limit` as a remedy instead of blaming the index.
+TOPIC_FILTER_OVERFETCH = 5
+
+_TOPIC_SEPARATOR_RE = re.compile(r"[\s_/\\]+")
+_TOPIC_DASH_RUN_RE = re.compile(r"-{2,}")
+_LEADING_DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
+
+
+def topic_filter_emptied_message(query: str, topic_slug: str | None, ranked_count: int) -> str | None:
+    """The line to print when the `--topic` post-filter, not the ranking, emptied a search.
+
+    Returns None when the ranking itself came back empty, because the two are
+    different problems with opposite remedies. Answering an emptied filter with
+    "is the index built?" points the operator at rebuilding an index that just
+    returned `ranked_count` results, and trains them to distrust the message.
+    """
+    if not topic_slug or not ranked_count:
+        return None
+    return (
+        f'No results for "{query}" in topic {topic_slug!r}. The ranking returned {ranked_count} '
+        f"result(s) and the topic filter removed all of them. Raise --limit, broaden the query, "
+        f"or re-run 'topics-build' if the topic membership is stale."
+    )
+
+
+def normalize_topic_slug(value: Any) -> str:
+    """Canonical topic slug (contract C1 / amendment 2).
+
+    ONE normalizer, shared by BOTH intake paths: the `_briefings/<folder>` name
+    and the `--topic` CLI value. Two normalizers would let `FDE` from the CLI
+    and `fde/` from a folder drift into separate topics, which is the whole
+    failure this function exists to prevent.
+
+    Lowercase, trim, any run of whitespace / underscore / slash collapses to a
+    single hyphen, repeated hyphens collapse, leading and trailing hyphens are
+    stripped. So `FDE`, `fde`, `fde/` and ` fde ` are one topic; `F D E` and
+    `f_d_e` are one topic (`f-d-e`), distinct from `fde` - the algorithm turns
+    a separator into a hyphen, it does not delete it.
+
+    Returns `""` when the value normalizes to nothing. Callers must reject that:
+    `parser.error` on the CLI path, skip-with-WARNING on the folder path.
+    """
+    text = str(value or "").strip().lower()
+    text = _TOPIC_SEPARATOR_RE.sub("-", text)
+    text = _TOPIC_DASH_RUN_RE.sub("-", text)
+    return text.strip("-")
+
+
+def topic_slug_arg(value: str) -> str:
+    """argparse `type=` for `--topic`: normalize, and reject an empty result.
+
+    Raising ArgumentTypeError routes through `parser.error` (exit 2) rather than
+    letting a slug of `""` reach the writer, where it would stamp an unusable
+    membership nothing can ever query back.
+    """
+    slug = normalize_topic_slug(value)
+    if not slug:
+        raise argparse.ArgumentTypeError(f"{value!r} normalizes to an empty topic slug")
+    return slug
+
+
+def resolve_cli_topics(args) -> list[str]:
+    """Sorted, deduplicated, NORMALIZED `--topic` slugs off a parsed args namespace.
+
+    Normalizes again even though `topic_slug_arg` already did: argparse is not
+    the only caller. A Gate-1 smoke run that built the namespace directly wrote
+    `["FDE", "fde/", "Founder Led Sales"]` straight into a meta.json, which is
+    three separate topics in `topics.json` for one curation decision - exactly
+    the drift contract C1 exists to prevent. Normalization belongs at the point
+    the values are READ, where every caller passes, not only at the CLI edge.
+    """
+    return sorted({slug for slug in (normalize_topic_slug(t) for t in getattr(args, "topic", None) or []) if slug})
+
+
+def topic_from_briefing_path(md_path: Path, briefings_dir: Path) -> str | None:
+    """Topic asserted by a briefing's location, or None when it asserts none.
+
+    The topic is the FIRST path segment under `_briefings/` (amendment 3), so
+    `_briefings/fde/deep-dives/note.md` is `fde`, never `deep-dives`. A briefing
+    directly in the `_briefings/` root has no topic. `nuggets` is reserved.
+
+    This is the one place where a briefing folder name is semantically
+    load-bearing: renaming the folder renames the topic. Briefing SELECTION and
+    seen-state remain indifferent to the name (see `load_seen_video_ids`).
+    """
+    try:
+        rel = md_path.relative_to(briefings_dir)
+    except ValueError:
+        return None
+    if len(rel.parts) < 2:
+        return None
+    slug = normalize_topic_slug(rel.parts[0])
+    if not slug:
+        log.warning(
+            "  briefing folder %r normalizes to an empty topic slug; %s asserts no topic",
+            rel.parts[0],
+            rel.as_posix(),
+        )
+        return None
+    if slug in RESERVED_BRIEFING_DIRS:
+        return None
+    return slug
+
+
+def _coerce_to_date(value: Any):
+    """A `datetime.date` out of a YAML date, a datetime, or an ISO-ish string.
+
+    PyYAML returns a real `datetime.date` for `date: 2026-08-22` but a `str` for
+    `date: "2026-08-22"`, and the live corpus contains BOTH shapes for the same
+    key. One coercion point keeps that from becoming a per-call-site guess.
+    """
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        return _parse_iso_date(value)
+    return None
+
+
+def briefing_assertion_date(front_matter: dict, md_path: Path):
+    """`first_seen` evidence date for one briefing (contract C3).
+
+    Amendment 5 named only front-matter `date`, but a survey of the live corpus
+    found 20 of 30 topic-foldered briefings without that key: 8 use `created_at`
+    and 12 have neither. So the chain is explicit and fully input-derived:
+
+    1. front-matter `date`
+    2. front-matter `created_at`
+    3. the leading `YYYY-MM-DD` of the FILENAME
+    4. no contribution from this briefing
+
+    Never the wall clock - `topics.json` must be byte-stable for identical
+    inputs, and a clock reading makes every rebuild a diff.
+    """
+    for key in ("date", "created_at"):
+        parsed = _coerce_to_date(front_matter.get(key))
+        if parsed is not None:
+            return parsed
+    match = _LEADING_DATE_RE.match(md_path.name)
+    if match:
+        return _parse_iso_date(match.group(1))
+    return None
+
+
+def normalize_meta_topics(raw: Any, *, label: str) -> list[str]:
+    """Usable topic slugs out of a meta.json `topics` field.
+
+    Tolerant on purpose (contract C5): a scalar, a bare string, or a mixed list
+    keeps whatever string entries normalize, logs a WARNING, and returns the
+    rest. It must NOT quarantine the whole meta - `topics` is one optional
+    provenance field, and discarding `alt_titles` / `skip_modes` / transcript
+    status over a bad tag would cost far more than the tag is worth.
+    """
+    if raw is None:
+        return []
+    items = raw if isinstance(raw, list) else [raw]
+    slugs: list[str] = []
+    dropped = 0
+    for item in items:
+        slug = normalize_topic_slug(item) if isinstance(item, str) else ""
+        if slug:
+            slugs.append(slug)
+        else:
+            dropped += 1
+    if dropped or not isinstance(raw, list):
+        log.warning(
+            "  %s: malformed `topics` field (%s, %d unusable entr%s); keeping %d usable slug(s)",
+            label,
+            type(raw).__name__,
+            dropped,
+            "y" if dropped == 1 else "ies",
+            len(slugs),
+        )
+    return sorted(set(slugs))
+
+
+def stamp_video_topics(
+    meta_path: Path,
+    video: dict,
+    channel_name: str,
+    topics: list[str],
+) -> list[str] | None:
+    """Merge `--topic` slugs into a video's meta.json. Its own writer (C5).
+
+    Deliberately NOT `update_meta`. That is the shared SUCCESS-path writer and
+    it is wrong here on three counts: `meta.update(fields)` would OVERWRITE an
+    existing `topics` list instead of merging it, it appends to
+    `modes_completed`, and it clears `last_error`. A `--topic` stamp is
+    PROVENANCE, not stage completion - it has to be able to run on a lazy-skip
+    path where no stage ran at all (amendment 4), and it must never make a
+    failed video look done or erase the error that explains why it is not.
+
+    Modelled on `_record_concepts_error`, with the two standing meta contracts:
+
+    * **Issue #124** - the read goes through `_read_meta_best_effort`. This is a
+      SUCCESS path, so `raise_on_os_error=True`: a read we merely failed to
+      perform must not license overwriting a healthy file, where `alt_titles`
+      (title-rotation history) and `skip_modes` (the operator's deliberate stage
+      suppression) exist nowhere else.
+    * **Issue #66** - full identity is stamped on every write. A `{}` result
+      from a quarantined read means these fields become the WHOLE file, so a
+      write of only `{"topics": [...]}` would leave an identity-less meta that
+      `_load_video_id_index` skips, re-queueing a full re-transcribe. Recording
+      a free provenance tag must never cost an expensive re-run.
+
+    Like `_record_concepts_error` it never CREATES a meta that did not exist:
+    a second meta claiming the same video_id manufactures a dedupe group that
+    never existed. If there is nothing to annotate, the log line is the record.
+
+    Returns the merged slug list, or None when nothing was written.
+    """
+    # Last line of defense, mirroring how the existing `topics` field is read
+    # through `normalize_meta_topics`: an unnormalized slug that reaches disk is
+    # permanent until someone notices it, and nothing downstream can repair it.
+    topics = sorted({slug for slug in (normalize_topic_slug(t) for t in topics) if slug})
+    if not topics:
+        return None
+    if not meta_path.exists():
+        log.warning(
+            "  --topic %s not recorded for %s: no meta.json at %s",
+            ", ".join(topics),
+            video.get("video_id"),
+            meta_path,
+        )
+        return None
+    meta = _read_meta_best_effort(meta_path, raise_on_os_error=True)
+    existing = normalize_meta_topics(meta.get("topics"), label=meta_path.name)
+    merged = sorted(set(existing) | set(topics))
+    # Fill ABSENT identity keys only. `meta.update(...)` would replace a healthy
+    # on-disk `title` / `video_url` / `published` with whatever the caller's
+    # video dict happens to hold, and those legitimately differ: the caller's
+    # title is the CURRENT one on a rotated video, while the meta records the
+    # one its artifacts are named after. The falsy-drop inside
+    # `_transcript_identity_fields` only stops an EMPTY value from clobbering,
+    # never a different non-empty one. Filling gaps still satisfies issue #66
+    # byte for byte, because after a quarantined read every key is absent.
+    for key, value in _transcript_identity_fields(video, None, channel_name=channel_name).items():
+        if not meta.get(key):
+            meta[key] = value
+    meta["topics"] = merged
+    if not usable_video_id(meta.get("video_id")):
+        # The identity merge above can only stamp what the caller's resolver
+        # produced. A local file with no sibling meta, no dedup hit and no
+        # `--video-id` resolves none, and `_transcript_identity_fields` drops
+        # the falsy value (correctly - a stamp must never downgrade a healthy
+        # field), so the meta goes to disk with no `video_id` at all. The build
+        # joins on that id, so this tag is invisible to `topics-build` and
+        # nothing downstream can repair it. Write it anyway (the meta may hold
+        # other state, and refusing would lose the tag outright) but say so.
+        log.warning(
+            "  --topic on %s is NOT visible to topics-build: this meta carries no video_id and the build joins on it; "
+            "re-run with --video-id <id> to make this topic queryable",
+            meta_path.name,
+        )
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    log.info("  topics for %s: %s", meta_path.name, ", ".join(merged))
+    if channel_name == STANDALONE_CHANNEL:
+        # `collect_corpus_videos` skips `_`-prefixed dirs, which `_briefings`
+        # and `_headlines` depend on, so this stamp is on disk but can never
+        # reach `topics.json`. Loosening that rule is out of scope, so the
+        # operator gets the one thing they cannot get from the meta: a signal.
+        log.warning(
+            "  --topic on %s is not visible to topics-build (%s folders are skipped by the corpus walker); "
+            "re-run with --channel <name> to make this topic queryable",
+            meta_path.name,
+            STANDALONE_CHANNEL,
+        )
+    return merged
+
+
+#: Targets registered by a command that has resolved a video's identity but
+#: whose meta.json may not exist yet. Flushed once, from main(), so a stamp is
+#: never lost to an early return or a `sys.exit` deep inside a pipeline step.
+_PENDING_TOPIC_STAMPS: list[dict] = []
+
+
+def register_topic_stamp_target(args, video: dict, channel_dir: Path, prefix: str, channel_name: str) -> None:
+    """Record where this run's `--topic` slugs must land, and stamp if we can.
+
+    Called once per command path, as soon as the WRITER's own `(channel_dir,
+    prefix)` pair is known - never from a separately re-derived path (PR #136).
+
+    Stamping is attempted immediately, which is what makes the lazy-skip case
+    work by construction: when every stage skips because the artifacts already
+    exist, the meta is already on disk and the provenance lands with no stage
+    having run. An early stamp is also safe for a run that DOES work, because
+    no downstream writer touches `topics` (`update_meta` merges a fields dict
+    that never contains the key). When the meta does not exist yet - a video
+    this run is creating - the target stays pending and `flush_topic_stamps`
+    retries after the pipeline has written it.
+    """
+    topics = resolve_cli_topics(args)
+    if not topics:
+        return
+    target = {
+        "meta_path": channel_dir / f"{prefix}.meta.json",
+        "video": video,
+        "channel_name": channel_name,
+        "topics": topics,
+    }
+    if target["meta_path"].exists():
+        try:
+            stamp_video_topics(target["meta_path"], video, channel_name, topics)
+            return
+        except (OSError, ValueError) as exc:
+            # A transient read on a cloud-synced mount must not abort the
+            # command that is doing the actual work. `stamp_video_topics` keeps
+            # raising on purpose (a read we failed to PERFORM must not license
+            # overwriting a healthy meta); the recovery belongs here, and it is
+            # to fall through to the pending queue and retry at flush.
+            log.warning("  could not record --topic in %s yet (%s); deferring to exit", target["meta_path"], exc)
+    _PENDING_TOPIC_STAMPS.append(target)
+
+
+def flush_topic_stamps() -> None:
+    """Apply any `--topic` stamp whose meta.json did not exist at registration.
+
+    Runs from main()'s `finally`, so it fires on the deliberate-skip early
+    returns and on the `sys.exit(EXIT_PARTIAL)` path as well as on a clean run.
+    """
+    pending, _PENDING_TOPIC_STAMPS[:] = list(_PENDING_TOPIC_STAMPS), []
+    for target in pending:
+        try:
+            stamp_video_topics(
+                target["meta_path"],
+                target["video"],
+                target["channel_name"],
+                target["topics"],
+            )
+        except (OSError, ValueError) as exc:
+            # Provenance is worth less than the exit code of the work that just
+            # ran; a failed stamp must not rewrite a pipeline's verdict.
+            log.warning("  could not record --topic in %s (%s)", target["meta_path"], exc)
+
+
+def collect_briefing_topic_assertions(briefings_dir: Path) -> dict[str, dict[str, dict]]:
+    """`{topic: {relative briefing path: {"video_ids": [...], "date": date|None}}}`.
+
+    Recursive (`rglob`), matching `load_seen_video_ids`. A briefing that names
+    no `video_ids` asserts nothing and is dropped here, which is what makes an
+    empty topic disappear from `topics.json` entirely (contract C4): a topic is
+    a membership fact, and with no members there is no fact to record. 11 of 30
+    topic-foldered briefings in the live corpus are prose plans in exactly this
+    state.
+    """
+    out: dict[str, dict[str, dict]] = {}
+    if not briefings_dir.is_dir():
+        return out
+    for md in sorted(briefings_dir.rglob("*.md")):
+        topic = topic_from_briefing_path(md, briefings_dir)
+        if topic is None:
+            continue
+        try:
+            front_matter, _ = parse_front_matter(md.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            # Unreadable or undecodable: it asserts nothing rather than
+            # aborting a rebuild over one bad file.
+            continue
+        raw_ids = front_matter.get("video_ids")
+        if raw_ids is None:
+            continue
+        if not isinstance(raw_ids, list):
+            log.warning(
+                "  %s: `video_ids` is a %s, not a list; it asserts no topic membership",
+                md.name,
+                type(raw_ids).__name__,
+            )
+            continue
+        rel = md.relative_to(briefings_dir).as_posix()
+        # A YAML scalar is typed by the parser, not by the operator: unquoted
+        # `yes` comes back as True, `123` as int, `2026-08-22` as datetime.date.
+        # Coercing any of those with `str()` manufactures a membership for a
+        # video that does not exist ("True" surfaced as a real unresolved
+        # member), so only a genuine string is a video id. `bool` subclasses
+        # `int`, which is why one isinstance check covers all three shapes.
+        # One WARNING per file, not one per entry.
+        ids = sorted({v.strip() for v in raw_ids if usable_video_id(v)})
+        dropped = sum(1 for v in raw_ids if not usable_video_id(v))
+        if dropped:
+            log.warning(
+                "  %s: dropped %d `video_ids` entr%s that %s not a non-empty string "
+                "(unquoted YAML booleans, ints and dates are not video ids)",
+                rel,
+                dropped,
+                "y" if dropped == 1 else "ies",
+                "is" if dropped == 1 else "are",
+            )
+        if not ids:
+            continue
+        out.setdefault(topic, {})[rel] = {"video_ids": ids, "date": briefing_assertion_date(front_matter, md)}
+    return out
+
+
+def build_topics(output_dir: Path) -> dict:
+    """Materialize the two-source union into the derived `topics.json` shape.
+
+    Sources: briefing front matter (keyed by folder) and per-video meta.json
+    `topics`. Membership is the UNION, and each membership carries its own
+    provenance (`sources`) so removal follows the source: delete the briefing,
+    drop the id from its `video_ids`, or remove the slug from a meta, and the
+    assertion is gone on the next build. There is no `--remove-topic` - the
+    build never argues with its inputs.
+
+    The join is through `collect_corpus_videos`, i.e. through the existing
+    `video_id` identity, NEVER through a filename reconstructed from title and
+    date parts (contract C9 / PR #136). Title rotation moves the filename and
+    leaves the id alone, so a reconstructed path would report a genuinely
+    present video as unresolved.
+
+    Every collection is sorted and no value comes from the wall clock, so
+    identical inputs give a byte-identical file.
+    """
+    assertions = collect_briefing_topic_assertions(output_dir / BRIEFINGS_DIR_NAME)
+    corpus = {r["video_id"]: r for r in collect_corpus_videos(output_dir)}
+
+    memberships: dict[str, dict[str, dict]] = {}
+    evidence_dates: dict[str, list] = {}
+
+    for topic in sorted(assertions):
+        for rel_path in sorted(assertions[topic]):
+            entry = assertions[topic][rel_path]
+            for video_id in entry["video_ids"]:
+                slot = memberships.setdefault(topic, {}).setdefault(video_id, {"briefings": set(), "meta": False})
+                slot["briefings"].add(rel_path)
+            if entry["date"] is not None:
+                evidence_dates.setdefault(topic, []).append(entry["date"])
+
+    metas_asserting = 0
+    for video_id in sorted(corpus):
+        record = corpus[video_id]
+        if not record.get("topics"):
+            continue
+        metas_asserting += 1
+        processed = _coerce_to_date(record.get("processed") or None)
+        for topic in record["topics"]:
+            slot = memberships.setdefault(topic, {}).setdefault(video_id, {"briefings": set(), "meta": False})
+            slot["meta"] = True
+            if processed is not None:
+                evidence_dates.setdefault(topic, []).append(processed)
+
+    topics_out: dict[str, dict] = {}
+    channels_out: dict[str, set[str]] = {}
+    total_memberships = 0
+    total_unresolved = 0
+
+    for topic in sorted(memberships):
+        videos: list[dict] = []
+        channels: set[str] = set()
+        briefing_paths: set[str] = set()
+        unresolved = 0
+        for video_id in sorted(memberships[topic]):
+            slot = memberships[topic][video_id]
+            briefing_paths |= slot["briefings"]
+            entry = {
+                "video_id": video_id,
+                "sources": {"briefings": sorted(slot["briefings"]), "meta": slot["meta"]},
+            }
+            record = corpus.get(video_id)
+            if record is None:
+                # Kept, not dropped: a briefing that names an id we have no
+                # artifact for is a real curation fact plus a gap worth seeing.
+                # Excluded from the channel rollup because we do not know which
+                # channel it belongs to.
+                entry["unresolved"] = True
+                unresolved += 1
+            else:
+                entry["channel"] = record["channel"]
+                entry["title"] = record["title"]
+                entry["published"] = record["published"]
+                channels.add(record["channel"])
+            videos.append(entry)
+        if not videos:
+            continue
+        dates = evidence_dates.get(topic, [])
+        topics_out[topic] = {
+            "first_seen": min(dates).isoformat() if dates else None,
+            "video_count": len(videos),
+            "unresolved_count": unresolved,
+            "channels": sorted(channels),
+            "briefings": sorted(briefing_paths),
+            "videos": videos,
+        }
+        for channel in channels:
+            channels_out.setdefault(channel, set()).add(topic)
+        total_memberships += len(videos)
+        total_unresolved += unresolved
+
+    return {
+        "version": TOPICS_SCHEMA_VERSION,
+        "built_from": {
+            "briefings": sum(len(paths) for paths in assertions.values()),
+            "metas": metas_asserting,
+        },
+        "topics": topics_out,
+        "channels": {channel: sorted(slugs) for channel, slugs in sorted(channels_out.items())},
+        "summary": {
+            "topics": len(topics_out),
+            "memberships": total_memberships,
+            "unresolved": total_unresolved,
+        },
+    }
+
+
+def write_topics(output_dir: Path, topics: dict) -> Path:
+    """Write `topics.json` and return the path the WRITER used.
+
+    Returning the path (rather than letting callers rebuild it) is what keeps a
+    checker and this writer from drifting apart - the PR #136 rule.
+    """
+    path = output_dir / TOPICS_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(topics, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
+def load_topics_artifact(output_dir: Path) -> tuple[dict | None, str | None]:
+    """`(topics.json contents, actionable problem message)`; exactly one is None.
+
+    Contract C8: the read surfaces (`status`, `search --topic`) degrade with ONE
+    actionable message naming `topics-build`. Never a traceback, never silent
+    emptiness - an empty result set and a missing artifact look identical to a
+    user, and only one of them is answered by rebuilding.
+
+    No staleness detection in v1, matching the `taxonomy.json` convention:
+    derived, rebuilt on demand.
+    """
+    path = output_dir / TOPICS_FILENAME
+    if not path.exists():
+        return None, f"No topic index at {path}. Run 'topics-build' to create it."
+    try:
+        data = json.loads(path.read_bytes().decode("utf-8"))
+    except (ValueError, OSError) as exc:
+        return None, f"Topic index at {path} could not be read ({exc}). Re-run 'topics-build'."
+    if not isinstance(data, dict) or not isinstance(data.get("topics"), dict):
+        return None, f"Topic index at {path} is not in the expected shape. Re-run 'topics-build'."
+    return data, None
+
+
+def topic_video_ids(topics_data: dict, slug: str) -> set[str] | None:
+    """Every video id in a topic (resolved and unresolved), or None if unknown.
+
+    None means "no such topic", which is a different answer from an empty set
+    and must stay distinguishable: one is a typo or a missing rebuild, the other
+    is a topic that genuinely lost all its members.
+    """
+    topic = topics_data.get("topics", {}).get(slug)
+    if topic is None:
+        return None
+    return {v.get("video_id") for v in topic.get("videos", []) if v.get("video_id")}
+
+
+def cmd_topics_build(args, config):
+    """Rebuild `topics.json` from briefing front matter + meta.json topics."""
+    output_dir = resolve_output_dir(config)
+    topics = build_topics(output_dir)
+    summary = topics["summary"]
+    print(
+        f"Topics built from {topics['built_from']['briefings']} briefings "
+        f"and {topics['built_from']['metas']} meta.json topic stamps."
+    )
+    print(
+        f"  {summary['topics']} topics, {summary['memberships']} memberships, "
+        f"{summary['unresolved']} unresolved video ids"
+    )
+    for slug in sorted(topics["topics"]):
+        entry = topics["topics"][slug]
+        print(
+            f"    {slug}: {entry['video_count']} videos, {len(entry['channels'])} channels, "
+            f"first seen {entry['first_seen'] or 'unknown'}"
+        )
+    if getattr(args, "dry_run", False):
+        print(f"  Dry run: {output_dir / TOPICS_FILENAME} not written.")
+        return
+    print(f"  Saved: {write_topics(output_dir, topics)}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -9479,6 +10292,19 @@ Examples:
     mm_parser.add_argument(
         "--title",
         help="Video title. Auto-detected from YouTube snippet with --url; falls back to filename stem with --file.",
+    )
+    mm_parser.add_argument(
+        "--topic",
+        action="append",
+        dest="topic",
+        default=None,
+        type=topic_slug_arg,
+        help=(
+            "Tag this video with a curation topic in meta.json (repeatable). "
+            "Normalized: FDE, fde and fde/ are one topic. Recorded even when "
+            "every stage skips - provenance is the flag's whole purpose. "
+            "Rebuild the join with 'topics-build'."
+        ),
     )
     mm_parser.add_argument(
         "--date",
@@ -9580,6 +10406,19 @@ Examples:
             "Overrides the per-channel transcript_source config knob."
         ),
     )
+    tx_parser.add_argument(
+        "--topic",
+        action="append",
+        dest="topic",
+        default=None,
+        type=topic_slug_arg,
+        help=(
+            "Tag this video with a curation topic in meta.json (repeatable). "
+            "Normalized: FDE, fde and fde/ are one topic. Recorded even when "
+            "every stage skips - provenance is the flag's whole purpose. "
+            "Rebuild the join with 'topics-build'."
+        ),
+    )
 
     # process command: one-upload full pipeline for local MP4s
     process_parser = subparsers.add_parser(
@@ -9654,6 +10493,19 @@ Examples:
             "Applies to the --url path; --file uploads are always Gemini multimodal."
         ),
     )
+    process_parser.add_argument(
+        "--topic",
+        action="append",
+        dest="topic",
+        default=None,
+        type=topic_slug_arg,
+        help=(
+            "Tag this video with a curation topic in meta.json (repeatable). "
+            "Normalized: FDE, fde and fde/ are one topic. Recorded even when "
+            "every stage skips - provenance is the flag's whole purpose. "
+            "Rebuild the join with 'topics-build'."
+        ),
+    )
 
     # concepts command
     concepts_parser = subparsers.add_parser("concepts", help="Extract concepts from existing mindmaps")
@@ -9663,6 +10515,18 @@ Examples:
 
     # taxonomy-build command
     subparsers.add_parser("taxonomy-build", help="Rebuild taxonomy.json from all concept files")
+
+    # topics-build command (issue #146)
+    topics_parser = subparsers.add_parser(
+        "topics-build",
+        help="Rebuild topics.json from briefing folders and meta.json topic stamps",
+    )
+    topics_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="dry_run",
+        help="Print the derived topics without writing topics.json",
+    )
 
     # search command
     search_parser = subparsers.add_parser("search", help="Search corpus by concept or vector similarity")
@@ -9687,6 +10551,14 @@ Examples:
     search_parser.add_argument(
         "--since",
         help="Filter to videos published within a window. Accepts 'Nd' (e.g. '30d') or 'YYYY-MM-DD'.",
+    )
+    search_parser.add_argument(
+        "--topic",
+        type=topic_slug_arg,
+        help=(
+            "Restrict results to one curation topic's video set (see 'topics-build'). "
+            "Composable with --channel, --since and --vector."
+        ),
     )
     search_parser.add_argument(
         "--no-expand",
@@ -9905,38 +10777,48 @@ Examples:
             resolve_model(args, config),
         )
 
-    if args.command == "scan":
-        cmd_scan(args, config)
-    elif args.command == "mindmap":
-        cmd_mindmap(args, config)
-    elif args.command == "transcript":
-        cmd_transcript(args, config)
-    elif args.command == "process":
-        cmd_process(args, config)
-    elif args.command == "concepts":
-        cmd_concepts(args, config)
-    elif args.command == "taxonomy-build":
-        cmd_taxonomy_build(args, config)
-    elif args.command == "search":
-        cmd_search(args, config)
-    elif args.command == "index":
-        cmd_index(args, config)
-    elif args.command == "nugget":
-        cmd_nugget(args, config)
-    elif args.command == "status":
-        cmd_status(args, config)
-    elif args.command == "repair-metas":
-        cmd_repair_metas(args, config)
-    elif args.command == "dedupe":
-        cmd_dedupe(args, config)
-    elif args.command == "prune-shorts":
-        cmd_prune_shorts(args, config)
-    elif args.command == "mark-skip":
-        cmd_mark_skip(args, config)
-    elif args.command == "briefings":
-        cmd_briefings(args, config)
-    elif args.command == "profile":
-        cmd_profile(args, config)
+    # Issue #146: a --topic stamp registered by a command whose meta.json did
+    # not exist yet is applied here, in ONE place, from a finally - so it
+    # survives a deliberate-skip early return and the EXIT_PARTIAL exit as
+    # readily as a clean run. Provenance the operator asked for must not
+    # depend on how the pipeline happened to end.
+    try:
+        if args.command == "scan":
+            cmd_scan(args, config)
+        elif args.command == "mindmap":
+            cmd_mindmap(args, config)
+        elif args.command == "transcript":
+            cmd_transcript(args, config)
+        elif args.command == "process":
+            cmd_process(args, config)
+        elif args.command == "concepts":
+            cmd_concepts(args, config)
+        elif args.command == "taxonomy-build":
+            cmd_taxonomy_build(args, config)
+        elif args.command == "topics-build":
+            cmd_topics_build(args, config)
+        elif args.command == "search":
+            cmd_search(args, config)
+        elif args.command == "index":
+            cmd_index(args, config)
+        elif args.command == "nugget":
+            cmd_nugget(args, config)
+        elif args.command == "status":
+            cmd_status(args, config)
+        elif args.command == "repair-metas":
+            cmd_repair_metas(args, config)
+        elif args.command == "dedupe":
+            cmd_dedupe(args, config)
+        elif args.command == "prune-shorts":
+            cmd_prune_shorts(args, config)
+        elif args.command == "mark-skip":
+            cmd_mark_skip(args, config)
+        elif args.command == "briefings":
+            cmd_briefings(args, config)
+        elif args.command == "profile":
+            cmd_profile(args, config)
+    finally:
+        flush_topic_stamps()
 
 
 if __name__ == "__main__":
