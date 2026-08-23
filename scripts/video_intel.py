@@ -3787,6 +3787,16 @@ def _transcript_identity_fields(video: dict, channel_dir: Path | None, *, channe
     return {k: v for k, v in fields.items() if v}
 
 
+def usable_video_id(value: Any) -> bool:
+    """True when ``value`` can serve as the join key between corpus artifacts.
+
+    A YouTube video id is always a string; anything else on disk is malformed
+    data, and coercing it with ``str()`` would silently merge a hypothetical
+    ``123`` and ``"123"`` into one identity. Callers skip-with-WARNING instead.
+    """
+    return isinstance(value, str) and bool(value.strip())
+
+
 def _identity_from_mindmap_header(mindmap_path: Path) -> dict | None:
     """Reconstruct identity from a ``.mindmap.md`` HTML-comment header.
 
@@ -8455,6 +8465,30 @@ def collect_corpus_videos(output_dir: Path) -> list[dict]:
             video_id = meta.get("video_id")
             if not video_id:
                 continue
+            if not usable_video_id(video_id):
+                # A non-string id is malformed data, and it poisons every
+                # `sorted()` downstream that mixes it with real ids (Python
+                # refuses to order an int against a str), so one bad meta used
+                # to abort a whole `topics-build`. Skip it, name the file, and
+                # do NOT coerce: `str(123)` would merge it with a real "123".
+                log.warning(
+                    "  %s: `video_id` is a %s, not a string; skipping this meta",
+                    meta_path.name,
+                    type(video_id).__name__,
+                )
+                continue
+            channel = meta.get("channel") or channel_dir.name
+            if not isinstance(channel, str):
+                # `channels` is sorted and rolled up per topic, so a non-string
+                # here breaks the same ordering. The folder the meta actually
+                # lives in is the accurate fallback, not an invented label.
+                log.warning(
+                    "  %s: `channel` is a %s, not a string; using the folder name %s",
+                    meta_path.name,
+                    type(channel).__name__,
+                    channel_dir.name,
+                )
+                channel = channel_dir.name
             prefix = meta_path.name[: -len(".meta.json")]
             mindmap_path = channel_dir / f"{prefix}.mindmap.md"
             concepts_path = channel_dir / f"{prefix}.concepts.json"
@@ -8462,7 +8496,7 @@ def collect_corpus_videos(output_dir: Path) -> list[dict]:
                 "video_id": video_id,
                 "title": meta.get("title", prefix),
                 "published": meta.get("published", ""),
-                "channel": meta.get("channel", channel_dir.name),
+                "channel": channel,
                 "url": meta.get("video_url") or f"https://www.youtube.com/watch?v={video_id}",
                 "mindmap_path": mindmap_path if mindmap_path.exists() else None,
                 "concepts_path": concepts_path if concepts_path.exists() else None,
@@ -9827,6 +9861,20 @@ def stamp_video_topics(
         if not meta.get(key):
             meta[key] = value
     meta["topics"] = merged
+    if not usable_video_id(meta.get("video_id")):
+        # The identity merge above can only stamp what the caller's resolver
+        # produced. A local file with no sibling meta, no dedup hit and no
+        # `--video-id` resolves none, and `_transcript_identity_fields` drops
+        # the falsy value (correctly - a stamp must never downgrade a healthy
+        # field), so the meta goes to disk with no `video_id` at all. The build
+        # joins on that id, so this tag is invisible to `topics-build` and
+        # nothing downstream can repair it. Write it anyway (the meta may hold
+        # other state, and refusing would lose the tag outright) but say so.
+        log.warning(
+            "  --topic on %s is NOT visible to topics-build: this meta carries no video_id and the build joins on it; "
+            "re-run with --video-id <id> to make this topic queryable",
+            meta_path.name,
+        )
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     log.info("  topics for %s: %s", meta_path.name, ", ".join(merged))
     if channel_name == STANDALONE_CHANNEL:
@@ -9941,10 +9989,27 @@ def collect_briefing_topic_assertions(briefings_dir: Path) -> dict[str, dict[str
                 type(raw_ids).__name__,
             )
             continue
-        ids = sorted({str(v).strip() for v in raw_ids if isinstance(v, (str, int)) and str(v).strip()})
+        rel = md.relative_to(briefings_dir).as_posix()
+        # A YAML scalar is typed by the parser, not by the operator: unquoted
+        # `yes` comes back as True, `123` as int, `2026-08-22` as datetime.date.
+        # Coercing any of those with `str()` manufactures a membership for a
+        # video that does not exist ("True" surfaced as a real unresolved
+        # member), so only a genuine string is a video id. `bool` subclasses
+        # `int`, which is why one isinstance check covers all three shapes.
+        # One WARNING per file, not one per entry.
+        ids = sorted({v.strip() for v in raw_ids if usable_video_id(v)})
+        dropped = sum(1 for v in raw_ids if not usable_video_id(v))
+        if dropped:
+            log.warning(
+                "  %s: dropped %d `video_ids` entr%s that %s not a non-empty string "
+                "(unquoted YAML booleans, ints and dates are not video ids)",
+                rel,
+                dropped,
+                "y" if dropped == 1 else "ies",
+                "is" if dropped == 1 else "are",
+            )
         if not ids:
             continue
-        rel = md.relative_to(briefings_dir).as_posix()
         out.setdefault(topic, {})[rel] = {"video_ids": ids, "date": briefing_assertion_date(front_matter, md)}
     return out
 

@@ -1609,3 +1609,144 @@ class TestStandaloneStampWarnsItIsInvisible:
             stamp_video_topics(meta_path, video, "demo", ["fde"])
 
         assert "not visible to topics-build" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Peer-review finding 1 - a stamp with no video_id is invisible to the join
+# ---------------------------------------------------------------------------
+
+
+class TestStampWithoutAVideoIdWarns:
+    """`resolve_local_file_identity` can resolve no `video_id` at all.
+
+    A plain `ordinary-name.mp4 --channel demo` has no sibling meta, no dedup
+    hit and no `--video-id`, so the caller's video dict carries none.
+    `_transcript_identity_fields` drops the falsy value (correctly - a stamp
+    must never downgrade a healthy field), and the resulting meta reaches disk
+    with no `video_id`. `build_topics` joins on that id, so the tag is
+    permanently invisible and nothing downstream can repair it. The write still
+    happens (the meta may hold other state) but the operator gets a signal.
+    """
+
+    def test_stamp_writes_the_topic_and_warns_that_the_join_cannot_see_it(self, tmp_path, caplog):
+        channel_dir = tmp_path / "demo"
+        channel_dir.mkdir(parents=True)
+        meta_path = channel_dir / "ordinary-name.meta.json"
+        meta_path.write_text("{ this is not json", encoding="utf-8")
+        video = {"title": "ordinary-name", "published": "2026-08-22"}
+
+        with caplog.at_level("WARNING"):
+            merged = stamp_video_topics(meta_path, video, "demo", ["fde"])
+
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        assert merged == ["fde"]
+        assert meta["topics"] == ["fde"], "the tag is still recorded - refusing would lose it outright"
+        assert "video_id" not in meta
+        assert "topics-build" in caplog.text
+        assert "--video-id" in caplog.text
+
+    def test_a_resolved_video_id_stamps_silently(self, tmp_path, caplog):
+        meta_path = write_meta(tmp_path, "demo", "p", video_id="haveanid123")
+        video = {"video_id": "haveanid123", "url": "u", "title": "T", "published": "2026-05-01"}
+
+        with caplog.at_level("WARNING"):
+            stamp_video_topics(meta_path, video, "demo", ["fde"])
+
+        assert "--video-id" not in caplog.text
+
+    def test_an_on_disk_video_id_is_enough_even_when_the_caller_has_none(self, tmp_path, caplog):
+        """The check reads the MERGED meta, not the caller's dict.
+
+        A backfill stamp on an existing healthy meta supplies no identity of
+        its own, and warning there would be a false alarm on the flag's most
+        common use.
+        """
+        meta_path = write_meta(tmp_path, "demo", "p", video_id="ondiskid123")
+
+        with caplog.at_level("WARNING"):
+            stamp_video_topics(meta_path, {"title": "T"}, "demo", ["fde"])
+
+        assert "--video-id" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Peer-review finding 2 - one numeric video_id must not abort the build
+# ---------------------------------------------------------------------------
+
+
+class TestMalformedVideoIdDoesNotAbortTheBuild:
+    """`sorted()` refuses to order an int against a str.
+
+    One meta carrying `"video_id": 123` used to raise TypeError out of
+    `build_topics`, taking every healthy video with it. The id is skipped with
+    a WARNING naming the file - never coerced, because `str(123)` would merge a
+    malformed meta into a real `"123"` identity.
+    """
+
+    def test_a_numeric_id_is_skipped_and_the_rest_of_the_corpus_builds(self, tmp_path, caplog):
+        write_meta(tmp_path, "demo", "good", video_id="abc123", extra={"topics": ["fde"]})
+        write_meta(tmp_path, "demo", "bad", video_id=123, extra={"topics": ["fde"]})
+
+        with caplog.at_level("WARNING"):
+            topics = build_topics(tmp_path)
+
+        assert [v["video_id"] for v in topics["topics"]["fde"]["videos"]] == ["abc123"]
+        assert topics["built_from"]["metas"] == 1
+        assert "bad.meta.json" in caplog.text
+        assert "video_id" in caplog.text
+
+    def test_a_non_string_channel_falls_back_to_the_folder_name(self, tmp_path, caplog):
+        """`channels` is sorted and rolled up too, so it needs the same guard."""
+        write_meta(tmp_path, "demo", "good", video_id="abc123", extra={"topics": ["fde"], "channel": 7})
+
+        with caplog.at_level("WARNING"):
+            topics = build_topics(tmp_path)
+
+        assert topics["topics"]["fde"]["channels"] == ["demo"]
+        assert topics["channels"] == {"demo": ["fde"]}
+        assert "channel" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Peer-review finding 3 - YAML scalars are typed by the parser, not the operator
+# ---------------------------------------------------------------------------
+
+
+class TestYamlScalarVideoIdsAreNotVideoIds:
+    """Unquoted `yes` parses to `True`, and `str(True)` invented a member.
+
+    PyYAML returns bool / int / datetime.date / str for
+    `[yes, 123, 2026-08-22, AbC_123-xYz]`. Coercing the first three produced
+    ids like `"True"`, which then surfaced in `topics.json` as unresolved
+    members - videos that never existed. `bool` subclasses `int`, so one
+    `isinstance(..., str)` check covers all three shapes.
+    """
+
+    def test_only_the_real_string_id_survives_and_one_warning_names_the_file(self, tmp_path, caplog):
+        write_briefing(
+            tmp_path,
+            "fde/2026-08-22-yaml.md",
+            front_matter="video_ids: [yes, 123, 2026-08-22, AbC_123-xYz]\n",
+        )
+
+        with caplog.at_level("WARNING"):
+            assertions = collect_briefing_topic_assertions(tmp_path / "_briefings")
+
+        assert assertions["fde"]["fde/2026-08-22-yaml.md"]["video_ids"] == ["AbC_123-xYz"]
+        warnings = [r for r in caplog.records if "video_ids" in r.getMessage()]
+        assert len(warnings) == 1, "one line per file, not one per dropped entry"
+        assert "fde/2026-08-22-yaml.md" in warnings[0].getMessage()
+        assert "3" in warnings[0].getMessage()
+
+    def test_no_phantom_member_reaches_topics_json(self, tmp_path):
+        write_briefing(tmp_path, "fde/2026-08-22-yaml.md", front_matter="video_ids: [yes, AbC_123-xYz]\n")
+        topics = build_topics(tmp_path)
+        assert [v["video_id"] for v in topics["topics"]["fde"]["videos"]] == ["AbC_123-xYz"]
+
+    def test_a_clean_list_logs_nothing(self, tmp_path, caplog):
+        write_briefing(tmp_path, "fde/2026-08-22-clean.md", front_matter='video_ids: ["AbC_123-xYz"]\n')
+
+        with caplog.at_level("WARNING"):
+            collect_briefing_topic_assertions(tmp_path / "_briefings")
+
+        assert caplog.text == ""
