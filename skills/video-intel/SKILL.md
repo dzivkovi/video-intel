@@ -162,6 +162,8 @@ table is the canonical mapping — read it before picking a command.
 | "rebuild the index", "reindex after dedupe" | `index --force` | Write-path rebuild of LanceDB; query uses `video-intel-search` |
 | "prune shorts", "remove shorts", "too many shorts in my corpus" | `prune-shorts [--apply]` | **Always `--dry-run` first** — destructive on `--apply`; deletes mindmap/transcript/concepts/meta per Short |
 | "rebuild taxonomy", "update master vocabulary" | `taxonomy-build` | Derived artifact; rebuildable anytime |
+| "rebuild topics", "which channels belong to [topic]", "why is this channel in my corpus", "update the topic index", "what videos are in my FDE thread" | `topics-build [--dry-run]` | Derived artifact; rebuildable anytime. Unions two assertion sources: briefing front-matter `video_ids` keyed by the first folder under `_briefings/` (so `_briefings/fde/**` is topic `fde`; `_briefings/nuggets/` is reserved and excluded), and per-video `topics` stamps from `--topic`. Writes `<output_dir>/topics.json`; byte-stable, and it never touches `taxonomy.json`. Read it back with `status` (per-channel rollup) or `search --topic <slug>` in the search skill. |
+| "tag this video as [topic]", "this one is for the FDE thread", "record why I pulled this in", "backfill a topic onto a video I already have" | `--topic <slug>` on `process` / `transcript` / `mindmap` (repeatable) | Merges normalized slugs into the video's meta.json `topics`. `FDE`, `fde` and `fde/` are one topic. **Recorded even when every stage lazy-skips** - provenance is the flag's whole purpose, so it is the way to tag a video that is already fully processed. Run `topics-build` afterwards to refresh the join. There is no `--remove-topic`: delete the slug from the meta (or the id from the briefing) and rebuild. |
 | "catch me up on what I missed", "what haven't I been briefed on", "videos I haven't seen yet", "generate a catch-up briefing", "fill the gaps in my viewing guides", "give me the briefing as a PDF", "a briefing I can open on my phone / share" | `briefings --unseen [--dry-run] [--since DATE] [--until DATE] [--limit N] [--pdf]` | Surfaces corpus videos absent from every existing `_briefings/**/*.md` `video_ids` list, including topic subfolders like `_briefings/sales/` (strict set difference, never re-surfaced once briefed), **across the whole corpus by default (no recency floor)**, ranked by relevance overlap with the inferred profile in `_briefings/profile.yaml` and capped to the top `N` (default 30; `--limit 0` = no cap). Each entry shows an age badge (`age 3y`) and a "By year" appendix regroups the same set chronologically. `--dry-run` previews; otherwise writes `_briefings/<date>-catch-up-unseen.md`. `--pdf` additionally writes a clickable `.pdf` beside it (bold, accent-colored, hyperlinked timestamps; needs the `[pdf]` extra). Pass `--since 30d` (or any date) to *narrow* to a recency floor. No Gemini, no `channels:` required. |
 | "why am I seeing this", "what's ranking my briefings", "show my interest profile", "what does the digest think I care about", "where is my profile", "how do I retune my recommendations" | `profile show` | Also available from the read-only `video-intel-search` skill, so this question can be asked from any project (issue #117). Read-only. Prints the resolved interest model (source: persisted vs inferred), top weighted concepts/domains, and the on-disk paths of `_briefings/profile.yaml` (ranking weights) + `_briefings/audience.md` (reader-context prose). Writes nothing. One model powers both `briefings --unseen` and the scan headline digest. |
 | "set up my profile", "personalize my briefings", "let me tune what surfaces first", "create my audience profile", "save the inferred profile" | `profile init` | Persists the inferred `_briefings/profile.yaml` and scaffolds `_briefings/audience.md` from the template. **Never overwrites** an existing file (even a partial/malformed one) - hand-editing is the retune path. After it runs, point the user at the two files; there is no `profile edit`. |
@@ -260,8 +262,8 @@ For searching the corpus, nugget briefs, corpus status, or summarizing a video
 that is already indexed, use the **video-intel-search** skill. It is read-only,
 globally installable, and reads the same `output_dir` this skill writes to.
 This skill covers the write path only: scan, transcribe, process, index,
-concepts, dedupe, taxonomy-build, prune-shorts, mark-skip, repair-metas,
-briefings.
+concepts, dedupe, taxonomy-build, topics-build, prune-shorts, mark-skip,
+repair-metas, briefings.
 
 ## How to Use
 
@@ -681,6 +683,30 @@ python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" --log-level info conce
 # Rebuild master taxonomy from all concept files (fast, no Gemini call)
 python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" taxonomy-build
 ```
+
+### Follow a topic (curation intent, not emergent concepts)
+
+Topics answer "why did I pull this video in". They are a separate layer from
+`taxonomy.json`, which answers "what does this video say". Nothing moves on
+disk: membership is a tag keyed by `video_id`, so it survives title rotation.
+
+```bash
+# Tag at ingest time, before any briefing exists (repeatable).
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" process --url "URL" --topic fde --topic sales
+
+# Backfill a topic onto a video that is already fully processed. Every stage
+# lazy-skips and the stamp still lands.
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" transcript --url "URL" --topic fde
+
+# Rebuild the join. Preview first if you want to see what the briefing folders assert.
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" topics-build --dry-run
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" topics-build
+```
+
+Everything ever filed under a `_briefings/<topic>/` folder becomes tagged on
+the first `topics-build` run, at zero retroactive cost. A briefing id with no
+corpus artifact is kept and flagged `unresolved`, and counted in the summary
+line, rather than silently dropped.
 
 ### Clean up title-rotation duplicates
 

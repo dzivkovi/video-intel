@@ -49,7 +49,7 @@ transcribes.
 
 ## What This Skill Does
 
-Four commands against the pre-built corpus:
+Five commands against the pre-built corpus:
 
 1. **`search`** - find videos and transcript passages by concept, keyword, or
    semantic similarity. Two modes: concept (fast, no API calls, returns video
@@ -65,10 +65,16 @@ Four commands against the pre-built corpus:
    the write and keep the old stdout-only behavior. `--no-save` runs are
    fully write-free (no config snapshot either).
 
-3. **`status`** - report on corpus freshness (last scan per channel, video
+3. **`search --topic <slug>`** - narrow either search mode to one curation
+   topic's video set (see `topics-build` in the curate skill). Composable
+   with `--channel`, `--since` and `--vector`. Answers "which videos belong
+   to my FDE thread". Reads only the derived `topics.json`; when that file
+   is absent or unreadable it says so and names `topics-build`, rather than
+   returning a misleading empty result.
+4. **`status`** - report on corpus freshness (last scan per channel, video
    counts, taxonomy size). No API calls.
 
-4. **`profile show`** - print the personalization lens that ranks briefings and
+5. **`profile show`** - print the personalization lens that ranks briefings and
    the headline digest (the resolved interest model and the paths of the two
    files behind it). Writes nothing, needs no `channels:`.
 
@@ -224,6 +230,20 @@ Two states worth reading out loud when they appear:
 ```bash
 # Report freshness per channel, video counts, taxonomy size
 python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" status
+```
+
+The output includes a per-channel topics rollup (the answer to "why is this
+channel in my corpus"), when `topics.json` has been built.
+
+### Filter a search to one topic
+
+```bash
+# Concept mode
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" search "positioning" --topic fde
+
+# Hybrid mode, composed with the other filters
+python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" search "discovery calls" \
+  --vector --topic sales --since 180d
 ```
 
 ## When to Use This Skill vs video-intel (curate)
