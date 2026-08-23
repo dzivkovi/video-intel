@@ -8,6 +8,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
+# parse_time_to_seconds below is imported from video_intel on purpose: it is
+# a re-export from timestamp_utils.py (issue #152), and this import is the
+# test proving that re-export still works. Do not "tidy" it into importing
+# from timestamp_utils directly - that would silently delete the only proof
+# the re-export works.
 from video_intel import (
     DEFAULT_MODEL,
     KEYWORD_MAX_PAGES,

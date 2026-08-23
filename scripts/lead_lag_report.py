@@ -41,7 +41,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from intel_graph import timestamped_url
+from timestamp_utils import timestamped_url
 
 if TYPE_CHECKING:
     from duckdb import DuckDBPyConnection

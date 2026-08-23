@@ -1,15 +1,33 @@
-"""Shared timestamp normalization helpers.
+"""Shared timestamp helpers: normalization, parsing, and deep-link construction.
 
-Pure functions that fix Gemini's known timestamp malformations before
-chunk-offset classification. Imported by both `translate_video.py` (SRT
-translation chunk stitching) and `video_intel.py` (chunked transcript
-classifier). Splitting these four helpers into one module keeps the
-Gemini-quirk knowledge in a single place — see issue #58 for the bug
-class that motivated the extraction.
+Pure functions with no dependency beyond the standard library. That last part
+is a contract, not an accident (issue #152): this module is the import-weight
+firebreak that lets the standalone read-only analytics scripts
+(`wiki_concepts`, `wiki_atlas`, `lead_lag_report`, `lead_lag_viz`,
+`burst_report`) import without dragging in the curate stack. Adding a
+third-party import here re-couples all of them.
 
-All four helpers expect bracketed input (`[HH:MM:SS] ...` or `[MM:SS] ...`)
-at the start of `line`. Bare timestamps without surrounding brackets pass
-through unchanged — callers receiving bare strings must wrap before calling.
+Three groups live here:
+
+* **Normalization** - `normalize_timestamp`, `normalize_mm_ss_zero_timestamp`,
+  `should_reinterpret_part_as_mm_ss_zero`, `timestamp_tolerance`. These fix
+  Gemini's known timestamp malformations before chunk-offset classification,
+  and keeping that Gemini-quirk knowledge in one place is what issue #58
+  motivated. **These four, and only these four, expect bracketed input**
+  (`[HH:MM:SS] ...` or `[MM:SS] ...`) at the start of `line`; a bare timestamp
+  without surrounding brackets passes through unchanged, so callers holding a
+  bare string must wrap it before calling.
+* **Parsing** - `parse_time_to_seconds`, which takes a BARE time string
+  (`MM:SS`, `HH:MM:SS`, or raw seconds) and raises on anything else. Moved
+  here from `video_intel.py`, which re-exports it.
+* **Link construction** - `timestamped_url`, which appends a `t=<seconds>`
+  deep link to a video URL. Moved here from `intel_graph.py`, which
+  re-exports it.
+
+Imported by `translate_video.py` (SRT chunk stitching) and `video_intel.py`
+(chunked transcript classifier) as well; `translate_video.py` stays
+operationally separate, and the stdlib-only rule is what keeps that shared
+seam safe.
 """
 
 import re
@@ -90,3 +108,30 @@ def should_reinterpret_part_as_mm_ss_zero(
             alt_fit += 1
 
     return candidates >= 3 and alt_fit >= 3 and alt_fit > standard_fit
+
+
+def parse_time_to_seconds(value: str) -> int:
+    """Parse time string to seconds. Accepts 'MM:SS', 'HH:MM:SS', or raw seconds.
+
+    Examples: '05:30' -> 330, '01:15:45' -> 4545, '330' -> 330.
+    """
+    if not value or not value.strip():
+        raise ValueError("Empty time value")
+    stripped = value.strip()
+    parts = stripped.split(":")
+    if len(parts) == 1:
+        return int(parts[0])
+    if len(parts) == 2:
+        return int(parts[0]) * 60 + int(parts[1])
+    if len(parts) == 3:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+    raise ValueError(f"Invalid time format: {value!r}. Use MM:SS, HH:MM:SS, or raw seconds.")
+
+
+def timestamped_url(url: str | None, seconds: int | None) -> str:
+    if not url:
+        return ""
+    if seconds is None:
+        return url
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}t={seconds}"

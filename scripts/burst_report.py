@@ -29,8 +29,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from intel_graph import timestamped_url
 from lead_lag_report import DEFAULT_DB
+
+from timestamp_utils import timestamped_url
 
 if TYPE_CHECKING:
     from duckdb import DuckDBPyConnection

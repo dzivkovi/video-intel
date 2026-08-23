@@ -49,6 +49,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from timestamp_utils import timestamped_url
 from video_intel import chunk_transcript, load_config
 
 log = logging.getLogger("intel_graph")
@@ -168,15 +169,6 @@ def quote_around(text: str, needle: str, context: int = QUOTE_CONTEXT_CHARS) -> 
     end = min(len(text), idx + len(needle) + context // 2)
     snippet = text[start:end].strip()
     return ("..." if start > 0 else "") + snippet + ("..." if end < len(text) else "")
-
-
-def timestamped_url(url: str | None, seconds: int | None) -> str:
-    if not url:
-        return ""
-    if seconds is None:
-        return url
-    sep = "&" if "?" in url else "?"
-    return f"{url}{sep}t={seconds}"
 
 
 # ---------------------------------------------------------------------------

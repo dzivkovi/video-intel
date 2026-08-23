@@ -45,6 +45,8 @@ from lead_lag_report import (
 )
 from lead_lag_viz import ROBUST_EXPECTED, SMALL_SAMPLE_EXPECTED
 
+from timestamp_utils import timestamped_url
+
 if TYPE_CHECKING:
     pass
 
@@ -79,8 +81,6 @@ def _naive_ranks(data: ReportData) -> dict[str, int]:
 
 
 def _evidence_citation(m: FirstMention) -> str:
-    from intel_graph import timestamped_url
-
     link = timestamped_url(m.url, m.start_seconds if "youtube.com" in m.url else None)
     quote = extract_quote(m.segment_text, m.as_mentioned) if m.segment_text else "(mindmap-level mention, no segment)"
     return f'> "{quote}"\n>\n> - {m.source_id}, [{m.title}]({link}), {m.first_date.isoformat()}'
