@@ -1,10 +1,20 @@
-"""Tests for timestamp_utils.py — pure functions, no API calls."""
+"""Tests for timestamp_utils.py - pure functions, no API calls."""
+
+import ast
+import pathlib
+import subprocess
+import sys
+import textwrap
+
+import pytest
 
 from timestamp_utils import (
     normalize_mm_ss_zero_timestamp,
     normalize_timestamp,
+    parse_time_to_seconds,
     should_reinterpret_part_as_mm_ss_zero,
     timestamp_tolerance,
+    timestamped_url,
 )
 
 
@@ -94,3 +104,201 @@ class TestTimestampTolerance:
     def test_long_chunk_caps_at_300_seconds(self):
         # 10000s // 10 = 1000, capped to 300.
         assert timestamp_tolerance(10000) == 300
+
+
+class TestParseTimeToSeconds:
+    # Mirrors tests/test_utils.py::TestParseTimeToSeconds - this module now
+    # owns the function; video_intel.py re-exports it (issue #152). Keeping
+    # both test suites is deliberate: test_utils.py proves the re-export
+    # still works, this class proves the implementation itself is correct
+    # in its new home.
+    def test_mm_ss_returns_seconds(self):
+        assert parse_time_to_seconds("05:30") == 330
+
+    def test_hh_mm_ss_returns_seconds(self):
+        assert parse_time_to_seconds("01:15:45") == 4545
+
+    def test_raw_seconds_string(self):
+        assert parse_time_to_seconds("330") == 330
+
+    def test_zero_value(self):
+        assert parse_time_to_seconds("0") == 0
+        assert parse_time_to_seconds("00:00") == 0
+
+    def test_leading_zeros_in_components(self):
+        assert parse_time_to_seconds("00:05:00") == 300
+
+    def test_whitespace_tolerated(self):
+        assert parse_time_to_seconds(" 05:30 ") == 330
+
+    def test_empty_string_raises(self):
+        with pytest.raises(ValueError):
+            parse_time_to_seconds("")
+
+    def test_non_numeric_raises(self):
+        with pytest.raises(ValueError):
+            parse_time_to_seconds("not-a-time")
+
+    def test_too_many_colons_raises(self):
+        with pytest.raises(ValueError):
+            parse_time_to_seconds("1:2:3:4")
+
+
+class TestTimestampedUrl:
+    # Mirrors tests/test_intel_graph.py::TestTimestampedUrl - intel_graph.py
+    # re-exports this function (issue #152). Keeping both test suites is
+    # deliberate for the same reason as TestParseTimeToSeconds above.
+    def test_appends_t_param_when_query_string_exists(self):
+        assert timestamped_url("https://x.com/watch?v=1", 30) == "https://x.com/watch?v=1&t=30"
+
+    def test_appends_t_param_when_no_query_string(self):
+        assert timestamped_url("https://x.com/v", 30) == "https://x.com/v?t=30"
+
+    def test_none_url_returns_empty_string(self):
+        assert timestamped_url(None, 30) == ""
+
+
+class TestReExportsStayReExports:
+    """The two re-exports survive only INCIDENTALLY, which is the hazard.
+
+    `video_intel.parse_time_to_seconds` and `intel_graph.timestamped_url` are
+    plain imports kept alive by each module's own internal call sites. If a
+    future refactor drops those uses, ruff F401 fires and the obvious fix
+    (delete the import) silently breaks a documented compatibility contract
+    that `tests/test_utils.py` and `tests/test_intel_graph.py` depend on.
+
+    Asserting IDENTITY, not just presence, is the point: a re-implementation
+    copied back into either old home would satisfy both of those suites while
+    reintroducing exactly the duplication issue #152 removed.
+    """
+
+    def test_video_intel_re_exports_the_same_object(self):
+        import video_intel
+
+        assert video_intel.parse_time_to_seconds is parse_time_to_seconds
+
+    def test_intel_graph_re_exports_the_same_object(self):
+        import intel_graph
+
+        assert intel_graph.timestamped_url is timestamped_url
+
+
+class TestTimestampUtilsStaysStdlibOnly:
+    """CLAUDE.md states in bold that this module must never gain a dependency
+    beyond the standard library, because that is what lets the five standalone
+    analytics scripts import without the curate stack. Prose asserting an
+    invariant is not the invariant, so enforce it two ways.
+
+    Two checks, because neither alone is sufficient:
+
+    * The **runtime** check imports the module in a subprocess with non-stdlib
+      top-level packages blocked. Its known limit: `sys.meta_path` is consulted
+      only AFTER `sys.modules`, so a package already loaded during interpreter
+      startup (a `.pth` hook, for instance) would import without the blocker
+      ever running. The child runs with `-S` to shrink that window, but the
+      hole cannot be fully closed from inside the interpreter, so this check
+      does not prove "every" non-stdlib import is blocked.
+    * The **static** check reads the module's own AST and asserts every
+      top-level import names a stdlib module. This has no `sys.modules` blind
+      spot at all, and it is what actually enforces the documented rule.
+    """
+
+    def test_no_import_statement_names_a_non_stdlib_module(self):
+        source = (pathlib.Path(__file__).resolve().parent.parent / "scripts" / "timestamp_utils.py").read_text(
+            encoding="utf-8"
+        )
+        roots: set[str] = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Import):
+                roots.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                roots.add(node.module.split(".")[0])
+        offenders = sorted(r for r in roots if r not in sys.stdlib_module_names and r not in sys.builtin_module_names)
+        assert not offenders, (
+            f"timestamp_utils imports non-stdlib module(s) {offenders}. That breaks the "
+            "import-weight firebreak documented in CLAUDE.md: the five standalone analytics "
+            "scripts import this module precisely because it is stdlib-only."
+        )
+
+    def test_import_succeeds_with_all_third_party_packages_blocked(self):
+        child_script = textwrap.dedent("""
+            import sys, importlib.abc
+
+            class OnlyStdlib(importlib.abc.MetaPathFinder):
+                def find_spec(self, name, path=None, target=None):
+                    root = name.split('.')[0]
+                    # The module under test itself is obviously not stdlib.
+                    if root == 'timestamp_utils':
+                        return None
+                    if root in sys.builtin_module_names or root in sys.stdlib_module_names:
+                        return None
+                    raise ImportError('non-stdlib import blocked: ' + name)
+
+            sys.meta_path.insert(0, OnlyStdlib())
+            import timestamp_utils
+            print('OK')
+            """)
+        result = subprocess.run(
+            # -S skips site processing, shrinking the set of packages already in
+            # sys.modules before our finder is installed (see the class docstring).
+            [sys.executable, "-S", "-c", child_script],
+            cwd=str(pathlib.Path(__file__).resolve().parent.parent / "scripts"),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, (
+            "timestamp_utils gained a non-stdlib dependency. That breaks the import-weight "
+            "firebreak documented in CLAUDE.md: the five standalone analytics scripts import "
+            f"it precisely because it is stdlib-only.\n{result.stderr}"
+        )
+        assert "OK" in result.stdout
+
+
+class TestStandaloneScriptImportIsolation:
+    """Issue #152 acceptance criterion 2: each standalone analytics script must
+    import without google-api-python-client (or the other heavy curate-stack
+    deps) installed, and must not pull video_intel into sys.modules as a side
+    effect. A subprocess with a fresh module table is the only reliable way
+    to prove this - reusing the parent pytest process would see modules
+    already imported by other test files and give a false pass."""
+
+    # All five, not just wiki_concepts. Importing wiki_concepts transitively
+    # covers wiki_atlas, lead_lag_report, and lead_lag_viz, but NOTHING in that
+    # chain reaches burst_report - so a revert of burst_report's import back to
+    # `from intel_graph import timestamped_url` (the exact regression this
+    # guards) would have passed the whole suite undetected.
+    @pytest.mark.parametrize(
+        "module",
+        ["wiki_concepts", "wiki_atlas", "lead_lag_report", "lead_lag_viz", "burst_report"],
+    )
+    def test_import_succeeds_with_heavy_deps_blocked(self, module):
+        child_script = textwrap.dedent(f"""
+            import sys, importlib.abc
+            BLOCK = {{'googleapiclient', 'google_auth_oauthlib', 'google', 'lancedb', 'voyageai'}}
+
+            class Blocker(importlib.abc.MetaPathFinder):
+                def find_spec(self, name, path=None, target=None):
+                    if name.split('.')[0] in BLOCK:
+                        raise ImportError('blocked: ' + name)
+                    return None
+
+            sys.meta_path.insert(0, Blocker())
+            import {module}
+            print('OK')
+            print('video_intel pulled:', 'video_intel' in sys.modules)
+            print('intel_graph pulled:', 'intel_graph' in sys.modules)
+            """)
+        result = subprocess.run(
+            [sys.executable, "-c", child_script],
+            # Absolute, derived from this test file. A relative "scripts" would
+            # silently bind the test to pytest being invoked from the repo root.
+            cwd=str(pathlib.Path(__file__).resolve().parent.parent / "scripts"),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "OK" in result.stdout
+        assert "video_intel pulled: False" in result.stdout
+        assert "intel_graph pulled: False" in result.stdout

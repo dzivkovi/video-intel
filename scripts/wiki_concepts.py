@@ -40,8 +40,9 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
-from intel_graph import timestamped_url
 from wiki_atlas import slugify
+
+from timestamp_utils import parse_time_to_seconds, timestamped_url
 
 log = logging.getLogger(__name__)
 
@@ -372,7 +373,8 @@ def _whole_token_pattern(term: str) -> re.Pattern[str]:
 
     Mirrors `video_intel.py`'s `_alias_boundary_pattern` (duplicated rather
     than imported: importing `video_intel` here would drag in its heavy
-    transitive deps - see the lazy import below for the same reasoning).
+    transitive deps, which is the same reason `timestamped_url` and
+    `parse_time_to_seconds` live in `timestamp_utils` - see issue #152).
     stdlib `\\b` only matches between a word and a non-word character, so it
     silently fails for terms that begin/end with punctuation; the boundary
     here treats any non-word character OR the string edges as a boundary.
@@ -385,13 +387,6 @@ def parse_mindmap_timestamps(text: str) -> list[MindmapEntry]:
     a flat list carrying each bullet's first timestamp (seconds), or None
     when a bullet carries no parseable timestamp. Not a markdown library -
     the corpus's mindmap shape is stable and prompt-defined."""
-    # Lazy import (issue #150 FIX8c): video_intel.py pulls in google-genai,
-    # the YouTube Data API client, and other heavy transitive deps this
-    # standalone, read-only generator has no other reason to require at
-    # import time. Not relocated to timestamp_utils.py in this PR - that is
-    # its own ticket-sized refactor, not a review-finding fix.
-    from video_intel import parse_time_to_seconds
-
     entries: list[MindmapEntry] = []
     heading = ""
     subheading = ""

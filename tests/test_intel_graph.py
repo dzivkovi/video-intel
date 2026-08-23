@@ -203,6 +203,10 @@ class TestHelpers:
         assert len(q) < 400
 
     def test_timestamped_url(self):
+        # ig.timestamped_url is a re-export from timestamp_utils.py (issue
+        # #152); this test is the proof that re-export still works. Do not
+        # "tidy" it into testing timestamp_utils directly - that would
+        # silently delete the only proof intel_graph's re-export works.
         assert ig.timestamped_url("https://x.com/watch?v=1", 30) == "https://x.com/watch?v=1&t=30"
         assert ig.timestamped_url("https://x.com/v", 30) == "https://x.com/v?t=30"
         assert ig.timestamped_url(None, 30) == ""

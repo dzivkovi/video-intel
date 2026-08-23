@@ -25,7 +25,6 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from intel_graph import timestamped_url
 from lead_lag_report import (
     DEFAULT_DB,
     MIN_RANKED_CONCEPTS_DEFAULT,
@@ -38,6 +37,8 @@ from lead_lag_report import (
     ranked_creators,
     spearman,
 )
+
+from timestamp_utils import timestamped_url
 
 if TYPE_CHECKING:
     pass

@@ -49,7 +49,7 @@ from gemini_common import (
     require_gemini,
     require_youtube,
 )
-from timestamp_utils import normalize_timestamp, timestamp_tolerance
+from timestamp_utils import normalize_timestamp, parse_time_to_seconds, timestamp_tolerance
 
 log = logging.getLogger("video_intel")
 
@@ -3354,24 +3354,6 @@ def timestamp_to_seconds(ts):
     except (ValueError, TypeError):
         return 0
     return 0
-
-
-def parse_time_to_seconds(value: str) -> int:
-    """Parse time string to seconds. Accepts 'MM:SS', 'HH:MM:SS', or raw seconds.
-
-    Examples: '05:30' -> 330, '01:15:45' -> 4545, '330' -> 330.
-    """
-    if not value or not value.strip():
-        raise ValueError("Empty time value")
-    stripped = value.strip()
-    parts = stripped.split(":")
-    if len(parts) == 1:
-        return int(parts[0])
-    if len(parts) == 2:
-        return int(parts[0]) * 60 + int(parts[1])
-    if len(parts) == 3:
-        return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
-    raise ValueError(f"Invalid time format: {value!r}. Use MM:SS, HH:MM:SS, or raw seconds.")
 
 
 FILE_ACTIVE_POLL_SECONDS = 5
