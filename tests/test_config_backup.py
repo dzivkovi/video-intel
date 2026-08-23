@@ -62,8 +62,16 @@ def _case_str_constants(pattern: ast.AST) -> list[str]:
     """Collect string literals out of a `case` pattern.
 
     `case "scan":` is a MatchValue wrapping a Constant; `case "a" | "b":` is a
-    MatchOr of those. Anything else (a capture name, a class pattern, a guard)
-    names no literal command and contributes nothing.
+    MatchOr of those. `case "x" as selected:` is a MatchAs wrapping a
+    sub-pattern in `.pattern` - not recursing into it was a real bug (proven
+    by executing python against this exact shape): it returned nothing while
+    `_registered_commands` still found "x", so the parity test would REJECT a
+    perfectly valid `as`-bound case as a mismatch. A guard clause
+    (`case "x" if enabled:`) needs no such handling - the guard lives on
+    `ast.match_case.guard`, not on the pattern, so it never reaches this
+    function at all. A bare capture (`case selected:`) or wildcard
+    (`case _:`) is also a MatchAs, but with `pattern is None`, and names no
+    literal command.
     """
     if isinstance(pattern, ast.MatchValue):
         return _str_constants(pattern.value)
@@ -72,6 +80,10 @@ def _case_str_constants(pattern: ast.AST) -> list[str]:
         for sub in pattern.patterns:
             out.extend(_case_str_constants(sub))
         return out
+    if isinstance(pattern, ast.MatchAs):
+        if pattern.pattern is not None:
+            return _case_str_constants(pattern.pattern)
+        return []
     return []
 
 
@@ -160,6 +172,45 @@ def _registered_commands(module_src: str) -> set[str]:
         if isinstance(first, ast.Constant) and isinstance(first.value, str):
             commands.add(first.value)
     return commands
+
+
+def _unparseable_registrations(module_src: str) -> list[str]:
+    """Report every `subparsers.add_parser(...)` call whose name is not a string literal.
+
+    `_registered_commands` silently ignores such a call (a `CMD = "x"` /
+    `subparsers.add_parser(CMD)` registration, or a call with no positional
+    args at all). Proven by executing python against exactly that shape: BOTH
+    `_registered_commands` and `_dispatch_commands` return `set()` for "x", so
+    the registry equals the dispatch inventory (both simply lack it), the
+    parity test passes, and the union used by
+    test_all_dispatch_commands_are_classified never contains "x" - a new
+    subcommand can dodge classification entirely with every other guard
+    green. Ignoring is what makes that silent; this helper exists to fail
+    closed instead. It intentionally does not try to resolve a Name back to
+    its assignment (e.g. following CMD to "x") - that is a rabbit hole and
+    only a partial fix, whereas surfacing the call site as unparseable is
+    complete and cheap: the fix is either to use a string literal or to
+    extend the extractor, and the assertion message below says exactly that.
+    """
+    tree = ast.parse(textwrap.dedent(module_src))
+    problems: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "add_parser"):
+            continue
+        if not (isinstance(func.value, ast.Name) and func.value.id == "subparsers"):
+            continue
+        if not node.args:
+            problems.append(f"line {node.lineno}: subparsers.add_parser() called with no positional args")
+            continue
+        first = node.args[0]
+        if not (isinstance(first, ast.Constant) and isinstance(first.value, str)):
+            problems.append(
+                f"line {node.lineno}: subparsers.add_parser(...) first arg is not a string literal ({ast.dump(first)})"
+            )
+    return problems
 
 
 @pytest.fixture
@@ -382,6 +433,36 @@ class TestEveryMutatingCommandSnapshots:
     def test_scan_is_in_the_set(self):
         assert "scan" in CONFIG_BACKUP_COMMANDS
 
+    def test_every_subcommand_is_registered_with_a_string_literal(self):
+        """Fail closed on a common-mode blind spot in BOTH extractors at once.
+
+        Proven by executing python: `CMD = "x"` followed by
+        `subparsers.add_parser(CMD)` and `args.command == CMD` makes
+        `_registered_commands` AND `_dispatch_commands` both return `set()`
+        for "x" - not just one of them. The registry and the dispatch
+        inventory then agree (both lack "x"), so
+        test_dispatch_inventory_matches_the_argparse_registry stays green,
+        the union in test_all_dispatch_commands_are_classified never contains
+        "x", and "x" dodges classification with every other guard passing.
+        This test closes that gap by refusing to accept a non-literal
+        registration at all: a command must be reachable via a string
+        literal, or the extractor must be extended to understand the shape
+        that names it. `_dispatch_commands` needs no equivalent fail-closed
+        check for this same defect - once every registration is guaranteed
+        literal, a dispatch branch compared against a constant is caught by
+        the existing registered == dispatched equality test, because the
+        registry will have the name and the dispatch inventory will not.
+        """
+        module_src = inspect.getsource(video_intel)
+        unparseable = _unparseable_registrations(module_src)
+        assert not unparseable, (
+            "subcommand(s) registered without a string literal name - invisible to "
+            f"both _registered_commands and _dispatch_commands at once: {unparseable}. "
+            "Either register the command with a string literal, or extend "
+            "_unparseable_registrations (and _registered_commands) to understand "
+            "this shape."
+        )
+
     def test_nugget_is_exempt_from_config_backup(self):
         """Issue #147 guardrail 3: nugget writes only its own brief under
         output_dir/_briefings/nuggets/, never channel config or scan state, so
@@ -526,3 +607,53 @@ class TestDispatchExtractor:
     def test_registered_commands_excludes_a_nested_sub_action_parser(self):
         src = 'top_parser = subparsers.add_parser("top")\nnested_parser = profile_actions.add_parser("nested")\n'
         assert _registered_commands(src) == {"top"}
+
+    def test_case_as_binding_is_collected(self):
+        """Proven by execution: pre-fix, `case "x" as selected:` returned set() while
+        `_registered_commands` found {"x"}, so the parity test would REJECT this
+        perfectly valid refactor - a cry-wolf failure."""
+        src = 'match args.command:\n    case "x" as selected:\n        pass\n'
+        assert _dispatch_commands(src) == {"x"}
+
+    def test_case_or_with_as_binding_is_collected(self):
+        src = 'match args.command:\n    case ("x" | "y") as selected:\n        pass\n'
+        assert _dispatch_commands(src) == {"x", "y"}
+
+    def test_case_bare_capture_and_wildcard_yield_nothing(self):
+        src = "match args.command:\n    case selected:\n        pass\n    case _:\n        pass\n"
+        assert _dispatch_commands(src) == set()
+
+    def test_case_guard_clause_is_collected(self):
+        """Regression pin: a guard clause already worked pre-fix (verified by execution)
+        because a guard lives on ast.match_case.guard, not on the pattern - it never
+        touches _case_str_constants. Pinned here so a future change cannot break it
+        unnoticed."""
+        src = 'match args.command:\n    case "x" if enabled:\n        pass\n'
+        assert _dispatch_commands(src) == {"x"}
+
+
+class TestUnparseableRegistrations:
+    """Coverage for `_unparseable_registrations`, the fail-closed half of the P2 fix."""
+
+    def test_name_registration_is_reported(self):
+        src = 'CMD = "x"\nsubparsers.add_parser(CMD)\n'
+        problems = _unparseable_registrations(src)
+        assert len(problems) == 1
+        assert "line 2" in problems[0]
+
+    def test_string_literal_registration_is_not_reported(self):
+        src = 'subparsers.add_parser("ok")\n'
+        assert _unparseable_registrations(src) == []
+
+    def test_no_positional_args_is_reported(self):
+        src = "subparsers.add_parser()\n"
+        problems = _unparseable_registrations(src)
+        assert len(problems) == 1
+        assert "no positional args" in problems[0]
+
+    def test_live_module_has_no_unparseable_registrations(self):
+        """All 16 subcommands in scripts/video_intel.py register with a string
+        literal today; this pins that fact so a future non-literal registration
+        is caught immediately rather than silently dodging both extractors."""
+        module_src = inspect.getsource(video_intel)
+        assert _unparseable_registrations(module_src) == []
