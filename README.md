@@ -364,7 +364,24 @@ python scripts/video_intel.py briefings --unseen --pdf
 
 Each entry carries an **age badge** (`age 3y`), and a secondary **"By year"** section regroups the same videos chronologically - the primary list stays relevance-ranked (recency is only a tiebreaker, so an old-but-important video still surfaces near the top rather than being buried). On a first run against a large corpus with no tuned `profile.yaml` yet, a one-line warning points at `profile init`.
 
-**Organizing briefings by topic:** `_briefings/` may hold arbitrary subfolders (e.g. `_briefings/sales/`, `_briefings/observability/`) for manually curated or moved-there briefings. Seen-tracking recurses into them, so a video surfaced in a subfoldered briefing is never re-surfaced. Folder names are a filesystem convention only - there is no per-topic flag or config.
+**Organizing briefings by topic:** `_briefings/` may hold arbitrary subfolders (e.g. `_briefings/sales/`, `_briefings/observability/`) for manually curated or moved-there briefings. Seen-tracking recurses into them, so a video surfaced in a subfoldered briefing is never re-surfaced. There is still no per-topic flag or config to maintain. But as of the topics layer the folder name is no longer *only* a filesystem convention: it is the topic name, and `topics-build` derives channel and video membership from it. Renaming a topic folder renames the topic.
+
+**Topic following (why is this channel in my corpus?).** The corpus grows two ways: channels you follow, and one-off videos a research thread pulled in. That second group becomes an unreadable tail - `a16z` with one video and no explanation. The topics layer answers it, and the retroactive cost is zero because **your briefing folders already are the assignment**: every `_briefings/<topic>/` briefing carries a `video_ids:` list, so `topics-build` just materializes the join.
+
+```bash
+python scripts/video_intel.py topics-build     # derived, byte-stable, rebuild anytime
+python scripts/video_intel.py status           # per-channel rollup
+python scripts/video_intel.py search "positioning" --topic fde
+```
+
+```text
+a16z: 1 mindmaps, 1 transcripts, 1 concepts
+  topics: fde
+```
+
+`--topic <slug>` on `process` / `transcript` / `mindmap` covers the window before a briefing exists, and doubles as a backfill: on a video whose artifacts already exist every stage lazy-skips and the tag is still recorded, with no Gemini call. This is provenance only - it never influences ranking, and `taxonomy.json` (what a video *says*) stays entirely separate from `topics.json` (why you *pulled it in*).
+
+See **[docs/topics-layer.md](docs/topics-layer.md)** for the full guide: the removal path, the over-fetch behavior in `search --topic`, and what happens when you rename a topic folder.
 
 The `--pdf` flag is for reading on the go and sharing: it renders the ranked set as a one-page-friendly PDF whose video titles and timestamped moments are bold, accent-colored hyperlinks that open YouTube at the exact second. It is purely additive, the Markdown is always written and remains the record of what has been surfaced. The PDF writer is self-contained ([`scripts/briefing_pdf.py`](scripts/briefing_pdf.py), ~90 lines on top of `reportlab`), so anyone who installs the plugin gets it with no external service.
 
