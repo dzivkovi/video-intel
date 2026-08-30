@@ -45,9 +45,14 @@ def _payload(marker: str, start_secs: int, end_secs: int):
     pre-existing `_assess_chunk_coverage` thin-chunk detector stays quiet -
     otherwise every chunk would be flagged thin and `transcript_status` would
     read `partial` for reasons that have nothing to do with this guard.
+
+    Issue #157: 6 evenly-spaced marks (not 5) so the max internal gap stays
+    under BLIND_GAP_SEVERE_SECONDS (600s) on a 3000s (50-minute) chunk - the
+    quality assessor's blind-gap check is stricter than the old span-ratio
+    check this comment originally described.
     """
     span = end_secs - start_secs
-    marks = [start_secs + int(span * f) for f in (0.02, 0.25, 0.5, 0.75, 0.97)]
+    marks = [start_secs + int(span * f) for f in (0.02, 0.21, 0.40, 0.59, 0.78, 0.97)]
     return json.dumps(
         {
             "transcripts": [
