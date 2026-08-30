@@ -2100,6 +2100,32 @@ def _build_chunked_transcript_coverage_block(
     return "\n".join(lines)
 
 
+def _safe_timestamp_to_seconds(ts: str) -> int | None:
+    """Like `timestamp_to_seconds`, but returns None on a genuinely
+    unparseable stamp instead of silently falling through to 0 (issue #158
+    dual-review addendum, adversarial P3).
+
+    `timestamp_to_seconds`'s fallback-to-0 is fine for its own use (a sort
+    key: an unsortable entry just sorts first, harmlessly). It is NOT fine
+    for the window-mismatch detector: a garbage string carries no
+    positional evidence at all, so reading it as "0 seconds" would silently
+    become a false OUT-OF-WINDOW violation for any chunk whose window
+    doesn't include 0 (every chunk after the first), and a false IN-WINDOW
+    pass for chunk 1 (whose window does include 0) - two different wrong
+    answers depending on which chunk emitted the garbage. Callers must gate
+    on `is None` and count the stamp separately, never substitute a default.
+    """
+    parts = ts.split(":")
+    try:
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + int(float(parts[1]))
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(float(parts[2]))
+    except (ValueError, TypeError):
+        return None
+    return None
+
+
 def merge_chunked_transcripts(
     chunks: list[tuple[int, dict]],
     chunk_duration_seconds: int = 3000,
@@ -2127,12 +2153,23 @@ def merge_chunked_transcripts(
     the chunk's actual end, so a folded runt tail's legitimate content past
     the nominal boundary is never flagged. This is label-only bookkeeping: it
     never drops, reorders, or reclassifies an entry. When omitted (legacy
-    2-tuple callers), no violations are computed. Per-chunk raw counts are
-    returned via the `"_chunk_window_violations"` key: a list of
-    `{"chunk_index" (1-based), "classified_dialogue", "out_of_window"}` dicts,
-    one per chunk that had bounds supplied - the caller (`_run_chunked_
+    2-tuple callers), no violations are computed. If `chunk_bounds` is
+    supplied but its length does not match `chunks`, one WARNING names both
+    lengths - the caller likely built the two lists out of lockstep (see
+    `_run_chunked_transcript_url`'s `chunk_bounds_used`) - and detection
+    still degrades gracefully: any chunk index past the end of `chunk_bounds`
+    is simply treated as having no bounds (no window check for it), rather
+    than raising or silently mis-checking it against the wrong chunk's
+    window. Per-chunk raw counts are returned via the
+    `"_chunk_window_violations"` key: a list of `{"chunk_index" (1-based),
+    "classified_dialogue", "out_of_window", "unparseable"}` dicts, one per
+    chunk that had bounds supplied - the caller (`_run_chunked_
     transcript_url`) turns this into severe/mild quality flags via
-    `_classify_chunk_window_violations`.
+    `_classify_chunk_window_violations`. `"unparseable"` counts classified
+    dialogue stamps whose value could not be parsed to seconds at all (see
+    the window-check loop below for why these are excluded from both
+    `"classified_dialogue"` and `"out_of_window"` rather than defaulting
+    either way).
 
     Output: dict with the same shape as a single Gemini transcript response
     (transcripts, screen_content, speakers) with speakers deduplicated by
@@ -2157,6 +2194,26 @@ def merge_chunked_transcripts(
     post-merge gap/density signal (the shifted block can land inside another
     chunk's healthy range). `chunk_bounds` closes that blind spot.
 
+    **Scope, precisely (dual-review addendum) - this detector catches
+    OUT-OF-BAND placements only.** It fires when a classified value lands
+    OUTSIDE the emitting chunk's own real window: the double-offset shape
+    above, an implausible-passthrough value, or an overrun past a short
+    final chunk's real end. It structurally CANNOT catch a wrong-branch
+    classification whose result stays INSIDE the emitting chunk's own
+    window - there is no window violation to see, because the corrupted
+    number IS a legitimate coordinate inside the chunk that emitted it. The
+    historically observed case is the hour-digit-dropped shape (see
+    `docs/solutions/integration-issues/gemini-flash3-vs-pro25-chunked-
+    transcription-20260427.md`, Defect A): content genuinely at `[1:01:33]`
+    (chunk 2's territory) emitted by Gemini as `[01:33]` in chunk 1's
+    response. The classifier reads `01:33` (93 seconds) as a plausible
+    value for chunk 1 and leaves it there; the result sits inside chunk 1's
+    own real window, so no out-of-window signal is possible for this shape
+    no matter how this detector is tuned. Do not extend the claim beyond
+    this - same discipline as issue #128's monolithic-collapse detector,
+    which explicitly does not claim to catch the "collapse to one block"
+    early-stop shape either.
+
     Speaker dedup is by exact name match. If Gemini renumbers a speaker
     mid-stream (chunk 1's voice=1 = "Lex"; chunk 2's voice=1 = "Peter"),
     the merger correctly maps them to different global voice ids because
@@ -2168,6 +2225,20 @@ def merge_chunked_transcripts(
     slack = timestamp_tolerance(chunk_duration_seconds)
     chunk_window_violations: list[dict] = []
 
+    # Dual-review addendum (adversarial P3, issue #158): a chunk_bounds list
+    # that does not match chunks positionally would silently check each
+    # chunk against the WRONG bounds (or none at all past the shorter
+    # list's end) - loud, not silent, when the caller's two lists drift out
+    # of lockstep.
+    if chunk_bounds is not None and len(chunk_bounds) != len(chunks):
+        log.warning(
+            "merge_chunked_transcripts: chunk_bounds length (%d) does not match "
+            "chunks length (%d) - window-mismatch detection will be skipped for "
+            "any chunk past the shorter list's end.",
+            len(chunk_bounds),
+            len(chunks),
+        )
+
     for chunk_idx, (start_secs, chunk_json) in enumerate(chunks):
         if not isinstance(chunk_json, dict):
             continue
@@ -2176,6 +2247,7 @@ def merge_chunked_transcripts(
         window_hi = (bounds[1] if bounds is not None else start_secs + chunk_duration_seconds) + slack
         classified_dialogue = 0
         out_of_window = 0
+        unparseable = 0
 
         # Per-chunk (original_voice -> global_voice) map.
         voice_remap: dict[int, int] = {}
@@ -2197,12 +2269,25 @@ def merge_chunked_transcripts(
                 # Issue #158: post-classification window check, immediately
                 # after the classifier decided this stamp's placement. Never
                 # changes new_t["start"] - label-only via the counts returned
-                # below.
+                # below. Dual-review addendum (adversarial P3): an
+                # unparseable classified value must not count as EITHER a
+                # violation or a clean entry - timestamp_to_seconds falls
+                # through to 0 on garbage, which would silently read as
+                # out-of-window for every chunk with start_secs > 0 (0 <
+                # window_lo there) and as in-window for chunk 1 (0 is
+                # plausibly inside its own window) - both wrong, since a
+                # garbage string carries no positional evidence at all. Use
+                # _safe_timestamp_to_seconds (returns None on failure,
+                # unlike timestamp_to_seconds's 0-fallback meant for sort
+                # keys) and gate BOTH counters on a successful parse.
                 if bounds is not None and new_t["start"]:
-                    classified_secs = timestamp_to_seconds(str(new_t["start"]))
-                    classified_dialogue += 1
-                    if classified_secs < window_lo or classified_secs > window_hi:
-                        out_of_window += 1
+                    classified_secs = _safe_timestamp_to_seconds(str(new_t["start"]))
+                    if classified_secs is None:
+                        unparseable += 1
+                    else:
+                        classified_dialogue += 1
+                        if classified_secs < window_lo or classified_secs > window_hi:
+                            out_of_window += 1
             if t.get("voice") in voice_remap:
                 new_t["voice"] = voice_remap[t["voice"]]
             merged["transcripts"].append(new_t)
@@ -2221,6 +2306,7 @@ def merge_chunked_transcripts(
                     "chunk_index": chunk_idx + 1,
                     "classified_dialogue": classified_dialogue,
                     "out_of_window": out_of_window,
+                    "unparseable": unparseable,
                 }
             )
 
@@ -3074,9 +3160,26 @@ QUALITY_FLAG_CHUNK_WINDOW_MISMATCH_MILD = "chunk_window_mismatch_mild"
 #: Issue #158 severity thresholds: a chunk's out-of-window fraction has to
 #: exceed a majority (not merely reach it) AND the chunk needs a minimum
 #: number of classified dialogue entries, so a 1-of-1 or 2-of-3 chunk (too
-#: little evidence to call systemic) cannot trip severe on its own.
+#: little evidence to call systemic) cannot trip severe on its own via the
+#: fraction rule alone - see CHUNK_WINDOW_MISMATCH_UNANIMOUS_MIN_ENTRIES
+#: below for the SEPARATE rule that handles 100%-wrong short chunks.
 CHUNK_WINDOW_MISMATCH_SEVERE_FRACTION = 0.5
 CHUNK_WINDOW_MISMATCH_SEVERE_MIN_ENTRIES = 4
+
+#: Dual-review addendum (Codex MEDIUM, issue #158): with chunk_minutes <= 5,
+#: a chunk with 2-3 entries that are 100% out-of-window could never reach
+#: CHUNK_WINDOW_MISMATCH_SEVERE_MIN_ENTRIES (4) under the fraction rule
+#: alone - and the monolithic guard's own ">300s window" gate (see the
+#: issue #157 guardrail entry) also misses a short chunk like this, since a
+#: <=5-minute chunk's relativized span is under that floor. Unanimous
+#: wrongness needs no statistical mass to call systemic: if EVERY classified
+#: dialogue entry in a chunk is out of window, that is conclusive regardless
+#: of how few entries there are - except a single entry (classified_dialogue
+#: == 1), which is too weak a sample to call unanimous (matches the existing
+#: single-stray-stamp-is-mild case). The >= 4 floor is UNCHANGED for the
+#: majority-but-not-unanimous path - this constant governs ONLY the
+#: unanimous shortcut.
+CHUNK_WINDOW_MISMATCH_UNANIMOUS_MIN_ENTRIES = 2
 
 #: Flags that change transcript_status to "partial", count as a pipeline gap
 #: (exit EXIT_PARTIAL), and make resolve_mindmap_source's "auto" branch treat
@@ -3099,13 +3202,23 @@ def _classify_chunk_window_violations(per_chunk_counts: list[dict]) -> dict:
     severe/mild vocabulary and frozenset-membership mechanism every other
     transcript_quality_flags entry uses (see transcript_quality_flags_are_severe).
 
-    Per chunk with at least one out-of-window classified dialogue entry:
-      - out_of_window / classified_dialogue > CHUNK_WINDOW_MISMATCH_SEVERE_FRACTION
+    Per chunk with at least one out-of-window classified dialogue entry,
+    SEVERE fires on EITHER of two independent rules (dual-review addendum,
+    issue #158):
+      - UNANIMOUS: out_of_window == classified_dialogue AND classified_dialogue
+        >= CHUNK_WINDOW_MISMATCH_UNANIMOUS_MIN_ENTRIES (2) - every classified
+        stamp in the chunk is wrong. This needs no statistical mass (closes
+        the short-chunk hole: a 2-3 entry chunk that is 100% wrong could
+        never reach the 4-entry floor below). A single out-of-window entry
+        (classified_dialogue == 1) is deliberately excluded - one data point
+        is too weak to call unanimous.
+      - MAJORITY: out_of_window / classified_dialogue > CHUNK_WINDOW_MISMATCH_SEVERE_FRACTION
         AND classified_dialogue >= CHUNK_WINDOW_MISMATCH_SEVERE_MIN_ENTRIES
-        -> SEVERE (a majority of the chunk's own stamps are misplaced - the
-        double-offset shape issue #158 exists to catch).
-      - otherwise (any violation, but not a qualifying majority) -> MILD (a
-        stray stamp, not a systemic misclassification).
+        (4) - a majority, not necessarily all, of the chunk's own stamps are
+        misplaced (the double-offset shape issue #158 exists to catch).
+      Otherwise (any violation, but neither rule satisfied) -> MILD (a stray
+      stamp, or a majority with too little evidence, not a systemic
+      misclassification).
 
     A chunk with zero classified_dialogue contributes nothing (division would
     be undefined and there is no evidence either way). Never raises; a
@@ -3126,7 +3239,11 @@ def _classify_chunk_window_violations(per_chunk_counts: list[dict]) -> dict:
         if out_of_window <= 0 or classified <= 0:
             continue
         fraction = out_of_window / classified
-        if fraction > CHUNK_WINDOW_MISMATCH_SEVERE_FRACTION and classified >= CHUNK_WINDOW_MISMATCH_SEVERE_MIN_ENTRIES:
+        unanimous = out_of_window == classified and classified >= CHUNK_WINDOW_MISMATCH_UNANIMOUS_MIN_ENTRIES
+        majority = (
+            fraction > CHUNK_WINDOW_MISMATCH_SEVERE_FRACTION and classified >= CHUNK_WINDOW_MISMATCH_SEVERE_MIN_ENTRIES
+        )
+        if unanimous or majority:
             if QUALITY_FLAG_CHUNK_WINDOW_MISMATCH_SEVERE not in severe:
                 severe.append(QUALITY_FLAG_CHUNK_WINDOW_MISMATCH_SEVERE)
         elif QUALITY_FLAG_CHUNK_WINDOW_MISMATCH_MILD not in mild:
