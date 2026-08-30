@@ -179,26 +179,41 @@ class TestMakeThinkingConfigForTranscript:
         assert result is None
 
 
+def _dense_chunk_marks(span: int, fractions=(0.02, 0.21, 0.40, 0.59, 0.78, 0.97)) -> list[dict]:
+    """A healthy-density fixture: 6 evenly-spaced entries with max internal
+    gap well under BLIND_GAP_SEVERE_SECONDS (600s) for a 3000s window."""
+    return [{"start": _mmss(int(span * f)), "voice": 1, "text": f"line {i}"} for i, f in enumerate(fractions)]
+
+
+def _mmss(secs: int) -> str:
+    return f"{secs // 60:02d}:{secs % 60:02d}"
+
+
 class TestAssessChunkCoverage:
-    """Issue #58 Gate 2 sanity check: detect chunks that returned valid JSON
-    but transcribed only a fraction of their allotted time window."""
+    """Issue #58 Gate 2 / issue #157: detect chunks that returned valid JSON
+    but transcribed only a fraction of their allotted time window, are
+    hollow in the middle, or are otherwise monolithic. Rewritten for the
+    assess_transcript_artifact-backed implementation - see
+    tests/test_transcript_quality_guard.py for the pure-function contract."""
 
     def test_full_coverage_is_ok(self):
-        # 50-minute chunk where Gemini transcribed entries spanning the full
-        # window (~50 min observed span).
-        parsed = {
-            "transcripts": [
-                {"start": "00:30"},
-                {"start": "25:00"},
-                {"start": "49:30"},
-            ]
-        }
-        result = vi._assess_chunk_coverage(parsed, start_secs=3000, end_secs=6000, duration_seconds=11752, chunk_idx=2)
-        assert result == "ok"
+        # 50-minute chunk with dense, evenly-spread dialogue (15 entries,
+        # 0.3/min - above DENSITY_MILD_PER_MIN too) - genuinely healthy,
+        # no severe or mild flags at all.
+        fractions = [i / 14 for i in range(15)]
+        parsed = {"transcripts": _dense_chunk_marks(3000, fractions=fractions)}
+        status, metrics = vi._assess_chunk_coverage(
+            parsed, start_secs=3000, end_secs=6000, duration_seconds=11752, chunk_idx=2
+        )
+        assert status == "ok"
+        assert metrics["severe"] == []
+        assert metrics["mild"] == []
 
     def test_tucker_chunk2_thin_case_flagged(self):
         # Real-input regression: chunk 2 covered only 50:00-53:10 of its
-        # 50:00-1:40:00 (3000s) allotted window. Observed span ~190s = 6.3%.
+        # 50:00-1:40:00 (3000s) allotted window - 3 entries in the first 190s
+        # of a 50-minute chunk. Entries <= 3 is monolithic collapse
+        # regardless of where in the window they land.
         parsed = {
             "transcripts": [
                 {"start": "00:00"},
@@ -206,34 +221,72 @@ class TestAssessChunkCoverage:
                 {"start": "03:10"},
             ]
         }
-        result = vi._assess_chunk_coverage(parsed, start_secs=3000, end_secs=6000, duration_seconds=7355, chunk_idx=2)
-        assert result == "thin"
+        status, metrics = vi._assess_chunk_coverage(
+            parsed, start_secs=3000, end_secs=6000, duration_seconds=7355, chunk_idx=2
+        )
+        assert status == "thin"
+        assert "monolithic_severe" in metrics["severe"]
 
     def test_empty_transcripts_list_flagged_thin(self):
-        result = vi._assess_chunk_coverage(
+        status, metrics = vi._assess_chunk_coverage(
             {"transcripts": []}, start_secs=3000, end_secs=6000, duration_seconds=7355, chunk_idx=2
         )
-        assert result == "thin"
+        assert status == "thin"
+        assert "monolithic_severe" in metrics["severe"]
+        assert "blind_gap_severe" in metrics["severe"]
 
-    def test_single_timestamp_cannot_measure_span_flagged_thin(self):
-        # Need at least 2 timestamps to compute a span.
+    def test_single_timestamp_flagged_thin(self):
+        # A single entry is monolithic collapse (<=3 entries), independent
+        # of the old "need 2 timestamps to measure a span" framing.
         parsed = {"transcripts": [{"start": "00:30"}]}
-        result = vi._assess_chunk_coverage(parsed, start_secs=3000, end_secs=6000, duration_seconds=7355, chunk_idx=2)
-        assert result == "thin"
+        status, metrics = vi._assess_chunk_coverage(
+            parsed, start_secs=3000, end_secs=6000, duration_seconds=7355, chunk_idx=2
+        )
+        assert status == "thin"
+        assert "monolithic_severe" in metrics["severe"]
 
-    def test_single_chunk_video_skips_check(self):
-        # When there's no chunking (start=0, end=0), the allotted window is
-        # the whole video — coverage check would be ill-defined.
+    def test_sentinel_zero_zero_is_now_assessed_not_skipped(self):
+        """Issue #157 defect #4: the (0, 0) sentinel used to return "ok"
+        immediately, conflating "no clipping" with "no assessment". A
+        single-shot call reaching this function IS the whole video, so a
+        10-minute video with only 2 dialogue entries is genuine monolithic
+        collapse and must now be caught, not waved through."""
         parsed = {"transcripts": [{"start": "00:30"}, {"start": "01:00"}]}
-        result = vi._assess_chunk_coverage(parsed, start_secs=0, end_secs=0, duration_seconds=600, chunk_idx=1)
-        assert result == "ok"
+        status, metrics = vi._assess_chunk_coverage(parsed, start_secs=0, end_secs=0, duration_seconds=600, chunk_idx=1)
+        assert status == "thin"
+        assert "monolithic_severe" in metrics["severe"]
 
-    def test_50_percent_threshold_boundary(self):
-        # Boundary case: exactly 50% of allotted span = "ok".
-        parsed = {"transcripts": [{"start": "00:00"}, {"start": "25:00"}]}
-        # 1500s observed / 3000s allotted = 50% exactly — passes.
-        result = vi._assess_chunk_coverage(parsed, start_secs=3000, end_secs=6000, duration_seconds=7355, chunk_idx=2)
-        assert result == "ok"
+    def test_gap_just_under_severe_threshold_is_ok(self):
+        # 6 entries, 599s apart - below BLIND_GAP_SEVERE_SECONDS (600).
+        parsed = {"transcripts": [{"start": _mmss(s)} for s in (0, 599, 1198, 1797, 2396, 2995)]}
+        status, metrics = vi._assess_chunk_coverage(
+            parsed, start_secs=3000, end_secs=6000, duration_seconds=7355, chunk_idx=2
+        )
+        assert status == "ok"
+        assert metrics["max_blind_gap_seconds"] < 600
+
+    def test_gap_at_severe_threshold_is_thin(self):
+        # Same shape, gaps widened to exactly 600s.
+        parsed = {"transcripts": [{"start": _mmss(s)} for s in (0, 600, 1200, 1800, 2400, 3000 - 5)]}
+        status, metrics = vi._assess_chunk_coverage(
+            parsed, start_secs=3000, end_secs=6000, duration_seconds=7355, chunk_idx=2
+        )
+        assert status == "thin"
+        assert "blind_gap_severe" in metrics["severe"]
+
+    def test_sparse_but_not_monolithic_is_mild_not_severe(self):
+        """A chunk that is sparse but not collapsed stays "ok" - mild flags
+        are label-only and never flip the writer's ok/thin verdict."""
+        # 6 entries (> MONOLITHIC_MAX_ENTRIES) spread with gaps under 600s,
+        # but 6 entries / 50min = 0.12/min sits in the density_mild band
+        # (< 0.25) without being severe (>= 0.1).
+        parsed = {"transcripts": _dense_chunk_marks(3000)}
+        status, metrics = vi._assess_chunk_coverage(
+            parsed, start_secs=3000, end_secs=6000, duration_seconds=7355, chunk_idx=2
+        )
+        assert status == "ok"
+        assert "density_mild" in metrics["mild"]
+        assert metrics["severe"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -703,12 +756,33 @@ class TestCmdProcessUrl:
         monkeypatch.setattr(vi, "process_mindmap", fake_mindmap)
         monkeypatch.setattr(vi, "process_concepts", fake_concepts)
 
-        chunk_response = {"transcripts": [], "speakers": [{"voice": 1, "name": "S"}], "screen_content": []}
+        # Issue #157: dense enough (6 evenly-spaced entries per 3000s chunk,
+        # max internal gap ~570s) that the quality assessor stays healthy -
+        # this test is about chunk DISPATCH mechanics (call count, offsets),
+        # not transcript content, and an empty/sparse fixture would now
+        # trip transcript_status: partial and exit the pipeline at
+        # EXIT_PARTIAL before the assertions below run.
+        def _mmss(secs: int) -> str:
+            return f"{secs // 60:02d}:{secs % 60:02d}"
+
+        chunk_response = {
+            "transcripts": [
+                {"start": _mmss(int(3000 * f)), "voice": 1, "text": f"line {f}"}
+                for f in (0.02, 0.21, 0.40, 0.59, 0.78, 0.97)
+            ],
+            "speakers": [{"voice": 1, "name": "S"}],
+            "screen_content": [],
+        }
         chunk_calls = _stub_gemini_calls(monkeypatch, [chunk_response] * 4)
 
         config = {
             "output_dir": str(tmp_path),
             "channels": [{"name": "lex", "url": "https://example.com/lex"}],
+            # Pinned explicitly: this test asserts dispatch mechanics tied to
+            # a 50-minute chunk size (starts == [0, 3000, 6000, 9000]), which
+            # must stay independent of TRANSCRIPT_CHUNK_MINUTES_DEFAULT
+            # (lowered to 30 by issue #157).
+            "chunk_minutes": 50,
         }
         args = _process_url_args("https://www.youtube.com/watch?v=YFjfBk8HI5o", channel="lex")
         vi.cmd_process(args, config)

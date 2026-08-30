@@ -13,6 +13,7 @@ Prerequisites:
 
 import argparse
 import functools
+import itertools
 import json
 import logging
 import math
@@ -843,7 +844,7 @@ def channel_config_by_name(config: dict, channel_name: str | None) -> dict:
     return next((c for c in (config.get("channels") or []) if c.get("name") == channel_name), {})
 
 
-def resolve_mindmap_source(channel_config: dict, *, transcript_available: bool) -> str:
+def resolve_mindmap_source(channel_config: dict, *, transcript_available: bool, transcript_severe: bool = False) -> str:
     """Decide which input the mindmap step should consume.
 
     Returns one of ``"video" | "transcript" | "skip"`` (issue #54).
@@ -855,10 +856,26 @@ def resolve_mindmap_source(channel_config: dict, *, transcript_available: bool) 
     on-disk transcript still flips ``transcript_available`` to True (which
     is the right behavior — use what we have).
 
+    ``transcript_severe`` (issue #157 containment rule) is whether that
+    on-disk transcript carries a SEVERE quality flag (see
+    ``transcript_quality_flags_are_severe``) - a monolithic collapse, a
+    severe blind gap, or a severe backward jump. It changes behavior ONLY
+    for ``"auto"``, where a severe transcript is treated as unavailable and
+    the resolver falls back to ``"video"`` (the pre-#54 safe default),
+    rather than feeding a known-corrupt transcript into mindmap generation
+    and letting the corruption propagate into concepts, taxonomy.json, and
+    the LanceDB index. An explicit ``mindmap_source: transcript`` is still
+    honored regardless of severity — the operator asked for it by name, and
+    the existing partial-source provenance header (set by process_mindmap
+    from the same on-disk transcript_status) already marks the artifact.
+    Defaults to False so every pre-#157 caller that has not been updated to
+    check severity keeps its exact prior behavior.
+
     Channel config knob ``mindmap_source`` accepts:
-    - ``"auto"`` (default): transcript when available, else fall back to video.
-      The auto path makes the inversion safe to ship as the new default — a
-      missing transcript silently routes back to the legacy video code.
+    - ``"auto"`` (default): transcript when available and not severely
+      flagged, else fall back to video. The auto path makes the inversion
+      safe to ship as the new default — a missing OR corrupt transcript
+      silently routes back to the legacy video code.
     - ``"transcript"``: must use transcript. Raises ``ValueError`` when none
       is available. Common cause: the user set
       ``skip_modes['transcript']`` (issue #42) AND ``mindmap_source: transcript``
@@ -885,7 +902,7 @@ def resolve_mindmap_source(channel_config: dict, *, transcript_available: bool) 
             )
         return "transcript"
     # auto
-    return "transcript" if transcript_available else "video"
+    return "transcript" if (transcript_available and not transcript_severe) else "video"
 
 
 def find_mindmap_source(channel_dir: Path, prefix: str) -> Path | None:
@@ -1748,7 +1765,14 @@ def _fmt_hms(seconds: int) -> str:
 # ---------------------------------------------------------------------------
 
 
-TRANSCRIPT_CHUNK_MINUTES_DEFAULT = 50
+#: Issue #157: lowered from 50 to 30. This, not the runt-fold floor below, is
+#: what fixes the seed case's shape - a 51m30s (3090s) video used to build
+#: [(0,3000),(3000,3090)] and then fold (90s runt) into one 51.5-minute
+#: single-shot-equivalent call; at 30 minutes it builds two real ~26-minute
+#: chunks that never fold. Also narrows the window in which Gemini's ~30-
+#: minute-into-a-call degradation (median gap onset 28.6min, n=17) can hide
+#: inside a single chunk without tripping the per-chunk quality assessor.
+TRANSCRIPT_CHUNK_MINUTES_DEFAULT = 30
 
 #: Fraction of MAX_OUTPUT_TOKENS at or above which a response is treated as
 #: having hit the OUTPUT cap. Empirically the confirmed truncation reported
@@ -1846,6 +1870,13 @@ def resolve_chunk_minutes(channel_config: dict, config: dict, cli_override: int 
     return TRANSCRIPT_CHUNK_MINUTES_DEFAULT
 
 
+#: Issue #157: absolute floor (seconds) below which a chunked run's final
+#: tail folds into the previous chunk rather than becoming its own call.
+#: Replaces a 20% ratio that widened exposure as chunk_minutes grew - see
+#: the fold site in _build_transcript_chunks for the seed-case walkthrough.
+RUNT_FOLD_MAX_SECONDS = 120
+
+
 def _build_transcript_chunks(
     duration_seconds: int,
     chunk_minutes: int,
@@ -1877,9 +1908,20 @@ def _build_transcript_chunks(
     # wasted Gemini call that _assess_chunk_coverage then flags as thin,
     # forcing transcript_status: partial on a perfectly healthy video - noise
     # poured into exactly the bucket the truncation detection exists to clean
-    # up. A tail under 20% of a chunk carries too little content to justify
-    # its own call; the merged chunk stays well under 1.2x the requested size.
-    if len(chunks) >= 2 and (chunks[-1][1] - chunks[-1][0]) < chunk_seconds * 0.2:
+    # up. A tail under RUNT_FOLD_MAX_SECONDS carries too little content to
+    # justify its own call.
+    #
+    # Issue #157: was a 20% ratio (`< chunk_seconds * 0.2`), which WIDENED
+    # exposure instead of narrowing it - the seed video (3090s at the old
+    # 50-minute default) built [(0,3000),(3000,3090)], and the 90-second tail
+    # (3% of a 3000s chunk) folded well under that 20% floor, silently turning
+    # a just-chunked video back into an effectively single-shot 51.5-minute
+    # call. An ABSOLUTE floor does not scale with chunk_seconds the way a
+    # ratio does, so it cannot widen exposure as chunk_minutes changes; it is
+    # the chunk_minutes default drop to 30 (above), not this floor, that
+    # actually fixes the seed shape (a 90s runt still folds under 120s either
+    # way; at 30 minutes the seed splits into two real, un-folded chunks).
+    if len(chunks) >= 2 and (chunks[-1][1] - chunks[-1][0]) < RUNT_FOLD_MAX_SECONDS:
         _, last_end = chunks.pop()
         prev_start, _ = chunks.pop()
         chunks.append((prev_start, last_end))
@@ -2224,6 +2266,11 @@ def _run_chunked_transcript_url(
     failed_chunks: list[tuple[int, int, str]] = []
     thin_chunk_count = 0
     confabulated_chunks = 0
+    # Issue #157: union of every chunk's own severe+mild flags (most notably
+    # backward-jump - see assess_transcript_artifact's docstring for why that
+    # evidence only exists here, before merge/sort) plus the whole-stitched-
+    # transcript flags computed after merge below.
+    quality_flags: set[str] = set()
 
     for chunk_idx, (start_secs, end_secs) in enumerate(chunks, start=1):
         gemini_start: int | None = None if (start_secs == 0 and end_secs == 0) else start_secs
@@ -2290,7 +2337,7 @@ def _run_chunked_transcript_url(
         # #60 (single-shot transcript) and #119 (video mindmap) already closed.
         # prompt == 0 means Gemini ingested no video for this window and wrote
         # from priors. Discarding one chunk is cheap; the alternative is a
-        # fabricated 50-minute stretch sitting inside an otherwise real
+        # fabricated chunk-length stretch sitting inside an otherwise real
         # transcript, invisible because the neighbouring chunks are genuine and
         # the coverage table shows the window as present.
         #
@@ -2351,15 +2398,18 @@ def _run_chunked_transcript_url(
             segment_rows.append({"range": chunk_label, "status": "FAILED (parse)", "speakers": []})
             continue
 
-        # Issue #58 Gate 2: detect chunks that returned successful JSON but
-        # transcribed only a fraction of the allotted time window. Tucker
-        # chunk 2 trip: candidates=1484 thoughts=15013 -> Gemini burned its
-        # output budget on thinking and stopped after ~3 min of a 50-min
-        # window. With thinking_config now capped above this should be rare,
-        # but the sanity check makes any future stochastic dropout loud.
-        chunk_status = _assess_chunk_coverage(parsed, start_secs, end_secs, duration_seconds, chunk_idx)
+        # Issue #58 Gate 2 / #157: detect chunks that returned successful JSON
+        # but transcribed only a fraction of the allotted time window, are
+        # hollow in the middle, or jumped backward in time. Tucker chunk 2
+        # trip: candidates=1484 thoughts=15013 -> Gemini burned its output
+        # budget on thinking and stopped after ~3 min of a 50-min window.
+        # With thinking_config now capped above this should be rare, but the
+        # sanity check makes any future stochastic dropout loud.
+        chunk_status, chunk_metrics = _assess_chunk_coverage(parsed, start_secs, end_secs, duration_seconds, chunk_idx)
         if chunk_status == "thin":
             thin_chunk_count += 1
+        quality_flags.update(chunk_metrics["severe"])
+        quality_flags.update(chunk_metrics["mild"])
 
         chunk_results.append((start_secs, parsed))
         speaker_names = [s.get("name", f"Speaker {s.get('voice')}") for s in parsed.get("speakers", [])]
@@ -2388,27 +2438,25 @@ def _run_chunked_transcript_url(
     # the merged list interleaves chunks).
     merged["transcripts"].sort(key=lambda t: timestamp_to_seconds(t.get("start", "")))
 
-    # Post-merge monotonicity check (Gate-1 finding 2026-04-26): even with
-    # the per-timestamp classifier, Gemini hallucinations or edge cases can
-    # produce backward jumps. Log them so the user knows which sections to
-    # eyeball, and mark transcript_status: "partial" so downstream automation
-    # can detect quality issues.
-    monotonicity_warnings: list[tuple[str, str]] = []
-    last_secs: int | None = None
-    for t in merged["transcripts"]:
-        ts = t.get("start", "")
-        secs = timestamp_to_seconds(ts)
-        if last_secs is not None and secs < last_secs:
-            prev_label = _format_chunk_range_label(last_secs, last_secs).split(" - ")[0]
-            curr_label = _format_chunk_range_label(secs, secs).split(" - ")[0]
-            monotonicity_warnings.append((prev_label, curr_label))
-        last_secs = secs
-    if monotonicity_warnings:
-        log.warning(
-            "  Stitched transcript has %d non-monotonic timestamp jumps (transcript_status=partial). First 5: %s",
-            len(monotonicity_warnings),
-            ", ".join(f"{a}->{b}" for a, b in monotonicity_warnings[:5]),
-        )
+    # Issue #157: the old post-merge "monotonicity check" here was dead code
+    # (the sort immediately above orders by the identical key the check then
+    # tested, so `secs < last_secs` was unsatisfiable) and its log line
+    # claimed transcript_status=partial without ever reading its own
+    # `monotonicity_warnings`. A backward jump is only detectable in RAW
+    # emission order, per chunk, BEFORE this sort - see the
+    # _assess_chunk_coverage call inside the loop above, which is where that
+    # evidence is captured into `quality_flags` instead.
+    #
+    # What belongs here, after merge+sort, is a WHOLE-TRANSCRIPT assessment:
+    # a blind gap or monolithic collapse can span a chunk boundary or hide
+    # inside a chunk that individually scored "ok" (12/44 chunked 60min+
+    # corpus videos had >=10min holes with every chunk "ok" - see the module
+    # comment above assess_transcript_artifact). window=None assesses the
+    # full stitched transcript against the real known duration.
+    whole_metrics = assess_transcript_artifact(merged["transcripts"], duration_seconds, window=None)
+    quality_flags.update(whole_metrics["severe"])
+    quality_flags.update(whole_metrics["mild"])
+
     body = merge_transcript_json(merged, speakers_map={})
     coverage = _build_chunked_transcript_coverage_block(duration_seconds, chunk_minutes, segment_rows)
     transcript_path.write_text(coverage + "\n" + body, encoding="utf-8")
@@ -2418,7 +2466,12 @@ def _run_chunked_transcript_url(
         sidecar = channel_dir / f"{prefix}.transcript.raw.chunk{i}-{sstart}-{send}.txt"
         sidecar.write_text(raw, encoding="utf-8")
 
-    is_partial = bool(failed_chunks) or thin_chunk_count > 0
+    # Issue #157: a severe quality flag - on any single chunk OR on the
+    # stitched whole - demotes a chunked run to partial exactly like a failed
+    # or thin chunk always has. Quality statuses never start with "error", so
+    # the #120 livestream captions-first suppression and the captions
+    # failover (which key on that prefix) stay untouched.
+    is_partial = bool(failed_chunks) or thin_chunk_count > 0 or transcript_quality_flags_are_severe(quality_flags)
     meta_fields = {
         "video_url": video["url"],
         "video_id": video["video_id"],
@@ -2431,6 +2484,11 @@ def _run_chunked_transcript_url(
         "transcript_chunk_minutes": chunk_minutes,
         "transcript_thin_chunks": thin_chunk_count,
         "transcript_confabulated_chunks": confabulated_chunks,
+        "transcript_quality_flags": sorted(quality_flags),
+        "transcript_max_blind_gap_seconds": whole_metrics["max_blind_gap_seconds"],
+        "transcript_blind_gap_at_seconds": whole_metrics["blind_gap_at_seconds"],
+        "transcript_last_dialogue_fraction": whole_metrics["last_dialogue_fraction"],
+        "transcript_dialogue_entries": whole_metrics["dialogue_entries"],
     }
     if confabulated_chunks:
         # A dedicated field, NOT last_error: update_meta resets last_error to
@@ -2542,6 +2600,7 @@ def _scan_transcribe_one(
         transcript_source=transcript_source,
         transcript_timeout_seconds=transcript_timeout_seconds,
         livestream_captions_first=livestream_captions_first,
+        duration_seconds=duration_seconds,
     )
 
 
@@ -2848,69 +2907,381 @@ def _resolve_media_resolution(types, choice: str):
     return mapping[choice]
 
 
+# ---------------------------------------------------------------------------
+# Issue #157: transcript quality assessor.
+#
+# A 2,049-file corpus forensics sweep (2026-08-29, seed case uU5Gv2h8-9g)
+# found two distinct corruption shapes with OPPOSITE duration profiles, plus
+# a third one-off:
+#
+#   - monolithic collapse (<=3 dialogue entries for the whole video): a
+#     short-video, model-quality problem. 25.3% of 5-30min videos under
+#     gemini-3-flash-preview vs 3.4% under gemini-3.7-flash (Fisher exact
+#     p=0.0038, duration-stratified so it is not a confound of length).
+#   - blind gaps (>=10min contiguous dialogue hole): a long-video problem
+#     that CHUNKING DOES NOT FIX - 12/44 chunked 60min+ videos have >=10min
+#     holes with every chunk "ok" and file status "ok", because the hole
+#     spans a chunk boundary or sits inside a chunk that still passed the
+#     old 50%-of-window span ratio. Gap onset: median 28.6 minutes into a
+#     50-minute chunk (n=17) - Gemini degrades ~30min into a call regardless
+#     of the requested window.
+#   - clock slip (the seed case): one response's timestamps jumped backward
+#     ~20 minutes mid-call. merge_transcript_json() sorts by timestamp, so
+#     the real tail was sorted INTO the middle - an interleave, not lost
+#     text - but the evidence only exists in the RAW, pre-sort emission
+#     order (see the per-chunk check in _run_chunked_transcript_url).
+#
+# Corpus dialogue density is bimodal: 166 files < 0.1 entries/min, a valley
+# at 0.1-0.5, and a healthy median of 1.79 entries/min.
+# ---------------------------------------------------------------------------
+
+#: >= this many contiguous seconds with no dialogue entry is a SEVERE blind
+#: gap when it is LEADING or INTERNAL (content genuinely missing from the
+#: start or the middle). The same magnitude at the TRAILING edge is only
+#: MILD - a long silent outro/credits/Q&A-cut-short tail is common and must
+#: never false-alarm severe (see QUALITY_FLAG_TRAILING_GAP_MILD).
+BLIND_GAP_SEVERE_SECONDS = 600
+
+#: <= this many dialogue entries is monolithic collapse regardless of the
+#: assessed window's length - a real conversation does not compress to 3
+#: lines, whether that window is a whole short video or one long chunk.
+MONOLITHIC_MAX_ENTRIES = 3
+
+#: Entries-per-minute below this, measured against the assessed window's
+#: KNOWN length (never the entries' own observed/covered span - a true
+#: collapse has ~0 covered span, which would trivially pass a covered-span-
+#: relative density check), is monolithic collapse. Gated on the window
+#: being > 5 minutes so a genuinely short clip cannot trip it.
+DENSITY_SEVERE_PER_MIN = 0.1
+
+#: Entries-per-minute below this is worth a label but not severe - sits in
+#: the valley of the corpus's bimodal density distribution (healthy median
+#: 1.79/min).
+DENSITY_MILD_PER_MIN = 0.25
+
+#: A single backward timestamp jump at or above this many seconds, measured
+#: in RAW EMISSION ORDER (see _run_chunked_transcript_url), is worth a MILD
+#: label - a clock slip without lost text (an interleave) is possible.
+BACKWARD_JUMP_MILD_SECONDS = 60
+
+#: A backward jump at or above this is SEVERE - the seed case regressed
+#: ~20 minutes (1200s) mid-call, well past this floor.
+BACKWARD_JUMP_SEVERE_SECONDS = 600
+
+QUALITY_FLAG_MONOLITHIC_SEVERE = "monolithic_severe"
+QUALITY_FLAG_BLIND_GAP_SEVERE = "blind_gap_severe"
+QUALITY_FLAG_BACKWARD_JUMP_SEVERE = "backward_jump_severe"
+QUALITY_FLAG_DENSITY_MILD = "density_mild"
+QUALITY_FLAG_BACKWARD_JUMP_MILD = "backward_jump_mild"
+QUALITY_FLAG_TRAILING_GAP_MILD = "trailing_gap_mild"
+
+#: Flags that change transcript_status to "partial", count as a pipeline gap
+#: (exit EXIT_PARTIAL), and make resolve_mindmap_source's "auto" branch treat
+#: the transcript as unavailable. Membership-tested against a PERSISTED
+#: transcript_quality_flags list, not recomputed - see
+#: transcript_quality_flags_are_severe().
+_SEVERE_QUALITY_FLAGS = frozenset(
+    {
+        QUALITY_FLAG_MONOLITHIC_SEVERE,
+        QUALITY_FLAG_BLIND_GAP_SEVERE,
+        QUALITY_FLAG_BACKWARD_JUMP_SEVERE,
+    }
+)
+
+
+def transcript_quality_flags_are_severe(flags: list | None) -> bool:
+    """Whether a PERSISTED transcript_quality_flags list contains a severe flag.
+
+    The single place every consumer (the writers computing transcript_status,
+    resolve_mindmap_source's containment check, the process orchestrators'
+    exit-code gate) re-derives severity from what actually landed in
+    meta.json, rather than each hand-rolling its own membership test against
+    _SEVERE_QUALITY_FLAGS. A missing or empty list is not severe.
+    """
+    if not flags:
+        return False
+    return any(f in _SEVERE_QUALITY_FLAGS for f in flags)
+
+
+def _transcript_quality_severe_from_meta(meta_path: Path) -> bool:
+    """Read a transcript's on-disk severity for the resolve_mindmap_source
+    containment check (issue #157).
+
+    Best-effort (issue #124: never raise on a corrupt or missing meta - the
+    caller's fallback is "treat as not severe", which is the pre-#157
+    behavior and therefore always safe to fall back to). A missing file
+    reads as an empty dict, which `transcript_quality_flags_are_severe`
+    correctly treats as not severe.
+    """
+    if not meta_path.exists():
+        return False
+    meta = _read_meta_best_effort(meta_path, raise_on_os_error=False)
+    return transcript_quality_flags_are_severe(meta.get("transcript_quality_flags"))
+
+
+def assess_transcript_artifact(
+    transcripts: list[dict],
+    duration_seconds: int | None,
+    window: tuple[int, int] | None = None,
+) -> dict:
+    """Pure, side-effect-free quality assessment of a dialogue entry list.
+
+    `transcripts` is the raw ``transcripts`` array from a parsed Gemini
+    transcript response (or the merged/sorted equivalent) - dicts with a
+    ``"start"`` timestamp string. Screen content is not dialogue and is
+    never passed here.
+
+    Backward-jump detection uses the entries in the ORDER GIVEN, never a
+    sorted copy: the sort that both merge_chunked_transcripts() and
+    merge_transcript_json() apply destroys emission-order evidence, which is
+    the only place a clock slip is visible (issue #157 design decision - see
+    _run_chunked_transcript_url's per-chunk call, which passes raw, pre-sort,
+    pre-offset-classification entries for exactly this reason). Gap and
+    density metrics use a SEPARATE, internally-sorted copy, since those
+    describe chronological coverage regardless of emission order.
+
+    `window` bounds the assessed span as `(start_seconds, end_seconds)` in
+    the same coordinate space as the timestamps in `transcripts`. `None`
+    means "assess the whole known video" - i.e. `(0, duration_seconds)` -
+    which is what the single-shot writer and the chunked writer's post-merge
+    call both want. A per-chunk caller passes its own chunk-relative window
+    (`(0, chunk_length)`, since raw per-chunk timestamps are chunk-relative
+    by convention here) so leading/trailing gaps are measured against that
+    chunk's own edges, not the full video's.
+
+    When both `duration_seconds` and `window` are None (duration unknown,
+    e.g. a manual `--file` transcript with no ffprobe result), gap and
+    density cannot be computed - the assessor still reports dialogue_entries
+    and max_backward_jump_seconds ("metrics only"; see the monolithic
+    <=3-entries check, which needs no duration).
+
+    Returns a dict of metrics plus `severe`/`mild` flag-name lists (empty
+    when healthy). Never raises - a malformed entry is skipped, not fatal.
+    """
+    if window is not None:
+        window_start, window_end = window
+        span_seconds: int | None = max(1, window_end - window_start)
+    elif duration_seconds is not None and duration_seconds > 0:
+        window_start, window_end = 0, duration_seconds
+        span_seconds = duration_seconds
+    else:
+        window_start, window_end = 0, 0
+        span_seconds = None
+
+    # Emission-order backward-jump check FIRST, before any sorting - the
+    # entries are read exactly as given.
+    raw_seconds: list[int] = []
+    for entry in transcripts:
+        ts = entry.get("start") if isinstance(entry, dict) else None
+        if not ts:
+            continue
+        try:
+            raw_seconds.append(timestamp_to_seconds(str(ts)))
+        except (ValueError, AttributeError):
+            continue
+
+    max_backward_jump = 0
+    running_max: int | None = None
+    for secs in raw_seconds:
+        if running_max is not None and secs < running_max:
+            max_backward_jump = max(max_backward_jump, running_max - secs)
+        running_max = secs if running_max is None else max(running_max, secs)
+
+    dialogue_entries = len(raw_seconds)
+    sorted_seconds = sorted(raw_seconds)
+
+    density_per_min: float | None = None
+    last_dialogue_fraction: float | None = None
+    if span_seconds is not None and span_seconds > 0:
+        density_per_min = dialogue_entries / (span_seconds / 60.0)
+        if sorted_seconds:
+            last_dialogue_fraction = (sorted_seconds[-1] - window_start) / span_seconds
+
+    # Blind-gap detection: leading (window start -> first entry), internal
+    # (between consecutive entries), trailing (last entry -> window end).
+    # Skipped entirely when the window is unknowable (span_seconds is None).
+    max_gap = 0
+    gap_at: int | None = None
+    gap_kind: str | None = None
+    if span_seconds is not None:
+        if not sorted_seconds:
+            # Zero dialogue entries: the whole window is one blind gap.
+            max_gap = span_seconds
+            gap_at = window_start
+            gap_kind = "leading"
+        else:
+            leading = sorted_seconds[0] - window_start
+            if leading > max_gap:
+                max_gap, gap_at, gap_kind = leading, window_start, "leading"
+            for prev, curr in itertools.pairwise(sorted_seconds):
+                gap = curr - prev
+                if gap > max_gap:
+                    max_gap, gap_at, gap_kind = gap, prev, "internal"
+            trailing = window_end - sorted_seconds[-1]
+            if trailing > max_gap:
+                max_gap, gap_at, gap_kind = trailing, sorted_seconds[-1], "trailing"
+
+    severe: list[str] = []
+    mild: list[str] = []
+
+    # Both sub-checks share the "known window > 5min" gate. Without it, a
+    # legitimately short clip (or a test fixture, or a caller that genuinely
+    # does not know the duration) with 1-3 dialogue entries would false-alarm
+    # monolithic - the evidence base for this flag is 5-30min+ videos, never
+    # sub-5-minute ones, and "unknown duration = metrics only" (issue #157
+    # item 10) means a None duration must never manufacture a severe verdict.
+    known_window = span_seconds is not None and span_seconds > 300
+    monolithic = known_window and (
+        dialogue_entries <= MONOLITHIC_MAX_ENTRIES
+        or (density_per_min is not None and density_per_min < DENSITY_SEVERE_PER_MIN)
+    )
+    if monolithic:
+        severe.append(QUALITY_FLAG_MONOLITHIC_SEVERE)
+    elif density_per_min is not None and density_per_min < DENSITY_MILD_PER_MIN:
+        mild.append(QUALITY_FLAG_DENSITY_MILD)
+
+    if gap_kind in ("leading", "internal") and max_gap >= BLIND_GAP_SEVERE_SECONDS:
+        severe.append(QUALITY_FLAG_BLIND_GAP_SEVERE)
+    elif gap_kind == "trailing" and max_gap >= BLIND_GAP_SEVERE_SECONDS:
+        # Design decision: a trailing gap never escalates past MILD on its
+        # own. If the body is genuinely unhealthy the monolithic/density
+        # check above has already fired its own severe flag independently.
+        mild.append(QUALITY_FLAG_TRAILING_GAP_MILD)
+
+    if max_backward_jump >= BACKWARD_JUMP_SEVERE_SECONDS:
+        severe.append(QUALITY_FLAG_BACKWARD_JUMP_SEVERE)
+    elif max_backward_jump >= BACKWARD_JUMP_MILD_SECONDS:
+        mild.append(QUALITY_FLAG_BACKWARD_JUMP_MILD)
+
+    return {
+        "dialogue_entries": dialogue_entries,
+        "density_per_min": density_per_min,
+        "last_dialogue_fraction": last_dialogue_fraction,
+        "max_blind_gap_seconds": max_gap,
+        "blind_gap_at_seconds": gap_at,
+        "blind_gap_kind": gap_kind,
+        "max_backward_jump_seconds": max_backward_jump,
+        "severe": severe,
+        "mild": mild,
+    }
+
+
+def _relativize_chunk_entries(transcripts: list, start_secs: int, allotted_span: int) -> list[dict]:
+    """Rewrite each RAW per-chunk dialogue timestamp into the chunk's own
+    ``[0, allotted_span)`` frame, for gap/density assessment only.
+
+    Gemini is inconsistent about whether a per-chunk timestamp is
+    chunk-relative or absolute-to-the-video (see
+    ``_classify_and_offset_timestamp``, which this reuses so the assessor is
+    not a second, potentially-divergent classifier). Blind-gap and density
+    math need every entry in ONE coherent frame of reference to measure a
+    distance from the window's edges; a mix of the two conventions would
+    make an absolute chunk-2 timestamp (e.g. 3060s into an 11752s video)
+    look like a multi-thousand-second leading gap in a chunk window of
+    ``[0, 3000)``.
+
+    Deliberately NOT used for backward-jump detection (see
+    ``_assess_chunk_coverage``): classification can shift different entries
+    by different amounts, which would blur the raw, as-emitted evidence a
+    clock slip leaves behind.
+    """
+    relativized: list[dict] = []
+    for entry in transcripts:
+        if not isinstance(entry, dict):
+            continue
+        ts = entry.get("start")
+        if not ts:
+            continue
+        try:
+            absolute_ts = _classify_and_offset_timestamp(str(ts), start_secs, allotted_span)
+            secs = max(0, timestamp_to_seconds(absolute_ts) - start_secs)
+        except (ValueError, AttributeError):
+            continue
+        relativized.append({**entry, "start": f"{secs // 3600}:{(secs % 3600) // 60:02d}:{secs % 60:02d}"})
+    return relativized
+
+
 def _assess_chunk_coverage(
     parsed: dict,
     start_secs: int,
     end_secs: int,
     duration_seconds: int,
     chunk_idx: int,
-) -> str:
+) -> tuple[str, dict]:
     """Detect chunks that returned successful JSON but transcribed only a
     fraction of the allotted time window.
 
-    Returns "ok" when the chunk's observed timestamp span covers >= 50% of
-    its allotted window, "thin" otherwise. "thin" propagates to overall
-    transcript_status as partial so downstream automation can detect the
-    quality issue without re-parsing the transcript.
+    Returns ``(verdict, metrics)``. ``verdict`` is ``"ok"`` or ``"thin"`` -
+    that two-value vocabulary is the writer's contract and is unchanged by
+    issue #157; ``"thin"`` propagates to overall transcript_status as
+    partial exactly as before. ``metrics`` is the full
+    ``assess_transcript_artifact()`` dict, which the caller unions into the
+    stitched transcript's overall ``transcript_quality_flags`` - most
+    importantly the backward-jump flag, whose only evidence is this raw,
+    pre-merge, pre-sort call (see that function's docstring).
+
+    Issue #157 replaced the OLD metric (observed span / allotted span >=
+    50%) with assess_transcript_artifact's gap/density/entry-count model.
+    The old metric was blind to a HOLLOW chunk (entries only at the very
+    start and the very end of the window score ~100% despite an empty
+    middle) and its 50% floor passed a chunk that died at minute 26 of 50.
+    The `(start_secs, end_secs) == (0, 0)` sentinel used to skip assessment
+    entirely (conflating "no clipping" with "no assessment" - issue #157
+    defect #4); it now assesses against the full known `duration_seconds`
+    instead, since a single-shot call reaching this function IS the whole
+    video.
 
     Issue #58 Gate 2: Tucker chunk 2 returned candidates=1484, thoughts=15013
     -> ~3 minutes of content for a 50-minute window. With thinking_config
     capped via _make_thinking_config_for_transcript this should be rare,
     but the check makes any future stochastic dropout loud rather than
-    silently shipping a 50%-empty transcript with status=ok.
+    silently shipping a mostly-empty transcript with status=ok.
     """
-    if start_secs == 0 and end_secs == 0:
-        return "ok"
     transcripts = parsed.get("transcripts") or []
-    if not transcripts:
+    # Backward-jump evidence must come from RAW, pre-classification emission
+    # order (issue #157 design decision). A duration=None/window=None probe
+    # skips gap/density/monolithic entirely (span is unknowable) and reports
+    # only entry count and the raw backward jump - exactly what is needed
+    # here, computed once so this and assess_transcript_artifact never
+    # disagree about what "raw order" means.
+    raw_backward_jump = assess_transcript_artifact(transcripts, None, window=None)["max_backward_jump_seconds"]
+
+    if start_secs == 0 and end_secs == 0:
+        # Single unchunked call reaching this function IS the whole video;
+        # the raw list IS already in one coherent (absolute-from-zero) frame,
+        # so no relativization step is needed and its own backward-jump
+        # value already matches raw_backward_jump.
+        metrics = assess_transcript_artifact(transcripts, duration_seconds, window=None)
+    else:
+        allotted_span = max(1, end_secs - start_secs)
+        relativized = _relativize_chunk_entries(transcripts, start_secs, allotted_span)
+        metrics = dict(assess_transcript_artifact(relativized, allotted_span, window=(0, allotted_span)))
+        # Reconcile: gap/density/monolithic come from the relativized frame,
+        # but backward-jump must reflect RAW emission order, not whatever
+        # order relativization happened to leave entries in.
+        metrics["severe"] = [f for f in metrics["severe"] if f != QUALITY_FLAG_BACKWARD_JUMP_SEVERE]
+        metrics["mild"] = [f for f in metrics["mild"] if f != QUALITY_FLAG_BACKWARD_JUMP_MILD]
+        metrics["max_backward_jump_seconds"] = raw_backward_jump
+        if raw_backward_jump >= BACKWARD_JUMP_SEVERE_SECONDS:
+            metrics["severe"].append(QUALITY_FLAG_BACKWARD_JUMP_SEVERE)
+        elif raw_backward_jump >= BACKWARD_JUMP_MILD_SECONDS:
+            metrics["mild"].append(QUALITY_FLAG_BACKWARD_JUMP_MILD)
+    if metrics["severe"]:
         log.warning(
-            "Chunk %d transcribed 0 entries for window %ds-%ds; flagged as thin.",
+            "Chunk %d flagged severe for window %ds-%ds: %s (entries=%d, density=%s/min, "
+            "max_gap=%ds kind=%s, backward_jump=%ds). Re-run may be needed to recover content.",
             chunk_idx,
             start_secs,
             end_secs,
+            ", ".join(metrics["severe"]),
+            metrics["dialogue_entries"],
+            f"{metrics['density_per_min']:.2f}" if metrics["density_per_min"] is not None else "?",
+            metrics["max_blind_gap_seconds"],
+            metrics["blind_gap_kind"],
+            metrics["max_backward_jump_seconds"],
         )
-        return "thin"
-    ts_seconds: list[int] = []
-    for t in transcripts:
-        ts_str = t.get("start") if isinstance(t, dict) else None
-        if not ts_str:
-            continue
-        try:
-            ts_seconds.append(timestamp_to_seconds(str(ts_str)))
-        except (ValueError, AttributeError):
-            continue
-    if len(ts_seconds) < 2:
-        log.warning(
-            "Chunk %d has fewer than 2 parseable timestamps for window %ds-%ds; flagged as thin.",
-            chunk_idx,
-            start_secs,
-            end_secs,
-        )
-        return "thin"
-    observed_span = max(ts_seconds) - min(ts_seconds)
-    allotted_span = max(1, end_secs - start_secs)
-    ratio = observed_span / allotted_span
-    if ratio < 0.5:
-        log.warning(
-            "Chunk %d transcribed %ds of %ds (%.1f%% of allotted window); flagged as thin. "
-            "Re-run may be needed to recover content.",
-            chunk_idx,
-            observed_span,
-            allotted_span,
-            ratio * 100,
-        )
-        return "thin"
-    return "ok"
+        return "thin", metrics
+    return "ok", metrics
 
 
 def call_gemini(
@@ -3260,6 +3631,21 @@ def process_mindmap(
 # ---------------------------------------------------------------------------
 # Transcript processing
 # ---------------------------------------------------------------------------
+
+
+def _dialogue_entries_from_raw_json(raw_json) -> list[dict]:
+    """Pull the ``transcripts`` (dialogue-only, never screen_content) array
+    out of a parsed transcript response for quality assessment.
+
+    Mirrors merge_transcript_json's own list-unwrapping so a single-shot
+    "complete" response that happens to arrive wrapped in ``[...]`` gets
+    assessed the same shape it will be rendered from.
+    """
+    if isinstance(raw_json, list):
+        raw_json = raw_json[0] if raw_json else {}
+    if not isinstance(raw_json, dict):
+        return []
+    return raw_json.get("transcripts") or []
 
 
 def merge_transcript_json(raw_json, speakers_map):
@@ -3960,6 +4346,7 @@ def process_transcript(
     transcript_source: str = "gemini",
     transcript_timeout_seconds: int = TRANSCRIPT_TIMEOUT_DEFAULT,
     livestream_captions_first: bool = False,
+    duration_seconds: int | None = None,
 ):
     """Generate a fused transcript for a single video with layered JSON resilience.
 
@@ -3970,6 +4357,15 @@ def process_transcript(
 
     Optional start_offset/end_offset (in seconds) pass through to Gemini for
     segment clipping. Applies on initial call and any retries.
+
+    ``duration_seconds`` (issue #157) is the video's real, looked-up known
+    duration, used ONLY for the quality assessor - it is unrelated to
+    ``start_offset``/``end_offset``, which are the real Gemini clip
+    parameters. Passing the real duration here (rather than deriving a
+    stand-in from those offsets, or from any (0, 0)-style "no clipping"
+    convention) is what keeps the single-shot path's "unknown duration"
+    degrade-gracefully case honest: ``None`` genuinely means unknown, not
+    "not clipped".
 
     Optional media_uri overrides what is sent to Gemini as the media source
     (e.g. a Gemini Files API URI for locally-uploaded MP4s) while video["url"]
@@ -4170,16 +4566,38 @@ def process_transcript(
             # Full parse succeeded - write transcript, no raw sidecar
             fused = merge_transcript_json(raw_json, {})
             _write_transcript_md(transcript_path, video, fused, transcript_source=TRANSCRIPT_SOURCE_GEMINI)
+            # Issue #157: assess quality even on the "healthy" full-parse path
+            # - the seed case (a clock-slip interleave) and monolithic
+            # collapse both arrive as valid, fully-parseable JSON. window=None
+            # assesses against the real known duration; duration_seconds is
+            # the caller's looked-up value, never a (0, 0) clipping stand-in.
+            quality_metrics = assess_transcript_artifact(
+                _dialogue_entries_from_raw_json(raw_json), duration_seconds, window=None
+            )
+            quality_flags = sorted(set(quality_metrics["severe"]) | set(quality_metrics["mild"]))
+            quality_severe = transcript_quality_flags_are_severe(quality_flags)
             update_meta(
                 meta_path,
                 {
                     **_transcript_identity_fields(video, channel_dir),
                     "processed": datetime.now(UTC).isoformat(),
-                    "transcript_status": "complete",
+                    "transcript_status": "partial" if quality_severe else "complete",
                     "transcript_source": TRANSCRIPT_SOURCE_GEMINI,
+                    "transcript_quality_flags": quality_flags,
+                    "transcript_max_blind_gap_seconds": quality_metrics["max_blind_gap_seconds"],
+                    "transcript_blind_gap_at_seconds": quality_metrics["blind_gap_at_seconds"],
+                    "transcript_last_dialogue_fraction": quality_metrics["last_dialogue_fraction"],
+                    "transcript_dialogue_entries": quality_metrics["dialogue_entries"],
                 },
                 "transcript",
             )
+            if quality_severe:
+                log.warning(
+                    "  %s: quality guard flagged %s - transcript_status set to partial.",
+                    prefix,
+                    ", ".join(quality_flags),
+                )
+                return prefix, "partial (quality guard)"
             return prefix, "done"
 
         # Full parse failed - save raw sidecar for forensics
@@ -4213,6 +4631,22 @@ def process_transcript(
                 finish_capture.get("reason"),
                 max_output_tokens=MAX_OUTPUT_TOKENS,
             )
+            # Issue #157: metrics persisted here too ("on every Gemini
+            # transcript meta write, healthy or not") but the status is
+            # deliberately left alone - a salvage is already non-healthy for
+            # a DIFFERENT, more specific reason (malformed JSON / output cap,
+            # issue #128), and overriding TRANSCRIPT_STATUS_TRUNCATED down to
+            # the generic "partial" would destroy exactly the sweepability
+            # distinction that status exists for. A salvage with genuinely
+            # good density (the documented "95% salvage" case) must not
+            # ALSO be quality-flagged severe - false-alarming a working
+            # recovery is the one thing this guard must never do.
+            salvage_quality_metrics = assess_transcript_artifact(
+                salvaged.get("transcripts") or [], duration_seconds, window=None
+            )
+            salvage_quality_flags = sorted(
+                set(salvage_quality_metrics["severe"]) | set(salvage_quality_metrics["mild"])
+            )
             salvage_fields = {
                 **_transcript_identity_fields(video, channel_dir),
                 "processed": datetime.now(UTC).isoformat(),
@@ -4221,6 +4655,11 @@ def process_transcript(
                 "transcript_recovery": "salvaged_sections",
                 "transcript_parse_error": parse_error,
                 "transcript_warning": salvage_warning,
+                "transcript_quality_flags": salvage_quality_flags,
+                "transcript_max_blind_gap_seconds": salvage_quality_metrics["max_blind_gap_seconds"],
+                "transcript_blind_gap_at_seconds": salvage_quality_metrics["blind_gap_at_seconds"],
+                "transcript_last_dialogue_fraction": salvage_quality_metrics["last_dialogue_fraction"],
+                "transcript_dialogue_entries": salvage_quality_metrics["dialogue_entries"],
             }
             if truncated:
                 salvage_fields["transcript_output_tokens"] = usage_capture.get("candidates")
@@ -4928,8 +5367,18 @@ def cmd_scan(args, config):
                 v_prefix = video_file_prefix(v)
                 v_transcript_path = _channel_dir / f"{v_prefix}.transcript.md"
                 transcript_available = v_transcript_path.exists()
+                # Issue #157 containment: a severe-flagged transcript is
+                # treated as unavailable under mindmap_source=auto, so a
+                # known-corrupt transcript never feeds mindmap generation.
+                transcript_severe = (
+                    _transcript_quality_severe_from_meta(_channel_dir / f"{v_prefix}.meta.json")
+                    if transcript_available
+                    else False
+                )
                 try:
-                    src = resolve_mindmap_source(_ch, transcript_available=transcript_available)
+                    src = resolve_mindmap_source(
+                        _ch, transcript_available=transcript_available, transcript_severe=transcript_severe
+                    )
                 except ValueError as exc:
                     return v_prefix, f"error: {exc}"
                 if src == "skip":
@@ -5280,12 +5729,21 @@ def _cmd_mindmap_impl(args, config):
     register_topic_stamp_target(args, video, channel_dir, prefix_for_lookup, channel_name)
     transcript_path = channel_dir / f"{prefix_for_lookup}.transcript.md"
     transcript_available = transcript_path.exists()
+    # Issue #157 containment: treat a severe-flagged transcript as unavailable
+    # under mindmap_source=auto.
+    transcript_severe = (
+        _transcript_quality_severe_from_meta(channel_dir / f"{prefix_for_lookup}.meta.json")
+        if transcript_available
+        else False
+    )
     channel_cfg: dict = next(
         (c for c in config.get("channels", []) if c.get("name") == channel_name),
         {},
     )
     try:
-        resolved_source = resolve_mindmap_source(channel_cfg, transcript_available=transcript_available)
+        resolved_source = resolve_mindmap_source(
+            channel_cfg, transcript_available=transcript_available, transcript_severe=transcript_severe
+        )
     except ValueError as exc:
         log.error("Mindmap source unresolvable for %s: %s", video_id, exc)
         sys.exit(1)
@@ -5618,6 +6076,12 @@ def _cmd_transcript_impl(args, config):
     # whole regardless of length), so route it to the single-shot path which
     # handles the captions source.
     use_chunking = args.url and not manual_segment and transcript_source != "yt-captions"
+    # Issue #157: threaded into the single-shot fallthrough call below for the
+    # quality assessor. Stays None (metrics-only degrade) rather than paying
+    # for a fresh YouTube lookup when use_chunking never ran one - a manual
+    # --start/--end segment or --file has no duration lookup here at all, and
+    # that is an accepted, minimal-scope gap (see the issue #157 report).
+    duration_seconds: int | None = None
 
     if use_chunking:
         duration_seconds = _lookup_video_duration_seconds(video["video_id"])
@@ -5699,6 +6163,7 @@ def _cmd_transcript_impl(args, config):
         media_resolution=media_resolution_enum,
         transcript_source=transcript_source,
         livestream_captions_first=vod_captions_first,
+        duration_seconds=duration_seconds,
     )
     out_path = channel_dir / f"{prefix}.transcript.md"
     log.info("  %s: %s", prefix, status)
@@ -5794,6 +6259,19 @@ def missing_pipeline_artifacts(steps: list[dict]) -> list[str]:
     step from gap detection - a guard against silent incompleteness that can
     itself be silently disabled, which is the exact failure class this function
     exists to close. A malformed step must raise at the call site instead.
+
+    Issue #157 amends invariant (b) above, deliberately and narrowly: an
+    OPTIONAL ``"quality_severe"`` key (``.get(..., False)`` - unlike
+    ``"requested"``, most steps never set it and False is the correct,
+    pre-#157 answer for all of them) also counts as a gap when True, even
+    though the artifact exists and its status never starts with ``"error"``
+    (a severe transcript quality flag demotes ``transcript_status`` to
+    ``"partial"``, not ``"error"`` - see the design decision in
+    ``assess_transcript_artifact``'s module comment). This is narrow on
+    purpose: a monolithic 3-line transcript of a 60-minute video, or a
+    genuine >=10min blind gap, is not the "degraded but real" salvage this
+    function was built to protect; a 95% salvage with a healthy body still
+    is, and the assessor is designed to never flag that case severe.
     """
     missing: list[str] = []
     for step in steps:
@@ -5801,7 +6279,8 @@ def missing_pipeline_artifacts(steps: list[dict]) -> list[str]:
             continue
         path = step["path"]
         present = path is not None and path.exists() and path.stat().st_size > 0
-        if not present or str(step["status"] or "").startswith("error"):
+        quality_severe = step.get("quality_severe", False)
+        if not present or str(step["status"] or "").startswith("error") or quality_severe:
             missing.append(step["label"])
     return missing
 
@@ -6028,6 +6507,7 @@ def _cmd_process_url(args, config):
                 media_resolution=media_resolution_enum,
                 transcript_source=transcript_source,
                 livestream_captions_first=vod_captions_first,
+                duration_seconds=duration_seconds,
             )
     except Exception as exc:
         transcript_status = f"error: {exc}"
@@ -6035,10 +6515,23 @@ def _cmd_process_url(args, config):
     log.info("    transcript [%s]: %s", prefix, transcript_status)
     if transcript_status.startswith("error"):
         _log_chunk_recovery_recipe(video, duration_seconds, chunk_minutes)
+    # Issue #157: read back what the transcript writer just persisted, from
+    # the SAME meta_path the writer used - never a separately re-derived one
+    # (the PR #136 checker/writer-path-drift class). A severe flag demotes
+    # this step to a pipeline gap (missing_pipeline_artifacts) even though
+    # the artifact exists and transcript_status never starts with "error".
+    transcript_meta_path = channel_dir / f"{prefix}.meta.json"
+    transcript_quality_severe = _transcript_quality_severe_from_meta(transcript_meta_path)
     # Issue #129: accumulate what this run was asked to produce, so every exit
     # below can tell "we are done" from "we ran and left a hole".
     steps: list[dict] = [
-        {"label": "transcript", "requested": True, "status": transcript_status, "path": transcript_path}
+        {
+            "label": "transcript",
+            "requested": True,
+            "status": transcript_status,
+            "path": transcript_path,
+            "quality_severe": transcript_quality_severe,
+        }
     ]
 
     # Step 2/3: mindmap. Resolver picks source based on channel config and
@@ -6046,7 +6539,9 @@ def _cmd_process_url(args, config):
     # this run, or already present from a prior run).
     transcript_available = transcript_path.exists()
     try:
-        resolved_source = resolve_mindmap_source(channel_cfg, transcript_available=transcript_available)
+        resolved_source = resolve_mindmap_source(
+            channel_cfg, transcript_available=transcript_available, transcript_severe=transcript_quality_severe
+        )
     except ValueError as exc:
         log.error("Mindmap source unresolvable for %s: %s", video_id, exc)
         sys.exit(1)
@@ -6484,6 +6979,7 @@ def _cmd_process_impl(args, config):
                         end_offset=end_offset,
                         media_uri=uri,
                         media_resolution=media_resolution_enum,
+                        duration_seconds=duration_seconds,
                     )
 
                 _, transcript_status = _call_with_file_expiry_retry("transcript", _transcript_call)
@@ -6492,6 +6988,16 @@ def _cmd_process_impl(args, config):
             log.warning("    transcript [%s] raised: %s", prefix, exc)
         log.info("    transcript [%s]: %s", prefix, transcript_status)
 
+    # Issue #157: read back what the transcript writer just persisted, from
+    # the SAME meta_path the writer used - never a separately re-derived one
+    # (the PR #136 checker/writer-path-drift class). A severe flag demotes
+    # this step to a pipeline gap even though the artifact exists and
+    # transcript_status never starts with "error". A deliberate skip
+    # (skip_transcript) never had a transcript writer run, so it is never
+    # severe - `_transcript_quality_severe_from_meta` reads whatever meta
+    # already existed on disk, which is correct: a skip must never
+    # re-litigate a PRIOR run's quality via this run's exit code.
+    transcript_quality_severe = _transcript_quality_severe_from_meta(meta_path)
     # Issue #129: a per-mode skip is `requested=False` and can never be a gap;
     # a step that ran and left nothing can.
     steps: list[dict] = [
@@ -6500,6 +7006,7 @@ def _cmd_process_impl(args, config):
             "requested": not skip_transcript,
             "status": transcript_status,
             "path": transcript_path,
+            "quality_severe": transcript_quality_severe,
         }
     ]
 
@@ -6511,7 +7018,9 @@ def _cmd_process_impl(args, config):
     # ============================================================================
     transcript_available = transcript_path.exists()
     try:
-        resolved_source = resolve_mindmap_source(channel_cfg, transcript_available=transcript_available)
+        resolved_source = resolve_mindmap_source(
+            channel_cfg, transcript_available=transcript_available, transcript_severe=transcript_quality_severe
+        )
     except ValueError as exc:
         log.error("Mindmap source unresolvable: %s", exc)
         sys.exit(1)

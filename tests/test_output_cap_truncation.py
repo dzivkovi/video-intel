@@ -83,6 +83,12 @@ class TestHitOutputCap:
         signature; calling it "truncation" would be a false negative dressed up
         as coverage. This test exists so nobody later reads the detector as
         wider than it is.
+
+        That shape now HAS a claimant (issue #157): `assess_transcript_artifact`'s
+        monolithic-collapse detection (`MONOLITHIC_MAX_ENTRIES` / `DENSITY_SEVERE_PER_MIN`,
+        see tests/test_transcript_quality_guard.py) catches it deterministically by
+        counting dialogue entries, independent of `finish_reason` or token counts -
+        `hit_output_cap` still correctly has no opinion about it.
         """
         assert hit_output_cap(3000, "STOP", max_output_tokens=MAX_OUTPUT_TOKENS) is False
 
