@@ -258,6 +258,50 @@ class TestZeroZeroSentinelStillAssessedWithKnownDuration:
         assert "monolithic_severe" in metrics["severe"]
 
 
+class TestDialogueEntriesFromRawJsonRejectsNonListScalars:
+    """Issue #171, third review round: `_dialogue_entries_from_raw_json`
+    (the SINGLE-SHOT sibling of `_assess_chunk_coverage`'s chunked
+    `parsed.get("transcripts") or []` fix) had the identical hole -
+    `or` only substitutes `[]` for a FALSY value, so a truthy non-list
+    SCALAR (`int`, `float`, bare `True`) sailed through unguarded. Its one
+    caller (`process_transcript`'s single-shot success path) hands the
+    result straight to `assess_transcript_artifact`, which does `for
+    entry in transcripts` and raised `TypeError: <type> object is not
+    iterable`. A bare STRING was already safe by luck (it iterates to
+    individual characters, each rejected by `_usable_timestamp`'s
+    `isinstance(entry, dict)` check) - locked in below alongside the three
+    scalar shapes precisely because that "safe by luck" case is what made
+    the scalar hole easy to miss.
+    """
+
+    @pytest.mark.parametrize("bad_value", [5, 2.5, True])
+    def test_scalar_transcripts_value_does_not_crash_and_returns_empty(self, bad_value):
+        raw_json = {"transcripts": bad_value, "screen_content": [], "speakers": []}
+        # Must not raise TypeError - the load-bearing assertion.
+        entries = vi._dialogue_entries_from_raw_json(raw_json)
+        assert entries == []
+        # And the downstream assessor it feeds must not raise either.
+        metrics = assess_transcript_artifact(entries, duration_seconds=600, window=None)
+        assert metrics["dialogue_entries"] == 0
+
+    def test_bare_string_transcripts_value_stays_safe_by_luck_and_is_covered_too(self):
+        raw_json = {"transcripts": "garbage", "screen_content": [], "speakers": []}
+        entries = vi._dialogue_entries_from_raw_json(raw_json)
+        assert entries == []
+        metrics = assess_transcript_artifact(entries, duration_seconds=600, window=None)
+        assert metrics["dialogue_entries"] == 0
+
+    def test_healthy_list_value_is_unaffected(self):
+        raw_json = {
+            "transcripts": [{"start": "00:05", "voice": 1, "text": "hi"}],
+            "screen_content": [],
+            "speakers": [],
+        }
+        entries = vi._dialogue_entries_from_raw_json(raw_json)
+        assert len(entries) == 1
+        assert entries[0]["text"] == "hi"
+
+
 # ---------------------------------------------------------------------------
 # 2. Writer integration - real process_transcript / _run_chunked_transcript_url
 # ---------------------------------------------------------------------------
@@ -345,6 +389,37 @@ class TestMonolithicSingleShotSevere:
         meta = json.loads((channel_dir / f"{prefix}.meta.json").read_text(encoding="utf-8"))
         assert meta["transcript_status"] == "complete"
         assert meta["transcript_quality_flags"] == []
+
+
+class TestSingleShotCallerSurvivesAScalarTranscriptsValue:
+    """Issue #171, third review round: proves the
+    `_dialogue_entries_from_raw_json` fix at the REAL caller
+    (`process_transcript`, single-shot, only the Gemini call stubbed) -
+    not just at the pure-function level. Before the fix, a response whose
+    `transcripts` field parsed to a non-list scalar crashed
+    `assess_transcript_artifact` on the single-shot success path, one
+    function away from the identical fix already proven at the caller
+    level on the chunked path (`_assess_chunk_coverage`).
+    """
+
+    @pytest.mark.parametrize("bad_value", [5, 2.5, True])
+    def test_scalar_transcripts_value_does_not_crash_the_real_caller(self, tmp_path, monkeypatch, bad_value):
+        payload = json.dumps({"transcripts": bad_value, "screen_content": [], "speakers": []})
+        client, types = _stub_single_shot(monkeypatch, payload)
+        video = _video()
+        channel_dir = tmp_path / "demo"
+
+        # The load-bearing assertion IS that this call does not raise.
+        prefix, status = process_transcript(
+            client, types, video, "prompt", "gemini-test", channel_dir, "2026-08-31-scalar-talk", duration_seconds=3600
+        )
+
+        meta_path = channel_dir / f"{prefix}.meta.json"
+        assert meta_path.exists(), "a real meta.json must be written - a crash here writes nothing"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        # Identity is still stamped even on this degraded path (issue #66).
+        assert meta["video_id"] == video["video_id"]
+        assert status is not None
 
 
 class TestSalvageNeverFalseAlarms:

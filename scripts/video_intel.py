@@ -4115,12 +4115,31 @@ def _dialogue_entries_from_raw_json(raw_json) -> list[dict]:
     Mirrors merge_transcript_json's own list-unwrapping so a single-shot
     "complete" response that happens to arrive wrapped in ``[...]`` gets
     assessed the same shape it will be rendered from.
+
+    Issue #171 follow-up (third review round): the old final line,
+    ``raw_json.get("transcripts") or []``, only substitutes ``[]`` for a
+    FALSY value - a truthy non-list SCALAR (``5``, ``2.5``, bare ``True``)
+    sailed through unguarded, and this function's one caller hands the
+    result straight to ``assess_transcript_artifact``, which does ``for
+    entry in transcripts`` and raises ``TypeError: <type> object is not
+    iterable`` - the identical shape fixed in ``_assess_chunk_coverage``
+    on the chunked path, one function away on the SINGLE-SHOT path this
+    function owns. A bare string was already safe by luck (it iterates to
+    individual characters, and ``_usable_timestamp``'s ``isinstance(entry,
+    dict)`` check rejects every one) - that lucky case is exactly why the
+    scalar case reads as safe and is not. ``_usable_task_list`` closes
+    this the same way it closes every other "task value is the wrong
+    type" hole in this file; the throwaway ``note_sink=[]`` avoids a
+    duplicate warning, since this function's one call site always runs
+    AFTER ``merge_transcript_json(raw_json, {})`` on the same ``raw_json``
+    in the same code block, and that call already reports the same
+    wrong-typed value through its own ``_usable_task_list`` call.
     """
     if isinstance(raw_json, list):
         raw_json = raw_json[0] if raw_json else {}
     if not isinstance(raw_json, dict):
         return []
-    return raw_json.get("transcripts") or []
+    return _usable_task_list(raw_json, "transcripts", note_sink=[])
 
 
 def _usable_timestamp(entry: Any, key: str) -> bool:
@@ -5319,12 +5338,25 @@ def process_transcript(
             # produces zero entries (see docs/solutions/integration-issues/
             # gemini-pro-task-wrapper-and-cyrillic-intrusions-20260426.md).
             if isinstance(raw_json, dict):
+                # Issue #171 follow-up (third review round): this is a pure
+                # diagnostic log line, but `len(raw_json.get(key, []))`
+                # only defaults to `[]` for a MISSING key - a PRESENT
+                # non-list, non-sized scalar (int, float, bare True) still
+                # reaches `len()` unguarded and raises `TypeError: object
+                # of type '<type>' has no len()`, crashing this line before
+                # the real parse-shape logic below (already fixed via
+                # `_dialogue_entries_from_raw_json`) ever runs. Reuses
+                # `_usable_task_list` a third time on this exact path with
+                # a throwaway `note_sink=[]` for the same reason as its
+                # siblings: `merge_transcript_json`, called moments below,
+                # is the one authoritative place that logs a warning for
+                # whichever of these three values is malformed.
                 log.info(
                     "  transcript JSON parsed: dict keys=%s, transcripts=%d, screen_content=%d, speakers=%d",
                     sorted(list(raw_json.keys()))[:8],
-                    len(raw_json.get("transcripts", [])),
-                    len(raw_json.get("screen_content", [])),
-                    len(raw_json.get("speakers", [])),
+                    len(_usable_task_list(raw_json, "transcripts", note_sink=[])),
+                    len(_usable_task_list(raw_json, "screen_content", note_sink=[])),
+                    len(_usable_task_list(raw_json, "speakers", note_sink=[])),
                 )
             elif isinstance(raw_json, list):
                 first_keys = (
