@@ -7,6 +7,20 @@ knobs, and `cmd_scan` calls it at the top of the channel loop - before
 `get_channel_id` and before the `--dry-run` early return - so a config typo
 is visible on a dry run instead of only surfacing on the real (paid) run.
 The preflight is report-only: it never changes where the actual skip happens.
+
+Round 3 rewrote the consequence model after an adversarial reviewer executed
+the runtime and found two defects:
+
+- P1-A: `transcript_timeout_seconds` does NOT abort the scan the way
+  `transcript_max_duration_seconds` does - its `TypeError` lands in the
+  existing per-video `except Exception` handlers, so it degrades to a failed
+  transcript rather than killing the run. It gets its own consequence,
+  `KNOB_CONSEQUENCE_FAILS_TRANSCRIPTS`.
+- P1-B: the composite downgrade (`_downgrade_unreached_knobs`) now covers
+  BOTH stopping consequences (`ABORTS_SCAN` and `SKIPS_CHANNEL`), keyed on
+  the REAL runtime firing order, so a problem checked after a stopping one
+  is rewritten to `KNOB_CONSEQUENCE_NOT_REACHED` rather than reporting a
+  consequence for code that never runs.
 """
 
 from __future__ import annotations
@@ -20,12 +34,24 @@ import video_intel as vi
 from video_intel import (
     KNOB_CONSEQUENCE_ABORTS_SCAN,
     KNOB_CONSEQUENCE_FAILS_MINDMAPS,
-    KNOB_CONSEQUENCE_NOT_REACHED_BY_SCAN,
+    KNOB_CONSEQUENCE_FAILS_TRANSCRIPTS,
+    KNOB_CONSEQUENCE_NOT_REACHED,
     KNOB_CONSEQUENCE_SKIPS_CHANNEL,
     load_prompt,
     resolve_prompt_path,
     validate_channel_knobs,
 )
+
+
+def _not_reached_for(knob_name: str) -> str:
+    """The exact consequence string a NOT_REACHED knob carries, given whether
+    it is one of the manual-command knobs (`_MANUAL_COMMAND_KNOBS`). Built
+    from the module's own constants rather than hardcoded prose, per the
+    file's existing convention.
+    """
+    if knob_name in vi._MANUAL_COMMAND_KNOBS:
+        return KNOB_CONSEQUENCE_NOT_REACHED + vi._MANUAL_COMMAND_SUFFIX
+    return KNOB_CONSEQUENCE_NOT_REACHED
 
 
 class TestValidateChannelKnobsHealthyConfigs:
@@ -118,29 +144,34 @@ class TestValidateChannelKnobsConsequenceStrings:
         assert problems[0][2] == KNOB_CONSEQUENCE_SKIPS_CHANNEL
 
     @pytest.mark.parametrize("auto_transcript", [None, "none"], ids=["absent", "explicit_none"])
-    def test_bad_transcript_source_without_auto_transcript_all_is_inert(self, auto_transcript):
+    def test_bad_transcript_source_without_auto_transcript_all_still_breaks_manual_commands(self, auto_transcript):
+        """transcript_source is a `_MANUAL_COMMAND_KNOBS` member: cmd_transcript
+        and _cmd_process_url resolve it off the same channel dict (issue #127),
+        so a NOT_REACHED-by-scan typo still fails those manual commands, and
+        the consequence string must say so - never bare NOT_REACHED, and never
+        "inert"."""
         cfg = {"transcript_source": "bogus"}
         if auto_transcript is not None:
             cfg["auto_transcript"] = auto_transcript
 
         problems = validate_channel_knobs(cfg, {})
 
-        assert problems[0][2] == KNOB_CONSEQUENCE_NOT_REACHED_BY_SCAN
+        assert problems[0][2] == _not_reached_for("transcript_source")
 
     def test_bad_chunk_minutes_with_auto_transcript_all_skips_the_channel(self):
         problems = validate_channel_knobs({"chunk_minutes": 0, "auto_transcript": "all"}, {})
 
         assert problems[0][2] == KNOB_CONSEQUENCE_SKIPS_CHANNEL
 
-    def test_bad_chunk_minutes_without_auto_transcript_all_is_inert(self):
+    def test_bad_chunk_minutes_without_auto_transcript_all_still_breaks_manual_commands(self):
         problems = validate_channel_knobs({"chunk_minutes": 0}, {})
 
-        assert problems[0][2] == KNOB_CONSEQUENCE_NOT_REACHED_BY_SCAN
+        assert problems[0][2] == _not_reached_for("chunk_minutes")
 
-    def test_bad_mindmap_source_with_auto_mindmap_none_is_inert(self):
+    def test_bad_mindmap_source_with_auto_mindmap_none_still_breaks_manual_commands(self):
         problems = validate_channel_knobs({"mindmap_source": "screenshots", "auto_mindmap": "none"}, {})
 
-        assert problems[0][2] == KNOB_CONSEQUENCE_NOT_REACHED_BY_SCAN
+        assert problems[0][2] == _not_reached_for("mindmap_source")
 
     def test_bad_mindmap_source_with_default_auto_mindmap_fails_every_mindmap(self):
         # auto_mindmap defaults to "all" when the key is absent.
@@ -150,20 +181,23 @@ class TestValidateChannelKnobsConsequenceStrings:
 
     def test_bad_mindmap_source_alone_still_fails_every_mindmap_composite_fix_did_not_flatten_the_normal_case(self):
         """Round 2: the composite downgrade (below) must only fire when a
-        SKIPS_CHANNEL problem is genuinely present. A lone bad mindmap_source,
-        with no transcript/chunk_minutes problem at all, must keep reporting
-        FAILS_MINDMAPS - proving the composite fix did not flatten this case."""
+        stopping problem is genuinely present. A lone bad mindmap_source,
+        with no transcript/chunk_minutes/prompt problem at all, must keep
+        reporting FAILS_MINDMAPS - proving the composite fix did not flatten
+        this case."""
         problems = validate_channel_knobs({"mindmap_source": "screenshots", "auto_mindmap": "all"}, {})
 
         assert len(problems) == 1
         assert problems[0][0] == "mindmap_source"
         assert problems[0][2] == KNOB_CONSEQUENCE_FAILS_MINDMAPS
 
-    def test_skips_channel_problem_downgrades_a_coexisting_mindmap_problem_to_not_reached_by_scan(self):
+    def test_skips_channel_problem_downgrades_a_coexisting_mindmap_problem_to_not_reached(self):
         """Round 2 composite-contradiction fix: a skipped channel never reaches
         the mindmap loop, so a bad mindmap_source alongside a channel-skipping
-        transcript_source problem must report NOT_REACHED_BY_SCAN, never
-        FAILS_MINDMAPS - claiming both would contradict the runtime."""
+        transcript_source problem must report NOT_REACHED (with the manual-
+        command suffix, since mindmap_source is a _MANUAL_COMMAND_KNOBS
+        member), never FAILS_MINDMAPS - claiming both would contradict the
+        runtime."""
         problems = validate_channel_knobs(
             {
                 "auto_transcript": "all",
@@ -175,7 +209,7 @@ class TestValidateChannelKnobsConsequenceStrings:
 
         by_knob = {p[0]: p[2] for p in problems}
         assert by_knob["transcript_source"] == KNOB_CONSEQUENCE_SKIPS_CHANNEL
-        assert by_knob["mindmap_source"] == KNOB_CONSEQUENCE_NOT_REACHED_BY_SCAN
+        assert by_knob["mindmap_source"] == _not_reached_for("mindmap_source")
 
 
 class TestValidateChannelKnobsPrompt:
@@ -223,10 +257,16 @@ class TestValidateChannelKnobsPrompt:
 
 
 class TestValidateChannelKnobsNumericTranscriptKnobs:
-    """Round 2: `transcript_max_duration_seconds` / `transcript_timeout_seconds`
-    have no resolver - scan reads them straight off the dict and uses them
-    numerically AFTER the dry-run early return, so a bad value raises an
-    uncaught TypeError on a real run instead of failing gracefully."""
+    """`transcript_max_duration_seconds` / `transcript_timeout_seconds` have no
+    resolver - scan reads them straight off the dict and uses them numerically
+    AFTER the dry-run early return, so a bad value raises an uncaught TypeError
+    on a real run instead of failing gracefully. Round 3: the two knobs look
+    identical in the source (a bare dict lookup, no resolver) but behave
+    differently at runtime - see TestTranscriptTimeoutVsMaxDurationConsequence
+    below, which replaces the round-2 test that was blind to this because it
+    was parametrized over both knob names and asserted a module constant
+    against itself without ever touching the runtime.
+    """
 
     @pytest.mark.parametrize("knob_name", ["transcript_max_duration_seconds", "transcript_timeout_seconds"])
     def test_string_value_is_flagged(self, knob_name):
@@ -251,19 +291,259 @@ class TestValidateChannelKnobsNumericTranscriptKnobs:
 
     @pytest.mark.parametrize("knob_name", ["transcript_max_duration_seconds", "transcript_timeout_seconds"])
     def test_absent_key_is_healthy(self, knob_name):
-        assert validate_channel_knobs({}, {}) == []
+        """Issue #169 round-3 nit: this test was parametrized over knob_name
+        but never used it, so it ran the identical assertion twice. Now it
+        sets the OTHER numeric knob to a valid value and asserts that the
+        absent one specifically raises no problem for itself - proving the
+        `numeric_knob not in channel_config: continue` guard is genuinely
+        per-knob, not a coincidence of an empty config."""
+        other_knob = ({"transcript_max_duration_seconds", "transcript_timeout_seconds"} - {knob_name}).pop()
 
-    @pytest.mark.parametrize("knob_name", ["transcript_max_duration_seconds", "transcript_timeout_seconds"])
-    def test_consequence_is_aborts_scan_when_auto_transcript_is_all(self, knob_name):
-        problems = validate_channel_knobs({knob_name: "bad", "auto_transcript": "all"}, {})
+        problems = validate_channel_knobs({other_knob: 100}, {})
+
+        assert not any(p[0] == knob_name for p in problems)
+
+
+class TestTranscriptTimeoutVsMaxDurationConsequence:
+    """P1-A: the two numeric transcript knobs look identical in the source but
+    behave differently at runtime, established by EXECUTING it, not reading it.
+
+    `transcript_max_duration_seconds` raises an uncaught `TypeError` with no
+    handler in the channel body - it genuinely ABORTS the scan. `transcript_
+    timeout_seconds`'s `TypeError` surfaces inside `_run_with_timeout` and lands
+    in the existing per-video `except Exception` handlers on both the single-
+    shot and chunked transcript paths, so the scan completes and every later
+    channel is still reached - it only fails that channel's transcripts.
+    """
+
+    def test_transcript_max_duration_seconds_aborts_the_scan_when_auto_transcript_is_all(self):
+        problems = validate_channel_knobs({"transcript_max_duration_seconds": "bad", "auto_transcript": "all"}, {})
 
         assert problems[0][2] == KNOB_CONSEQUENCE_ABORTS_SCAN
 
+    def test_transcript_timeout_seconds_fails_transcripts_and_must_never_be_reported_as_aborts_scan(self):
+        problems = validate_channel_knobs({"transcript_timeout_seconds": "bad", "auto_transcript": "all"}, {})
+
+        assert problems[0][2] == KNOB_CONSEQUENCE_FAILS_TRANSCRIPTS
+        assert problems[0][2] != KNOB_CONSEQUENCE_ABORTS_SCAN
+
     @pytest.mark.parametrize("knob_name", ["transcript_max_duration_seconds", "transcript_timeout_seconds"])
-    def test_consequence_is_not_reached_by_scan_when_auto_transcript_is_not_all(self, knob_name):
+    def test_consequence_is_not_reached_when_auto_transcript_is_not_all(self, knob_name):
+        """Neither numeric knob is in `_MANUAL_COMMAND_KNOBS` - the AST walk
+        found `cmd_scan` is the only reader of either - so the NOT_REACHED
+        consequence carries no manual-command suffix for either one."""
         problems = validate_channel_knobs({knob_name: "bad"}, {})
 
-        assert problems[0][2] == KNOB_CONSEQUENCE_NOT_REACHED_BY_SCAN
+        assert problems[0][2] == KNOB_CONSEQUENCE_NOT_REACHED
+
+
+class TestReviewerVerifiedRuntimeBehavior:
+    """Locks in the exact six cases the adversarial reviewer verified by
+    executing the runtime (see the task's "Verified current behavior" table).
+    Each assertion matches that transcript line for line.
+    """
+
+    def test_bad_transcript_timeout_seconds_alone_auto_transcript_all(self):
+        problems = validate_channel_knobs({"transcript_timeout_seconds": "bad", "auto_transcript": "all"}, {})
+
+        assert len(problems) == 1
+        assert problems[0][0] == "transcript_timeout_seconds"
+        assert problems[0][2] == KNOB_CONSEQUENCE_FAILS_TRANSCRIPTS
+
+    def test_bad_transcript_max_duration_seconds_alone_auto_transcript_all(self):
+        problems = validate_channel_knobs({"transcript_max_duration_seconds": "bad", "auto_transcript": "all"}, {})
+
+        assert len(problems) == 1
+        assert problems[0][0] == "transcript_max_duration_seconds"
+        assert problems[0][2] == KNOB_CONSEQUENCE_ABORTS_SCAN
+
+    def test_bad_prompt_plus_bad_mindmap_source(self):
+        problems = validate_channel_knobs(
+            {"prompt": "does-not-exist-xyz", "mindmap_source": "screenshots", "auto_mindmap": "all"}, {}
+        )
+
+        by_knob = {p[0]: p[2] for p in problems}
+        assert by_knob["prompt"] == KNOB_CONSEQUENCE_ABORTS_SCAN
+        assert by_knob["mindmap_source"] == _not_reached_for("mindmap_source")
+
+    def test_bad_transcript_source_plus_bad_transcript_max_duration_seconds_auto_transcript_all(self):
+        problems = validate_channel_knobs(
+            {
+                "auto_transcript": "all",
+                "transcript_source": "bogus",
+                "transcript_max_duration_seconds": "bad",
+            },
+            {},
+        )
+
+        by_knob = {p[0]: p[2] for p in problems}
+        assert by_knob["transcript_source"] == KNOB_CONSEQUENCE_SKIPS_CHANNEL
+        # Not a _MANUAL_COMMAND_KNOBS member, so bare NOT_REACHED - no suffix.
+        assert by_knob["transcript_max_duration_seconds"] == KNOB_CONSEQUENCE_NOT_REACHED
+
+    def test_bad_transcript_max_duration_seconds_no_auto_transcript(self):
+        problems = validate_channel_knobs({"transcript_max_duration_seconds": "bad"}, {})
+
+        assert problems[0][2] == KNOB_CONSEQUENCE_NOT_REACHED
+
+    def test_bad_transcript_source_no_auto_transcript(self):
+        problems = validate_channel_knobs({"transcript_source": "bogus"}, {})
+
+        assert problems[0][2] == _not_reached_for("transcript_source")
+
+
+class TestValidateChannelKnobsCompositeDowngradeEdgeCases:
+    """Item 3: coverage the reviewer's six cases don't exercise on their own -
+    two stopping-class knobs stacked, a NOT_REACHED knob that was never
+    "downgraded" (it was already NOT_REACHED for its own reason) still getting
+    its suffix, and the case a naive "downgrade everything after the first
+    problem" implementation gets wrong.
+    """
+
+    def test_two_skips_channel_knobs_together_the_second_downgrades(self):
+        """transcript_source (runtime order 2) and chunk_minutes (order 3) are
+        both SKIPS_CHANNEL-class. transcript_source fires first and stops the
+        channel, so chunk_minutes's own SKIPS_CHANNEL claim describes code
+        that never runs and must be downgraded."""
+        problems = validate_channel_knobs(
+            {"auto_transcript": "all", "transcript_source": "bogus", "chunk_minutes": 0}, {}
+        )
+
+        by_knob = {p[0]: p[2] for p in problems}
+        assert by_knob["transcript_source"] == KNOB_CONSEQUENCE_SKIPS_CHANNEL
+        assert by_knob["chunk_minutes"] == _not_reached_for("chunk_minutes")
+
+    def test_a_knob_already_not_reached_before_any_stopping_knob_still_gets_the_manual_command_suffix(self):
+        """transcript_source resolves to NOT_REACHED on its own here (no
+        auto_transcript: all), for a reason entirely unrelated to the prompt
+        problem. `_downgrade_unreached_knobs` must still append the manual-
+        command suffix to it even though it was never actually "downgraded"
+        by the stopping prompt problem - it already carried the plain
+        NOT_REACHED consequence before the downgrade pass ever ran."""
+        problems = validate_channel_knobs({"prompt": "does-not-exist-xyz", "transcript_source": "bogus"}, {})
+
+        by_knob = {p[0]: p[2] for p in problems}
+        assert by_knob["prompt"] == KNOB_CONSEQUENCE_ABORTS_SCAN
+        assert by_knob["transcript_source"] == _not_reached_for("transcript_source")
+
+    def test_fails_transcripts_and_fails_mindmaps_together_neither_downgrades_the_other(self):
+        """Neither FAILS_TRANSCRIPTS nor FAILS_MINDMAPS stops the channel, so a
+        naive "downgrade everything after the first problem" implementation
+        would wrongly demote FAILS_MINDMAPS to NOT_REACHED just because
+        transcript_timeout_seconds fired earlier in the runtime order. Both
+        must survive as reported - this is the case that proves the downgrade
+        keys on the STOPPING consequences only, never "any problem"."""
+        problems = validate_channel_knobs(
+            {
+                "auto_transcript": "all",
+                "transcript_timeout_seconds": "bad",
+                "auto_mindmap": "all",
+                "mindmap_source": "screenshots",
+            },
+            {},
+        )
+
+        by_knob = {p[0]: p[2] for p in problems}
+        assert by_knob["transcript_timeout_seconds"] == KNOB_CONSEQUENCE_FAILS_TRANSCRIPTS
+        assert by_knob["mindmap_source"] == KNOB_CONSEQUENCE_FAILS_MINDMAPS
+
+
+class TestValidateChannelKnobsCheckOrderIsTheContract:
+    """P3: nothing enforces that the checks stay in cmd_scan's real runtime
+    firing order - a hypothetical stopping knob appended AFTER the mindmap
+    check would produce a self-contradictory report (claiming both a real
+    consequence for a later knob AND that everything after the first stopping
+    knob is unreachable) while every other test in this file stays green,
+    because none of them assert the ORDER itself. This test is the one that
+    would catch that: the order IS the contract, not an implementation detail.
+    """
+
+    def test_every_knob_bad_at_once_reports_in_documented_runtime_order_with_exactly_one_stopping_consequence(self):
+        config = {
+            "prompt": "does-not-exist-xyz",
+            "auto_transcript": "all",
+            "transcript_source": "bogus",
+            "chunk_minutes": 0,
+            "transcript_max_duration_seconds": "bad",
+            "transcript_timeout_seconds": "bad",
+            "auto_mindmap": "all",
+            "mindmap_source": "screenshots",
+        }
+
+        problems = validate_channel_knobs(config, {})
+
+        assert [p[0] for p in problems] == [
+            "prompt",
+            "transcript_source",
+            "chunk_minutes",
+            "transcript_max_duration_seconds",
+            "transcript_timeout_seconds",
+            "mindmap_source",
+        ]
+
+        consequences = [p[2] for p in problems]
+        stopping = [c for c in consequences if c in vi._KNOB_STOPPING_CONSEQUENCES]
+        assert len(stopping) == 1, f"expected exactly one stopping consequence, got: {consequences}"
+        assert consequences[0] in vi._KNOB_STOPPING_CONSEQUENCES, (
+            "the FIRST knob in runtime order (prompt) must be the one that stops the channel here"
+        )
+        assert all(c.startswith(KNOB_CONSEQUENCE_NOT_REACHED) for c in consequences[1:]), (
+            f"every problem after the first stopping one must be downgraded to NOT_REACHED, got: {consequences}"
+        )
+
+
+class TestDowngradeUnreachedKnobsDirectly:
+    """`_downgrade_unreached_knobs` is provable without constructing configs at
+    all - it operates purely on the (knob_name, message, consequence) tuples
+    `validate_channel_knobs` hands it in runtime order.
+    """
+
+    def test_empty_list_returns_empty_list(self):
+        assert vi._downgrade_unreached_knobs([]) == []
+
+    def test_no_stopping_consequence_changes_nothing(self):
+        problems = [
+            ("transcript_timeout_seconds", "bad", KNOB_CONSEQUENCE_FAILS_TRANSCRIPTS),
+            ("mindmap_source", "bad", KNOB_CONSEQUENCE_FAILS_MINDMAPS),
+        ]
+
+        assert vi._downgrade_unreached_knobs(problems) == problems
+
+    def test_stopping_first_downgrades_every_later_problem(self):
+        problems = [
+            ("prompt", "bad", KNOB_CONSEQUENCE_ABORTS_SCAN),
+            ("mindmap_source", "bad", KNOB_CONSEQUENCE_FAILS_MINDMAPS),
+        ]
+
+        result = vi._downgrade_unreached_knobs(problems)
+
+        assert result[0] == ("prompt", "bad", KNOB_CONSEQUENCE_ABORTS_SCAN)
+        assert result[1][0] == "mindmap_source"
+        assert result[1][2] == _not_reached_for("mindmap_source")
+
+    def test_stopping_last_downgrades_nothing_because_nothing_follows_it(self):
+        problems = [
+            ("transcript_timeout_seconds", "bad", KNOB_CONSEQUENCE_FAILS_TRANSCRIPTS),
+            ("transcript_source", "bad", KNOB_CONSEQUENCE_SKIPS_CHANNEL),
+        ]
+
+        assert vi._downgrade_unreached_knobs(problems) == problems
+
+    def test_manual_command_suffix_applied_only_to_manual_command_knobs(self):
+        problems = [
+            ("prompt", "bad", KNOB_CONSEQUENCE_ABORTS_SCAN),
+            ("transcript_max_duration_seconds", "bad", KNOB_CONSEQUENCE_ABORTS_SCAN),
+            ("mindmap_source", "bad", KNOB_CONSEQUENCE_FAILS_MINDMAPS),
+        ]
+
+        result = vi._downgrade_unreached_knobs(problems)
+        by_knob = {p[0]: p[2] for p in result}
+
+        # transcript_max_duration_seconds is downgraded but is NOT a manual-
+        # command knob (cmd_scan reads it alone) - bare NOT_REACHED, no suffix.
+        assert by_knob["transcript_max_duration_seconds"] == KNOB_CONSEQUENCE_NOT_REACHED
+        # mindmap_source IS a manual-command knob - suffix applied.
+        assert by_knob["mindmap_source"] == _not_reached_for("mindmap_source")
 
 
 class TestResolvePromptPathMatchesLoadPrompt:
@@ -510,7 +790,9 @@ class TestScanDryRunPreflight:
         """A channel with BOTH a typoed prompt (ABORTS) and a typoed
         transcript_source (SKIPS) must emit exactly one NOTE line, and it must
         be the ABORTS one - aborting the scan is strictly worse than (and
-        subsumes) skipping the one channel."""
+        subsumes) skipping the one channel. Item 6, first reviewer case: a bad
+        prompt plus a bad transcript_source emits exactly ONE dry-run NOTE and
+        it is the ABORTS one."""
         env = _ScanEnvironment()
         env.wire(monkeypatch, dry_run=True)
         config = env.config(tmp_path)
@@ -526,6 +808,32 @@ class TestScanDryRunPreflight:
         assert len(notes) == 1, f"expected exactly one dry-run NOTE, got: {notes}"
         assert "ABORTS" in notes[0]
         assert "SKIPS" not in notes[0]
+
+    def test_skips_note_wins_when_the_downgraded_max_duration_problem_would_otherwise_falsely_claim_aborts(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """P1-B(ii) regression, item 6's second reviewer case: transcript_source
+        (runtime order 2, SKIPS_CHANNEL) fires before transcript_max_duration_
+        seconds (runtime order 4, ABORTS_SCAN) in cmd_scan's real firing order.
+        Once transcript_source's SKIPS_CHANNEL problem stops the channel,
+        transcript_max_duration_seconds's own ABORTS_SCAN claim describes code
+        that never runs and must be downgraded to NOT_REACHED - so the dry-run
+        NOTE must be the SKIPS one, never the FALSE ABORTS one that used to win
+        before the composite downgrade covered ABORTS_SCAN too."""
+        env = _ScanEnvironment()
+        env.wire(monkeypatch, dry_run=True)
+        config = env.config(tmp_path)
+        typo_ch = next(c for c in config["channels"] if c["name"] == "typo")
+        # transcript_source stays "captions" (invalid) from env.config().
+        typo_ch["transcript_max_duration_seconds"] = "not-a-number"
+
+        with caplog.at_level("INFO"):
+            vi.cmd_scan(_scan_args(dry_run=True), config)
+
+        notes = [r.message for r in caplog.records if "would NOT be processed" in r.message]
+        assert len(notes) == 1, f"expected exactly one dry-run NOTE, got: {notes}"
+        assert "SKIPS this channel" in notes[0]
+        assert "ABORTS" not in notes[0]
 
     def test_typoed_transcript_source_without_auto_transcript_logs_warning_with_manual_commands_wording(
         self, tmp_path, monkeypatch, caplog
@@ -551,7 +859,7 @@ class TestScanDryRunPreflight:
         assert "inert" not in warning_records[0].message
 
         error_records = [r for r in caplog.records if r.levelname == "ERROR" and "transcript_source" in r.message]
-        assert error_records == [], f"a NOT_REACHED_BY_SCAN problem must log at WARNING, not ERROR: {error_records}"
+        assert error_records == [], f"a NOT_REACHED problem must log at WARNING, not ERROR: {error_records}"
 
 
 class TestScanNonDryRunRoutingUnchanged:
