@@ -145,6 +145,41 @@ class TestAccumulateConceptsIntoTaxonomy:
         assert added == 1
         assert "ai.rag" in taxonomy["concepts"]
 
+    @pytest.mark.parametrize(
+        ("label", "body"),
+        [
+            ("list", "[]"),
+            ("nonempty_list", '[{"concept_id": "c1"}]'),
+            ("string", '"hello"'),
+            ("number", "42"),
+            ("null", "null"),
+            ("bool", "true"),
+        ],
+    )
+    def test_a_successful_parse_with_a_non_object_top_level_does_not_crash(self, tmp_path, caplog, label, body):
+        """A parse that SUCCEEDS can still hand back a non-dict.
+
+        `json.loads` returns a list for `[]`, a str for `"hello"`, an int for
+        `42` and None for `null`, and `.get` on any of them raises
+        AttributeError - escaping the read guard immediately above it, inside a
+        loop that has already paid for a Gemini call. All four crashed before
+        this check. Same "the guard has a hole one layer in" shape as the
+        issue #161/#171 family; caught by the Codex peer pass, not by the
+        in-family review.
+        """
+        concepts_path = tmp_path / f"{label}.concepts.json"
+        concepts_path.write_text(body, encoding="utf-8")
+        taxonomy = {"concepts": {}}
+
+        with caplog.at_level("WARNING"):
+            added = accumulate_concepts_into_taxonomy(taxonomy, concepts_path)
+
+        assert added == 0
+        assert taxonomy == {"concepts": {}}, "a non-object top level must contribute nothing"
+        assert any("top level" in r.message for r in caplog.records), (
+            "a skipped artifact must say so; a guard that stops guarding silently is the failure mode"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Shared cmd_scan stubbing (mirrors tests/test_process_force_propagation.py's
@@ -225,11 +260,10 @@ def _make_fake_mindmap(channel_dir_by_name):
 
     return fake_mindmap
 
-
-# ---------------------------------------------------------------------------
-# 2. The issue's own test contract: within one channel, video 2 must see
-#    video 1's newly-minted concept id.
-# ---------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
+    # 2. The issue's own test contract: within one channel, video 2 must see
+    #    video 1's newly-minted concept id.
+    # ---------------------------------------------------------------------------
 
 
 class TestScanAccumulatesWithinOneChannel:

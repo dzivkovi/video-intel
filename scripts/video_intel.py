@@ -656,6 +656,19 @@ def accumulate_concepts_into_taxonomy(taxonomy: dict, concepts_path: Path) -> in
         log.warning("Skipping malformed concepts.json for accumulation: %s (%s)", concepts_path, e)
         return 0
 
+    if not isinstance(data, dict):
+        # A parse that SUCCEEDS can still hand back a list, string, number or
+        # None, and `.get` on any of them raises AttributeError - escaping the
+        # very guard above it. Verified: `[]`, `"hello"`, `42` and `null` all
+        # crashed here before this check. Caught by the Codex peer pass; it is
+        # the same "the guard has a hole one layer in" shape as issues #161/#171.
+        log.warning(
+            "Skipping concepts.json whose top level is a %s, not an object: %s",
+            type(data).__name__,
+            concepts_path,
+        )
+        return 0
+
     concepts = data.get("concepts", [])
     if not isinstance(concepts, list):
         # Warn for the same reason the read failure above warns: a wrong SHAPE
