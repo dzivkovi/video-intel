@@ -5696,11 +5696,20 @@ def cmd_scan(args, config):
                     if transcript_available
                     else False
                 )
+                # Issue #135 (coordinator follow-up): this closure runs inside a
+                # ThreadPoolExecutor worker (see executor.submit below), so an
+                # escaping TypeError (a non-string mindmap_source - a YAML mapping
+                # or sequence) does not just fail one video the way a returned
+                # error: string does - it propagates out through the executor and
+                # can take down the whole mindmap stage for the channel, after
+                # transcript work and quota are already spent. Catch both, keep
+                # returning the same error: shape - it already lands in the failure
+                # summary through the task-result path below.
                 try:
                     src = resolve_mindmap_source(
                         _ch, transcript_available=transcript_available, transcript_severe=transcript_severe
                     )
-                except ValueError as exc:
+                except (ValueError, TypeError) as exc:
                     return v_prefix, f"error: {exc}"
                 if src == "skip":
                     return v_prefix, "skipped (mindmap_source=none)"

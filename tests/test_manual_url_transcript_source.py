@@ -512,3 +512,98 @@ class TestScanChannelConfigTypoSkipsOnlyThatChannel:
         error_messages = [r.message for r in caplog.records if r.levelname == "ERROR"]
         assert error_messages, "the non-string value must produce a clean ERROR line, not a silent pass-through"
         assert "typo" in error_messages[0]
+
+
+class TestScanMindmapSourceNonStringConfigValueInThreadedClosure:
+    """Coordinator follow-up (third commit): a fourth `resolve_mindmap_source`
+    call site was missed in the first two commits - `cmd_scan`'s per-video
+    mindmap closure at ~:5709. It matters MORE than the ones already guarded:
+    the closure runs inside a `ThreadPoolExecutor` worker, so an escaping
+    `TypeError` does not just fail one video the way the closure's normal
+    `return v_prefix, f"error: {exc}"` does - `future.result()` re-raises it
+    with nothing above catching it, taking down the whole mindmap stage for
+    the channel (and the scan run) after transcript work and quota are
+    already spent. That is the exact "one typo must not cost the run"
+    failure #135 exists to prevent.
+    """
+
+    def test_non_string_mindmap_source_yields_a_per_video_error_not_an_escaping_traceback(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        typo_video = {
+            "video_id": "typo-mm1",
+            "title": "Typo mindmap_source video",
+            "published": "2026-04-15",
+            "url": "https://www.youtube.com/watch?v=typo-mm1",
+        }
+        good_video = {
+            "video_id": "good-mm1",
+            "title": "Good mindmap video",
+            "published": "2026-04-15",
+            "url": "https://www.youtube.com/watch?v=good-mm1",
+        }
+        videos_by_channel_url = {
+            "https://example.com/typo-mindmap": [typo_video],
+            "https://example.com/good-mindmap": [good_video],
+        }
+
+        monkeypatch.setenv("GEMINI_API_KEY", "test")
+        monkeypatch.setenv("YOUTUBE_API_KEY", "test")
+        monkeypatch.setattr(vi, "require_gemini", lambda: (None, None))
+        monkeypatch.setattr(vi, "require_youtube", lambda: lambda *a, **kw: None)
+        monkeypatch.setattr(vi, "create_client", lambda *a, **kw: None)
+        monkeypatch.setattr(vi, "get_channel_id", lambda yt, url: (url, url))
+        monkeypatch.setattr(vi, "fetch_channel_videos", lambda yt, cid, since: list(videos_by_channel_url.get(cid, [])))
+        monkeypatch.setattr(vi, "enrich_with_durations", lambda _yt, ids: dict.fromkeys(ids))
+        monkeypatch.setattr(vi, "fetch_preflight_status", lambda _yt, ids: {vid: {} for vid in ids})
+        monkeypatch.setattr(vi, "_is_youtube_short_url", lambda video_id: False)
+
+        mindmaps_seen: list[str] = []
+
+        def fake_mindmap(*args, **kwargs):
+            video = args[2] if len(args) > 2 else kwargs.get("video")
+            mindmaps_seen.append(video["video_id"])
+            return (video.get("video_id", "prefix"), "done")
+
+        monkeypatch.setattr(vi, "process_mindmap", fake_mindmap)
+
+        # auto_transcript defaults to "none" on both channels - this test is
+        # scoped to the mindmap-loop guard alone, not the transcript-loop
+        # guard already covered by TestScanChannelConfigTypoSkipsOnlyThatChannel.
+        # The typo channel is listed FIRST so a pre-fix escaping TypeError
+        # (which future.result() re-raises with nothing above it to catch)
+        # would abort the run before the good channel is ever reached -
+        # proving "one typo must not cost the run", not just "this channel
+        # fails".
+        config = {
+            "output_dir": str(tmp_path),
+            "channels": [
+                {
+                    "name": "typo-mindmap",
+                    "url": "https://example.com/typo-mindmap",
+                    "mindmap_source": {"mode": "auto"},
+                },
+                {"name": "good-mindmap", "url": "https://example.com/good-mindmap"},
+            ],
+        }
+
+        with caplog.at_level("WARNING"):
+            vi.cmd_scan(_scan_args(), config)
+
+        assert "good-mm1" in mindmaps_seen, (
+            "the healthy channel's mindmap must still run - a non-string mindmap_source on "
+            "an earlier channel must not abort the whole scan"
+        )
+        assert "typo-mm1" not in mindmaps_seen, "the typo video's mindmap call must never be reached"
+
+        # The closure's existing `return v_prefix, f"error: {exc}"` shape is
+        # unchanged: it lands in the failure summary through the normal
+        # task-result path (`if status.startswith("error"): errors.append(...)`),
+        # not through a converted errors.append call site of its own.
+        summary_lines = [r.message for r in caplog.records if r.levelname == "WARNING"]
+        assert any("FAILED" in line for line in summary_lines), (
+            f"expected a '--- N FAILED ---' summary line, got: {summary_lines}"
+        )
+        assert any("typo-mindmap" in line and "unhashable type" in line for line in summary_lines), (
+            f"expected the typo channel's video named in the failure summary, got: {summary_lines}"
+        )
