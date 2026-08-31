@@ -905,6 +905,93 @@ def resolve_mindmap_source(channel_config: dict, *, transcript_available: bool, 
     return "transcript" if (transcript_available and not transcript_severe) else "video"
 
 
+# Issue #169: consequence strings for `validate_channel_knobs`'s --dry-run
+# preflight. Kept as module-level constants so tests can assert on them
+# without duplicating literals, and so the preflight's wording tracks the
+# runtime skip sites' own log messages instead of drifting independently.
+KNOB_CONSEQUENCE_SKIPS_CHANNEL = "skips the whole channel (mindmap and concepts too)"
+KNOB_CONSEQUENCE_FAILS_MINDMAPS = "fails every mindmap for this channel"
+KNOB_CONSEQUENCE_INERT = "inert with this channel's current settings"
+
+
+def validate_channel_knobs(
+    channel_config: dict,
+    config: dict,
+    cli_chunk_minutes: int | None = None,
+) -> list[tuple[str, str, str]]:
+    """Preflight-validate a channel's per-video config knobs (issue #169).
+
+    Returns ``[(knob_name, error_message, consequence), ...]`` - empty when the
+    channel's knobs all resolve. Never raises, never mutates, never touches disk
+    or the network.
+
+    Reuses the REAL resolvers (`resolve_transcript_source`, `resolve_chunk_minutes`,
+    `resolve_mindmap_source`) rather than re-deriving their valid-value sets or
+    checks - this repo's standing guardrail is "a verifier must use the WRITER's
+    path, never re-derive its own" (CLAUDE.md, the PR #136 entry). A hand-rolled
+    copy of the valid-value sets here would drift the moment a resolver changes.
+
+    Call shapes mirror `cmd_scan`'s own call sites exactly, so this preflight can
+    never disagree with what a real run would do:
+
+    - `resolve_transcript_source(channel_config)` - no CLI override, matching
+      scan's own site (~:6061); the `--transcript-source` CLI flag only exists
+      on the manual `--url` commands, never on `scan`.
+    - `resolve_chunk_minutes(channel_config, config, cli_chunk_minutes)` -
+      matching scan's site (~:6098).
+    - `resolve_mindmap_source(channel_config, transcript_available=True)` -
+      `True` is deliberate and load-bearing. It isolates the ENUM check (is
+      `mindmap_source` one of the four valid strings?) from the availability
+      conflict (`mindmap_source: transcript` with no transcript on disk yet).
+      Passing `False` would make `resolve_mindmap_source` raise its "no
+      transcript is available" `ValueError` for every channel legitimately
+      configured `mindmap_source: transcript` whose transcripts simply have
+      not been written yet - a permanent false alarm on a healthy config, the
+      exact failure class this repo documents: a guard whose only value is
+      being believed must never cry wolf.
+
+    Each resolver call is wrapped in `except (ValueError, TypeError)` per the
+    issue #135 finding: a non-string YAML value (a mapping or a sequence) fails
+    a resolver's `in` membership test with `TypeError`, not `ValueError`.
+
+    The `consequence` string describes what actually happens on a real `scan`
+    run, derived from this channel's own settings:
+
+    - `transcript_source` and `chunk_minutes` are resolved only inside
+      `cmd_scan`'s `if auto_transcript == "all":` block, and both of that
+      block's existing guards `continue` the WHOLE channel. So the consequence
+      is `KNOB_CONSEQUENCE_SKIPS_CHANNEL` when `auto_transcript == "all"`,
+      otherwise `KNOB_CONSEQUENCE_INERT` (the knob is never reached).
+    - `mindmap_source` is resolved per-video inside the mindmap loop's threaded
+      closure, which returns an `error:` status per video - it does NOT skip
+      the channel. So the consequence is `KNOB_CONSEQUENCE_FAILS_MINDMAPS`
+      when `auto_mindmap != "none"`, otherwise `KNOB_CONSEQUENCE_INERT`.
+    """
+    problems: list[tuple[str, str, str]] = []
+    transcript_all = channel_config.get("auto_transcript", "none") == "all"
+    mindmap_active = channel_config.get("auto_mindmap", "all") != "none"
+
+    try:
+        resolve_transcript_source(channel_config)
+    except (ValueError, TypeError) as e:
+        consequence = KNOB_CONSEQUENCE_SKIPS_CHANNEL if transcript_all else KNOB_CONSEQUENCE_INERT
+        problems.append(("transcript_source", str(e), consequence))
+
+    try:
+        resolve_chunk_minutes(channel_config, config, cli_chunk_minutes)
+    except (ValueError, TypeError) as e:
+        consequence = KNOB_CONSEQUENCE_SKIPS_CHANNEL if transcript_all else KNOB_CONSEQUENCE_INERT
+        problems.append(("chunk_minutes", str(e), consequence))
+
+    try:
+        resolve_mindmap_source(channel_config, transcript_available=True)
+    except (ValueError, TypeError) as e:
+        consequence = KNOB_CONSEQUENCE_FAILS_MINDMAPS if mindmap_active else KNOB_CONSEQUENCE_INERT
+        problems.append(("mindmap_source", str(e), consequence))
+
+    return problems
+
+
 def find_mindmap_source(channel_dir: Path, prefix: str) -> Path | None:
     """Find the best mindmap file for concept extraction.
 
@@ -5816,6 +5903,38 @@ def cmd_scan(args, config):
         ch_name = ch["name"]
         ch_url = ch["url"]
 
+        # Issue #169: preflight this channel's per-video knobs BEFORE anything
+        # else runs. Two placements matter, both deliberate:
+        # (a) before get_channel_id() so the diagnostic for a config typo
+        #     surfaces in the log before this channel's first YouTube-quota
+        #     call, not buried after it or after other channels' output;
+        # (b) before the `if args.dry_run: ... continue` early return further
+        #     down - that ordering is the entire point of the issue: it makes
+        #     `--dry-run` a real preflight instead of a preview that returns
+        #     before the knob resolvers ever run.
+        # This is REPORT ONLY: no continue, no sys.exit, no errors.append here.
+        # get_channel_id() and (on a non-dry-run) the rest of this channel's
+        # processing still run exactly as before - this preflight never skips
+        # anything. The existing runtime skip sites (transcript_source,
+        # chunk_minutes, mindmap_source, further down this function) are
+        # unchanged and still own where the actual skip happens. A real
+        # (non-dry-run) run will log a problem twice - once here, once at the
+        # skip site - and that is intended: the first says the config is
+        # invalid, the second says what is being done about it.
+        knob_problems = validate_channel_knobs(ch, config, getattr(args, "chunk_minutes", None))
+        for knob_name, error_message, consequence in knob_problems:
+            log_fn = log.warning if consequence == KNOB_CONSEQUENCE_INERT else log.error
+            log_fn(
+                "[%s] invalid %s (%s) - %s",
+                ch_name,
+                knob_name,
+                error_message,
+                consequence,
+            )
+        # Whether a real run would skip this channel outright. Read ONLY by the
+        # --dry-run preview below; it never gates anything on a real run.
+        knob_blocks_channel = any(c == KNOB_CONSEQUENCE_SKIPS_CHANNEL for _, _, c in knob_problems)
+
         # Resolve channel
         channel_id, channel_title = get_channel_id(youtube, ch_url)
         if not channel_id:
@@ -6014,6 +6133,21 @@ def cmd_scan(args, config):
         log.info("  Found %d videos, %d %s.", len(videos), len(new_videos), label)
 
         if args.dry_run:
+            # Issue #169: without this the preview contradicts itself. The
+            # preflight above says the channel would be skipped, and then the
+            # very next lines announce "Found N videos, N new" and list them -
+            # so the operator reads a count of work that a real run would not
+            # do. Naming the contradiction here is the difference between a
+            # preview that reports a typo and a preview that tells the truth
+            # about its own numbers. Dry-run only: `knob_blocks_channel` is
+            # read nowhere else, so a real run's routing is untouched.
+            if knob_blocks_channel:
+                log.error(
+                    "  [%s] NOTE: a real run SKIPS this channel (see the config error above); "
+                    "the %d video(s) listed below would NOT be processed.",
+                    ch_name,
+                    len(new_videos),
+                )
             for v in new_videos:
                 log.info("    %s - %s", v["published"], v["title"])
             continue
