@@ -8376,16 +8376,49 @@ _MODE_ARTIFACT_PATTERNS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _pick_canonical(metas: list[tuple[Path, dict]]) -> tuple[Path, dict]:
-    """Pick canonical by (latest processed, most modes_completed, prefix).
+def _dedupe_meta_is_severe(meta_data: dict) -> bool:
+    """Whether one dedupe-group member's transcript carries a severe quality
+    flag, for canonical selection (issue #159).
 
-    Reverse-sort so index 0 is canonical. Stable tie-break on alphabetical
-    prefix keeps the choice deterministic when timestamps are identical.
+    Delegates entirely to `transcript_quality_flags_are_severe()` (the
+    #157/#158 severity test) - this never re-implements severity, it only
+    guards the call against a malformed on-disk value so a corrupt or
+    hand-edited meta degrades to "not severe" instead of crashing the dedupe
+    sort. A `transcript_quality_flags` value that isn't a list (e.g. a bare
+    string) is treated as absent rather than passed through: a scalar string
+    happening to equal a severe flag's name is not the documented list shape
+    the helper expects, and iterating its characters is not a meaningful
+    severity signal either way. A list containing unhashable entries (which
+    would raise inside the frozenset membership test) is likewise treated as
+    not severe - malformed input degrades here, it does not crash a group
+    comparison.
+    """
+    flags = meta_data.get("transcript_quality_flags")
+    if not isinstance(flags, list):
+        flags = None
+    try:
+        return transcript_quality_flags_are_severe(flags)
+    except TypeError:
+        return False
+
+
+def _pick_canonical(metas: list[tuple[Path, dict]]) -> tuple[Path, dict]:
+    """Pick canonical by (not severe first, then latest processed, most
+    modes_completed, prefix).
+
+    Issue #159: a meta whose transcript tripped a severe quality flag
+    (`_dedupe_meta_is_severe`, reusing `transcript_quality_flags_are_severe`)
+    never outranks a clean duplicate, even a much older one - a severe rerun
+    is worse, not better, regardless of recency. Within one severity bucket
+    (both clean or both severe) the pre-#159 order is unchanged: reverse-sort
+    so index 0 is canonical, stable tie-break on alphabetical prefix keeps
+    the choice deterministic when timestamps are identical.
     """
 
-    def sort_key(item: tuple[Path, dict]) -> tuple[str, int, str]:
+    def sort_key(item: tuple[Path, dict]) -> tuple[bool, str, int, str]:
         path, data = item
         return (
+            not _dedupe_meta_is_severe(data),
             data.get("processed", ""),
             len(data.get("modes_completed", [])),
             path.name,

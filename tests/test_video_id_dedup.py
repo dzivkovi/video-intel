@@ -312,6 +312,247 @@ def test_dedupe_preserves_existing_alt_titles_on_canonical(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Quality-aware canonical selection (issue #159)
+# ---------------------------------------------------------------------------
+#
+# Background: dedupe used to pick canonical by latest `processed` timestamp
+# alone. A rerun whose transcript tripped the #157/#158 severe quality guards
+# (e.g. a monolithic-collapse transcript) is newer but worse, and used to beat
+# a healthy older duplicate - the healthy artifacts became the deleted losers.
+# The fix: a meta WITHOUT severe transcript_quality_flags always outranks one
+# WITH severe flags, via the existing transcript_quality_flags_are_severe()
+# helper (never a re-implemented severity test). Within one severity bucket,
+# the pre-#159 tie-break (latest processed, modes_completed size, prefix) is
+# unchanged.
+
+
+def _meta_tuple(prefix: str, **fields) -> tuple[Path, dict]:
+    """Build a (Path, dict) pair shaped like `_pick_canonical` expects,
+    without touching disk - these tests exercise the pure selection logic."""
+    return Path(f"{prefix}.meta.json"), fields
+
+
+def test_pick_canonical_prefers_clean_over_severe_regardless_of_recency():
+    """The headline case: a newer, severe-flagged rerun must never beat an
+    older, clean duplicate."""
+    older_clean = _meta_tuple(
+        "2026-04-15-older",
+        processed="2026-04-18T00:00:00+00:00",
+        modes_completed=["scan", "transcript"],
+    )
+    newer_severe = _meta_tuple(
+        "2026-04-20-newer",
+        processed="2026-04-20T00:00:00+00:00",
+        modes_completed=["scan", "transcript"],
+        transcript_quality_flags=["monolithic_severe"],
+    )
+    canonical_path, _ = vi._pick_canonical([older_clean, newer_severe])
+    assert canonical_path.name == "2026-04-15-older.meta.json"
+
+
+def test_pick_canonical_both_clean_newer_wins_regression_lock():
+    """Regression lock: with neither meta severe, behavior is unchanged from
+    pre-#159 - latest processed wins."""
+    older = _meta_tuple("2026-04-15-a", processed="2026-04-18T00:00:00+00:00", modes_completed=["scan"])
+    newer = _meta_tuple("2026-04-15-b", processed="2026-04-20T00:00:00+00:00", modes_completed=["scan"])
+    canonical_path, _ = vi._pick_canonical([older, newer])
+    assert canonical_path.name == "2026-04-15-b.meta.json"
+
+
+def test_pick_canonical_both_severe_newer_wins():
+    """With both metas severe, the pre-#159 tie-break still applies: latest
+    processed wins even though neither is clean."""
+    older_severe = _meta_tuple(
+        "2026-04-15-a",
+        processed="2026-04-18T00:00:00+00:00",
+        modes_completed=["scan"],
+        transcript_quality_flags=["blind_gap_severe"],
+    )
+    newer_severe = _meta_tuple(
+        "2026-04-15-b",
+        processed="2026-04-20T00:00:00+00:00",
+        modes_completed=["scan"],
+        transcript_quality_flags=["monolithic_severe"],
+    )
+    canonical_path, _ = vi._pick_canonical([older_severe, newer_severe])
+    assert canonical_path.name == "2026-04-15-b.meta.json"
+
+
+def test_pick_canonical_absent_flags_field_treated_clean():
+    """No transcript_quality_flags key at all - must not be mistaken for
+    severe; the meta with the field absent still wins over a severe one even
+    if it is older."""
+    older_absent = _meta_tuple("2026-04-15-a", processed="2026-04-18T00:00:00+00:00", modes_completed=["scan"])
+    newer_severe = _meta_tuple(
+        "2026-04-15-b",
+        processed="2026-04-20T00:00:00+00:00",
+        modes_completed=["scan"],
+        transcript_quality_flags=["monolithic_severe"],
+    )
+    canonical_path, _ = vi._pick_canonical([older_absent, newer_severe])
+    assert canonical_path.name == "2026-04-15-a.meta.json"
+
+
+def test_pick_canonical_malformed_flags_scalar_string_treated_clean_without_crash():
+    """A malformed transcript_quality_flags value that is a bare string
+    (not a list) must degrade to 'not severe' rather than crashing the
+    dedupe sort - and rather than being scanned character-by-character."""
+    older_malformed = _meta_tuple(
+        "2026-04-15-a",
+        processed="2026-04-18T00:00:00+00:00",
+        modes_completed=["scan"],
+        transcript_quality_flags="monolithic_severe",
+    )
+    newer_severe = _meta_tuple(
+        "2026-04-15-b",
+        processed="2026-04-20T00:00:00+00:00",
+        modes_completed=["scan"],
+        transcript_quality_flags=["monolithic_severe"],
+    )
+    canonical_path, _ = vi._pick_canonical([older_malformed, newer_severe])
+    assert canonical_path.name == "2026-04-15-a.meta.json"
+
+
+def test_pick_canonical_malformed_flags_int_entries_treated_clean_without_crash():
+    """A transcript_quality_flags list with non-string (int) entries must
+    degrade to 'not severe' without raising."""
+    older_malformed = _meta_tuple(
+        "2026-04-15-a",
+        processed="2026-04-18T00:00:00+00:00",
+        modes_completed=["scan"],
+        transcript_quality_flags=[1, 2, 3],
+    )
+    newer_severe = _meta_tuple(
+        "2026-04-15-b",
+        processed="2026-04-20T00:00:00+00:00",
+        modes_completed=["scan"],
+        transcript_quality_flags=["monolithic_severe"],
+    )
+    canonical_path, _ = vi._pick_canonical([older_malformed, newer_severe])
+    assert canonical_path.name == "2026-04-15-a.meta.json"
+
+
+def _make_dupe_group_quality_aware(
+    ch: Path,
+    prefix_older_clean: str,
+    prefix_newer_severe: str,
+) -> None:
+    """Same shape as `_make_dupe_group`, but the newer meta carries a severe
+    transcript_quality_flags entry and the older is clean."""
+    _write_meta(
+        ch,
+        prefix_older_clean,
+        {
+            "video_id": "dup1",
+            "video_url": "https://www.youtube.com/watch?v=dup1",
+            "channel": ch.name,
+            "title": "Healthy Older Title",
+            "published": "2026-04-15",
+            "processed": "2026-04-18T04:04:43+00:00",
+            "modes_completed": ["scan", "transcript", "concepts"],
+        },
+    )
+    _touch(ch / f"{prefix_older_clean}.mindmap.md", "older mindmap")
+    _touch(ch / f"{prefix_older_clean}.transcript.md", "older transcript, healthy")
+    _touch(ch / f"{prefix_older_clean}.concepts.json", "{}")
+
+    _write_meta(
+        ch,
+        prefix_newer_severe,
+        {
+            "video_id": "dup1",
+            "video_url": "https://www.youtube.com/watch?v=dup1",
+            "channel": ch.name,
+            "title": "Severe Rerun Title",
+            "published": "2026-04-15",
+            "processed": "2026-04-20T04:05:17+00:00",
+            "modes_completed": ["scan", "transcript"],
+            "transcript_quality_flags": ["monolithic_severe"],
+        },
+    )
+    _touch(ch / f"{prefix_newer_severe}.mindmap.md", "newer mindmap")
+    _touch(ch / f"{prefix_newer_severe}.transcript.md", "newer transcript, collapsed")
+
+
+def test_dedupe_apply_severe_flagged_newer_loses_to_clean_older_headline_case(tmp_path):
+    """End-to-end: `dedupe --apply` must keep the older, clean duplicate as
+    canonical and delete the newer, severe-flagged rerun's artifacts - the
+    exact defect issue #159 reports."""
+    ch = tmp_path / "ch"
+    _make_dupe_group_quality_aware(ch, "2026-04-15-older", "2026-04-20-newer")
+
+    vi.cmd_dedupe(Namespace(channel=None, apply=True), _make_config(tmp_path, ["ch"]))
+
+    assert (ch / "2026-04-15-older.meta.json").exists()
+    assert not (ch / "2026-04-20-newer.meta.json").exists()
+    # The healthy transcript survives untouched under the canonical prefix.
+    assert (ch / "2026-04-15-older.transcript.md").read_text() == "older transcript, healthy"
+
+
+def test_dedupe_apply_flipped_winner_still_merges_alt_titles_and_topics(tmp_path):
+    """The severity-based flip must not disturb the surrounding mechanics:
+    alt_titles merge and topics union still work with the clean-older meta
+    as canonical."""
+    ch = tmp_path / "ch"
+    _make_dupe_group_quality_aware(ch, "2026-04-15-older", "2026-04-20-newer")
+
+    vi.cmd_dedupe(Namespace(channel=None, apply=True), _make_config(tmp_path, ["ch"]))
+
+    canonical = json.loads((ch / "2026-04-15-older.meta.json").read_text())
+    assert canonical["title"] == "Healthy Older Title"
+    assert canonical["alt_titles"] == ["Severe Rerun Title"]
+    # concepts mode: only the (now-canonical) older meta had it, so it's
+    # already present and no artifact move was needed for it; the union of
+    # modes_completed still reflects both losers' completed modes.
+    assert set(canonical["modes_completed"]) == {"scan", "transcript", "concepts"}
+
+
+def test_dedupe_apply_flipped_winner_moves_missing_mode_artifact_from_severe_loser(tmp_path):
+    """If the severe-flagged (and thus non-canonical) meta is the only one
+    with a given mode's artifact, that artifact must still be moved onto the
+    canonical prefix rather than deleted with the rest of the loser's
+    siblings - the artifact-move mechanics are untouched by the flip."""
+    ch = tmp_path / "ch"
+    _write_meta(
+        ch,
+        "2026-04-15-older",
+        {
+            "video_id": "v1",
+            "title": "Older, clean, scan-only",
+            "published": "2026-04-15",
+            "processed": "2026-04-18T00:00:00+00:00",
+            "modes_completed": ["scan"],
+        },
+    )
+    _touch(ch / "2026-04-15-older.mindmap.md", "older mindmap")
+    _write_meta(
+        ch,
+        "2026-04-20-newer-severe",
+        {
+            "video_id": "v1",
+            "title": "Newer, severe, has transcript",
+            "published": "2026-04-15",
+            "processed": "2026-04-20T00:00:00+00:00",
+            "modes_completed": ["scan", "transcript"],
+            "transcript_quality_flags": ["blind_gap_severe"],
+        },
+    )
+    _touch(ch / "2026-04-20-newer-severe.mindmap.md", "newer mindmap")
+    _touch(ch / "2026-04-20-newer-severe.transcript.md", "newer transcript content")
+
+    vi.cmd_dedupe(Namespace(channel=None, apply=True), _make_config(tmp_path, ["ch"]))
+
+    # Older/clean survives as canonical, despite starting less complete.
+    assert (ch / "2026-04-15-older.meta.json").exists()
+    assert not (ch / "2026-04-20-newer-severe.meta.json").exists()
+    # But the transcript artifact only the severe loser had is preserved by
+    # moving it onto the canonical prefix - content is not lost.
+    assert (ch / "2026-04-15-older.transcript.md").read_text() == "newer transcript content"
+    canonical = json.loads((ch / "2026-04-15-older.meta.json").read_text())
+    assert set(canonical["modes_completed"]) == {"scan", "transcript"}
+
+
+# ---------------------------------------------------------------------------
 # Pre-scan alt_title rotation recorder
 # ---------------------------------------------------------------------------
 
