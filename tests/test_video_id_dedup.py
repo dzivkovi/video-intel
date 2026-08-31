@@ -635,6 +635,102 @@ def test_dedupe_apply_disk_verifies_canonical_claim_before_computing_missing_mod
     assert set(canonical["modes_completed"]) == {"scan", "transcript"}
 
 
+def test_dedupe_apply_partial_collision_never_credits_mode_on_sidecar_alone(tmp_path):
+    """Issue #159 dual-review ROUND 2, P1 (the adversarial re-verify's own
+    executed repro): a PARTIAL destination collision must not credit a mode.
+
+    The canonical prefix has a STALE, unclaimed `.transcript.md` sitting on
+    disk (an orphan from some earlier run - canonical's own meta never
+    claims "transcript"). The severe loser has BOTH the real
+    `.transcript.md` primary artifact AND a `.transcript.raw.txt` sidecar.
+    When dedupe tries to move the loser's "transcript" mode onto canonical:
+    the PRIMARY move is blocked (stale file already occupies the
+    destination), but the SIDECAR moves cleanly (no collision there). Before
+    this fix, `moved_any` flipped True on the sidecar alone, crediting the
+    mode, copying the loser's severe provenance onto a meta whose actual
+    transcript is the unrelated stale file, and the end-of-group sweep would
+    then delete the loser's real transcript outright. None of that may
+    happen now: the mode must not be credited, no provenance may be copied,
+    and the loser's real transcript.md must survive on disk (preserved from
+    the sweep, since it never actually moved)."""
+    ch = tmp_path / "ch"
+    _write_meta(
+        ch,
+        "2026-04-15-canonical",
+        {
+            "video_id": "v1",
+            "title": "Canonical, clean, does not claim transcript",
+            "published": "2026-04-15",
+            "processed": "2026-04-18T00:00:00+00:00",
+            "modes_completed": ["scan"],
+        },
+    )
+    _touch(ch / "2026-04-15-canonical.mindmap.md", "canonical mindmap")
+    # A stale, unclaimed leftover .transcript.md already sits at the
+    # canonical prefix - not referenced by modes_completed at all.
+    _touch(ch / "2026-04-15-canonical.transcript.md", "STALE unrelated content, not a real transcript")
+
+    _write_meta(
+        ch,
+        "2026-04-20-severe-loser",
+        {
+            "video_id": "v1",
+            "title": "Severe loser with the real transcript and a raw sidecar",
+            "published": "2026-04-15",
+            "processed": "2026-04-20T00:00:00+00:00",
+            "modes_completed": ["scan", "transcript"],
+            "transcript_status": "partial",
+            "transcript_quality_flags": ["monolithic_severe"],
+        },
+    )
+    _touch(ch / "2026-04-20-severe-loser.mindmap.md", "loser mindmap")
+    _touch(ch / "2026-04-20-severe-loser.transcript.md", "the loser's real transcript content")
+    _touch(ch / "2026-04-20-severe-loser.transcript.raw.txt", "raw sidecar content")
+
+    vi.cmd_dedupe(Namespace(channel=None, apply=True), _make_config(tmp_path, ["ch"]))
+
+    # Canonical survives (it was already clean and the group's pick).
+    assert (ch / "2026-04-15-canonical.meta.json").exists()
+    assert not (ch / "2026-04-20-severe-loser.meta.json").exists()
+
+    # The stale canonical file is untouched - the collision that blocked
+    # the primary move must not have overwritten it.
+    assert (ch / "2026-04-15-canonical.transcript.md").read_text() == "STALE unrelated content, not a real transcript"
+
+    # The loser's REAL transcript survives on disk (not deleted by the
+    # sweep) precisely because it never actually moved.
+    assert (ch / "2026-04-20-severe-loser.transcript.md").read_text() == "the loser's real transcript content"
+
+    # No provenance was laundered onto canonical, and the mode was not
+    # credited: canonical's meta must not claim "transcript" nor carry any
+    # of the loser's transcript_* fields.
+    canonical = json.loads((ch / "2026-04-15-canonical.meta.json").read_text())
+    assert "transcript" not in canonical["modes_completed"]
+    assert "transcript_status" not in canonical
+    assert "transcript_quality_flags" not in canonical
+
+
+def test_move_missing_mode_artifacts_does_not_credit_mode_when_only_sidecar_moves(tmp_path):
+    """Unit-level companion, isolating `_move_missing_mode_artifacts` itself
+    from the rest of the dedupe pipeline: gate `moved_modes` on the
+    PRIMARY pattern moving, never a sidecar alone."""
+    ch = tmp_path / "ch"
+    ch.mkdir()
+    _touch(ch / "canonical.transcript.md", "stale canonical content, blocks the primary move")
+    _touch(ch / "loser.transcript.md", "loser's real primary transcript")
+    _touch(ch / "loser.transcript.raw.txt", "loser's sidecar, no collision here")
+
+    moved, blocked = vi._move_missing_mode_artifacts(ch, "canonical", "loser", {"transcript"})
+
+    assert moved == set(), "the primary was blocked, so the mode must not be credited"
+    assert (ch / "loser.transcript.md") in blocked
+    # Primary stayed in place (blocked); sidecar moved cleanly (no collision).
+    assert (ch / "loser.transcript.md").read_text() == "loser's real primary transcript"
+    assert not (ch / "loser.transcript.raw.txt").exists(), "the sidecar, having no collision, still moves"
+    assert (ch / "canonical.transcript.raw.txt").exists()
+    assert (ch / "canonical.transcript.md").read_text() == "stale canonical content, blocks the primary move"
+
+
 def test_dedupe_apply_three_meta_mixed_severity_group_best_clean_wins(tmp_path):
     """Three-way group: two clean metas and one severe. The severe meta must
     never win regardless of recency, and among the two clean metas the
@@ -752,9 +848,10 @@ def test_move_missing_mode_artifacts_warns_and_skips_when_destination_already_ex
     _touch(ch / "canonical.mindmap.md", "canonical's own stale mindmap")
 
     with caplog.at_level("WARNING"):
-        moved = vi._move_missing_mode_artifacts(ch, "canonical", "loser", {"scan"})
+        moved, blocked = vi._move_missing_mode_artifacts(ch, "canonical", "loser", {"scan"})
 
     assert moved == set(), "a move that hit an existing destination must not be credited as moved"
+    assert blocked == {ch / "loser.mindmap.md"}, "the blocked source must be reported so the sweep can preserve it"
     assert (ch / "canonical.mindmap.md").read_text() == "canonical's own stale mindmap"
     assert (ch / "loser.mindmap.md").exists(), "source is left in place when the move is skipped"
     assert any("already exists" in rec.message for rec in caplog.records)

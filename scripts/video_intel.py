@@ -3295,11 +3295,25 @@ def _transcript_quality_severe_from_meta(meta_path: Path) -> bool:
     behavior and therefore always safe to fall back to). A missing file
     reads as an empty dict, which `transcript_quality_flags_are_severe`
     correctly treats as not severe.
+
+    Issue #159 dual-review round 2 P3: this docstring's "never raise"
+    promise was not actually true for a scalar `transcript_quality_flags`
+    value (e.g. `7`) - `transcript_quality_flags_are_severe`'s entry filter
+    protects against malformed LIST entries, but a non-list value at all is
+    not iterable and raised TypeError before that filter ever runs, on
+    every one of this helper's four #157 containment call sites. Coerced
+    here the same way `_dedupe_meta_is_severe` already coerces it for
+    dedupe: a `transcript_quality_flags` value that isn't a `list` (a
+    scalar int, a bare string, a dict, ...) degrades to "no flags" rather
+    than being passed through.
     """
     if not meta_path.exists():
         return False
     meta = _read_meta_best_effort(meta_path, raise_on_os_error=False)
-    return transcript_quality_flags_are_severe(meta.get("transcript_quality_flags"))
+    flags = meta.get("transcript_quality_flags")
+    if not isinstance(flags, list):
+        flags = None
+    return transcript_quality_flags_are_severe(flags)
 
 
 def assess_transcript_artifact(
@@ -8480,7 +8494,7 @@ def _move_missing_mode_artifacts(
     canonical_prefix: str,
     loser_prefix: str,
     missing_modes: set[str],
-) -> set[str]:
+) -> tuple[set[str], set[Path]]:
     """Move artifacts for each missing mode from loser_prefix to canonical_prefix.
 
     Skips if the destination already exists (shouldn't happen when canonical
@@ -8488,17 +8502,37 @@ def _move_missing_mode_artifacts(
     issue #159 dual-review item 4: that skip now logs a WARNING naming both
     paths, since a stale file silently blocking a move used to be invisible.
 
-    Returns the subset of `missing_modes` for which at least one artifact
-    was actually moved. A mode can be "missing" by the loser's meta.json
-    *claim* alone with no real file behind it (issue #159 dual-review item
-    2's "empty-shell" case, mirrored from the other side): the caller must
-    not credit `modes_completed` or copy provenance for a mode that never
-    genuinely moved.
+    Returns `(moved_modes, blocked_paths)`:
+
+    - `moved_modes`: the subset of `missing_modes` whose PRIMARY artifact
+      pattern (`_MODE_ARTIFACT_PATTERNS[mode][0]`) actually moved. Issue
+      #159 dual-review round 2 P1: crediting a mode when ANY of its
+      patterns moved let a sidecar-only move (e.g. `.transcript.raw.txt`)
+      credit the mode and copy the loser's provenance even when the
+      PRIMARY artifact (`.transcript.md`) was blocked by a stale
+      destination file and never actually moved - the meta would then
+      describe a transcript that isn't the one actually sitting under the
+      canonical prefix. A mode is also not credited by claim alone: it can
+      be "missing" by the loser's meta.json claim with no real file behind
+      it at all (issue #159 dual-review round 1 item 2's "empty-shell"
+      case, mirrored from the other side) - the caller must not credit
+      `modes_completed` or copy provenance for a mode that never
+      genuinely moved its primary artifact.
+    - `blocked_paths`: every source file that was skipped due to an
+      existing destination, regardless of which pattern it was. The caller
+      MUST exclude these from the loser's end-of-group sweep - a file that
+      failed to move because of a collision is the one remaining real copy
+      of that artifact; sweeping it away as an ordinary "cleaned up loser
+      sibling" would destroy the only correct copy of a mode that was
+      never actually adopted onto the canonical prefix.
     """
     moved_modes: set[str] = set()
+    blocked_paths: set[Path] = set()
     for mode in missing_modes:
-        moved_any = False
-        for pattern in _MODE_ARTIFACT_PATTERNS.get(mode, ()):
+        patterns = _MODE_ARTIFACT_PATTERNS.get(mode, ())
+        primary_pattern = patterns[0] if patterns else None
+        primary_moved = False
+        for pattern in patterns:
             for src in channel_dir.glob(pattern.format(prefix=loser_prefix)):
                 suffix = src.name[len(loser_prefix) :]
                 dst = channel_dir / f"{canonical_prefix}{suffix}"
@@ -8508,12 +8542,14 @@ def _move_missing_mode_artifacts(
                         src,
                         dst,
                     )
+                    blocked_paths.add(src)
                     continue
                 src.rename(dst)
-                moved_any = True
-        if moved_any:
+                if pattern == primary_pattern:
+                    primary_moved = True
+        if primary_moved:
             moved_modes.add(mode)
-    return moved_modes
+    return moved_modes, blocked_paths
 
 
 #: Issue #159 dual-review item 1 ("flag laundering"): when a mode's artifact
@@ -8619,11 +8655,18 @@ def _apply_dedupe_group(
     )
 
     # Union modes_completed and move any artifact only losers have. Only a
-    # mode that ACTUALLY moved (moved_modes, not the claimed `missing` set)
-    # is credited to canonical_modes or has its provenance copied - issue
-    # #159 dual-review item 1 ("flag laundering"): the moved artifact IS the
-    # loser's artifact, so canonical's meta must describe it under its own
-    # provenance, not silently keep looking clean.
+    # mode whose PRIMARY artifact ACTUALLY moved (moved_modes, not the
+    # claimed `missing` set) is credited to canonical_modes or has its
+    # provenance copied - issue #159 dual-review item 1 ("flag laundering"):
+    # the moved artifact IS the loser's artifact, so canonical's meta must
+    # describe it under its own provenance, not silently keep looking
+    # clean. Any source file `_move_missing_mode_artifacts` could not move
+    # (blocked by an existing destination) is tracked per loser so the
+    # end-of-group sweep below never deletes it - a blocked file is the
+    # one remaining real copy of an uncredited mode's artifact, not an
+    # ordinary "cleaned up loser sibling" (issue #159 dual-review round 2
+    # P1).
+    blocked_paths_by_loser: dict[Path, set[Path]] = {}
     for loser_path, loser_data in metas:
         if loser_path == canonical_path:
             continue
@@ -8631,11 +8674,15 @@ def _apply_dedupe_group(
         loser_modes = set(loser_data.get("modes_completed", []))
         missing = loser_modes - canonical_modes
         if missing:
-            moved_modes = _move_missing_mode_artifacts(channel_dir, canonical_prefix, loser_prefix, missing)
+            moved_modes, blocked_paths = _move_missing_mode_artifacts(
+                channel_dir, canonical_prefix, loser_prefix, missing
+            )
             if moved_modes:
                 canonical_modes |= moved_modes
                 for mode in moved_modes:
                     canonical_data.update(_mode_provenance_fields(mode, loser_data))
+            if blocked_paths:
+                blocked_paths_by_loser[loser_path] = blocked_paths
 
     canonical_data["modes_completed"] = sorted(canonical_modes)
     merged_alts = _merge_alt_titles(canonical_data, metas, canonical_path)
@@ -8658,12 +8705,19 @@ def _apply_dedupe_group(
 
     canonical_path.write_text(json.dumps(canonical_data, indent=2), encoding="utf-8")
 
-    # Sweep every loser prefix's remaining siblings.
+    # Sweep every loser prefix's remaining siblings - except any file that
+    # failed to move onto the canonical prefix due to a destination
+    # collision (blocked_paths_by_loser). That file is the one remaining
+    # real copy of an uncredited mode's artifact; deleting it here would
+    # destroy the only correct copy instead of merely tidying a duplicate.
     for loser_path, _ in metas:
         if loser_path == canonical_path:
             continue
         loser_prefix = loser_path.name.removesuffix(".meta.json")
+        preserved = blocked_paths_by_loser.get(loser_path, set())
         for sibling in channel_dir.glob(f"{loser_prefix}.*"):
+            if sibling in preserved:
+                continue
             sibling.unlink()
 
     _invalidate_video_id_cache(channel_dir)

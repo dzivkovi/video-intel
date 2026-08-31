@@ -405,14 +405,37 @@ class TestSeverityIsOrderIndependentAndMalformedEntriesDegrade:
         assert transcript_quality_flags_are_severe([{"x": 1}, "density_mild", None]) is False
 
     def test_transcript_quality_severe_from_meta_also_inherits_the_hardened_helper(self, tmp_path):
-        """The standards-reviewer note: `_transcript_quality_severe_from_meta`
-        does its own read (no wrapper-level list coercion like dedupe's), so
-        it must be protected purely by the shared helper's own hardening."""
+        """The standards-reviewer note: a malformed LIST entry inside
+        `transcript_quality_flags` must not raise, whether read through
+        `_transcript_quality_severe_from_meta` or the shared helper
+        directly - both now filter to string entries before the membership
+        test."""
         meta_path = tmp_path / "video.meta.json"
         meta_path.write_text(
             json.dumps({"transcript_quality_flags": [{"x": 1}, "monolithic_severe"]}),
             encoding="utf-8",
         )
+        assert vi._transcript_quality_severe_from_meta(meta_path) is True
+
+    @pytest.mark.parametrize("scalar_flags", [7, "monolithic_severe", {"x": 1}])
+    def test_transcript_quality_severe_from_meta_scalar_shapes_degrade_without_raising(self, tmp_path, scalar_flags):
+        """Issue #159 dual-review ROUND 2, P3: `_transcript_quality_severe_
+        from_meta`'s docstring promised it never raises, but a non-list
+        `transcript_quality_flags` value (a scalar int, a bare string, a
+        dict) is not iterable the way `transcript_quality_flags_are_severe`
+        expects and raised TypeError before its entry filter could run -
+        on all four #157 containment call sites. It must now coerce a
+        non-list value to "no flags" the same way dedupe's own wrapper
+        already does, and return False without raising."""
+        meta_path = tmp_path / "video.meta.json"
+        meta_path.write_text(json.dumps({"transcript_quality_flags": scalar_flags}), encoding="utf-8")
+        assert vi._transcript_quality_severe_from_meta(meta_path) is False
+
+    def test_transcript_quality_severe_from_meta_real_severe_list_still_true(self, tmp_path):
+        """Regression lock alongside the scalar-degrade cases: a genuine
+        severe list must still be detected as severe."""
+        meta_path = tmp_path / "video.meta.json"
+        meta_path.write_text(json.dumps({"transcript_quality_flags": ["monolithic_severe"]}), encoding="utf-8")
         assert vi._transcript_quality_severe_from_meta(meta_path) is True
 
 
