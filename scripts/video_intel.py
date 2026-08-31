@@ -3945,28 +3945,98 @@ def _dialogue_entries_from_raw_json(raw_json) -> list[dict]:
     return raw_json.get("transcripts") or []
 
 
+def _usable_timestamp(entry: dict, key: str) -> bool:
+    """True when ``entry[key]`` is present and a non-empty string.
+
+    Issue #161: a real gemini-3.7-flash response has been observed to omit a
+    `start` key entirely. Gemini's malformed shapes for a field like this
+    can also arrive as None, an empty string, a dict, a list, or a bare
+    number instead of a timestamp string like "12:34" - none of those are
+    usable as a sortable/renderable timestamp. Never coerce with str() and
+    never synthesize a replacement: a fabricated "00:00" would sort the
+    entry to the top of the transcript and corrupt deep-links (timestamps
+    are load-bearing, not decoration - see CLAUDE.md). The caller skips the
+    whole entry instead.
+    """
+    value = entry.get(key)
+    return isinstance(value, str) and value != ""
+
+
+def _usable_voice_id(speaker: dict) -> bool:
+    """True when ``speaker["voice"]`` is present and not an empty placeholder.
+
+    Unlike `start`, `voice` is a Gemini-assigned integer ID (see
+    prompts/transcript.md task 1: "voice integer ID (1, 2, 3...)"), so a
+    legitimate value is an int, not a string - the `_usable_timestamp`
+    non-empty-string rule does not apply here. A speaker record is usable
+    when its voice id is present and not None or "".
+    """
+    value = speaker.get("voice")
+    return value is not None and value != ""
+
+
+def _log_skipped_entries(list_name: str, skipped_indices: list[int]) -> None:
+    """One WARNING per malformed task list, not per entry (issue #161).
+
+    A systematically malformed response could otherwise emit thousands of
+    log lines. Names the list, the count skipped, and the first few
+    offending indices so an operator can go find the raw response.
+    """
+    if not skipped_indices:
+        return
+    plural = "y" if len(skipped_indices) == 1 else "ies"
+    log.warning(
+        "merge_transcript_json: skipped %d malformed %s entr%s, indices %s%s",
+        len(skipped_indices),
+        list_name,
+        plural,
+        skipped_indices[:5],
+        " (+more)" if len(skipped_indices) > 5 else "",
+    )
+
+
 def merge_transcript_json(raw_json, speakers_map):
-    """Merge three-task JSON into a fused markdown transcript."""
+    """Merge three-task JSON into a fused markdown transcript.
+
+    Issue #161: a malformed entry (missing/empty `start` in `transcripts` or
+    `screen_content`, missing/empty `voice` in `speakers`) is skipped rather
+    than raising - a raw KeyError used to destroy an entire already-paid
+    Gemini transcript call over one bad entry. A response where every entry
+    is malformed still does not raise; it produces a transcript with no
+    dialogue, which the existing #157 monolithic/blind-gap guards flag on
+    their own. See `_usable_timestamp`, `_usable_voice_id`.
+    """
     # Gemini sometimes wraps the response in an array
     if isinstance(raw_json, list):
         raw_json = raw_json[0] if raw_json else {}
 
     lines = []
 
-    # Build voice-to-name mapping
+    # Build voice-to-name mapping. A speaker missing a usable voice id is
+    # skipped from this map only - it must never drop a transcript entry;
+    # those entries fall back to the existing voice_names.get(...) default.
     voice_names = {}
     evidence_notes = []
-    for s in raw_json.get("speakers", []):
+    skipped_speakers: list[int] = []
+    for idx, s in enumerate(raw_json.get("speakers", [])):
+        if not _usable_voice_id(s):
+            skipped_speakers.append(idx)
+            continue
         voice_names[s["voice"]] = s.get("name", f"Speaker {s['voice']}")
         if s.get("evidence"):
             evidence_notes.append(f"- **{voice_names[s['voice']]}**: {s['evidence']}")
         if s.get("role"):
             voice_names[s["voice"]] += f" ({s['role']})"
+    _log_skipped_entries("speakers", skipped_speakers)
 
     # Merge transcripts and screen_content by timestamp
     entries = []
 
-    for t in raw_json.get("transcripts", []):
+    skipped_transcripts: list[int] = []
+    for idx, t in enumerate(raw_json.get("transcripts", [])):
+        if not _usable_timestamp(t, "start"):
+            skipped_transcripts.append(idx)
+            continue
         entries.append(
             {
                 "type": "speech",
@@ -3976,20 +4046,27 @@ def merge_transcript_json(raw_json, speakers_map):
                 "text": t.get("text", ""),
             }
         )
+    _log_skipped_entries("transcripts", skipped_transcripts)
 
-    for sc in raw_json.get("screen_content", []):
+    skipped_screen_content: list[int] = []
+    for idx, sc in enumerate(raw_json.get("screen_content", [])):
+        if not _usable_timestamp(sc, "start"):
+            skipped_screen_content.append(idx)
+            continue
+        start_val = sc["start"]
         entries.append(
             {
                 "type": "screen",
-                "start": sc["start"],
-                "end": sc.get("end", sc["start"]),
-                "sort_key": timestamp_to_seconds(sc["start"]),
+                "start": start_val,
+                "end": sc.get("end", start_val),
+                "sort_key": timestamp_to_seconds(start_val),
                 "screen_type": sc.get("type", "other"),
                 "description": sc.get("description", ""),
                 "code": sc.get("code"),
                 "transcribed_text": sc.get("transcribed_text"),
             }
         )
+    _log_skipped_entries("screen_content", skipped_screen_content)
 
     entries.sort(key=lambda e: e["sort_key"])
 
