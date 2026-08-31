@@ -905,6 +905,193 @@ def resolve_mindmap_source(channel_config: dict, *, transcript_available: bool, 
     return "transcript" if (transcript_available and not transcript_severe) else "video"
 
 
+# Issue #169: consequence strings for `validate_channel_knobs`'s --dry-run
+# preflight. Kept as module-level constants so tests can assert on them
+# without duplicating literals, and so the preflight's wording tracks the
+# runtime skip sites' own log messages instead of drifting independently.
+KNOB_CONSEQUENCE_ABORTS_SCAN = "ABORTS THE ENTIRE SCAN at this channel (every later channel is never reached)"
+KNOB_CONSEQUENCE_SKIPS_CHANNEL = "skips the whole channel (mindmap and concepts too)"
+KNOB_CONSEQUENCE_FAILS_TRANSCRIPTS = "fails every transcript for this channel"
+KNOB_CONSEQUENCE_FAILS_MINDMAPS = "fails every mindmap for this channel"
+#: Deliberately NOT called "inert", and deliberately carrying no blanket claim
+#: about the manual commands: whether a typo ALSO breaks them is per-knob (see
+#: _MANUAL_COMMAND_KNOBS). A blanket claim was false for the two knobs only
+#: `cmd_scan` reads.
+KNOB_CONSEQUENCE_NOT_REACHED = "not reached with this channel's current settings"
+#: Appended to NOT_REACHED for the knobs the manual single-video commands ALSO
+#: resolve off the same channel dict (issue #127), where they exit 1 on the same
+#: typo. Established by walking every command body's AST, not assumed:
+#: `transcript_max_duration_seconds` and `transcript_timeout_seconds` are read
+#: by `cmd_scan` ALONE, so telling the operator they break `transcript --url`
+#: would send them hunting a failure that cannot happen.
+_MANUAL_COMMAND_KNOBS = frozenset({"transcript_source", "mindmap_source", "chunk_minutes"})
+_MANUAL_COMMAND_SUFFIX = ", but still fails the manual transcript/mindmap/process --channel commands"
+#: The two consequences that STOP the channel body. Once one has fired, every
+#: knob checked later in the runtime order is unreachable, so its own
+#: consequence would be a claim about code that never runs.
+_KNOB_STOPPING_CONSEQUENCES = frozenset({KNOB_CONSEQUENCE_ABORTS_SCAN, KNOB_CONSEQUENCE_SKIPS_CHANNEL})
+
+
+def validate_channel_knobs(
+    channel_config: dict,
+    config: dict,
+    cli_chunk_minutes: int | None = None,
+) -> list[tuple[str, str, str]]:
+    """Preflight-validate a channel's per-video config knobs (issue #169).
+
+    Returns ``[(knob_name, error_message, consequence), ...]`` - empty when the
+    channel's knobs all resolve. Never raises, never mutates, never touches the
+    network.
+
+    Reuses the REAL resolvers (`resolve_transcript_source`, `resolve_chunk_minutes`,
+    `resolve_mindmap_source`, `resolve_prompt_path`) rather than re-deriving their
+    valid-value sets, checks, or paths - this repo's standing "a verifier must use
+    the WRITER's path, never re-derive its own" guardrail (CLAUDE.md, the PR #136
+    entry). A hand-rolled copy would drift the moment a resolver or the prompts
+    directory changes, and the preflight would start disagreeing with the runtime
+    it exists to predict.
+
+    Call shapes mirror `cmd_scan`'s own call sites, with one deliberate
+    exception: `resolve_mindmap_source(channel_config, transcript_available=True)`
+    passes `True` to isolate the ENUM check from the availability conflict.
+    `False` would make the resolver raise its "no transcript is available"
+    `ValueError` for every channel legitimately configured
+    `mindmap_source: transcript` whose transcripts simply have not been written
+    yet - a permanent false alarm on a healthy config, and a guard whose only
+    value is being believed must never cry wolf.
+
+    Each check is wrapped in `except (ValueError, TypeError)` per the issue #135
+    finding: a non-string YAML value (a mapping or a sequence) fails a resolver's
+    `in` membership test with `TypeError`, not `ValueError`.
+
+    **Consequences follow the RUNTIME FIRING ORDER, and the first stopping knob
+    wins.** The checks below are in the order `cmd_scan`'s channel body actually
+    reaches them, each carrying what it does when it is the FIRST to fire. A knob
+    later in that order can only matter if every stopping knob before it resolved
+    cleanly, so `_downgrade_unreached_knobs` rewrites every problem after the
+    first `ABORTS_SCAN` or `SKIPS_CHANNEL` as `NOT_REACHED`. Without that pass the
+    composite report contradicts itself and can lead with the FALSE line: a bad
+    `prompt` plus a bad `mindmap_source` used to promise "fails every mindmap"
+    for a run that dies at `load_prompt` before the mindmap loop is ever built,
+    and a channel-skipping `transcript_source` typo plus a bad
+    `transcript_max_duration_seconds` used to claim the whole scan aborts when
+    the `continue` fires first and every later channel runs fine.
+
+    Each knob's intrinsic consequence was established by EXECUTING the runtime,
+    not by reading it. In particular `transcript_timeout_seconds` does NOT abort
+    the scan the way `transcript_max_duration_seconds` does: its `TypeError`
+    surfaces inside `_run_with_timeout` and lands in the existing per-video
+    `except Exception` handlers on BOTH the single-shot and chunked transcript
+    paths, so it degrades to a per-video `error:` status and the scan completes
+    normally. The two knobs look identical in the source and behave differently.
+    """
+    problems: list[tuple[str, str, str]] = []
+    transcript_all = channel_config.get("auto_transcript", "none") == "all"
+    mindmap_active = channel_config.get("auto_mindmap", "all") != "none"
+
+    def _reached(consequence: str) -> str:
+        return consequence if transcript_all else KNOB_CONSEQUENCE_NOT_REACHED
+
+    # 1. `prompt` - load_prompt() runs before any per-mode gate and answers an
+    #    unresolvable name with sys.exit(1). The WORST of these knobs: it does
+    #    not skip a channel, it kills the run mid-scan after every earlier
+    #    channel's Gemini spend, and it is the one an operator least suspects.
+    prompt_name = channel_config.get("prompt") or config.get("default_prompt", "mindmap-light")
+    try:
+        prompt_resolves = resolve_prompt_path(prompt_name).exists()
+    except TypeError as e:
+        # A non-string prompt name (a YAML mapping or sequence) never reaches
+        # the existence check - normalize_prompt_name works on strings, and
+        # TypeError is the only thing it raises for a non-string.
+        problems.append(
+            (
+                "prompt",
+                f"prompt must be a string naming a file in prompts/, got {prompt_name!r} ({e})",
+                KNOB_CONSEQUENCE_ABORTS_SCAN,
+            )
+        )
+    else:
+        if not prompt_resolves:
+            problems.append(
+                (
+                    "prompt",
+                    f"no prompt file for {prompt_name!r} (looked for {resolve_prompt_path(prompt_name).name})",
+                    KNOB_CONSEQUENCE_ABORTS_SCAN,
+                )
+            )
+
+    # 2. `transcript_source` - resolved inside the `auto_transcript == "all"`
+    #    block; its guard `continue`s the whole channel.
+    try:
+        resolve_transcript_source(channel_config)
+    except (ValueError, TypeError) as e:
+        problems.append(("transcript_source", str(e), _reached(KNOB_CONSEQUENCE_SKIPS_CHANNEL)))
+
+    # 3. `chunk_minutes` - same block, same whole-channel `continue`.
+    try:
+        resolve_chunk_minutes(channel_config, config, cli_chunk_minutes)
+    except (ValueError, TypeError) as e:
+        problems.append(("chunk_minutes", str(e), _reached(KNOB_CONSEQUENCE_SKIPS_CHANNEL)))
+
+    # 4/5. Two knobs with no resolver: scan reads them straight off the dict.
+    #      See the docstring for why their consequences differ despite looking
+    #      identical in the source. `bool` is rejected explicitly because it
+    #      subclasses `int` (an unquoted YAML `yes` is `True`, and `True`
+    #      seconds is not a duration anyone meant).
+    for numeric_knob, numeric_consequence in (
+        ("transcript_max_duration_seconds", KNOB_CONSEQUENCE_ABORTS_SCAN),
+        ("transcript_timeout_seconds", KNOB_CONSEQUENCE_FAILS_TRANSCRIPTS),
+    ):
+        if numeric_knob not in channel_config:
+            continue
+        value = channel_config[numeric_knob]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            problems.append(
+                (
+                    numeric_knob,
+                    f"{numeric_knob} must be a number of seconds, got {value!r}",
+                    _reached(numeric_consequence),
+                )
+            )
+
+    # 6. `mindmap_source` - resolved per video inside the mindmap loop's threaded
+    #    closure, which returns an `error:` status per video rather than skipping
+    #    the channel.
+    try:
+        resolve_mindmap_source(channel_config, transcript_available=True)
+    except (ValueError, TypeError) as e:
+        consequence = KNOB_CONSEQUENCE_FAILS_MINDMAPS if mindmap_active else KNOB_CONSEQUENCE_NOT_REACHED
+        problems.append(("mindmap_source", str(e), consequence))
+
+    return _downgrade_unreached_knobs(problems)
+
+
+def _downgrade_unreached_knobs(problems: list[tuple[str, str, str]]) -> list[tuple[str, str, str]]:
+    """Rewrite every problem after the first STOPPING one as unreachable.
+
+    `problems` must arrive in `cmd_scan`'s runtime firing order (see
+    `validate_channel_knobs`). Once a knob aborts the run or skips the channel,
+    nothing checked later executes, so reporting those knobs' own consequences
+    describes code that never runs - and the contradictory pair reads as a bug in
+    the diagnostic rather than as one true line plus one moot one.
+
+    The per-knob manual-command note is appended here, and only here, so a
+    downgraded line still tells the operator what the typo genuinely breaks
+    outside `scan`.
+    """
+    downgraded: list[tuple[str, str, str]] = []
+    stopped = False
+    for knob_name, message, consequence in problems:
+        if stopped:
+            consequence = KNOB_CONSEQUENCE_NOT_REACHED
+        if consequence == KNOB_CONSEQUENCE_NOT_REACHED and knob_name in _MANUAL_COMMAND_KNOBS:
+            consequence += _MANUAL_COMMAND_SUFFIX
+        downgraded.append((knob_name, message, consequence))
+        if consequence in _KNOB_STOPPING_CONSEQUENCES:
+            stopped = True
+    return downgraded
+
+
 def find_mindmap_source(channel_dir: Path, prefix: str) -> Path | None:
     """Find the best mindmap file for concept extraction.
 
@@ -924,9 +1111,20 @@ def find_mindmap_source(channel_dir: Path, prefix: str) -> Path | None:
     return None
 
 
+def resolve_prompt_path(prompt_name: str) -> Path:
+    """The file `load_prompt` would read for this name. Existence NOT checked.
+
+    Split out for issue #169's preflight, which needs to ask "would this name
+    resolve?" WITHOUT the answer being `sys.exit(1)`. The preflight must not
+    re-derive `SKILL_DIR / "prompts" / f"{name}.md"` itself - that is the PR
+    #136 checker/writer-path-drift class, and a preflight that looks in a
+    different directory than the loader is worse than no preflight.
+    """
+    return SKILL_DIR / "prompts" / f"{normalize_prompt_name(prompt_name)}.md"
+
+
 def load_prompt(prompt_name: str) -> str:
-    prompt_name = normalize_prompt_name(prompt_name)
-    prompt_path = SKILL_DIR / "prompts" / f"{prompt_name}.md"
+    prompt_path = resolve_prompt_path(prompt_name)
     if not prompt_path.exists():
         log.error("Prompt file not found: %s", prompt_path)
         sys.exit(1)
@@ -5816,6 +6014,40 @@ def cmd_scan(args, config):
         ch_name = ch["name"]
         ch_url = ch["url"]
 
+        # Issue #169: preflight this channel's per-video knobs BEFORE anything
+        # else runs. Two placements matter, both deliberate:
+        # (a) before get_channel_id() so the diagnostic for a config typo
+        #     surfaces in the log before this channel's first YouTube-quota
+        #     call, not buried after it or after other channels' output;
+        # (b) before the `if args.dry_run: ... continue` early return further
+        #     down - that ordering is the entire point of the issue: it makes
+        #     `--dry-run` a real preflight instead of a preview that returns
+        #     before the knob resolvers ever run.
+        # This is REPORT ONLY: no continue, no sys.exit, no errors.append here.
+        # get_channel_id() and (on a non-dry-run) the rest of this channel's
+        # processing still run exactly as before - this preflight never skips
+        # anything. The existing runtime skip sites (transcript_source,
+        # chunk_minutes, mindmap_source, further down this function) are
+        # unchanged and still own where the actual skip happens. A real
+        # (non-dry-run) run will log a problem twice - once here, once at the
+        # skip site - and that is intended: the first says the config is
+        # invalid, the second says what is being done about it.
+        knob_problems = validate_channel_knobs(ch, config, getattr(args, "chunk_minutes", None))
+        for knob_name, error_message, consequence in knob_problems:
+            log_fn = log.warning if consequence.startswith(KNOB_CONSEQUENCE_NOT_REACHED) else log.error
+            log_fn(
+                "[%s] invalid %s (%s) - %s",
+                ch_name,
+                knob_name,
+                error_message,
+                consequence,
+            )
+        # What a real run would actually do to this channel, for the --dry-run
+        # preview below. Read ONLY there; it never gates anything on a real run.
+        knob_consequences = {c for _, _, c in knob_problems}
+        knob_aborts_scan = KNOB_CONSEQUENCE_ABORTS_SCAN in knob_consequences
+        knob_blocks_channel = KNOB_CONSEQUENCE_SKIPS_CHANNEL in knob_consequences
+
         # Resolve channel
         channel_id, channel_title = get_channel_id(youtube, ch_url)
         if not channel_id:
@@ -6014,6 +6246,31 @@ def cmd_scan(args, config):
         log.info("  Found %d videos, %d %s.", len(videos), len(new_videos), label)
 
         if args.dry_run:
+            # Issue #169: without this the preview contradicts itself. The
+            # preflight above says the channel would be skipped, and then the
+            # very next lines announce "Found N videos, N new" and list them -
+            # so the operator reads a count of work that a real run would not
+            # do. Naming the contradiction here is the difference between a
+            # preview that reports a typo and a preview that tells the truth
+            # about its own numbers. Dry-run only: `knob_blocks_channel` is
+            # read nowhere else, so a real run's routing is untouched.
+            if knob_aborts_scan:
+                # Strictly worse than a channel skip and the one an operator is
+                # least likely to suspect: the real run dies here, so channels
+                # AFTER this one are never reached either.
+                log.error(
+                    "  [%s] NOTE: a real run ABORTS at this channel (see the config error above); "
+                    "the %d video(s) listed below would NOT be processed, and no later channel would run.",
+                    ch_name,
+                    len(new_videos),
+                )
+            elif knob_blocks_channel:
+                log.error(
+                    "  [%s] NOTE: a real run SKIPS this channel (see the config error above); "
+                    "the %d video(s) listed below would NOT be processed.",
+                    ch_name,
+                    len(new_videos),
+                )
             for v in new_videos:
                 log.info("    %s - %s", v["published"], v["title"])
             continue

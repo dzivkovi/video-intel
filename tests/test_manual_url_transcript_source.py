@@ -468,10 +468,15 @@ class TestScanChannelConfigTypoSkipsOnlyThatChannel:
         error_messages = [
             r.message for r in caplog.records if r.levelname == "ERROR" and "transcript_source" in r.message
         ]
-        assert len(error_messages) == 1, f"expected exactly one named channel error, got: {error_messages}"
-        assert "typo" in error_messages[0], "the error must name the offending channel"
-        assert "entire channel" in error_messages[0], (
-            "the message must say the WHOLE channel is skipped, not just transcripts"
+        # Issue #169: the top-of-loop preflight (validate_channel_knobs) now
+        # logs this same problem once, in addition to this existing skip
+        # site's own log line - two ERROR lines about the same channel, by
+        # design (see tests/test_channel_knob_preflight.py for the dedicated
+        # coverage of that preflight).
+        assert len(error_messages) == 2, f"expected preflight + skip-site error lines, got: {error_messages}"
+        assert all("typo" in m for m in error_messages), "every error must name the offending channel"
+        assert any("entire channel" in m for m in error_messages), (
+            "the skip-site message must say the WHOLE channel is skipped, not just transcripts"
         )
 
     def test_typo_channel_appears_in_the_end_of_scan_failure_summary(self, tmp_path, monkeypatch, caplog):
