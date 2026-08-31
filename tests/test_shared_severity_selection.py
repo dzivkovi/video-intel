@@ -409,3 +409,65 @@ def test_find_canonical_meta_warns_naming_the_chosen_file(tmp_path, caplog):
         found = vi._find_canonical_meta_by_video_id(ch, "vid1")
     assert found.name == "2026-04-20-zzz-clean.meta.json"
     assert any("2026-04-20-zzz-clean.meta.json" in rec.message for rec in caplog.records)
+
+
+def test_topics_union_survives_when_severity_flips_the_winner_to_a_LATER_meta(tmp_path):
+    """The winner-CHANGES union branch, which no other test in this file reaches.
+
+    Every other `collect_corpus_videos` test here puts the eventual winner's
+    prefix FIRST, so the winner is always installed as `existing` and the loser
+    always arrives as `record` - meaning they all land in the
+    `elif record["topics"]` branch, and the union inside
+    `if record_key > existing_key:` is never executed with non-empty topics.
+    Removing that line passed the entire 2234-test suite.
+
+    Here the SEVERE meta sorts FIRST and carries the topic stamp, so the clean
+    meta arrives second and WINS, exercising the other branch. Without the union
+    there, the severe meta's `--topic` membership is silently deleted: exactly
+    the issue #146 regression.
+    """
+    output_dir = tmp_path / "corpus"
+    ch = output_dir / "channel"
+    _write_meta(
+        ch,
+        "2026-04-01-a-severe",
+        {
+            "video_id": "vid1",
+            "processed": "2026-04-01T00:00:00+00:00",
+            "transcript_quality_flags": ["monolithic_severe"],
+            "topics": ["sales"],
+        },
+    )
+    _write_meta(
+        ch,
+        "2026-04-20-z-clean",
+        {"video_id": "vid1", "processed": "2026-04-20T00:00:00+00:00", "topics": ["fde"]},
+    )
+
+    records = [r for r in vi.collect_corpus_videos(output_dir) if r["video_id"] == "vid1"]
+
+    assert len(records) == 1
+    assert records[0]["title"] == "2026-04-20-z-clean", "the clean meta must win even though it sorts later"
+    assert records[0]["topics"] == ["fde", "sales"], "the loser's --topic membership must survive the flip (issue #146)"
+
+
+def test_sorted_glob_is_what_makes_SAME_BUCKET_selection_deterministic(tmp_path, monkeypatch):
+    """The determinism half of the change, which the severity rule otherwise masks.
+
+    The sibling determinism test pairs a CLEAN meta with a SEVERE one, so the
+    severity rule alone satisfies its assertion and the `sorted()` is never
+    exercised - removing `sorted()` passed the whole suite. Two metas in the
+    SAME severity bucket plus a reversed glob is what actually pins it.
+    """
+    ch = tmp_path / "channel"
+    _write_meta(ch, "2026-04-01-a", {"video_id": "vid1"})
+    _write_meta(ch, "2026-04-30-b", {"video_id": "vid1"})
+
+    real_glob = Path.glob
+    monkeypatch.setattr(Path, "glob", lambda self, pattern: list(reversed(list(real_glob(self, pattern)))))
+    vi._invalidate_video_id_cache()
+
+    assert vi._load_video_id_index(ch)["vid1"] == "2026-04-01-a", (
+        "within one severity bucket the winner must come from the SORTED order, "
+        "not from whatever order the filesystem happened to return"
+    )

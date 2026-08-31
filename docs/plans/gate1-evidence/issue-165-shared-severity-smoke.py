@@ -23,6 +23,7 @@ Zero API calls. Never writes to the corpus.
 import json
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 WT = Path(sys.argv[1])
@@ -31,7 +32,7 @@ sys.argv = ["x"]
 import video_intel as vi  # noqa: E402
 
 CORPUS = Path(r"G:\My Drive\video-intel")
-OUT = Path(__file__).parent / "gate1_165_out"
+OUT = Path(tempfile.gettempdir()) / "gate1_165_out"
 if OUT.exists():
     shutil.rmtree(OUT)
 CH = OUT / "natebjones"
@@ -42,7 +43,7 @@ src = CORPUS / "natebjones"
 template = None
 for m in sorted(src.glob("*.meta.json")):
     d = json.loads(m.read_bytes().decode("utf-8"))
-    if d.get("video_id") and (src / f"{m.name[:-len('.meta.json')]}.mindmap.md").exists():
+    if d.get("video_id") and (src / f"{m.name[: -len('.meta.json')]}.mindmap.md").exists():
         template = (m, d)
         break
 assert template, "no usable real meta found"
@@ -89,9 +90,7 @@ results = {}
 vi._invalidate_video_id_cache()
 results["_load_video_id_index"] = vi._load_video_id_index(CH).get(VID)
 
-results["_find_canonical_meta_by_video_id"] = (
-    p.name if (p := vi._find_canonical_meta_by_video_id(CH, VID)) else None
-)
+results["_find_canonical_meta_by_video_id"] = p.name if (p := vi._find_canonical_meta_by_video_id(CH, VID)) else None
 
 recs = [r for r in vi.collect_corpus_videos(OUT) if r["video_id"] == VID]
 results["collect_corpus_videos"] = recs[0]["title"] if recs else None
