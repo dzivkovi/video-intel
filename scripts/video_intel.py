@@ -5537,10 +5537,26 @@ def cmd_scan(args, config):
             # caught by argparse choices. Same defensive shape as the
             # chunk_minutes guard below: one channel's typo must not abort the
             # whole scan after YouTube quota and Gemini spend are already sunk.
+            # (ValueError, TypeError): a non-string YAML value (a mapping or a
+            # sequence) fails the resolver's `in` membership test with
+            # TypeError, not ValueError - resolve_chunk_minutes hit the same
+            # hole and maps it at the source; this resolver never did, so the
+            # call site has to catch both.
+            # The WHOLE channel is skipped here, not just the transcript step.
+            # Disabling only the transcript step would flip mindmap_source=auto
+            # onto the ~10x more expensive mindmap-from-video path for this
+            # channel, so a one-character config typo would start spending real
+            # Gemini money instead of just failing loudly. Skipping the whole
+            # channel is the cheap, obvious, operator-fixable outcome.
             try:
                 transcript_source = resolve_transcript_source(ch)
-            except ValueError as e:
-                log.error("[%s] invalid transcript_source (%s); skipping channel", ch_name, e)
+            except (ValueError, TypeError) as e:
+                log.error(
+                    "[%s] invalid transcript_source (%s); skipping entire channel (mindmap and concepts too)",
+                    ch_name,
+                    e,
+                )
+                errors.append((ch_name, ch_name, f"error: {e}"))
                 continue
             # Issue #120 provenance rule: captions-first is mandatory for a VOD
             # only when nobody asked for Gemini. An explicit
@@ -6049,7 +6065,7 @@ def _cmd_mindmap_impl(args, config):
         resolved_source = resolve_mindmap_source(
             channel_cfg, transcript_available=transcript_available, transcript_severe=transcript_severe
         )
-    except ValueError as exc:
+    except (ValueError, TypeError) as exc:
         log.error("Mindmap source unresolvable for %s: %s", video_id, exc)
         sys.exit(1)
     if resolved_source == "skip":
@@ -6153,7 +6169,7 @@ def _cmd_transcript_impl(args, config):
     # consistency with the other three call sites and defense-in-depth.
     try:
         transcript_source = resolve_transcript_source({}, cli_transcript_source)
-    except ValueError as e:
+    except (ValueError, TypeError) as e:
         log.error("Invalid transcript_source: %s", e)
         sys.exit(1)
     # Raw channel dict, kept alongside the resolved string because
@@ -6327,7 +6343,7 @@ def _cmd_transcript_impl(args, config):
             # video call site already produces.
             try:
                 transcript_source = resolve_transcript_source(channel_cfg, cli_transcript_source)
-            except ValueError as e:
+            except (ValueError, TypeError) as e:
                 log.error("Invalid transcript_source: %s", e)
                 sys.exit(1)
             origin = (
@@ -6724,7 +6740,7 @@ def _cmd_process_url(args, config):
     # traceback-ing.
     try:
         transcript_source = resolve_transcript_source(channel_cfg, getattr(args, "transcript_source", None))
-    except ValueError as e:
+    except (ValueError, TypeError) as e:
         log.error("Invalid transcript_source: %s", e)
         sys.exit(1)
 
@@ -6870,7 +6886,7 @@ def _cmd_process_url(args, config):
         resolved_source = resolve_mindmap_source(
             channel_cfg, transcript_available=transcript_available, transcript_severe=transcript_quality_severe
         )
-    except ValueError as exc:
+    except (ValueError, TypeError) as exc:
         log.error("Mindmap source unresolvable for %s: %s", video_id, exc)
         sys.exit(1)
 
@@ -7349,7 +7365,7 @@ def _cmd_process_impl(args, config):
         resolved_source = resolve_mindmap_source(
             channel_cfg, transcript_available=transcript_available, transcript_severe=transcript_quality_severe
         )
-    except ValueError as exc:
+    except (ValueError, TypeError) as exc:
         log.error("Mindmap source unresolvable: %s", exc)
         sys.exit(1)
 

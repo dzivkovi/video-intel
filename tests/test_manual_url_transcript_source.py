@@ -370,24 +370,40 @@ def _scan_args(**overrides):
 class TestScanChannelConfigTypoSkipsOnlyThatChannel:
     """The per-channel loop guard at :5536 - the load-bearing case in #135:
     one channel's typo must not abort the whole scan after YouTube quota and
-    Gemini spend are already sunk on other channels."""
+    Gemini spend are already sunk on other channels.
 
-    def test_typo_channel_skipped_healthy_channel_still_processed(self, tmp_path, monkeypatch, caplog):
-        good_video = {
-            "video_id": "good1",
-            "title": "Good video",
-            "published": "2026-04-15",
-            "url": "https://www.youtube.com/watch?v=good1",
-        }
-        typo_video = {
-            "video_id": "typo1",
-            "title": "Typo channel video",
-            "published": "2026-04-15",
-            "url": "https://www.youtube.com/watch?v=typo1",
-        }
+    The typo channel is listed FIRST in every config below (not last) so
+    "continues to the NEXT channel" is actually exercised - with the typo
+    channel last, a passing test would prove nothing about `continue` at
+    all, since there is no next channel to reach.
+    """
+
+    good_video: ClassVar[dict] = {
+        "video_id": "good1",
+        "title": "Good video",
+        "published": "2026-04-15",
+        "url": "https://www.youtube.com/watch?v=good1",
+    }
+    typo_video: ClassVar[dict] = {
+        "video_id": "typo1",
+        "title": "Typo channel video",
+        "published": "2026-04-15",
+        "url": "https://www.youtube.com/watch?v=typo1",
+    }
+
+    def _run_scan(self, monkeypatch, caplog, tmp_path, *, bad_transcript_source):
+        """Drive the real cmd_scan with only the network/paid boundary stubbed.
+
+        Returns (transcripts_seen, mindmaps_seen, caplog) for the caller to
+        assert against. `bad_transcript_source` is whatever invalid value the
+        test wants to plant on the typo channel - a typo string, a mapping,
+        or a sequence (issue #135 review: a non-string value fails the
+        resolver's `in` check with TypeError, not ValueError, and must be
+        caught the same way).
+        """
         videos_by_channel_url = {
-            "https://example.com/good": [good_video],
-            "https://example.com/typo": [typo_video],
+            "https://example.com/typo": [self.typo_video],
+            "https://example.com/good": [self.good_video],
         }
 
         monkeypatch.setenv("GEMINI_API_KEY", "test")
@@ -420,24 +436,79 @@ class TestScanChannelConfigTypoSkipsOnlyThatChannel:
         config = {
             "output_dir": str(tmp_path),
             "channels": [
-                {"name": "good", "url": "https://example.com/good", "auto_transcript": "all"},
                 {
                     "name": "typo",
                     "url": "https://example.com/typo",
                     "auto_transcript": "all",
-                    "transcript_source": "captions",
+                    "transcript_source": bad_transcript_source,
                 },
+                {"name": "good", "url": "https://example.com/good", "auto_transcript": "all"},
             ],
         }
 
-        with caplog.at_level("ERROR"):
+        with caplog.at_level("WARNING"):
             vi.cmd_scan(_scan_args(), config)
 
-        assert "good1" in transcripts_seen, "the healthy channel must still be processed"
+        return transcripts_seen, mindmaps_seen
+
+    def test_typo_channel_skipped_healthy_channel_still_processed(self, tmp_path, monkeypatch, caplog):
+        transcripts_seen, mindmaps_seen = self._run_scan(
+            monkeypatch, caplog, tmp_path, bad_transcript_source="captions"
+        )
+
+        assert "good1" in transcripts_seen, "the healthy channel's transcript must still run"
         assert "typo1" not in transcripts_seen, "the typo channel's transcript step must be skipped"
+        # Item 4a: the mindmap loop must be proven too, not just recorded and
+        # ignored - the whole point of the broad `continue` (item 3) is that
+        # BOTH steps are skipped for the typo channel, and only asserting
+        # transcripts would let a regression that runs mindmap anyway through.
+        assert "good1" in mindmaps_seen, "the healthy channel's mindmap must still run"
+        assert "typo1" not in mindmaps_seen, "the typo channel's mindmap step must also be skipped"
 
         error_messages = [
             r.message for r in caplog.records if r.levelname == "ERROR" and "transcript_source" in r.message
         ]
         assert len(error_messages) == 1, f"expected exactly one named channel error, got: {error_messages}"
         assert "typo" in error_messages[0], "the error must name the offending channel"
+        assert "entire channel" in error_messages[0], (
+            "the message must say the WHOLE channel is skipped, not just transcripts"
+        )
+
+    def test_typo_channel_appears_in_the_end_of_scan_failure_summary(self, tmp_path, monkeypatch, caplog):
+        """Item 2 (Codex + in-family corroborated): a `continue` with no
+        `errors.append` leaves the scan reporting `Done.` and exiting 0 with
+        a channel silently dropped. The skipped channel must show up in the
+        `--- N FAILED ---` block, same as the mirrored mindmap guard does.
+        """
+        self._run_scan(monkeypatch, caplog, tmp_path, bad_transcript_source="captions")
+
+        summary_lines = [r.message for r in caplog.records if r.levelname == "WARNING"]
+        assert any("FAILED" in line for line in summary_lines), (
+            f"expected a '--- N FAILED ---' summary line, got: {summary_lines}"
+        )
+        assert any("typo" in line and "transcript_source" in line.lower() for line in summary_lines), (
+            f"expected the typo channel named in the failure summary, got: {summary_lines}"
+        )
+
+    @pytest.mark.parametrize(
+        "bad_value",
+        [{"mode": "auto"}, ["auto"]],
+        ids=["yaml_mapping", "yaml_sequence"],
+    )
+    def test_non_string_config_value_is_caught_not_a_raw_typeerror(self, tmp_path, monkeypatch, caplog, bad_value):
+        """Item 1 (P1, executed): `transcript_source: {mode: auto}` or
+        `[auto]` fails the resolver's `in` membership test with TypeError,
+        not ValueError - a bare `except ValueError` lets it escape and kill
+        the whole scan exactly like the original bug. This test would have
+        caught that hole; it did not exist before this PR's second commit.
+        """
+        transcripts_seen, mindmaps_seen = self._run_scan(monkeypatch, caplog, tmp_path, bad_transcript_source=bad_value)
+
+        assert "good1" in transcripts_seen, "a non-string typo must not abort the whole scan either"
+        assert "typo1" not in transcripts_seen
+        assert "good1" in mindmaps_seen, "the healthy channel's mindmap must also survive a non-string typo"
+        assert "typo1" not in mindmaps_seen
+
+        error_messages = [r.message for r in caplog.records if r.levelname == "ERROR"]
+        assert error_messages, "the non-string value must produce a clean ERROR line, not a silent pass-through"
+        assert "typo" in error_messages[0]
