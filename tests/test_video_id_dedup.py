@@ -450,6 +450,7 @@ def _make_dupe_group_quality_aware(
             "published": "2026-04-15",
             "processed": "2026-04-18T04:04:43+00:00",
             "modes_completed": ["scan", "transcript", "concepts"],
+            "topics": ["ai-agents"],
         },
     )
     _touch(ch / f"{prefix_older_clean}.mindmap.md", "older mindmap")
@@ -468,6 +469,7 @@ def _make_dupe_group_quality_aware(
             "processed": "2026-04-20T04:05:17+00:00",
             "modes_completed": ["scan", "transcript"],
             "transcript_quality_flags": ["monolithic_severe"],
+            "topics": ["safety"],
         },
     )
     _touch(ch / f"{prefix_newer_severe}.mindmap.md", "newer mindmap")
@@ -505,13 +507,22 @@ def test_dedupe_apply_flipped_winner_still_merges_alt_titles_and_topics(tmp_path
     # already present and no artifact move was needed for it; the union of
     # modes_completed still reflects both losers' completed modes.
     assert set(canonical["modes_completed"]) == {"scan", "transcript", "concepts"}
+    # topics union (issue #146 mechanics, unaffected by the #159 flip): each
+    # meta's own topic is present, not overwritten by the other's.
+    assert set(canonical["topics"]) == {"ai-agents", "safety"}
 
 
 def test_dedupe_apply_flipped_winner_moves_missing_mode_artifact_from_severe_loser(tmp_path):
     """If the severe-flagged (and thus non-canonical) meta is the only one
     with a given mode's artifact, that artifact must still be moved onto the
     canonical prefix rather than deleted with the rest of the loser's
-    siblings - the artifact-move mechanics are untouched by the flip."""
+    siblings - the artifact-move mechanics are untouched by the flip.
+
+    Issue #159 dual-review item 1 ("flag laundering"): the moved transcript
+    IS the severe loser's transcript, so canonical's meta must inherit its
+    per-mode provenance - both the fixed fields and an arbitrary extra
+    transcript_* field, proving the generic prefix sweep in
+    `_mode_provenance_fields` (not just the hand-enumerated list)."""
     ch = tmp_path / "ch"
     _write_meta(
         ch,
@@ -534,7 +545,10 @@ def test_dedupe_apply_flipped_winner_moves_missing_mode_artifact_from_severe_los
             "published": "2026-04-15",
             "processed": "2026-04-20T00:00:00+00:00",
             "modes_completed": ["scan", "transcript"],
+            "transcript_status": "partial",
             "transcript_quality_flags": ["blind_gap_severe"],
+            "transcript_max_blind_gap_seconds": 340,
+            "transcript_provenance_note": "recovered via captions fallback",
         },
     )
     _touch(ch / "2026-04-20-newer-severe.mindmap.md", "newer mindmap")
@@ -550,6 +564,215 @@ def test_dedupe_apply_flipped_winner_moves_missing_mode_artifact_from_severe_los
     assert (ch / "2026-04-15-older.transcript.md").read_text() == "newer transcript content"
     canonical = json.loads((ch / "2026-04-15-older.meta.json").read_text())
     assert set(canonical["modes_completed"]) == {"scan", "transcript"}
+    # The moved artifact's provenance must land on canonical - a severe
+    # transcript must stay severe-labeled, never laundered clean by the flip.
+    assert canonical["transcript_status"] == "partial"
+    assert canonical["transcript_quality_flags"] == ["blind_gap_severe"]
+    assert canonical["transcript_max_blind_gap_seconds"] == 340
+    assert canonical["transcript_provenance_note"] == "recovered via captions fallback"
+
+
+def test_dedupe_apply_disk_verifies_canonical_claim_before_computing_missing_modes(tmp_path):
+    """Issue #159 dual-review item 2 ("empty-shell winner"): the clean-older
+    meta claims a transcript mode whose .transcript.md was since deleted by
+    hand (the exact #159 remediation flow - an operator manually removing a
+    bad artifact without also editing modes_completed). The flip still picks
+    the clean meta as canonical by its meta-level standing (no
+    transcript_quality_flags key at all), but before computing which modes
+    are "missing" from the loser, dedupe must verify the canonical's claim
+    against disk - otherwise the loser's genuine (severe) transcript is
+    deleted outright and the meta still claims a complete transcript, so the
+    video is never re-queued."""
+    ch = tmp_path / "ch"
+    _write_meta(
+        ch,
+        "2026-04-15-older-shell",
+        {
+            "video_id": "v1",
+            "title": "Older, clean-labeled, but transcript file is gone",
+            "published": "2026-04-15",
+            "processed": "2026-04-18T00:00:00+00:00",
+            "modes_completed": ["scan", "transcript"],
+            # No transcript_quality_flags -> "clean" at the meta level, even
+            # though the artifact it claims no longer exists on disk.
+        },
+    )
+    _touch(ch / "2026-04-15-older-shell.mindmap.md", "older mindmap")
+    # Deliberately NO 2026-04-15-older-shell.transcript.md on disk.
+
+    _write_meta(
+        ch,
+        "2026-04-20-newer-severe",
+        {
+            "video_id": "v1",
+            "title": "Newer, severe, has the only real transcript",
+            "published": "2026-04-15",
+            "processed": "2026-04-20T00:00:00+00:00",
+            "modes_completed": ["scan", "transcript"],
+            "transcript_status": "partial",
+            "transcript_quality_flags": ["blind_gap_severe"],
+        },
+    )
+    _touch(ch / "2026-04-20-newer-severe.mindmap.md", "newer mindmap")
+    _touch(ch / "2026-04-20-newer-severe.transcript.md", "the only real transcript content")
+
+    vi.cmd_dedupe(Namespace(channel=None, apply=True), _make_config(tmp_path, ["ch"]))
+
+    # Clean-labeled shell still wins the top-level pick...
+    assert (ch / "2026-04-15-older-shell.meta.json").exists()
+    assert not (ch / "2026-04-20-newer-severe.meta.json").exists()
+
+    # ...but the loser's REAL transcript survives - it is not deleted with
+    # the rest of the loser's siblings just because the canonical falsely
+    # claimed to already have one.
+    assert (ch / "2026-04-15-older-shell.transcript.md").read_text() == "the only real transcript content"
+
+    # And the canonical meta now honestly records the severe provenance of
+    # the transcript it actually has on disk (item 1 + item 2 together).
+    canonical = json.loads((ch / "2026-04-15-older-shell.meta.json").read_text())
+    assert canonical["transcript_status"] == "partial"
+    assert canonical["transcript_quality_flags"] == ["blind_gap_severe"]
+    assert set(canonical["modes_completed"]) == {"scan", "transcript"}
+
+
+def test_dedupe_apply_three_meta_mixed_severity_group_best_clean_wins(tmp_path):
+    """Three-way group: two clean metas and one severe. The severe meta must
+    never win regardless of recency, and among the two clean metas the
+    pre-#159 tie-break (latest processed) still decides."""
+    ch = tmp_path / "ch"
+    _write_meta(
+        ch,
+        "2026-04-10-clean-oldest",
+        {
+            "video_id": "v1",
+            "title": "Clean, oldest",
+            "published": "2026-04-10",
+            "processed": "2026-04-11T00:00:00+00:00",
+            "modes_completed": ["scan"],
+        },
+    )
+    _touch(ch / "2026-04-10-clean-oldest.mindmap.md", "oldest clean mindmap")
+    _write_meta(
+        ch,
+        "2026-04-15-clean-best",
+        {
+            "video_id": "v1",
+            "title": "Clean, best (latest of the two clean)",
+            "published": "2026-04-10",
+            "processed": "2026-04-16T00:00:00+00:00",
+            "modes_completed": ["scan"],
+        },
+    )
+    _touch(ch / "2026-04-15-clean-best.mindmap.md", "best clean mindmap")
+    _write_meta(
+        ch,
+        "2026-04-20-severe-newest",
+        {
+            "video_id": "v1",
+            "title": "Severe, newest overall",
+            "published": "2026-04-10",
+            "processed": "2026-04-20T00:00:00+00:00",
+            "modes_completed": ["scan"],
+            "transcript_quality_flags": ["monolithic_severe"],
+        },
+    )
+    _touch(ch / "2026-04-20-severe-newest.mindmap.md", "severe mindmap")
+
+    vi.cmd_dedupe(Namespace(channel=None, apply=True), _make_config(tmp_path, ["ch"]))
+
+    # The best CLEAN meta wins, even though the severe meta is newer overall.
+    assert (ch / "2026-04-15-clean-best.meta.json").exists()
+    assert not (ch / "2026-04-10-clean-oldest.meta.json").exists()
+    assert not (ch / "2026-04-20-severe-newest.meta.json").exists()
+
+
+def test_pick_canonical_three_metas_mixed_severity_excludes_severe():
+    """Unit-level companion: `_pick_canonical` itself, not just the
+    end-to-end command, must exclude the severe entry from contention."""
+    clean_oldest = _meta_tuple("2026-04-10-a", processed="2026-04-11T00:00:00+00:00", modes_completed=["scan"])
+    clean_best = _meta_tuple("2026-04-15-b", processed="2026-04-16T00:00:00+00:00", modes_completed=["scan"])
+    severe_newest = _meta_tuple(
+        "2026-04-20-c",
+        processed="2026-04-20T00:00:00+00:00",
+        modes_completed=["scan"],
+        transcript_quality_flags=["monolithic_severe"],
+    )
+    canonical_path, _ = vi._pick_canonical([clean_oldest, clean_best, severe_newest])
+    assert canonical_path.name == "2026-04-15-b.meta.json"
+
+
+def test_dedupe_apply_both_severe_group_end_to_end_newer_wins(tmp_path):
+    """End-to-end companion to `test_pick_canonical_both_severe_newer_wins`:
+    when every meta in the group is severe, the pre-#159 tie-break (latest
+    processed) still governs which one survives `dedupe --apply`."""
+    ch = tmp_path / "ch"
+    _write_meta(
+        ch,
+        "2026-04-15-severe-older",
+        {
+            "video_id": "v1",
+            "title": "Severe, older",
+            "published": "2026-04-15",
+            "processed": "2026-04-18T00:00:00+00:00",
+            "modes_completed": ["scan"],
+            "transcript_quality_flags": ["blind_gap_severe"],
+        },
+    )
+    _touch(ch / "2026-04-15-severe-older.mindmap.md", "older severe mindmap")
+    _write_meta(
+        ch,
+        "2026-04-20-severe-newer",
+        {
+            "video_id": "v1",
+            "title": "Severe, newer",
+            "published": "2026-04-15",
+            "processed": "2026-04-20T00:00:00+00:00",
+            "modes_completed": ["scan"],
+            "transcript_quality_flags": ["monolithic_severe"],
+        },
+    )
+    _touch(ch / "2026-04-20-severe-newer.mindmap.md", "newer severe mindmap")
+
+    vi.cmd_dedupe(Namespace(channel=None, apply=True), _make_config(tmp_path, ["ch"]))
+
+    assert (ch / "2026-04-20-severe-newer.meta.json").exists()
+    assert not (ch / "2026-04-15-severe-older.meta.json").exists()
+    canonical = json.loads((ch / "2026-04-20-severe-newer.meta.json").read_text())
+    assert canonical["transcript_quality_flags"] == ["monolithic_severe"]
+
+
+def test_move_missing_mode_artifacts_warns_and_skips_when_destination_already_exists(tmp_path, caplog):
+    """Issue #159 dual-review item 4: a stale file blocking a move used to
+    fail silently. It must now log a WARNING naming both paths, leave the
+    pre-existing destination content untouched, and not credit the mode as
+    moved."""
+    ch = tmp_path / "ch"
+    ch.mkdir()
+    _touch(ch / "loser.mindmap.md", "loser mindmap content")
+    _touch(ch / "canonical.mindmap.md", "canonical's own stale mindmap")
+
+    with caplog.at_level("WARNING"):
+        moved = vi._move_missing_mode_artifacts(ch, "canonical", "loser", {"scan"})
+
+    assert moved == set(), "a move that hit an existing destination must not be credited as moved"
+    assert (ch / "canonical.mindmap.md").read_text() == "canonical's own stale mindmap"
+    assert (ch / "loser.mindmap.md").exists(), "source is left in place when the move is skipped"
+    assert any("already exists" in rec.message for rec in caplog.records)
+
+
+def test_cmd_dedupe_dry_run_logs_severity_standing(tmp_path, caplog):
+    """Issue #159 dual-review item 5: a quality flip must be auditable from
+    the dry-run log before a destructive --apply, so the per-meta lines
+    carry a visible clean/severe standing."""
+    ch = tmp_path / "ch"
+    _make_dupe_group_quality_aware(ch, "2026-04-15-older", "2026-04-20-newer")
+
+    with caplog.at_level("INFO"):
+        vi.cmd_dedupe(Namespace(channel=None, apply=False), _make_config(tmp_path, ["ch"]))
+
+    messages = "\n".join(rec.message for rec in caplog.records)
+    assert "[clean]" in messages
+    assert "[severe]" in messages
 
 
 # ---------------------------------------------------------------------------

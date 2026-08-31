@@ -3256,13 +3256,34 @@ def transcript_quality_flags_are_severe(flags: list | None) -> bool:
 
     The single place every consumer (the writers computing transcript_status,
     resolve_mindmap_source's containment check, the process orchestrators'
-    exit-code gate) re-derives severity from what actually landed in
-    meta.json, rather than each hand-rolling its own membership test against
-    _SEVERE_QUALITY_FLAGS. A missing or empty list is not severe.
+    exit-code gate, dedupe's canonical selection) re-derives severity from
+    what actually landed in meta.json, rather than each hand-rolling its own
+    membership test against _SEVERE_QUALITY_FLAGS. A missing or empty list is
+    not severe.
+
+    Issue #159 dual-review: the membership test filters to string entries
+    (`if isinstance(f, str)`) BEFORE evaluating `f in _SEVERE_QUALITY_FLAGS`,
+    for two reasons, not one. First, order-independence - `any()` short-
+    circuits on the first entry that satisfies the expression, so without
+    the filter a malformed list like `[{"x": 1}, "monolithic_severe"]` used
+    to raise TypeError on the unhashable dict *before* `any()` ever reached
+    the genuine severe string a few entries later, while the reordered list
+    `["monolithic_severe", {"x": 1}]` returned True correctly - the verdict
+    depended on where the bad entry happened to sit, in either direction.
+    Second, safety - a non-string entry (dict, list, custom object) can be
+    unhashable, and `in` on a frozenset requires hashing its left operand;
+    filtering by `isinstance(f, str)` first means the `in` test only ever
+    runs on a value that is guaranteed hashable, so no entry shape can raise
+    here. A non-string sibling anywhere in the list can now never mask - or
+    fake - a genuine severe flag, and malformed entries degrade to being
+    ignored rather than crashing the caller. A non-list `flags` argument
+    (e.g. a bare string) is unaffected by this change: iterating a string's
+    characters already returned False safely pre-#159, since no single
+    character equals a multi-character flag name.
     """
     if not flags:
         return False
-    return any(f in _SEVERE_QUALITY_FLAGS for f in flags)
+    return any(f in _SEVERE_QUALITY_FLAGS for f in flags if isinstance(f, str))
 
 
 def _transcript_quality_severe_from_meta(meta_path: Path) -> bool:
@@ -8381,25 +8402,23 @@ def _dedupe_meta_is_severe(meta_data: dict) -> bool:
     flag, for canonical selection (issue #159).
 
     Delegates entirely to `transcript_quality_flags_are_severe()` (the
-    #157/#158 severity test) - this never re-implements severity, it only
-    guards the call against a malformed on-disk value so a corrupt or
-    hand-edited meta degrades to "not severe" instead of crashing the dedupe
-    sort. A `transcript_quality_flags` value that isn't a list (e.g. a bare
-    string) is treated as absent rather than passed through: a scalar string
-    happening to equal a severe flag's name is not the documented list shape
-    the helper expects, and iterating its characters is not a meaningful
-    severity signal either way. A list containing unhashable entries (which
-    would raise inside the frozenset membership test) is likewise treated as
-    not severe - malformed input degrades here, it does not crash a group
-    comparison.
+    #157/#158 severity test, hardened against malformed list entries by the
+    #159 dual-review) - this never re-implements severity, it only guards
+    the call against a malformed on-disk *shape* so a corrupt or hand-edited
+    meta degrades to "not severe" instead of crashing the dedupe sort. A
+    `transcript_quality_flags` value that isn't a list at all (e.g. a bare
+    string) is treated as absent rather than passed through: a scalar
+    string happening to equal a severe flag's name is not the documented
+    list shape the helper expects, and iterating its characters is not a
+    meaningful severity signal either way. Malformed *entries within* a list
+    (non-string, unhashable, any order) are the shared helper's own concern
+    now - no try/except is needed here, because the helper's entry filter
+    means no entry shape can raise inside it.
     """
     flags = meta_data.get("transcript_quality_flags")
     if not isinstance(flags, list):
         flags = None
-    try:
-        return transcript_quality_flags_are_severe(flags)
-    except TypeError:
-        return False
+    return transcript_quality_flags_are_severe(flags)
 
 
 def _pick_canonical(metas: list[tuple[Path, dict]]) -> tuple[Path, dict]:
@@ -8461,19 +8480,122 @@ def _move_missing_mode_artifacts(
     canonical_prefix: str,
     loser_prefix: str,
     missing_modes: set[str],
-) -> None:
+) -> set[str]:
     """Move artifacts for each missing mode from loser_prefix to canonical_prefix.
 
     Skips if the destination already exists (shouldn't happen when canonical
-    lacks the mode, but the guard avoids overwriting unrelated content).
+    lacks the mode, but the guard avoids overwriting unrelated content) -
+    issue #159 dual-review item 4: that skip now logs a WARNING naming both
+    paths, since a stale file silently blocking a move used to be invisible.
+
+    Returns the subset of `missing_modes` for which at least one artifact
+    was actually moved. A mode can be "missing" by the loser's meta.json
+    *claim* alone with no real file behind it (issue #159 dual-review item
+    2's "empty-shell" case, mirrored from the other side): the caller must
+    not credit `modes_completed` or copy provenance for a mode that never
+    genuinely moved.
     """
+    moved_modes: set[str] = set()
     for mode in missing_modes:
+        moved_any = False
         for pattern in _MODE_ARTIFACT_PATTERNS.get(mode, ()):
             for src in channel_dir.glob(pattern.format(prefix=loser_prefix)):
                 suffix = src.name[len(loser_prefix) :]
                 dst = channel_dir / f"{canonical_prefix}{suffix}"
-                if not dst.exists():
-                    src.rename(dst)
+                if dst.exists():
+                    log.warning(
+                        "Dedupe: skipped moving %s -> %s (destination already exists)",
+                        src,
+                        dst,
+                    )
+                    continue
+                src.rename(dst)
+                moved_any = True
+        if moved_any:
+            moved_modes.add(mode)
+    return moved_modes
+
+
+#: Issue #159 dual-review item 1 ("flag laundering"): when a mode's artifact
+#: moves from a loser prefix onto the canonical prefix, the canonical meta
+#: must inherit the loser's per-mode provenance for that mode - the artifact
+#: now sitting under the canonical prefix IS the loser's artifact, so the
+#: meta must describe it. A severe transcript must stay severe-labeled so
+#: the #157/#158 containment check and any future corpus sweep still see
+#: it; silently keeping the canonical's own (absent-or-clean) provenance
+#: fields would launder a bad transcript into looking healthy.
+_TRANSCRIPT_PROVENANCE_FIELDS: tuple[str, ...] = (
+    "transcript_status",
+    "transcript_quality_flags",
+    "transcript_chunk_window_violations",
+    "transcript_max_blind_gap_seconds",
+    "transcript_blind_gap_at_seconds",
+    "transcript_last_dialogue_fraction",
+    "transcript_dialogue_entries",
+    "transcript_output_tokens",
+    "transcript_finish_reason",
+)
+
+#: The "scan" mode key in `_MODE_ARTIFACT_PATTERNS` is the mode that
+#: produces the mindmap artifact (historical naming - `modes_completed`
+#: calls it "scan", not "mindmap"). These are its provenance fields.
+_MINDMAP_PROVENANCE_FIELDS: tuple[str, ...] = (
+    "mindmap_source",
+    "mindmap_source_status",
+    "prompt",
+)
+
+
+def _mode_provenance_fields(mode: str, loser_data: dict) -> dict:
+    """Fields to copy from a loser meta onto canonical when `mode`'s
+    artifact moves from the loser to the canonical prefix (issue #159
+    dual-review item 1).
+
+    Copies only keys that exist on the loser - never invents a default for
+    a key the loser doesn't have. For transcript mode this also sweeps
+    every OTHER key on the loser starting with `transcript_`, so a future
+    per-video transcript provenance field is carried forward automatically
+    without this function needing an edit.
+    """
+    if mode == "transcript":
+        wanted = set(_TRANSCRIPT_PROVENANCE_FIELDS)
+        wanted |= {key for key in loser_data if isinstance(key, str) and key.startswith("transcript_")}
+    elif mode == "scan":
+        wanted = set(_MINDMAP_PROVENANCE_FIELDS)
+    else:
+        wanted = set()
+    return {key: loser_data[key] for key in wanted if key in loser_data}
+
+
+def _modes_present_on_disk(channel_dir: Path, prefix: str) -> set[str]:
+    """Which of `_MODE_ARTIFACT_PATTERNS`' tracked modes actually have an
+    artifact on disk under `prefix` (issue #159 dual-review item 2).
+
+    A meta.json's `modes_completed` is a claim, not a guarantee - an
+    operator can delete an artifact by hand, or a partially applied dedupe
+    pass can leave a meta that still claims a mode whose artifact never
+    landed. This walks the exact same `_MODE_ARTIFACT_PATTERNS` glob the
+    mover itself uses (checker-uses-the-writer's-path), so the claim can be
+    verified against the same shape the move actually depends on.
+    """
+    present: set[str] = set()
+    for mode, patterns in _MODE_ARTIFACT_PATTERNS.items():
+        for pattern in patterns:
+            if any(channel_dir.glob(pattern.format(prefix=prefix))):
+                present.add(mode)
+                break
+    return present
+
+
+def _verified_modes_completed(claimed: set[str], disk_present: set[str]) -> set[str]:
+    """Intersect a meta's `modes_completed` claim with what is actually on
+    disk, for the modes `_MODE_ARTIFACT_PATTERNS` can verify (issue #159
+    dual-review item 2). A mode outside that tracked set (if one ever
+    exists) is not disk-verifiable here and is trusted as claimed, rather
+    than silently dropped.
+    """
+    tracked = set(_MODE_ARTIFACT_PATTERNS)
+    return (claimed & tracked & disk_present) | (claimed - tracked)
 
 
 def _apply_dedupe_group(
@@ -8485,8 +8607,23 @@ def _apply_dedupe_group(
     canonical_path, canonical_data = _pick_canonical(metas)
     canonical_prefix = canonical_path.name.removesuffix(".meta.json")
 
-    # Union modes_completed and move any artifact only losers have.
-    canonical_modes = set(canonical_data.get("modes_completed", []))
+    # Start from the DISK-VERIFIED mode set, not the bare claim (issue #159
+    # dual-review item 2): the flip can promote an older meta whose claimed
+    # mode's artifact was since deleted by hand, and trusting the claim here
+    # would both under-count what's missing (so a loser's genuine artifact
+    # for that mode is deleted instead of rescued) and leave modes_completed
+    # claiming a mode with no artifact behind it at all.
+    canonical_modes = _verified_modes_completed(
+        set(canonical_data.get("modes_completed", [])),
+        _modes_present_on_disk(channel_dir, canonical_prefix),
+    )
+
+    # Union modes_completed and move any artifact only losers have. Only a
+    # mode that ACTUALLY moved (moved_modes, not the claimed `missing` set)
+    # is credited to canonical_modes or has its provenance copied - issue
+    # #159 dual-review item 1 ("flag laundering"): the moved artifact IS the
+    # loser's artifact, so canonical's meta must describe it under its own
+    # provenance, not silently keep looking clean.
     for loser_path, loser_data in metas:
         if loser_path == canonical_path:
             continue
@@ -8494,8 +8631,11 @@ def _apply_dedupe_group(
         loser_modes = set(loser_data.get("modes_completed", []))
         missing = loser_modes - canonical_modes
         if missing:
-            _move_missing_mode_artifacts(channel_dir, canonical_prefix, loser_prefix, missing)
-            canonical_modes |= missing
+            moved_modes = _move_missing_mode_artifacts(channel_dir, canonical_prefix, loser_prefix, missing)
+            if moved_modes:
+                canonical_modes |= moved_modes
+                for mode in moved_modes:
+                    canonical_data.update(_mode_provenance_fields(mode, loser_data))
 
     canonical_data["modes_completed"] = sorted(canonical_modes)
     merged_alts = _merge_alt_titles(canonical_data, metas, canonical_path)
@@ -8573,19 +8713,23 @@ def cmd_dedupe(args, config):
 
         for vid, metas in sorted(dup_groups.items()):
             canonical_path, canonical_data = _pick_canonical(metas)
+            canonical_standing = "severe" if _dedupe_meta_is_severe(canonical_data) else "clean"
             log.info("  video_id=%s", vid)
             log.info(
-                "    canonical: %s  '%s'  processed=%s",
+                "    canonical: %s  [%s]  '%s'  processed=%s",
                 canonical_path.name,
+                canonical_standing,
                 canonical_data.get("title", ""),
                 canonical_data.get("processed", "")[:19],
             )
             for loser_path, loser_data in metas:
                 if loser_path == canonical_path:
                     continue
+                loser_standing = "severe" if _dedupe_meta_is_severe(loser_data) else "clean"
                 log.info(
-                    "    loser:     %s  '%s'  processed=%s",
+                    "    loser:     %s  [%s]  '%s'  processed=%s",
                     loser_path.name,
+                    loser_standing,
                     loser_data.get("title", ""),
                     loser_data.get("processed", "")[:19],
                 )
