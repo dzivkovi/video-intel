@@ -5533,7 +5533,15 @@ def cmd_scan(args, config):
             # Issue #60: per-channel transcript source (gemini | yt-captions | auto).
             # Default "gemini" preserves current behavior; "auto" adds the captions
             # failover when Gemini fails (token-cap, 403, confabulation).
-            transcript_source = resolve_transcript_source(ch)
+            # Issue #135: unlike the CLI flag, a channel-config typo here is not
+            # caught by argparse choices. Same defensive shape as the
+            # chunk_minutes guard below: one channel's typo must not abort the
+            # whole scan after YouTube quota and Gemini spend are already sunk.
+            try:
+                transcript_source = resolve_transcript_source(ch)
+            except ValueError as e:
+                log.error("[%s] invalid transcript_source (%s); skipping channel", ch_name, e)
+                continue
             # Issue #120 provenance rule: captions-first is mandatory for a VOD
             # only when nobody asked for Gemini. An explicit
             # `transcript_source: gemini` on the channel is honored (documented
@@ -6139,7 +6147,15 @@ def _cmd_transcript_impl(args, config):
     # re-resolve once it has a channel. Precedence is unchanged either way:
     # CLI flag > channel config > "gemini".
     cli_transcript_source = getattr(args, "transcript_source", None)
-    transcript_source = resolve_transcript_source({}, cli_transcript_source)
+    # Issue #135: argparse `choices` already rejects an invalid CLI flag before
+    # this line is reached, so this placeholder call can only fail on a
+    # malformed cli_override reaching us some other way. Guarded anyway for
+    # consistency with the other three call sites and defense-in-depth.
+    try:
+        transcript_source = resolve_transcript_source({}, cli_transcript_source)
+    except ValueError as e:
+        log.error("Invalid transcript_source: %s", e)
+        sys.exit(1)
     # Raw channel dict, kept alongside the resolved string because
     # livestream_captions_first_applies needs the PROVENANCE (was the key
     # present?), which the resolved string collapses away.
@@ -6305,7 +6321,15 @@ def _cmd_transcript_impl(args, config):
                 transcript_source,
             )
         else:
-            transcript_source = resolve_transcript_source(channel_cfg, cli_transcript_source)
+            # Issue #135: this is the site #127 added to honor channel config on
+            # the manual --url path. A typo here would previously crash with a
+            # raw traceback rather than the actionable error every other single-
+            # video call site already produces.
+            try:
+                transcript_source = resolve_transcript_source(channel_cfg, cli_transcript_source)
+            except ValueError as e:
+                log.error("Invalid transcript_source: %s", e)
+                sys.exit(1)
             origin = (
                 "CLI flag"
                 if cli_transcript_source is not None
@@ -6695,7 +6719,14 @@ def _cmd_process_url(args, config):
     # Resolve mindmap source from the channel config (default "auto").
     channel_cfg: dict = channel_config_by_name(config, channel_name)
     # Issue #60: transcript source - CLI flag overrides the per-channel knob.
-    transcript_source = resolve_transcript_source(channel_cfg, getattr(args, "transcript_source", None))
+    # Issue #135: same guard as the other single-video call sites - one video,
+    # nothing to continue to, so a bad config value exits rather than
+    # traceback-ing.
+    try:
+        transcript_source = resolve_transcript_source(channel_cfg, getattr(args, "transcript_source", None))
+    except ValueError as e:
+        log.error("Invalid transcript_source: %s", e)
+        sys.exit(1)
 
     duration_seconds = _lookup_video_duration_seconds(video_id)
     transcript_path = channel_dir / f"{prefix}.transcript.md"
