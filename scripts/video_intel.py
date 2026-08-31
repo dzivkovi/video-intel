@@ -628,6 +628,61 @@ def load_taxonomy(output_dir: Path) -> dict:
     return {"version": 1, "built_from": 0, "concepts": {}}
 
 
+def accumulate_concepts_into_taxonomy(taxonomy: dict, concepts_path: Path) -> int:
+    """Merge a just-written concepts.json into the in-memory taxonomy (ADR-0010).
+
+    Shared by cmd_concepts and cmd_scan's auto_concepts loop so both batch
+    paths accumulate identically (issue #176) - a video later in a run
+    normalizes against concepts minted by earlier ones in the SAME run, not
+    just the on-disk snapshot from before the run started.
+
+    Returns the count of concepts newly added.
+
+    This runs inside a loop that has already paid for a Gemini call, so a
+    malformed artifact must degrade, never crash the run (the #124/#161/#171
+    family of paid-loop guards) - a bad read or a bad shape is skipped with a
+    warning, not raised.
+    """
+    if not concepts_path.exists():
+        return 0
+    try:
+        data = json.loads(concepts_path.read_text(encoding="utf-8"))
+    except (ValueError, OSError) as e:
+        # ValueError, not just OSError: UnicodeDecodeError subclasses
+        # ValueError, and a write torn mid-multibyte-character (Cyrillic/BCS
+        # titles) is the normal shape of a truncated write on this corpus.
+        # A malformed artifact must never crash a loop that has already paid
+        # for a Gemini call - skip and warn, never raise or quarantine.
+        log.warning("Skipping malformed concepts.json for accumulation: %s (%s)", concepts_path, e)
+        return 0
+
+    concepts = data.get("concepts", [])
+    if not isinstance(concepts, list):
+        # Warn for the same reason the read failure above warns: a wrong SHAPE
+        # here means the extraction produced something unusable, and silently
+        # accumulating nothing would hide that from the operator.
+        log.warning(
+            "Skipping concepts.json with a non-list `concepts` (%s): %s",
+            type(concepts).__name__,
+            concepts_path,
+        )
+        return 0
+
+    added = 0
+    for c in concepts:
+        if not isinstance(c, dict):
+            continue
+        cid = c.get("concept_id", "")
+        if cid and cid not in taxonomy.get("concepts", {}):
+            taxonomy.setdefault("concepts", {})[cid] = {
+                "preferred_label": c.get("preferred_label", cid),
+                "aliases": [],
+                "domain": c.get("domain", ""),
+            }
+            added += 1
+    return added
+
+
 # ---------------------------------------------------------------------------
 # Stage 1 query expansion (ADR-0017, docs/plans/2026-04-20-feat-kb-stage1-*)
 # ---------------------------------------------------------------------------
@@ -6022,6 +6077,14 @@ def cmd_scan(args, config):
         )
     channels = [c for c in channels if _channel_scan_enabled(c)]
 
+    # Loaded lazily by the first auto_concepts channel that needs it and kept
+    # across the WHOLE scan (not reloaded per channel), so channel 2 sees
+    # concepts channel 1 minted in this same run - the identical ADR-0010
+    # accumulation rule cmd_concepts already applies, one scope wider
+    # (issue #176). Lazy, not hoisted-unconditional, so a scan with no
+    # auto_concepts channel pays no file read.
+    scan_taxonomy: dict | None = None
+
     for ch in channels:
         ch_name = ch["name"]
         ch_url = ch["url"]
@@ -6586,7 +6649,15 @@ def cmd_scan(args, config):
         # special-casing. Prefix is derived from the meta filename, not recomputed.
         auto_concepts = ch.get("auto_concepts", config.get("auto_concepts", False))
         if auto_concepts:
-            taxonomy = load_taxonomy(output_dir)
+            # Lazy single load for the whole scan (issue #176) - see
+            # scan_taxonomy's binding above the channel loop. Do NOT reload
+            # per channel: that re-reads the pre-scan on-disk snapshot and
+            # loses every concept a prior channel in this same scan minted,
+            # the identical drift ADR-0010's accumulation exists to prevent,
+            # one scope wider (cross-channel instead of cross-video).
+            if scan_taxonomy is None:
+                scan_taxonomy = load_taxonomy(output_dir)
+            taxonomy = scan_taxonomy
             prompt_name = ch.get("prompt") or config.get("default_prompt", "mindmap-knowledge")
             channel_dir_for_concepts = output_dir / ch_name
             # Issue #173 (scan half): this pre-filter and the process_concepts
@@ -6664,6 +6735,16 @@ def cmd_scan(args, config):
                     log.info("    %s: %s", out_prefix, status)
                     if status.startswith("error"):
                         errors.append((ch_name, out_prefix, status))
+                    else:
+                        # Accumulate into the SAME in-memory taxonomy the next
+                        # video (this channel or the next) normalizes
+                        # against - ADR-0010, mirroring cmd_concepts. Skip
+                        # only on "error"; "skipped (exists)" still
+                        # accumulates because the on-disk file it points at
+                        # is real, current vocabulary (issue #176).
+                        accumulate_concepts_into_taxonomy(
+                            taxonomy, output_dir / ch_name / f"{out_prefix}.concepts.json"
+                        )
 
     if errors:
         log.warning("--- %d FAILED ---", len(errors))
@@ -8497,18 +8578,11 @@ def cmd_concepts(args, config):
         log.info("[%d/%d] [%s] %s: %s", i, total, ch_name, prefix, status)
 
         # Accumulate new concepts into in-memory taxonomy so the next video
-        # can normalize against concepts discovered in earlier videos.
-        concepts_path = output_dir / ch_name / f"{prefix}.concepts.json"
-        if concepts_path.exists():
-            data = json.loads(concepts_path.read_text(encoding="utf-8"))
-            for c in data.get("concepts", []):
-                cid = c.get("concept_id", "")
-                if cid and cid not in taxonomy.get("concepts", {}):
-                    taxonomy.setdefault("concepts", {})[cid] = {
-                        "preferred_label": c.get("preferred_label", cid),
-                        "aliases": [],
-                        "domain": c.get("domain", ""),
-                    }
+        # can normalize against concepts discovered in earlier videos
+        # (ADR-0010). Shared with cmd_scan's auto_concepts loop - see
+        # accumulate_concepts_into_taxonomy for the paid-loop robustness
+        # contract (issue #176).
+        accumulate_concepts_into_taxonomy(taxonomy, output_dir / ch_name / f"{prefix}.concepts.json")
 
     elapsed = time.monotonic() - t0
     minutes, seconds = divmod(int(elapsed), 60)
