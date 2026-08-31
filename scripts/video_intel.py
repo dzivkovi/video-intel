@@ -5533,7 +5533,31 @@ def cmd_scan(args, config):
             # Issue #60: per-channel transcript source (gemini | yt-captions | auto).
             # Default "gemini" preserves current behavior; "auto" adds the captions
             # failover when Gemini fails (token-cap, 403, confabulation).
-            transcript_source = resolve_transcript_source(ch)
+            # Issue #135: unlike the CLI flag, a channel-config typo here is not
+            # caught by argparse choices. Same defensive shape as the
+            # chunk_minutes guard below: one channel's typo must not abort the
+            # whole scan after YouTube quota and Gemini spend are already sunk.
+            # (ValueError, TypeError): a non-string YAML value (a mapping or a
+            # sequence) fails the resolver's `in` membership test with
+            # TypeError, not ValueError - resolve_chunk_minutes hit the same
+            # hole and maps it at the source; this resolver never did, so the
+            # call site has to catch both.
+            # The WHOLE channel is skipped here, not just the transcript step.
+            # Disabling only the transcript step would flip mindmap_source=auto
+            # onto the ~10x more expensive mindmap-from-video path for this
+            # channel, so a one-character config typo would start spending real
+            # Gemini money instead of just failing loudly. Skipping the whole
+            # channel is the cheap, obvious, operator-fixable outcome.
+            try:
+                transcript_source = resolve_transcript_source(ch)
+            except (ValueError, TypeError) as e:
+                log.error(
+                    "[%s] invalid transcript_source (%s); skipping entire channel (mindmap and concepts too)",
+                    ch_name,
+                    e,
+                )
+                errors.append((ch_name, ch_name, f"error: {e}"))
+                continue
             # Issue #120 provenance rule: captions-first is mandatory for a VOD
             # only when nobody asked for Gemini. An explicit
             # `transcript_source: gemini` on the channel is honored (documented
@@ -5672,11 +5696,20 @@ def cmd_scan(args, config):
                     if transcript_available
                     else False
                 )
+                # Issue #135 (coordinator follow-up): this closure runs inside a
+                # ThreadPoolExecutor worker (see executor.submit below), so an
+                # escaping TypeError (a non-string mindmap_source - a YAML mapping
+                # or sequence) does not just fail one video the way a returned
+                # error: string does - it propagates out through the executor and
+                # can take down the whole mindmap stage for the channel, after
+                # transcript work and quota are already spent. Catch both, keep
+                # returning the same error: shape - it already lands in the failure
+                # summary through the task-result path below.
                 try:
                     src = resolve_mindmap_source(
                         _ch, transcript_available=transcript_available, transcript_severe=transcript_severe
                     )
-                except ValueError as exc:
+                except (ValueError, TypeError) as exc:
                     return v_prefix, f"error: {exc}"
                 if src == "skip":
                     return v_prefix, "skipped (mindmap_source=none)"
@@ -6041,7 +6074,7 @@ def _cmd_mindmap_impl(args, config):
         resolved_source = resolve_mindmap_source(
             channel_cfg, transcript_available=transcript_available, transcript_severe=transcript_severe
         )
-    except ValueError as exc:
+    except (ValueError, TypeError) as exc:
         log.error("Mindmap source unresolvable for %s: %s", video_id, exc)
         sys.exit(1)
     if resolved_source == "skip":
@@ -6139,7 +6172,15 @@ def _cmd_transcript_impl(args, config):
     # re-resolve once it has a channel. Precedence is unchanged either way:
     # CLI flag > channel config > "gemini".
     cli_transcript_source = getattr(args, "transcript_source", None)
-    transcript_source = resolve_transcript_source({}, cli_transcript_source)
+    # Issue #135: argparse `choices` already rejects an invalid CLI flag before
+    # this line is reached, so this placeholder call can only fail on a
+    # malformed cli_override reaching us some other way. Guarded anyway for
+    # consistency with the other three call sites and defense-in-depth.
+    try:
+        transcript_source = resolve_transcript_source({}, cli_transcript_source)
+    except (ValueError, TypeError) as e:
+        log.error("Invalid transcript_source: %s", e)
+        sys.exit(1)
     # Raw channel dict, kept alongside the resolved string because
     # livestream_captions_first_applies needs the PROVENANCE (was the key
     # present?), which the resolved string collapses away.
@@ -6305,7 +6346,15 @@ def _cmd_transcript_impl(args, config):
                 transcript_source,
             )
         else:
-            transcript_source = resolve_transcript_source(channel_cfg, cli_transcript_source)
+            # Issue #135: this is the site #127 added to honor channel config on
+            # the manual --url path. A typo here would previously crash with a
+            # raw traceback rather than the actionable error every other single-
+            # video call site already produces.
+            try:
+                transcript_source = resolve_transcript_source(channel_cfg, cli_transcript_source)
+            except (ValueError, TypeError) as e:
+                log.error("Invalid transcript_source: %s", e)
+                sys.exit(1)
             origin = (
                 "CLI flag"
                 if cli_transcript_source is not None
@@ -6695,7 +6744,14 @@ def _cmd_process_url(args, config):
     # Resolve mindmap source from the channel config (default "auto").
     channel_cfg: dict = channel_config_by_name(config, channel_name)
     # Issue #60: transcript source - CLI flag overrides the per-channel knob.
-    transcript_source = resolve_transcript_source(channel_cfg, getattr(args, "transcript_source", None))
+    # Issue #135: same guard as the other single-video call sites - one video,
+    # nothing to continue to, so a bad config value exits rather than
+    # traceback-ing.
+    try:
+        transcript_source = resolve_transcript_source(channel_cfg, getattr(args, "transcript_source", None))
+    except (ValueError, TypeError) as e:
+        log.error("Invalid transcript_source: %s", e)
+        sys.exit(1)
 
     duration_seconds = _lookup_video_duration_seconds(video_id)
     transcript_path = channel_dir / f"{prefix}.transcript.md"
@@ -6839,7 +6895,7 @@ def _cmd_process_url(args, config):
         resolved_source = resolve_mindmap_source(
             channel_cfg, transcript_available=transcript_available, transcript_severe=transcript_quality_severe
         )
-    except ValueError as exc:
+    except (ValueError, TypeError) as exc:
         log.error("Mindmap source unresolvable for %s: %s", video_id, exc)
         sys.exit(1)
 
@@ -7318,7 +7374,7 @@ def _cmd_process_impl(args, config):
         resolved_source = resolve_mindmap_source(
             channel_cfg, transcript_available=transcript_available, transcript_severe=transcript_quality_severe
         )
-    except ValueError as exc:
+    except (ValueError, TypeError) as exc:
         log.error("Mindmap source unresolvable: %s", exc)
         sys.exit(1)
 
