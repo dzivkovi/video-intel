@@ -909,9 +909,18 @@ def resolve_mindmap_source(channel_config: dict, *, transcript_available: bool, 
 # preflight. Kept as module-level constants so tests can assert on them
 # without duplicating literals, and so the preflight's wording tracks the
 # runtime skip sites' own log messages instead of drifting independently.
+KNOB_CONSEQUENCE_ABORTS_SCAN = "ABORTS THE ENTIRE SCAN at this channel (every later channel is never reached)"
 KNOB_CONSEQUENCE_SKIPS_CHANNEL = "skips the whole channel (mindmap and concepts too)"
 KNOB_CONSEQUENCE_FAILS_MINDMAPS = "fails every mindmap for this channel"
-KNOB_CONSEQUENCE_INERT = "inert with this channel's current settings"
+#: Deliberately NOT called "inert". The knob is unreachable *for scan* with
+#: this channel's current settings, but the manual single-video commands
+#: resolve the SAME channel dict (issue #127) and exit 1 on it - so telling
+#: the operator it is inert would send them past a typo that hard-kills
+#: `transcript --url --channel X`.
+KNOB_CONSEQUENCE_NOT_REACHED_BY_SCAN = (
+    "not reached by scan with this channel's current settings, but still fails "
+    "the manual transcript/mindmap/process --channel commands"
+)
 
 
 def validate_channel_knobs(
@@ -961,32 +970,88 @@ def validate_channel_knobs(
       `cmd_scan`'s `if auto_transcript == "all":` block, and both of that
       block's existing guards `continue` the WHOLE channel. So the consequence
       is `KNOB_CONSEQUENCE_SKIPS_CHANNEL` when `auto_transcript == "all"`,
-      otherwise `KNOB_CONSEQUENCE_INERT` (the knob is never reached).
+      otherwise `KNOB_CONSEQUENCE_NOT_REACHED_BY_SCAN` (the knob is never reached).
     - `mindmap_source` is resolved per-video inside the mindmap loop's threaded
       closure, which returns an `error:` status per video - it does NOT skip
       the channel. So the consequence is `KNOB_CONSEQUENCE_FAILS_MINDMAPS`
-      when `auto_mindmap != "none"`, otherwise `KNOB_CONSEQUENCE_INERT`.
+      when `auto_mindmap != "none"`, otherwise `KNOB_CONSEQUENCE_NOT_REACHED_BY_SCAN`.
     """
     problems: list[tuple[str, str, str]] = []
     transcript_all = channel_config.get("auto_transcript", "none") == "all"
     mindmap_active = channel_config.get("auto_mindmap", "all") != "none"
 
+    # The prompt name resolves BEFORE any per-mode gate, and `load_prompt`
+    # answers an unresolvable name with sys.exit(1) - so this is the WORST of
+    # the knobs checked here: it does not skip a channel, it kills the run
+    # mid-scan, after every earlier channel's Gemini spend. Checked first
+    # because it is also the one an operator is least likely to suspect.
+    prompt_name = channel_config.get("prompt") or config.get("default_prompt", "mindmap-light")
+    try:
+        prompt_resolves = resolve_prompt_path(prompt_name).exists()
+    except (AttributeError, TypeError, ValueError, OSError) as e:
+        # A non-string prompt name (a YAML mapping or sequence) never reaches
+        # the existence check - normalize_prompt_name works on strings.
+        problems.append(
+            (
+                "prompt",
+                f"prompt must be a string naming a file in prompts/, got {prompt_name!r} ({e})",
+                KNOB_CONSEQUENCE_ABORTS_SCAN,
+            )
+        )
+    else:
+        if not prompt_resolves:
+            problems.append(
+                (
+                    "prompt",
+                    f"no prompt file for {prompt_name!r} (looked for {resolve_prompt_path(prompt_name).name})",
+                    KNOB_CONSEQUENCE_ABORTS_SCAN,
+                )
+            )
+
     try:
         resolve_transcript_source(channel_config)
     except (ValueError, TypeError) as e:
-        consequence = KNOB_CONSEQUENCE_SKIPS_CHANNEL if transcript_all else KNOB_CONSEQUENCE_INERT
+        consequence = KNOB_CONSEQUENCE_SKIPS_CHANNEL if transcript_all else KNOB_CONSEQUENCE_NOT_REACHED_BY_SCAN
         problems.append(("transcript_source", str(e), consequence))
 
     try:
         resolve_chunk_minutes(channel_config, config, cli_chunk_minutes)
     except (ValueError, TypeError) as e:
-        consequence = KNOB_CONSEQUENCE_SKIPS_CHANNEL if transcript_all else KNOB_CONSEQUENCE_INERT
+        consequence = KNOB_CONSEQUENCE_SKIPS_CHANNEL if transcript_all else KNOB_CONSEQUENCE_NOT_REACHED_BY_SCAN
         problems.append(("chunk_minutes", str(e), consequence))
+
+    # These two have no resolver: scan reads them straight off the dict and
+    # uses them in a numeric comparison / as a thread timeout, both AFTER the
+    # dry-run early return, so a string value raises an uncaught TypeError and
+    # takes the whole scan down. `bool` is rejected explicitly because it
+    # subclasses `int` (an unquoted YAML `yes` is `True`, and `True` seconds is
+    # not a timeout anyone meant).
+    for numeric_knob in ("transcript_max_duration_seconds", "transcript_timeout_seconds"):
+        if numeric_knob not in channel_config:
+            continue
+        value = channel_config[numeric_knob]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            problems.append(
+                (
+                    numeric_knob,
+                    f"{numeric_knob} must be a number of seconds, got {value!r}",
+                    KNOB_CONSEQUENCE_ABORTS_SCAN if transcript_all else KNOB_CONSEQUENCE_NOT_REACHED_BY_SCAN,
+                )
+            )
 
     try:
         resolve_mindmap_source(channel_config, transcript_available=True)
     except (ValueError, TypeError) as e:
-        consequence = KNOB_CONSEQUENCE_FAILS_MINDMAPS if mindmap_active else KNOB_CONSEQUENCE_INERT
+        # A channel already being skipped never reaches the mindmap loop, so
+        # claiming "fails every mindmap" alongside a SKIPS_CHANNEL problem
+        # would be a consequence string that contradicts the runtime (and the
+        # composite report would contradict itself). The channel-skip line is
+        # the true one; this knob is genuinely not reached.
+        channel_already_skipped = any(c == KNOB_CONSEQUENCE_SKIPS_CHANNEL for _, _, c in problems)
+        if mindmap_active and not channel_already_skipped:
+            consequence = KNOB_CONSEQUENCE_FAILS_MINDMAPS
+        else:
+            consequence = KNOB_CONSEQUENCE_NOT_REACHED_BY_SCAN
         problems.append(("mindmap_source", str(e), consequence))
 
     return problems
@@ -1011,9 +1076,20 @@ def find_mindmap_source(channel_dir: Path, prefix: str) -> Path | None:
     return None
 
 
+def resolve_prompt_path(prompt_name: str) -> Path:
+    """The file `load_prompt` would read for this name. Existence NOT checked.
+
+    Split out for issue #169's preflight, which needs to ask "would this name
+    resolve?" WITHOUT the answer being `sys.exit(1)`. The preflight must not
+    re-derive `SKILL_DIR / "prompts" / f"{name}.md"` itself - that is the PR
+    #136 checker/writer-path-drift class, and a preflight that looks in a
+    different directory than the loader is worse than no preflight.
+    """
+    return SKILL_DIR / "prompts" / f"{normalize_prompt_name(prompt_name)}.md"
+
+
 def load_prompt(prompt_name: str) -> str:
-    prompt_name = normalize_prompt_name(prompt_name)
-    prompt_path = SKILL_DIR / "prompts" / f"{prompt_name}.md"
+    prompt_path = resolve_prompt_path(prompt_name)
     if not prompt_path.exists():
         log.error("Prompt file not found: %s", prompt_path)
         sys.exit(1)
@@ -5923,7 +5999,7 @@ def cmd_scan(args, config):
         # invalid, the second says what is being done about it.
         knob_problems = validate_channel_knobs(ch, config, getattr(args, "chunk_minutes", None))
         for knob_name, error_message, consequence in knob_problems:
-            log_fn = log.warning if consequence == KNOB_CONSEQUENCE_INERT else log.error
+            log_fn = log.warning if consequence == KNOB_CONSEQUENCE_NOT_REACHED_BY_SCAN else log.error
             log_fn(
                 "[%s] invalid %s (%s) - %s",
                 ch_name,
@@ -5931,9 +6007,11 @@ def cmd_scan(args, config):
                 error_message,
                 consequence,
             )
-        # Whether a real run would skip this channel outright. Read ONLY by the
-        # --dry-run preview below; it never gates anything on a real run.
-        knob_blocks_channel = any(c == KNOB_CONSEQUENCE_SKIPS_CHANNEL for _, _, c in knob_problems)
+        # What a real run would actually do to this channel, for the --dry-run
+        # preview below. Read ONLY there; it never gates anything on a real run.
+        knob_consequences = {c for _, _, c in knob_problems}
+        knob_aborts_scan = KNOB_CONSEQUENCE_ABORTS_SCAN in knob_consequences
+        knob_blocks_channel = KNOB_CONSEQUENCE_SKIPS_CHANNEL in knob_consequences
 
         # Resolve channel
         channel_id, channel_title = get_channel_id(youtube, ch_url)
@@ -6141,7 +6219,17 @@ def cmd_scan(args, config):
             # preview that reports a typo and a preview that tells the truth
             # about its own numbers. Dry-run only: `knob_blocks_channel` is
             # read nowhere else, so a real run's routing is untouched.
-            if knob_blocks_channel:
+            if knob_aborts_scan:
+                # Strictly worse than a channel skip and the one an operator is
+                # least likely to suspect: the real run dies here, so channels
+                # AFTER this one are never reached either.
+                log.error(
+                    "  [%s] NOTE: a real run ABORTS at this channel (see the config error above); "
+                    "the %d video(s) listed below would NOT be processed, and no later channel would run.",
+                    ch_name,
+                    len(new_videos),
+                )
+            elif knob_blocks_channel:
                 log.error(
                     "  [%s] NOTE: a real run SKIPS this channel (see the config error above); "
                     "the %d video(s) listed below would NOT be processed.",

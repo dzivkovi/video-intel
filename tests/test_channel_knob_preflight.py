@@ -18,9 +18,12 @@ import pytest
 
 import video_intel as vi
 from video_intel import (
+    KNOB_CONSEQUENCE_ABORTS_SCAN,
     KNOB_CONSEQUENCE_FAILS_MINDMAPS,
-    KNOB_CONSEQUENCE_INERT,
+    KNOB_CONSEQUENCE_NOT_REACHED_BY_SCAN,
     KNOB_CONSEQUENCE_SKIPS_CHANNEL,
+    load_prompt,
+    resolve_prompt_path,
     validate_channel_knobs,
 )
 
@@ -122,7 +125,7 @@ class TestValidateChannelKnobsConsequenceStrings:
 
         problems = validate_channel_knobs(cfg, {})
 
-        assert problems[0][2] == KNOB_CONSEQUENCE_INERT
+        assert problems[0][2] == KNOB_CONSEQUENCE_NOT_REACHED_BY_SCAN
 
     def test_bad_chunk_minutes_with_auto_transcript_all_skips_the_channel(self):
         problems = validate_channel_knobs({"chunk_minutes": 0, "auto_transcript": "all"}, {})
@@ -132,18 +135,157 @@ class TestValidateChannelKnobsConsequenceStrings:
     def test_bad_chunk_minutes_without_auto_transcript_all_is_inert(self):
         problems = validate_channel_knobs({"chunk_minutes": 0}, {})
 
-        assert problems[0][2] == KNOB_CONSEQUENCE_INERT
+        assert problems[0][2] == KNOB_CONSEQUENCE_NOT_REACHED_BY_SCAN
 
     def test_bad_mindmap_source_with_auto_mindmap_none_is_inert(self):
         problems = validate_channel_knobs({"mindmap_source": "screenshots", "auto_mindmap": "none"}, {})
 
-        assert problems[0][2] == KNOB_CONSEQUENCE_INERT
+        assert problems[0][2] == KNOB_CONSEQUENCE_NOT_REACHED_BY_SCAN
 
     def test_bad_mindmap_source_with_default_auto_mindmap_fails_every_mindmap(self):
         # auto_mindmap defaults to "all" when the key is absent.
         problems = validate_channel_knobs({"mindmap_source": "screenshots"}, {})
 
         assert problems[0][2] == KNOB_CONSEQUENCE_FAILS_MINDMAPS
+
+    def test_bad_mindmap_source_alone_still_fails_every_mindmap_composite_fix_did_not_flatten_the_normal_case(self):
+        """Round 2: the composite downgrade (below) must only fire when a
+        SKIPS_CHANNEL problem is genuinely present. A lone bad mindmap_source,
+        with no transcript/chunk_minutes problem at all, must keep reporting
+        FAILS_MINDMAPS - proving the composite fix did not flatten this case."""
+        problems = validate_channel_knobs({"mindmap_source": "screenshots", "auto_mindmap": "all"}, {})
+
+        assert len(problems) == 1
+        assert problems[0][0] == "mindmap_source"
+        assert problems[0][2] == KNOB_CONSEQUENCE_FAILS_MINDMAPS
+
+    def test_skips_channel_problem_downgrades_a_coexisting_mindmap_problem_to_not_reached_by_scan(self):
+        """Round 2 composite-contradiction fix: a skipped channel never reaches
+        the mindmap loop, so a bad mindmap_source alongside a channel-skipping
+        transcript_source problem must report NOT_REACHED_BY_SCAN, never
+        FAILS_MINDMAPS - claiming both would contradict the runtime."""
+        problems = validate_channel_knobs(
+            {
+                "auto_transcript": "all",
+                "transcript_source": "bogus",
+                "mindmap_source": "screenshots",
+            },
+            {},
+        )
+
+        by_knob = {p[0]: p[2] for p in problems}
+        assert by_knob["transcript_source"] == KNOB_CONSEQUENCE_SKIPS_CHANNEL
+        assert by_knob["mindmap_source"] == KNOB_CONSEQUENCE_NOT_REACHED_BY_SCAN
+
+
+class TestValidateChannelKnobsPrompt:
+    """Round 2: the reviewer's first finding. `prompt` resolves BEFORE any
+    per-mode gate (`load_prompt` runs unconditionally), so a bad prompt name
+    does not skip a channel - it ABORTS the whole scan mid-run, after every
+    earlier channel's Gemini spend already happened."""
+
+    def test_missing_prompt_file_is_flagged_aborts_scan(self):
+        problems = validate_channel_knobs({"prompt": "does-not-exist-xyz"}, {})
+
+        assert len(problems) == 1
+        knob, message, consequence = problems[0]
+        assert knob == "prompt"
+        assert "does-not-exist-xyz" in message
+        assert consequence == KNOB_CONSEQUENCE_ABORTS_SCAN
+
+    def test_existing_prompt_file_is_healthy(self):
+        # mindmap-light.md is a real, committed prompt file.
+        assert validate_channel_knobs({"prompt": "mindmap-light"}, {}) == []
+
+    def test_missing_default_prompt_fallback_is_flagged(self):
+        """No per-channel `prompt` - the top-level `default_prompt` fallback
+        must be checked too, not just the per-channel override."""
+        problems = validate_channel_knobs({}, {"default_prompt": "does-not-exist-xyz"})
+
+        assert len(problems) == 1
+        assert problems[0][0] == "prompt"
+        assert "does-not-exist-xyz" in problems[0][1]
+        assert problems[0][2] == KNOB_CONSEQUENCE_ABORTS_SCAN
+
+    def test_no_prompt_and_no_default_prompt_resolves_to_the_builtin_default(self):
+        """Neither the channel nor the top-level config names a prompt - the
+        hardcoded 'mindmap-light' fallback inside validate_channel_knobs
+        itself must resolve to a real file, not merely 'no problem by luck'."""
+        assert validate_channel_knobs({}, {}) == []
+
+    @pytest.mark.parametrize("bad_value", [{"mode": "auto"}, ["a", "b"]], ids=["yaml_mapping", "yaml_sequence"])
+    def test_non_string_prompt_is_flagged_rather_than_raising(self, bad_value):
+        problems = validate_channel_knobs({"prompt": bad_value}, {})
+
+        assert len(problems) == 1
+        assert problems[0][0] == "prompt"
+        assert problems[0][2] == KNOB_CONSEQUENCE_ABORTS_SCAN
+
+
+class TestValidateChannelKnobsNumericTranscriptKnobs:
+    """Round 2: `transcript_max_duration_seconds` / `transcript_timeout_seconds`
+    have no resolver - scan reads them straight off the dict and uses them
+    numerically AFTER the dry-run early return, so a bad value raises an
+    uncaught TypeError on a real run instead of failing gracefully."""
+
+    @pytest.mark.parametrize("knob_name", ["transcript_max_duration_seconds", "transcript_timeout_seconds"])
+    def test_string_value_is_flagged(self, knob_name):
+        problems = validate_channel_knobs({knob_name: "not-a-number"}, {})
+
+        assert len(problems) == 1
+        assert problems[0][0] == knob_name
+
+    @pytest.mark.parametrize("knob_name", ["transcript_max_duration_seconds", "transcript_timeout_seconds"])
+    def test_bool_value_is_flagged_even_though_bool_subclasses_int(self, knob_name):
+        # An unquoted YAML `yes` parses as Python True; True seconds is not a
+        # timeout anyone meant.
+        problems = validate_channel_knobs({knob_name: True}, {})
+
+        assert len(problems) == 1
+        assert problems[0][0] == knob_name
+
+    @pytest.mark.parametrize("knob_name", ["transcript_max_duration_seconds", "transcript_timeout_seconds"])
+    @pytest.mark.parametrize("good_value", [7200, 600.0])
+    def test_int_and_float_values_are_healthy(self, knob_name, good_value):
+        assert validate_channel_knobs({knob_name: good_value}, {}) == []
+
+    @pytest.mark.parametrize("knob_name", ["transcript_max_duration_seconds", "transcript_timeout_seconds"])
+    def test_absent_key_is_healthy(self, knob_name):
+        assert validate_channel_knobs({}, {}) == []
+
+    @pytest.mark.parametrize("knob_name", ["transcript_max_duration_seconds", "transcript_timeout_seconds"])
+    def test_consequence_is_aborts_scan_when_auto_transcript_is_all(self, knob_name):
+        problems = validate_channel_knobs({knob_name: "bad", "auto_transcript": "all"}, {})
+
+        assert problems[0][2] == KNOB_CONSEQUENCE_ABORTS_SCAN
+
+    @pytest.mark.parametrize("knob_name", ["transcript_max_duration_seconds", "transcript_timeout_seconds"])
+    def test_consequence_is_not_reached_by_scan_when_auto_transcript_is_not_all(self, knob_name):
+        problems = validate_channel_knobs({knob_name: "bad"}, {})
+
+        assert problems[0][2] == KNOB_CONSEQUENCE_NOT_REACHED_BY_SCAN
+
+
+class TestResolvePromptPathMatchesLoadPrompt:
+    """Load-bearing: `resolve_prompt_path` was split out of `load_prompt` so
+    the preflight could ask "would this resolve?" without the answer being
+    sys.exit(1). If the two ever disagree about where a prompt file lives,
+    the preflight is worse than no preflight (the PR #136 checker/writer-path
+    -drift class). Both halves derived independently and then compared.
+    """
+
+    def test_resolve_prompt_path_points_at_the_exact_file_load_prompt_reads(self):
+        path = resolve_prompt_path("mindmap-light")
+        assert path.exists()
+        assert path.read_text(encoding="utf-8") == load_prompt("mindmap-light")
+
+    def test_load_prompt_exits_1_for_a_name_resolve_prompt_path_reports_as_missing(self):
+        name = "does-not-exist-xyz"
+        assert not resolve_prompt_path(name).exists()
+
+        with pytest.raises(SystemExit) as excinfo:
+            load_prompt(name)
+        assert excinfo.value.code == 1
 
 
 class TestValidateChannelKnobsDeterministicOrder:
@@ -341,6 +483,75 @@ class TestScanDryRunPreflight:
         assert not [r for r in caplog.records if "would NOT be processed" in r.message], (
             "a non-blocking knob problem must not claim the channel is skipped"
         )
+
+    def test_dry_run_note_says_aborts_and_no_later_channel_for_a_typoed_prompt(self, tmp_path, monkeypatch, caplog):
+        """Round 2 finding 1: a bad `prompt` does not skip a channel, it kills
+        the whole run mid-scan. The dry-run NOTE must say so explicitly and
+        must not use the SKIPS wording."""
+        env = _ScanEnvironment()
+        env.wire(monkeypatch, dry_run=True)
+        config = env.config(tmp_path)
+        typo_ch = next(c for c in config["channels"] if c["name"] == "typo")
+        typo_ch.pop("transcript_source", None)
+        typo_ch["prompt"] = "does-not-exist-xyz"
+
+        with caplog.at_level("INFO"):
+            vi.cmd_scan(_scan_args(dry_run=True), config)
+
+        notes = [r.message for r in caplog.records if "would NOT be processed" in r.message]
+        assert len(notes) == 1, f"expected exactly one dry-run NOTE, got: {notes}"
+        assert "ABORTS" in notes[0]
+        assert "no later channel would run" in notes[0]
+        assert "SKIPS" not in notes[0]
+
+    def test_aborts_note_takes_precedence_over_skips_note_when_a_channel_has_both_problems(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """A channel with BOTH a typoed prompt (ABORTS) and a typoed
+        transcript_source (SKIPS) must emit exactly one NOTE line, and it must
+        be the ABORTS one - aborting the scan is strictly worse than (and
+        subsumes) skipping the one channel."""
+        env = _ScanEnvironment()
+        env.wire(monkeypatch, dry_run=True)
+        config = env.config(tmp_path)
+        typo_ch = next(c for c in config["channels"] if c["name"] == "typo")
+        # transcript_source stays "captions" (invalid) from env.config(), and
+        # auto_transcript stays "all", so the SKIPS consequence also fires.
+        typo_ch["prompt"] = "does-not-exist-xyz"
+
+        with caplog.at_level("INFO"):
+            vi.cmd_scan(_scan_args(dry_run=True), config)
+
+        notes = [r.message for r in caplog.records if "would NOT be processed" in r.message]
+        assert len(notes) == 1, f"expected exactly one dry-run NOTE, got: {notes}"
+        assert "ABORTS" in notes[0]
+        assert "SKIPS" not in notes[0]
+
+    def test_typoed_transcript_source_without_auto_transcript_logs_warning_with_manual_commands_wording(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Round 2 finding 2 (the rename): the preflight must never call this
+        knob 'inert'. A channel with no auto_transcript still fails the
+        manual transcript/mindmap/process --channel commands (issue #127
+        resolves the same channel dict), so the log line must say so, and it
+        must be a WARNING (not an ERROR - a real scan is unaffected)."""
+        env = _ScanEnvironment()
+        env.wire(monkeypatch, dry_run=True)
+        config = env.config(tmp_path)
+        typo_ch = next(c for c in config["channels"] if c["name"] == "typo")
+        typo_ch.pop("auto_transcript", None)
+        # transcript_source stays "captions" (invalid) from env.config().
+
+        with caplog.at_level("WARNING"):
+            vi.cmd_scan(_scan_args(dry_run=True), config)
+
+        warning_records = [r for r in caplog.records if r.levelname == "WARNING" and "transcript_source" in r.message]
+        assert len(warning_records) == 1, f"expected one WARNING-level transcript_source line, got: {warning_records}"
+        assert "still fails the manual" in warning_records[0].message
+        assert "inert" not in warning_records[0].message
+
+        error_records = [r for r in caplog.records if r.levelname == "ERROR" and "transcript_source" in r.message]
+        assert error_records == [], f"a NOT_REACHED_BY_SCAN problem must log at WARNING, not ERROR: {error_records}"
 
 
 class TestScanNonDryRunRoutingUnchanged:
