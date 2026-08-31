@@ -303,10 +303,38 @@ class TestAggregatedWarningNamesChunkIndices:
             r.message for r in caplog.records if r.levelname == "WARNING" and "transcripts entr" in r.message
         ]
         assert len(transcript_warnings) == 1, "must be aggregated into exactly one warning, not one per chunk"
-        assert "chunk 3" in transcript_warnings[0]
-        assert "chunk 6" in transcript_warnings[0]
+        # Full deterministic message, not a substring check (issue #171 P3
+        # dual-review follow-up) - locks the count AND the caller prefix,
+        # not just the presence of a chunk number somewhere in the text.
+        assert transcript_warnings[0] == (
+            "merge_chunked_transcripts: skipped 2 malformed transcripts entries: "
+            "[chunk 3 entry 1] 'None', [chunk 6 entry 1] 'None'"
+        )
 
-    def test_whole_list_wrong_type_and_per_entry_skips_share_the_same_aggregated_warning(self, caplog):
+    def test_healthy_multi_chunk_run_logs_no_warnings(self, caplog):
+        chunk1 = _healthy_chunk([10, 20])
+        chunk2 = _healthy_chunk([3010, 3020])
+        with caplog.at_level(logging.WARNING, logger="video_intel"):
+            merge_chunked_transcripts([(0, chunk1), (3000, chunk2)], chunk_duration_seconds=3000)
+        assert caplog.records == []
+
+
+class TestWholeTaskListDropsGetTheirOwnWarning:
+    """Issue #171 P3, dual-review follow-up: a WHOLE task list being the
+    wrong type is a categorically bigger loss than a per-entry skip - if
+    `transcripts` comes back as a bare string, that chunk's entire dialogue
+    is gone, not "1 malformed entry." This must be its own warning, naming
+    the offending chunk(s), separate from `_log_skipped_entries`'s
+    per-entry aggregate (which, after this fix, counts ONLY genuine
+    per-entry skips).
+    """
+
+    def test_whole_list_drop_and_a_per_entry_skip_produce_two_separate_warnings(self, caplog):
+        # Chunk 1: the WHOLE transcripts value is wrong-typed (a bare
+        # string) - total content loss for that chunk. Chunk 2: transcripts
+        # is a genuine list with one bad ENTRY inside it - a much smaller,
+        # single-line loss. These must not be reported as the same kind of
+        # event.
         chunk1 = {"transcripts": "garbage", "screen_content": [], "speakers": []}
         chunk2 = {
             "transcripts": [{"start": "00:01", "voice": 1, "text": "ok"}, "bad"],
@@ -316,19 +344,56 @@ class TestAggregatedWarningNamesChunkIndices:
         with caplog.at_level(logging.WARNING, logger="video_intel"):
             merge_chunked_transcripts([(0, chunk1), (3000, chunk2)], chunk_duration_seconds=3000)
 
-        transcript_warnings = [
-            r.message for r in caplog.records if r.levelname == "WARNING" and "transcripts entr" in r.message
+        whole_list_warnings = [r.message for r in caplog.records if r.levelname == "WARNING" and "WHOLE" in r.message]
+        per_entry_warnings = [
+            r.message
+            for r in caplog.records
+            if r.levelname == "WARNING" and r.message.startswith("merge_chunked_transcripts: skipped")
         ]
-        assert len(transcript_warnings) == 1
-        assert "chunk 1" in transcript_warnings[0]
-        assert "chunk 2" in transcript_warnings[0]
 
-    def test_healthy_multi_chunk_run_logs_no_warnings(self, caplog):
+        assert len(whole_list_warnings) == 1, "the whole-list drop must get its own warning"
+        assert whole_list_warnings[0] == (
+            "merge_chunked_transcripts: WHOLE transcripts task value was unusable (not a "
+            "per-entry skip) in 1 chunk - that chunk's entire transcripts list is missing: "
+            "[chunk 1] 'transcripts' task value is str, not a list - the whole task is "
+            "unusable (not entry-by-entry malformed); ignoring it."
+        )
+
+        assert len(per_entry_warnings) == 1, "the per-entry skip must stay in its own separate aggregate"
+        assert per_entry_warnings[0] == (
+            "merge_chunked_transcripts: skipped 1 malformed transcripts entry: [chunk 2 entry 1] \"'bad'\""
+        )
+        # Chunk 1's whole-list loss must never be counted as "1 entry" in
+        # the per-entry aggregate - that is exactly the under-reporting
+        # this split exists to fix.
+        assert "chunk 1" not in per_entry_warnings[0]
+
+    def test_whole_list_drop_across_multiple_chunks_names_every_offending_chunk_in_one_warning(self, caplog):
+        chunks = [
+            (0, {"transcripts": "garbage-a", "screen_content": [], "speakers": []}),
+            (3000, _healthy_chunk([3001])),
+            (6000, {"transcripts": 42, "screen_content": [], "speakers": []}),
+        ]
+        with caplog.at_level(logging.WARNING, logger="video_intel"):
+            merge_chunked_transcripts(chunks, chunk_duration_seconds=3000)
+
+        whole_list_warnings = [r.message for r in caplog.records if r.levelname == "WARNING" and "WHOLE" in r.message]
+        assert len(whole_list_warnings) == 1
+        assert whole_list_warnings[0] == (
+            "merge_chunked_transcripts: WHOLE transcripts task value was unusable (not a "
+            "per-entry skip) in 2 chunks - that chunk's entire transcripts list is missing: "
+            "[chunk 1] 'transcripts' task value is str, not a list - the whole task is "
+            "unusable (not entry-by-entry malformed); ignoring it., [chunk 3] 'transcripts' "
+            "task value is int, not a list - the whole task is unusable (not entry-by-entry "
+            "malformed); ignoring it."
+        )
+
+    def test_healthy_multi_chunk_run_logs_no_whole_list_warning(self, caplog):
         chunk1 = _healthy_chunk([10, 20])
         chunk2 = _healthy_chunk([3010, 3020])
         with caplog.at_level(logging.WARNING, logger="video_intel"):
             merge_chunked_transcripts([(0, chunk1), (3000, chunk2)], chunk_duration_seconds=3000)
-        assert caplog.records == []
+        assert [r.message for r in caplog.records if "WHOLE" in r.message] == []
 
 
 # ---------------------------------------------------------------------------
@@ -421,4 +486,317 @@ class TestCallerLevelDoesNotCrashOnMalformedChunkEntry:
             r.message for r in caplog.records if r.levelname == "WARNING" and "transcripts entr" in r.message
         ]
         assert len(transcript_warnings) == 1
-        assert "chunk 1" in transcript_warnings[0]
+        # Full deterministic message (issue #171 P3 dual-review follow-up),
+        # not a "chunk 1 in message" substring check.
+        assert (
+            transcript_warnings[0]
+            == "merge_chunked_transcripts: skipped 1 malformed transcripts entry: [chunk 1 entry 1] 'None'"
+        )
+
+
+def _base_healthy_chunk_json(dialogue_text: str, speaker_name: str, start: str = "00:05") -> dict:
+    return {
+        "transcripts": [{"start": start, "voice": 1, "text": dialogue_text}],
+        "screen_content": [{"start": start, "end": start, "type": "slide", "description": f"{speaker_name} slide"}],
+        "speakers": [{"voice": 1, "name": speaker_name}],
+    }
+
+
+class TestCallerLevelCoverageTableSpeakerReadDoesNotCrash:
+    """Issue #171 P0 (dual-review follow-up): `_run_chunked_transcript_url`
+    builds its coverage-table `speaker_names` list INSIDE the per-chunk
+    loop, roughly 30 lines BEFORE it ever calls `merge_chunked_transcripts`
+    - a separate, earlier consumer of the exact same malformed shapes the
+    merge layer guards. This drives all SIX combinations (three task
+    lists x {whole-list wrong type, non-dict entry inside a real list})
+    through the REAL caller (only the Gemini call stubbed), because a
+    caller-level crash here means one paid chunk call is made, zero files
+    are written, and the exception propagates all the way out of
+    `cmd_transcript`'s `try`/`finally` with no captions failover - a
+    function-level-only test cannot see any of that (issue #161's review
+    made exactly this point).
+    """
+
+    @staticmethod
+    def _malformed_chunk1_json(task_key: str, mode: str) -> dict:
+        chunk = _base_healthy_chunk_json("chunk1 dialogue", "Chunk1 Speaker")
+        if mode == "whole_list":
+            chunk[task_key] = "garbage-not-a-list"
+        elif mode == "entry":
+            chunk[task_key] = [None]
+        else:  # pragma: no cover - guards the parametrize table itself
+            raise ValueError(f"unknown mode {mode!r}")
+        return chunk
+
+    @staticmethod
+    def _run_and_assert_survives(tmp_path, monkeypatch, task_key: str, mode: str, prefix: str):
+        chunk1_json = TestCallerLevelCoverageTableSpeakerReadDoesNotCrash._malformed_chunk1_json(task_key, mode)
+        chunk2_json = _base_healthy_chunk_json("healthy line two", "Chunk2 Speaker", start="50:10")
+        responses = [json.dumps(chunk1_json), json.dumps(chunk2_json)]
+        _stub_chunked_call_gemini(monkeypatch, responses)
+
+        channel_dir = tmp_path / "demo"
+        video = _video()
+
+        # The load-bearing assertion IS that this call does not raise -
+        # pytest fails the test loudly on an uncaught exception, which is
+        # exactly the P0 crash shape (AttributeError from `s.get("voice")`
+        # on a non-dict "entry" produced by iterating a bare string
+        # character by character, or on a genuine non-dict list entry).
+        status = vi._run_chunked_transcript_url(
+            client=MagicMock(),
+            types=MagicMock(),
+            video=video,
+            prompt_text="PROMPT",
+            model="stub-model",
+            channel_dir=channel_dir,
+            prefix=prefix,
+            chunks=[(0, 3000), (3000, 6000)],
+            duration_seconds=6000,
+            chunk_minutes=50,
+            force=False,
+        )
+
+        transcript_path = channel_dir / f"{prefix}.transcript.md"
+        assert transcript_path.exists(), "a real file must be written - a crash here writes nothing"
+        body = transcript_path.read_text(encoding="utf-8")
+        assert "healthy line two" in body, "the healthy sibling chunk's content must survive intact"
+        assert status in ("done", "partial")
+        return body
+
+    @pytest.mark.parametrize("task_key", ["speakers", "transcripts", "screen_content"])
+    def test_whole_list_wrong_type_in_chunk_1_does_not_crash_the_real_caller(self, tmp_path, monkeypatch, task_key):
+        self._run_and_assert_survives(tmp_path, monkeypatch, task_key, "whole_list", f"2026-08-31-p0-whole-{task_key}")
+
+    @pytest.mark.parametrize("task_key", ["speakers", "transcripts", "screen_content"])
+    def test_non_dict_entry_in_chunk_1_does_not_crash_the_real_caller(self, tmp_path, monkeypatch, task_key):
+        self._run_and_assert_survives(tmp_path, monkeypatch, task_key, "entry", f"2026-08-31-p0-entry-{task_key}")
+
+
+class TestAssessChunkCoverageNonIterableTranscriptsScalar:
+    """Issue #171 P0 follow-up, found while proving the coverage-table fix
+    at the real-caller level: `_assess_chunk_coverage` read `parsed.get(
+    "transcripts") or []`, which only substitutes `[]` for a FALSY value -
+    a truthy non-list SCALAR (int, float, `True`) sailed through and
+    crashed `for entry in transcripts` with `TypeError: <type> object is
+    not iterable` a few lines later, inside `assess_transcript_artifact`.
+    This is a DIFFERENT crash shape from the `speaker_names` P0 (that one
+    iterated a STRING character by character and crashed later on
+    `.get()`; a bare int/float/bool cannot even start iterating) on the
+    SAME real path, reached BEFORE `merge_chunked_transcripts` for every
+    chunk in `_run_chunked_transcript_url`.
+    """
+
+    @pytest.mark.parametrize("bad_value", [42, 3.14, True])
+    def test_assess_chunk_coverage_does_not_crash_on_a_non_iterable_transcripts_scalar(self, bad_value):
+        parsed = {"transcripts": bad_value, "screen_content": [], "speakers": []}
+        # Must not raise TypeError - the load-bearing assertion.
+        status, metrics = vi._assess_chunk_coverage(parsed, 0, 3000, 6000, 1)
+        assert status in ("ok", "thin")
+        assert isinstance(metrics, dict)
+
+    def test_real_caller_survives_an_int_transcripts_value_in_chunk_1(self, tmp_path, monkeypatch):
+        chunk1_json = {"transcripts": 42, "screen_content": [], "speakers": [{"voice": 1, "name": "Chunk1 Speaker"}]}
+        chunk2_json = _base_healthy_chunk_json("healthy line two", "Chunk2 Speaker", start="50:10")
+        responses = [json.dumps(chunk1_json), json.dumps(chunk2_json)]
+        _stub_chunked_call_gemini(monkeypatch, responses)
+
+        channel_dir = tmp_path / "demo"
+        video = _video()
+
+        status = vi._run_chunked_transcript_url(
+            client=MagicMock(),
+            types=MagicMock(),
+            video=video,
+            prompt_text="PROMPT",
+            model="stub-model",
+            channel_dir=channel_dir,
+            prefix="2026-08-31-p0-int-transcripts",
+            chunks=[(0, 3000), (3000, 6000)],
+            duration_seconds=6000,
+            chunk_minutes=50,
+            force=False,
+        )
+
+        transcript_path = channel_dir / "2026-08-31-p0-int-transcripts.transcript.md"
+        assert transcript_path.exists()
+        body = transcript_path.read_text(encoding="utf-8")
+        assert "healthy line two" in body
+        assert status in ("done", "partial")
+
+
+class TestDroppedMalformedEntriesShrinkTheSeverityDenominatorOnPurpose:
+    """Issue #171 P3, dual-review follow-up: dropping malformed entries
+    shrinks `classified_dialogue` (the issue #158 severity denominator),
+    so a chunk that lost most of its entries to malformed-entry skipping
+    can reach `chunk_window_mismatch_severe` on very few SURVIVING
+    stamps. This is judged CORRECT and INTENTIONAL, not a bug to guard
+    against: a chunk that lost 20 of 22 entries to malformation is
+    genuinely degraded, and the 2 real stamps that did survive are exactly
+    what the severity math is supposed to see - see the CLAUDE.md
+    guardrail entry for this file. This test locks the shape in as a
+    documented decision, not an emergent, unasserted side effect.
+    """
+
+    def test_two_surviving_out_of_window_stamps_among_twenty_dropped_entries_flags_severe(self):
+        # 20 malformed (non-dict) transcript entries, dropped before they
+        # are ever classified - per TestSkipsDoNotTouchWindowViolationCounters,
+        # none of them touch classified_dialogue/out_of_window/unparseable.
+        malformed_entries = [None] * 20
+        # 2 genuine entries whose classified timestamps land OUTSIDE this
+        # chunk's real [600, 1200] window (the same double-offset shape
+        # tests/test_chunk_window_mismatch.py uses) - both survivors are
+        # out of window, so the UNANIMOUS rule
+        # (CHUNK_WINDOW_MISMATCH_UNANIMOUS_MIN_ENTRIES = 2) fires SEVERE
+        # even though classified_dialogue (2) is below the majority rule's
+        # own 4-entry floor.
+        surviving_entries = [
+            {"start": "21:40", "voice": 1, "text": "survivor one"},
+            {"start": "22:30", "voice": 1, "text": "survivor two"},
+        ]
+        chunk2_json = {
+            "transcripts": malformed_entries + surviving_entries,
+            "screen_content": [],
+            "speakers": [{"voice": 1, "name": "Host"}],
+        }
+        chunk1_json = {
+            "transcripts": [{"start": "00:10", "voice": 1, "text": "healthy"}],
+            "screen_content": [],
+            "speakers": [{"voice": 1, "name": "Host"}],
+        }
+
+        merged = vi.merge_chunked_transcripts(
+            [(0, chunk1_json), (600, chunk2_json)],
+            chunk_duration_seconds=600,
+            chunk_bounds=[(0, 600), (600, 1200)],
+        )
+
+        chunk2_violations = merged["_chunk_window_violations"][1]
+        assert chunk2_violations["chunk_index"] == 2
+        # Exactly 2 of the 22 raw entries were ever classified - the 20
+        # malformed ones never reached the classifier at all.
+        assert chunk2_violations["classified_dialogue"] == 2
+        assert chunk2_violations["out_of_window"] == 2
+        assert chunk2_violations["unparseable"] == 0
+
+        result = vi._classify_chunk_window_violations(merged["_chunk_window_violations"])
+        assert vi.QUALITY_FLAG_CHUNK_WINDOW_MISMATCH_SEVERE in result["severe"]
+        assert vi.transcript_quality_flags_are_severe(result["severe"]) is True
+
+
+class TestUnhashableVoiceAndNameFieldsDoNotCrashTheChunkedMerger:
+    """Issue #171 P1, dual-review follow-up: `_is_unhashable_json_scalar`
+    guards every place `merge_chunked_transcripts` uses a raw JSON `voice`
+    or `name` value as a dict key or membership-test operand. JSON has
+    exactly two unhashable shapes - `dict` and `list` - and Gemini can, in
+    principle, emit either where an int/str/None was expected. Three
+    distinct call sites, all in this function:
+      1. `voice_remap[voice] = ...` - an unhashable `voice` on an
+         otherwise-usable speaker.
+      2. `name not in name_to_global` / `name_to_global[name] = ...` - an
+         unhashable `name`.
+      3. `t.get("voice") in voice_remap` - an unhashable `voice` on a
+         TRANSCRIPTS entry (never validated by `_usable_voice_id`, which
+         only ever runs on SPEAKERS entries).
+    """
+
+    def test_unhashable_voice_on_a_speaker_does_not_crash_and_keeps_the_speaker_by_name(self):
+        chunk = {
+            "transcripts": [{"start": "00:01", "voice": 1, "text": "hi"}],
+            "screen_content": [],
+            "speakers": [{"voice": {"nested": "shape"}, "name": "Weird Voice Host"}],
+        }
+        merged = vi.merge_chunked_transcripts([(0, chunk)], chunk_duration_seconds=3000)
+        # The speaker is kept under its (hashable) name - exactly like the
+        # pre-existing `voice is None` case already behaves - never
+        # dropped just because its voice id could not be used as a key.
+        assert len(merged["speakers"]) == 1
+        assert merged["speakers"][0]["name"] == "Weird Voice Host"
+
+    def test_unhashable_name_on_a_speaker_does_not_crash_and_is_skipped(self, caplog):
+        chunk = {
+            "transcripts": [{"start": "00:01", "voice": 1, "text": "hi"}],
+            "screen_content": [],
+            "speakers": [{"voice": 1, "name": ["a", "list", "name"]}],
+        }
+        with caplog.at_level(logging.WARNING, logger="video_intel"):
+            merged = vi.merge_chunked_transcripts([(0, chunk)], chunk_duration_seconds=3000)
+        # No usable key to store this speaker under at all - skipped, not
+        # crashed on, and reported through the same aggregate as any other
+        # unusable speaker entry.
+        assert merged["speakers"] == []
+        speaker_warnings = [
+            r.message for r in caplog.records if r.levelname == "WARNING" and "speakers entr" in r.message
+        ]
+        assert len(speaker_warnings) == 1
+        # Expected snippet computed independently (repr()[:40], mirroring
+        # `_entry_snippet`'s own truncation rule) rather than hand-typed,
+        # since the raw text mixes single and double quotes in a way that
+        # is error-prone to escape by hand - the point of this assertion
+        # is locking count + chunk/entry label + caller prefix, which a
+        # hand-typo in the snippet body would not actually test.
+        malformed_speaker = {"voice": 1, "name": ["a", "list", "name"]}
+        expected_snippet = repr(malformed_speaker)[:40]
+        assert speaker_warnings[0] == (
+            f"merge_chunked_transcripts: skipped 1 malformed speakers entry: [chunk 1 entry 0] {expected_snippet!r}"
+        )
+
+    def test_unhashable_voice_on_a_transcripts_entry_does_not_crash(self):
+        chunk = {
+            "transcripts": [
+                {"start": "00:01", "voice": {"nested": "shape"}, "text": "weird voice line"},
+                {"start": "00:02", "voice": 1, "text": "normal line"},
+            ],
+            "screen_content": [],
+            "speakers": [{"voice": 1, "name": "Host"}],
+        }
+        # Must not raise TypeError: unhashable type at `t.get("voice") in voice_remap`.
+        merged = vi.merge_chunked_transcripts([(0, chunk)], chunk_duration_seconds=3000)
+        assert len(merged["transcripts"]) == 2
+        texts = [t["text"] for t in merged["transcripts"]]
+        assert "weird voice line" in texts
+        assert "normal line" in texts
+        # The entry with the unhashable voice keeps its raw (unremapped)
+        # voice value - it simply never matched any (necessarily hashable)
+        # voice_remap key.
+        weird_entry = next(t for t in merged["transcripts"] if t["text"] == "weird voice line")
+        assert weird_entry["voice"] == {"nested": "shape"}
+
+    def test_real_caller_survives_an_unhashable_voice_on_a_transcripts_entry(self, tmp_path, monkeypatch):
+        chunk1_json = {
+            "transcripts": [
+                {"start": "00:10", "voice": ["a", "list"], "text": "chunk1 weird voice line"},
+            ],
+            "screen_content": [],
+            "speakers": [{"voice": 1, "name": "Chunk1 Speaker"}],
+        }
+        chunk2_json = _base_healthy_chunk_json("healthy line two", "Chunk2 Speaker", start="50:10")
+        responses = [json.dumps(chunk1_json), json.dumps(chunk2_json)]
+        _stub_chunked_call_gemini(monkeypatch, responses)
+
+        channel_dir = tmp_path / "demo"
+        video = _video()
+
+        status = vi._run_chunked_transcript_url(
+            client=MagicMock(),
+            types=MagicMock(),
+            video=video,
+            prompt_text="PROMPT",
+            model="stub-model",
+            channel_dir=channel_dir,
+            prefix="2026-08-31-p1-unhashable-voice",
+            chunks=[(0, 3000), (3000, 6000)],
+            duration_seconds=6000,
+            chunk_minutes=50,
+            force=False,
+        )
+
+        transcript_path = channel_dir / "2026-08-31-p1-unhashable-voice.transcript.md"
+        assert transcript_path.exists()
+        body = transcript_path.read_text(encoding="utf-8")
+        assert "healthy line two" in body
+        # The unhashable-voice entry survives too, just unrendered by name
+        # - falls back to the "Speaker None" default (issue #171 P1
+        # normalization in merge_transcript_json).
+        assert "chunk1 weird voice line" in body
+        assert status in ("done", "partial")

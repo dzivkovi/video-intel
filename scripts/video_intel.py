@@ -2241,16 +2241,28 @@ def merge_chunked_transcripts(
     chunk_window_violations: list[dict] = []
 
     # Issue #171: aggregated across the WHOLE call (every chunk), not reset
-    # per chunk - _log_skipped_entries is called once per task list AFTER
-    # the loop below, so a systematically malformed multi-chunk run emits
-    # exactly 3 warnings (one per task list) instead of up to 3-per-chunk.
-    # Each label embeds its 1-based chunk index (matching the existing
-    # chunk_window_violations["chunk_index"] convention) because a bare
-    # list index is meaningless once entries from different chunks are
-    # aggregated together.
+    # per chunk - the warning helpers below are called once per task list
+    # AFTER the loop, so a systematically malformed multi-chunk run emits
+    # a small, fixed number of warnings rather than one (or more) per
+    # chunk. Each label embeds its 1-based chunk index (matching the
+    # existing chunk_window_violations["chunk_index"] convention) because a
+    # bare list index is meaningless once entries from different chunks
+    # are aggregated together.
+    #
+    # Dual-review follow-up (P3): a WHOLE task list being the wrong type
+    # (e.g. `"transcripts": "garbage"`) is kept in ITS OWN dict
+    # (`whole_list_drops`), separate from `skipped_*` (genuine per-entry
+    # skips only) - see `_log_whole_task_list_drops` below for why folding
+    # the two together under-reports a whole-chunk content loss as "1
+    # malformed entry".
     skipped_speakers: list[tuple[str, str]] = []
     skipped_transcripts: list[tuple[str, str]] = []
     skipped_screen_content: list[tuple[str, str]] = []
+    whole_list_drops: dict[str, list[tuple[int, str]]] = {
+        "speakers": [],
+        "transcripts": [],
+        "screen_content": [],
+    }
 
     # Dual-review addendum (adversarial P3, issue #158): a chunk_bounds list
     # that does not match chunks positionally would silently check each
@@ -2294,7 +2306,7 @@ def merge_chunked_transcripts(
         speakers_notes: list[str] = []
         chunk_speakers = _usable_task_list(chunk_json, "speakers", note_sink=speakers_notes)
         for note in speakers_notes:
-            skipped_speakers.append((f"chunk {chunk_num}", note))
+            whole_list_drops["speakers"].append((chunk_num, note))
         voice_remap: dict[int, int] = {}
         for entry_idx, s in enumerate(chunk_speakers):
             if not isinstance(s, dict):
@@ -2302,11 +2314,30 @@ def merge_chunked_transcripts(
                 continue
             voice = s.get("voice")
             name = s.get("name") or f"Speaker {voice}"
+            # Dual-review follow-up (P1): `name` and `voice` are both used
+            # as dict keys/membership operands below, and both are
+            # unconstrained JSON values - a dict or list for either raises
+            # `TypeError: unhashable type` at the point of use, not at the
+            # point the malformed value was read. `_is_unhashable_json_scalar`
+            # is the shared, narrower-than-`_usable_voice_id` check for
+            # exactly this (see its docstring for why the two must stay
+            # separate). An unhashable `name` has no usable key to store
+            # this speaker under at all - skip the whole entry, same
+            # bucket as a non-dict entry. An unhashable `voice` on an
+            # otherwise-usable speaker keeps the speaker (under its name,
+            # exactly like the existing `voice is None` case already
+            # does) and only skips the remap step - a transcript entry
+            # referencing it falls back to the existing
+            # `voice_names.get(...)` default, the same consequence #161
+            # already accepts for a missing voice id.
+            if _is_unhashable_json_scalar(name):
+                skipped_speakers.append((f"chunk {chunk_num} entry {entry_idx}", _entry_snippet(s)))
+                continue
             if name not in name_to_global:
                 name_to_global[name] = next_global
                 next_global += 1
                 merged["speakers"].append({**s, "voice": name_to_global[name]})
-            if voice is not None:
+            if voice is not None and not _is_unhashable_json_scalar(voice):
                 voice_remap[voice] = name_to_global[name]
 
         # Per-timestamp absolute-vs-relative classification. Issue #171:
@@ -2317,7 +2348,7 @@ def merge_chunked_transcripts(
         transcripts_notes: list[str] = []
         chunk_transcripts = _usable_task_list(chunk_json, "transcripts", note_sink=transcripts_notes)
         for note in transcripts_notes:
-            skipped_transcripts.append((f"chunk {chunk_num}", note))
+            whole_list_drops["transcripts"].append((chunk_num, note))
         for entry_idx, t in enumerate(chunk_transcripts):
             if not isinstance(t, dict):
                 skipped_transcripts.append((f"chunk {chunk_num} entry {entry_idx}", _entry_snippet(t)))
@@ -2343,6 +2374,11 @@ def merge_chunked_transcripts(
                 # Issue #171: a SKIPPED entry (above) never reaches this
                 # block at all, so it cannot inflate classified_dialogue,
                 # out_of_window, or unparseable - it was never classified.
+                #
+                # Issue #171 P1 note: this classification/severity math is
+                # driven entirely by `new_t["start"]`, never by `voice` -
+                # an unhashable `t["voice"]` (guarded just below) has no
+                # effect on classified_dialogue/out_of_window/unparseable.
                 if bounds is not None and new_t["start"]:
                     classified_secs = _safe_timestamp_to_seconds(str(new_t["start"]))
                     if classified_secs is None:
@@ -2351,8 +2387,19 @@ def merge_chunked_transcripts(
                         classified_dialogue += 1
                         if classified_secs < window_lo or classified_secs > window_hi:
                             out_of_window += 1
-            if t.get("voice") in voice_remap:
-                new_t["voice"] = voice_remap[t["voice"]]
+            # Dual-review follow-up (P1): `t.get("voice")` is a raw,
+            # unvalidated JSON value from a TRANSCRIPTS entry (unlike a
+            # SPEAKERS entry's voice, this one is never checked by
+            # `_usable_voice_id`) - a dict or list there used to raise
+            # `TypeError: unhashable type` at the `in voice_remap`
+            # membership test. `_is_unhashable_json_scalar` guards it the
+            # same way as the speakers loop above; an unhashable voice
+            # here simply never matches any (necessarily hashable) key in
+            # voice_remap, so new_t["voice"] is left as whatever raw value
+            # Gemini sent - unrendered by name, but never crashing.
+            t_voice = t.get("voice")
+            if not _is_unhashable_json_scalar(t_voice) and t_voice in voice_remap:
+                new_t["voice"] = voice_remap[t_voice]
             merged["transcripts"].append(new_t)
 
         # Issue #171: same treatment as transcripts above - non-list value
@@ -2360,7 +2407,7 @@ def merge_chunked_transcripts(
         screen_notes: list[str] = []
         chunk_screen_content = _usable_task_list(chunk_json, "screen_content", note_sink=screen_notes)
         for note in screen_notes:
-            skipped_screen_content.append((f"chunk {chunk_num}", note))
+            whole_list_drops["screen_content"].append((chunk_num, note))
         for entry_idx, sc in enumerate(chunk_screen_content):
             if not isinstance(sc, dict):
                 skipped_screen_content.append((f"chunk {chunk_num} entry {entry_idx}", _entry_snippet(sc)))
@@ -2382,9 +2429,18 @@ def merge_chunked_transcripts(
                 }
             )
 
-    # Issue #171: one aggregated warning per task list for the WHOLE call,
-    # after every chunk has been processed - see the comment where the
-    # three skipped_* lists are initialized above.
+    # Issue #171: whole-task-list drops get their OWN warning per task
+    # list, distinct from (and reported before) the per-entry aggregate -
+    # see `_log_whole_task_list_drops`'s docstring for why the two must
+    # not be folded together.
+    _log_whole_task_list_drops("speakers", whole_list_drops["speakers"])
+    _log_whole_task_list_drops("transcripts", whole_list_drops["transcripts"])
+    _log_whole_task_list_drops("screen_content", whole_list_drops["screen_content"])
+
+    # One aggregated warning per task list for the WHOLE call, after every
+    # chunk has been processed - counts ONLY genuine per-entry skips now
+    # (a non-dict item inside an otherwise-real list), never a whole-list
+    # type failure (that is `_log_whole_task_list_drops`'s job, above).
     _log_skipped_entries("speakers", skipped_speakers, caller="merge_chunked_transcripts")
     _log_skipped_entries("transcripts", skipped_transcripts, caller="merge_chunked_transcripts")
     _log_skipped_entries("screen_content", skipped_screen_content, caller="merge_chunked_transcripts")
@@ -2644,7 +2700,25 @@ def _run_chunked_transcript_url(
 
         chunk_results.append((start_secs, parsed))
         chunk_bounds_used.append((start_secs, end_secs or duration_seconds))
-        speaker_names = [s.get("name", f"Speaker {s.get('voice')}") for s in parsed.get("speakers", [])]
+        # Issue #171 P0: this coverage-table speaker read runs BEFORE
+        # merge_chunked_transcripts (below) ever sees `parsed` - it is a
+        # separate, earlier consumer of the exact same malformed shapes
+        # (a non-list "speakers" value used to iterate character by
+        # character and crash on `s.get("voice")`; a non-dict entry inside
+        # a real list crashed the same way), so it needs its own guard,
+        # not a guard only in the merge layer. Reuses the same
+        # `_usable_task_list` + `isinstance(s, dict)` convention. A
+        # throwaway `note_sink=[]` suppresses this call's own warning:
+        # `merge_chunked_transcripts` processes this SAME `parsed` dict a
+        # few lines below via `chunk_results` and is the one authoritative
+        # place that logs the aggregated warning - logging here too would
+        # double-report, and under the wrong caller name besides
+        # (`_usable_task_list`'s no-note_sink branch hardcodes
+        # "merge_transcript_json:").
+        chunk_speakers_for_display = _usable_task_list(parsed, "speakers", note_sink=[])
+        speaker_names = [
+            s.get("name", f"Speaker {s.get('voice')}") for s in chunk_speakers_for_display if isinstance(s, dict)
+        ]
         segment_rows.append({"range": chunk_label, "status": chunk_status, "speakers": speaker_names})
 
     if not chunk_results:
@@ -3618,7 +3692,27 @@ def _assess_chunk_coverage(
     but the check makes any future stochastic dropout loud rather than
     silently shipping a mostly-empty transcript with status=ok.
     """
-    transcripts = parsed.get("transcripts") or []
+    # Issue #171 P0 follow-up (dual-review, found while proving the
+    # coverage-table speaker-read fix at the real-caller level): the old
+    # `parsed.get("transcripts") or []` pattern lets a truthy NON-list
+    # scalar (an int, a float, or a bare `True`) through unguarded - `or`
+    # only substitutes `[]` for a FALSY value (None, 0, "", False), not for
+    # a wrong TYPE. `for entry in transcripts` a few lines below (inside
+    # `assess_transcript_artifact`) then raises `TypeError: <type> object
+    # is not iterable` for exactly those three JSON scalar shapes - a
+    # DIFFERENT crash from the P0 `speaker_names` one (that one iterated a
+    # STRING character by character and crashed later on `.get()`; this
+    # one cannot even start iterating an int/float/bool). This function
+    # runs for EVERY chunk that reaches this point in `_run_chunked_
+    # transcript_url`, strictly before `merge_chunked_transcripts` -
+    # exactly the same "separate, earlier consumer of the same malformed
+    # shape" structure as the P0 fix. `_usable_task_list` is reused with a
+    # throwaway `note_sink=[]` for the same reason as that fix: every
+    # chunk that reaches here is unconditionally appended to
+    # `chunk_results` right after, so `merge_chunked_transcripts` is the
+    # one authoritative place that logs the warning for this exact value -
+    # this call must stay silent to avoid double-reporting.
+    transcripts = _usable_task_list(parsed, "transcripts", note_sink=[])
     # Backward-jump evidence must come from RAW, pre-classification emission
     # order (issue #157 design decision). A duration=None/window=None probe
     # skips gap/density/monolithic entirely (span is unknowable) and reports
@@ -4104,6 +4198,33 @@ def _usable_voice_id(speaker: Any) -> bool:
     return isinstance(value, (int, float, str)) and value != ""
 
 
+def _is_unhashable_json_scalar(value: Any) -> bool:
+    """True when ``value`` is a JSON-decoded ``dict`` or ``list`` - the ONLY
+    two JSON shapes that are not hashable (``str``/``int``/``float``/
+    ``bool``/``None`` all are, including as dict keys).
+
+    Issue #171 P1 (dual-review follow-up): `_usable_voice_id` already
+    rejects an unhashable `voice` field on a SPEAKERS entry, but that
+    predicate never runs on a `voice` field read off a TRANSCRIPTS entry
+    (those are gated by `_usable_timestamp`, which only looks at `start`),
+    nor on a speaker's `name` field, nor inside the chunked merger's own
+    `name_to_global`/`voice_remap` dicts - four separate call sites use a
+    raw JSON `voice` or `name` value as a dict key or membership-test
+    operand, and every one of them raises `TypeError: unhashable type`
+    when Gemini emits a dict or list there instead. This is a narrower,
+    more general check than `_usable_voice_id` on purpose: `_usable_voice_id`
+    also requires non-blank int/float/str (a stricter "is this a usable
+    id" contract for one specific field on one specific dict shape);
+    `_is_unhashable_json_scalar` answers only "would using this value as a
+    dict key raise," which is what every one of those four sites actually
+    needs, and it must accept a bare `None` (hashable, and the existing
+    "no voice id" sentinel every one of those sites already relies on) as
+    perfectly fine - do not fold this into `_usable_voice_id` or narrow its
+    allowed types to match it.
+    """
+    return isinstance(value, (dict, list))
+
+
 def _entry_snippet(entry: Any, max_len: int = 40) -> str:
     """Best-effort ~40-char snippet of a skipped entry, for the WARNING.
 
@@ -4124,6 +4245,45 @@ def _entry_snippet(entry: Any, max_len: int = 40) -> str:
             snippet = text.strip()
             return snippet[:max_len] + ("..." if len(snippet) > max_len else "")
     return repr(entry)[:max_len]
+
+
+def _log_whole_task_list_drops(list_name: str, drops: list[tuple[int, str]]) -> None:
+    """One WARNING per task list naming every chunk whose WHOLE
+    ``list_name`` task value was the wrong type (issue #171 P3,
+    dual-review follow-up).
+
+    A whole-list drop is a categorically bigger loss than a per-entry
+    skip: if a chunk's `transcripts` value comes back as a bare string,
+    that chunk's ENTIRE dialogue is gone, not "1 malformed entry."
+    Folding this into `_log_skipped_entries`'s per-entry aggregate used to
+    under-report it as "skipped 1 malformed transcripts entry" - which
+    reads, to an operator grepping logs during a bulk remediation sweep
+    (issue #172), as one bad line item, not "this chunk transcribed
+    nothing." This warning is deliberately SEPARATE: after this change
+    `_log_skipped_entries` counts ONLY genuine per-entry skips (a
+    non-dict item inside an otherwise-real list).
+
+    `drops` is a list of `(chunk_number, detail)` pairs in encounter
+    order, one per chunk where the value was rejected by
+    `_usable_task_list`'s `note_sink` path; `detail` is that helper's own
+    "task value is X, not a list" message, so the type is named alongside
+    the chunk number. Unlike `_log_skipped_entries`, every chunk is shown
+    (never truncated to 5 + "+more") - a whole-list drop is bounded by
+    the chunk count, not by potentially hundreds of entries.
+    """
+    if not drops:
+        return
+    plural = "s" if len(drops) != 1 else ""
+    shown = ", ".join(f"[chunk {chunk_num}] {detail}" for chunk_num, detail in drops)
+    log.warning(
+        "merge_chunked_transcripts: WHOLE %s task value was unusable (not a per-entry "
+        "skip) in %d chunk%s - that chunk's entire %s list is missing: %s",
+        list_name,
+        len(drops),
+        plural,
+        list_name,
+        shown,
+    )
 
 
 def _log_skipped_entries(list_name: str, skipped: list[tuple[Any, str]], caller: str = "merge_transcript_json") -> None:
@@ -4253,12 +4413,27 @@ def merge_transcript_json(raw_json, speakers_map):
         if not _usable_timestamp(t, "start"):
             skipped_transcripts.append((idx, _entry_snippet(t)))
             continue
+        # Issue #171 P1 (dual-review follow-up): a TRANSCRIPTS entry's
+        # `voice` is never checked by `_usable_voice_id` (that predicate
+        # only runs on SPEAKERS entries) - it sails through this loop
+        # unvalidated and used to crash the RENDER loop below at
+        # `voice_names.get(entry["voice"], ...)` when Gemini emitted a
+        # dict or list there (`TypeError: unhashable type`). Normalize it
+        # to None HERE, at copy time, rather than guarding the render
+        # loop's `.get()` call directly: None is already this file's
+        # existing "no voice id" sentinel (see `_usable_voice_id`'s own
+        # `voice is None` handling elsewhere), so an unhashable voice
+        # renders through the pre-existing `f"Speaker {entry['voice']}"`
+        # -> "Speaker None" default with no new branch at render time, and
+        # `voice_names` (keyed only by hashable ids from `_usable_voice_id`)
+        # is never even consulted with an unhashable key.
+        raw_voice = t.get("voice")
         entries.append(
             {
                 "type": "speech",
                 "start": t["start"],
                 "sort_key": timestamp_to_seconds(t["start"]),
-                "voice": t.get("voice"),
+                "voice": None if _is_unhashable_json_scalar(raw_voice) else raw_voice,
                 "text": t.get("text", ""),
             }
         )

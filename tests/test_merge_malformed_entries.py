@@ -330,6 +330,59 @@ class TestUnhashableVoiceIsGuarded:
         assert "Alice" not in result
 
 
+class TestUnhashableVoiceOnATranscriptsEntryIsGuarded:
+    """Issue #171 P1, dual-review follow-up: `TestUnhashableVoiceIsGuarded`
+    above only covers an unhashable `voice` on a SPEAKERS entry (guarded
+    by `_usable_voice_id`, issue #161). A TRANSCRIPTS entry's `voice` is
+    never validated by that predicate at all - it is gated only by
+    `_usable_timestamp` (which looks at `start`, not `voice`) - so it sailed
+    straight through into the render loop's `voice_names.get(entry["voice"],
+    ...)` and raised `TypeError: unhashable type` there, one merge layer
+    away from `TestUnhashableVoiceIsGuarded`'s coverage. This is the P1
+    site the dual-review flagged as making the #161 "one malformed entry
+    cannot crash a paid call" claim false at BOTH merge layers, not just
+    the chunked one.
+    """
+
+    def test_dict_voice_on_a_transcripts_entry_renders_as_speaker_none_no_crash(self):
+        payload = {
+            "transcripts": [{"start": "00:01", "voice": {"nested": "shape"}, "text": "weird voice line"}],
+            "screen_content": [],
+            "speakers": [{"voice": 1, "name": "Host"}],
+        }
+        # Must not raise TypeError: unhashable type.
+        result = merge_transcript_json(payload, {})
+        assert "weird voice line" in result
+        # Normalized to the pre-existing "no voice id" sentinel (None) at
+        # copy time, so it renders through the existing default - no new
+        # branch, no dropped entry.
+        assert "Speaker None" in result
+
+    def test_list_voice_on_a_transcripts_entry_renders_as_speaker_none_no_crash(self):
+        payload = {
+            "transcripts": [{"start": "00:01", "voice": ["a", "list"], "text": "another weird voice line"}],
+            "screen_content": [],
+            "speakers": [],
+        }
+        result = merge_transcript_json(payload, {})
+        assert "another weird voice line" in result
+        assert "Speaker None" in result
+
+    def test_healthy_sibling_entry_with_a_normal_voice_is_unaffected(self):
+        payload = {
+            "transcripts": [
+                {"start": "00:01", "voice": {"nested": "shape"}, "text": "weird voice line"},
+                {"start": "00:02", "voice": 1, "text": "normal line"},
+            ],
+            "screen_content": [],
+            "speakers": [{"voice": 1, "name": "Host"}],
+        }
+        result = merge_transcript_json(payload, {})
+        assert "Host:" in result
+        assert '"normal line"' in result
+        assert "Speaker None" in result
+
+
 class TestNonDictListItemIsGuarded:
     """Issue #161 review, P1: a non-dict item inside any task list
     (e.g. `transcripts: [null, "foo"]`) used to raise AttributeError inside
