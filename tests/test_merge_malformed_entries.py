@@ -50,6 +50,24 @@ must-fix items - see the debrief for the full pass-by-pass breakdown):
     TestChunkedPathDoesNotCrashOnNonStringStart.
   - P3: a whitespace-only `start` ("   ") used to pass a bare `!= ""` check
     and still sort to the top - now rejected via `.strip()`.
+
+Third commit (adversarial re-verify PASSED all four second-commit items;
+three small follow-ups before merge):
+  - The load-bearing one: `_usable_voice_id` excluding `float` was a
+    REGRESSION the second commit would have shipped knowingly - a float
+    voice (hash(1.0) == hash(1)) worked before this whole fix landed. See
+    TestFloatVoiceIdKeepsItsName.
+  - A non-list task VALUE (e.g. `{"transcripts": "00:01 hello"}`) used to
+    be walked character-by-character by `enumerate()`, producing a
+    correct-but-misleading WARNING ("skipped 11 malformed entries: [0]
+    '0', ..."). `_usable_task_list` now rejects the wrong-typed value
+    itself with one clear line naming the real problem. See
+    TestNonListTaskValueGuarded.
+  - `_usable_timestamp`'s docstring is corrected: it checks SHAPE only and
+    never parses timestamp content - a non-blank-but-unparseable string
+    like "N/A" is deliberately admitted (both the writer and the assessor
+    already agree on it, so it can no longer cause their divergence). See
+    TestUnparseableButNonBlankStartIsAdmitted.
 """
 
 from __future__ import annotations
@@ -364,6 +382,146 @@ class TestNonDictRawJsonRoot:
 
     def test_bare_int_root_returns_empty_string_no_crash(self):
         assert merge_transcript_json(5, {}) == ""
+
+
+class TestFloatVoiceIdKeepsItsName:
+    """Issue #161 second review round (P1, load-bearing): a float voice
+    (e.g. 1.0) is a perfectly good, hashable dict key - hash(1.0) ==
+    hash(1) - and worked before this whole fix landed. An earlier revision
+    of _usable_voice_id excluded float from the accepted types, which would
+    have shipped a REGRESSION: the speaker's NAME silently vanished (the
+    transcript line still rendered via the Speaker <id> fallback, so this
+    was not a crash - just a quieter, still-real loss of identity)."""
+
+    def test_float_voice_keeps_its_mapped_name(self):
+        payload = {
+            "transcripts": [{"start": "00:01", "voice": 1.0, "text": "hi"}],
+            "screen_content": [],
+            "speakers": [{"voice": 1.0, "name": "Alice"}],
+        }
+
+        result = merge_transcript_json(payload, {})
+
+        assert 'Alice: "hi"' in result
+        assert "Speaker 1.0" not in result
+        assert "Speaker" not in result  # never falls back to the default
+
+    def test_float_voice_speaker_not_logged_as_skipped(self, caplog):
+        payload = {
+            "transcripts": [{"start": "00:01", "voice": 1.0, "text": "hi"}],
+            "screen_content": [],
+            "speakers": [{"voice": 1.0, "name": "Alice"}],
+        }
+
+        with caplog.at_level(logging.WARNING):
+            merge_transcript_json(payload, {})
+
+        assert not caplog.records
+
+
+class TestNonListTaskValueGuarded:
+    """Issue #161 second review round (P1): a task VALUE that is itself the
+    wrong type (most concretely a string) is still iterable, so enumerate()
+    used to walk it character by character. The OUTCOME was already right
+    (nothing merges, no crash) but the diagnosis was actively misleading -
+    an operator would see "skipped 11 malformed transcripts entries: [0]
+    '0', [1] '0', [2] ':', ..." with no way to tell the real problem is the
+    whole task's TYPE, not eleven malformed entries. One clear line naming
+    the actual problem replaces that noise."""
+
+    def test_string_transcripts_value_produces_one_clear_warning_not_per_character_noise(self, caplog):
+        payload = {"transcripts": "00:01 hello", "screen_content": [], "speakers": []}
+
+        with caplog.at_level(logging.WARNING):
+            result = merge_transcript_json(payload, {})
+
+        assert result == ""
+        messages = [r.message for r in caplog.records]
+        assert len(messages) == 1
+        assert messages[0] == (
+            "merge_transcript_json: 'transcripts' task value is str, not a list - the whole "
+            "task is unusable (not entry-by-entry malformed); ignoring it."
+        )
+        # None of the per-character noise from the old behavior.
+        assert not any("entries:" in m for m in messages)
+
+    def test_dict_screen_content_value_produces_one_clear_warning(self, caplog):
+        payload = {"transcripts": [], "screen_content": {"start": "00:05"}, "speakers": []}
+
+        with caplog.at_level(logging.WARNING):
+            result = merge_transcript_json(payload, {})
+
+        assert result == ""
+        messages = [r.message for r in caplog.records]
+        assert len(messages) == 1
+        assert "'screen_content' task value is dict, not a list" in messages[0]
+
+    def test_int_speakers_value_produces_one_clear_warning(self, caplog):
+        payload = {"transcripts": [], "screen_content": [], "speakers": 5}
+
+        with caplog.at_level(logging.WARNING):
+            result = merge_transcript_json(payload, {})
+
+        assert result == ""
+        messages = [r.message for r in caplog.records]
+        assert len(messages) == 1
+        assert "'speakers' task value is int, not a list" in messages[0]
+
+    def test_non_list_task_value_does_not_suppress_other_healthy_lists(self):
+        payload = {
+            "transcripts": "garbage",
+            "screen_content": [{"start": "00:20", "type": "slide", "description": "fine"}],
+            "speakers": [],
+        }
+
+        result = merge_transcript_json(payload, {})
+
+        assert "fine" in result
+
+    def test_missing_task_key_still_defaults_to_empty_no_warning(self, caplog):
+        """A key that is simply ABSENT (the normal shape when a task
+        legitimately has nothing to report) must not be confused with a
+        present-but-wrong-type value."""
+        payload = {"transcripts": [{"start": "00:01", "voice": 1, "text": "hi"}]}
+
+        with caplog.at_level(logging.WARNING):
+            result = merge_transcript_json(payload, {})
+
+        assert "hi" in result
+        assert not [r for r in caplog.records if "not a list" in r.message]
+
+
+class TestUnparseableButNonBlankStartIsAdmitted:
+    """Issue #161 second review round (P3, docstring correction): locks the
+    documented, deliberate behavior that _usable_timestamp checks SHAPE
+    only, never parses timestamp content. A non-blank string that is not a
+    real timestamp ("N/A") is admitted and rendered - it sorts wherever
+    timestamp_to_seconds's own fallback-to-0 places it, which both the
+    writer and the assessor already agree on, so it can no longer cause the
+    writer/assessor divergence this predicate exists to prevent. This is
+    NOT something to "fix" - see the docstring."""
+
+    def test_non_timestamp_but_non_blank_string_is_admitted_and_rendered(self):
+        payload = {
+            "transcripts": [{"start": "N/A", "voice": 1, "text": "garbled stamp"}],
+            "screen_content": [],
+            "speakers": [{"voice": 1, "name": "Host"}],
+        }
+
+        result = merge_transcript_json(payload, {})
+
+        assert "garbled stamp" in result
+        assert "[N/A]" in result
+
+    def test_writer_and_assessor_still_agree_on_the_admitted_na_entry(self):
+        transcripts = [{"start": "N/A", "voice": 1, "text": "garbled stamp"}]
+        payload = {"transcripts": transcripts, "screen_content": [], "speakers": []}
+
+        rendered = merge_transcript_json(payload, {})
+        assert "garbled stamp" in rendered
+
+        metrics = vi.assess_transcript_artifact(transcripts, duration_seconds=None, window=None)
+        assert metrics["dialogue_entries"] == 1
 
 
 class TestAllEntriesMalformed:

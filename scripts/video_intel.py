@@ -3968,11 +3968,21 @@ def _dialogue_entries_from_raw_json(raw_json) -> list[dict]:
 def _usable_timestamp(entry: Any, key: str) -> bool:
     """True when ``entry`` is a dict and ``entry[key]`` is a non-blank string.
 
-    Issue #161: a real gemini-3.7-flash response has been observed to omit a
-    `start` key entirely. Gemini's malformed shapes for a field like this
-    can also arrive as None, an empty string, whitespace-only, a dict, a
-    list, or a bare number instead of a timestamp string like "12:34" -
-    none of those are usable as a sortable/renderable timestamp. A
+    SHAPE only - this does NOT parse or validate timestamp content (issue
+    #161 second review round: an earlier version of this docstring implied
+    unparseable values were rejected; they are not). A non-blank string
+    that is not a real timestamp (e.g. "N/A") passes this check and IS
+    admitted - deliberately: both consumers (the writer's sort key and the
+    assessor's dialogue count) already agree on that value via the shared
+    `timestamp_to_seconds` fallback-to-0, so it can no longer cause the
+    writer/assessor divergence this predicate exists to prevent. Do not
+    "fix" this function to reject unparseable strings - that is a
+    different, more invasive change (what counts as parseable? a locale
+    variant?) that is out of scope here.
+
+    What this DOES reject: a value that cannot even be treated as a string
+    at all - None, an empty string, whitespace-only, a dict, a list, or a
+    bare number instead of a timestamp-shaped string like "12:34". A
     whitespace-only value ("   ") would otherwise pass a bare `!= ""` check
     and still sort to the top of the transcript - exactly the corruption
     this guard exists to prevent - so blankness is checked via `.strip()`,
@@ -4011,14 +4021,23 @@ def _usable_voice_id(speaker: Any) -> bool:
     HASHABLE: a dict or list `voice` would otherwise pass a bare
     `is not None` check and then raise `TypeError: unhashable type` at
     `voice_names[s["voice"]]` on the very next line (issue #161 review) -
-    so this requires an int or str scalar explicitly. `speaker` itself may
-    not be a dict (a malformed task list item) - guarded here so the caller
-    can skip on a single check.
+    so this requires an int, float, or str scalar explicitly. `speaker`
+    itself may not be a dict (a malformed task list item) - guarded here so
+    the caller can skip on a single check.
+
+    Issue #161 second review round: `float` MUST stay in this tuple. A
+    float voice (e.g. `1.0`) is a perfectly good, hashable dict key -
+    `hash(1.0) == hash(1)` - and was accepted before this whole fix landed.
+    An earlier revision of this predicate excluded it, which was a
+    regression this fix would have shipped knowingly: a float-voice
+    speaker's NAME silently vanished (the transcript line still rendered,
+    falling back to `Speaker <id>`, so it was not a crash - just a quieter,
+    still-real loss of the speaker's identity).
     """
     if not isinstance(speaker, dict):
         return False
     value = speaker.get("voice")
-    return isinstance(value, (int, str)) and value != ""
+    return isinstance(value, (int, float, str)) and value != ""
 
 
 def _entry_snippet(entry: Any, max_len: int = 40) -> str:
@@ -4067,6 +4086,36 @@ def _log_skipped_entries(list_name: str, skipped: list[tuple[int, str]]) -> None
     )
 
 
+def _usable_task_list(raw_json: dict, key: str) -> list:
+    """Return ``raw_json[key]`` only if it is actually a list; otherwise log
+    ONE clear WARNING naming the real problem and return ``[]``.
+
+    Issue #161 second review round: without this guard, a task VALUE that
+    is itself the wrong type (most concretely a string, e.g.
+    ``{"transcripts": "00:01 hello"}``) is still iterable, so
+    ``enumerate()`` happily walks it character by character and
+    ``_usable_timestamp``/``_usable_voice_id`` correctly reject every
+    "entry" (a single character has no dict shape). The OUTCOME was
+    already right (nothing merges, no crash) - but the diagnosis was
+    actively misleading: an operator would see a WARNING reading "skipped
+    11 malformed transcripts entries: [0] '0', [1] '0', [2] ':', ..." and
+    have no way to tell that the real problem is the whole task VALUE
+    being the wrong type, not eleven individually-malformed entries. A
+    dict task value (whose iteration would walk KEYS, not entries) is
+    caught the same way.
+    """
+    value = raw_json.get(key, [])
+    if isinstance(value, list):
+        return value
+    log.warning(
+        "merge_transcript_json: %r task value is %s, not a list - the whole task is "
+        "unusable (not entry-by-entry malformed); ignoring it.",
+        key,
+        type(value).__name__,
+    )
+    return []
+
+
 def merge_transcript_json(raw_json, speakers_map):
     """Merge three-task JSON into a fused markdown transcript.
 
@@ -4098,7 +4147,7 @@ def merge_transcript_json(raw_json, speakers_map):
     voice_names = {}
     evidence_notes = []
     skipped_speakers: list[tuple[int, str]] = []
-    for idx, s in enumerate(raw_json.get("speakers", [])):
+    for idx, s in enumerate(_usable_task_list(raw_json, "speakers")):
         if not _usable_voice_id(s):
             skipped_speakers.append((idx, _entry_snippet(s)))
             continue
@@ -4113,7 +4162,7 @@ def merge_transcript_json(raw_json, speakers_map):
     entries = []
 
     skipped_transcripts: list[tuple[int, str]] = []
-    for idx, t in enumerate(raw_json.get("transcripts", [])):
+    for idx, t in enumerate(_usable_task_list(raw_json, "transcripts")):
         if not _usable_timestamp(t, "start"):
             skipped_transcripts.append((idx, _entry_snippet(t)))
             continue
@@ -4129,7 +4178,7 @@ def merge_transcript_json(raw_json, speakers_map):
     _log_skipped_entries("transcripts", skipped_transcripts)
 
     skipped_screen_content: list[tuple[int, str]] = []
-    for idx, sc in enumerate(raw_json.get("screen_content", [])):
+    for idx, sc in enumerate(_usable_task_list(raw_json, "screen_content")):
         if not _usable_timestamp(sc, "start"):
             skipped_screen_content.append((idx, _entry_snippet(sc)))
             continue
