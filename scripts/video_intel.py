@@ -1957,10 +1957,10 @@ def _offset_timestamp(ts: str, offset_seconds: int) -> str:
 
 
 def _classify_and_offset_timestamp(
-    ts: str,
+    ts: Any,
     chunk_start_secs: int,
     chunk_duration_secs: int,
-) -> str:
+) -> Any:
     """Per-timestamp classifier handling Gemini's inconsistent absolute-vs-
     relative timestamp behavior across chunks. Ported from translate_video.py's
     apply_timestamp_offset (proven empirically on BCS translation runs).
@@ -1980,7 +1980,22 @@ def _classify_and_offset_timestamp(
     Returns the offset-applied (or unchanged) timestamp in the most compact
     form: under one hour stays MM:SS; one hour or more becomes H:MM:SS to
     match merge_transcript_json's rendering convention.
+
+    Issue #161 review (P1): `ts` can be a non-string (dict, list, int, None)
+    when a chunk's raw entry is malformed - merge_chunked_transcripts calls
+    this unconditionally whenever `"start" in new_t`, with no type check.
+    That used to crash inside the wrap-and-strip below (`ts.strip()`) before
+    the final merge-time guard (`_usable_timestamp` in
+    merge_transcript_json) ever got a chance to skip the entry - meaning the
+    "one malformed entry cannot kill a paid call" claim this issue makes was
+    false on the chunked path, which most long videos take. A non-string
+    value is passed through UNCHANGED here: classification decisions stay
+    where they are (issue #158 guardrail - this function does not drop or
+    coerce), and the final merge guard is what skips it.
     """
+    if not isinstance(ts, str):
+        return ts
+
     # Wrap-and-strip around normalize_timestamp: classifier receives bare
     # strings, normalize_timestamp expects bracketed input. Defensively
     # strip any pre-existing brackets so an already-bracketed caller does
@@ -3367,15 +3382,21 @@ def assess_transcript_artifact(
 
     # Emission-order backward-jump check FIRST, before any sorting - the
     # entries are read exactly as given.
+    # Issue #161 review (P1): reuse the SAME "usable start" predicate the
+    # writer (merge_transcript_json) uses, rather than re-deriving a local
+    # truthiness check here. Before this, a dict/list/int `start` (all
+    # truthy) was accepted as "present" by this loop but skipped by the
+    # writer - so a response the writer rendered with ZERO dialogue lines
+    # was reported here as a healthy `dialogue_entries` count with
+    # `severe: []`, turning the crash issue #161 fixes into a silent,
+    # undetected empty transcript stamped transcript_status="complete"
+    # (CLAUDE.md: "a verifier must use the WRITER's path, never re-derive
+    # its own" - PR #136).
     raw_seconds: list[int] = []
     for entry in transcripts:
-        ts = entry.get("start") if isinstance(entry, dict) else None
-        if not ts:
+        if not _usable_timestamp(entry, "start"):
             continue
-        try:
-            raw_seconds.append(timestamp_to_seconds(str(ts)))
-        except (ValueError, AttributeError):
-            continue
+        raw_seconds.append(timestamp_to_seconds(entry["start"]))
 
     max_backward_jump = 0
     running_max: int | None = None
@@ -3482,18 +3503,17 @@ def _relativize_chunk_entries(transcripts: list, start_secs: int, allotted_span:
     by different amounts, which would blur the raw, as-emitted evidence a
     clock slip leaves behind.
     """
+    # Issue #161 review (P1): same shared predicate as assess_transcript_artifact
+    # and merge_transcript_json - see the comment there. entry["start"] is
+    # guaranteed a non-blank string once _usable_timestamp passes, so no
+    # str() coercion or try/except is needed here (_classify_and_offset_timestamp
+    # already catches its own internal ValueError and returns `ts` unchanged).
     relativized: list[dict] = []
     for entry in transcripts:
-        if not isinstance(entry, dict):
+        if not _usable_timestamp(entry, "start"):
             continue
-        ts = entry.get("start")
-        if not ts:
-            continue
-        try:
-            absolute_ts = _classify_and_offset_timestamp(str(ts), start_secs, allotted_span)
-            secs = max(0, timestamp_to_seconds(absolute_ts) - start_secs)
-        except (ValueError, AttributeError):
-            continue
+        absolute_ts = _classify_and_offset_timestamp(entry["start"], start_secs, allotted_span)
+        secs = max(0, timestamp_to_seconds(absolute_ts) - start_secs)
         relativized.append({**entry, "start": f"{secs // 3600}:{(secs % 3600) // 60:02d}:{secs % 60:02d}"})
     return relativized
 
@@ -3945,28 +3965,207 @@ def _dialogue_entries_from_raw_json(raw_json) -> list[dict]:
     return raw_json.get("transcripts") or []
 
 
+def _usable_timestamp(entry: Any, key: str) -> bool:
+    """True when ``entry`` is a dict and ``entry[key]`` is a non-blank string.
+
+    SHAPE only - this does NOT parse or validate timestamp content (issue
+    #161 second review round: an earlier version of this docstring implied
+    unparseable values were rejected; they are not). A non-blank string
+    that is not a real timestamp (e.g. "N/A") passes this check and IS
+    admitted - deliberately: both consumers (the writer's sort key and the
+    assessor's dialogue count) already agree on that value via the shared
+    `timestamp_to_seconds` fallback-to-0, so it can no longer cause the
+    writer/assessor divergence this predicate exists to prevent. Do not
+    "fix" this function to reject unparseable strings - that is a
+    different, more invasive change (what counts as parseable? a locale
+    variant?) that is out of scope here.
+
+    What this DOES reject: a value that cannot even be treated as a string
+    at all - None, an empty string, whitespace-only, a dict, a list, or a
+    bare number instead of a timestamp-shaped string like "12:34". A
+    whitespace-only value ("   ") would otherwise pass a bare `!= ""` check
+    and still sort to the top of the transcript - exactly the corruption
+    this guard exists to prevent - so blankness is checked via `.strip()`,
+    matching this file's `usable_video_id`. Never coerce with str() and
+    never synthesize a replacement: a fabricated "00:00" would sort the
+    entry to the top of the transcript and corrupt deep-links (timestamps
+    are load-bearing, not decoration - see CLAUDE.md). `entry` itself may
+    not be a dict at all (a malformed task list item, e.g. `None` or a bare
+    string) - guarded here so every caller can skip on a single check.
+
+    Issue #161 review (P1): this is the ONE "usable start" predicate shared
+    by every consumer that reads a raw `start` field - the writer
+    (`merge_transcript_json`, below), the quality assessor
+    (`assess_transcript_artifact`'s `raw_seconds` loop), and the per-chunk
+    relativizer (`_relativize_chunk_entries`). They must agree on what
+    counts as a usable entry (CLAUDE.md: "a verifier must use the WRITER's
+    path, never re-derive its own" - PR #136) - a divergent assessor used
+    to report a healthy `dialogue_entries` count and `severe: []` for a
+    response the writer rendered as zero dialogue lines, turning the crash
+    this issue fixes into a silent, undetected empty transcript stamped
+    `transcript_status: "complete"`.
+    """
+    if not isinstance(entry, dict):
+        return False
+    value = entry.get(key)
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _usable_voice_id(speaker: Any) -> bool:
+    """True when ``speaker`` is a dict and ``speaker["voice"]`` is a usable id.
+
+    Unlike `start`, `voice` is a Gemini-assigned ID (see
+    prompts/transcript.md task 1: "voice integer ID (1, 2, 3...)"), so a
+    legitimate value is an int, not a string - the `_usable_timestamp`
+    non-empty-string rule does not apply here. A usable id must also be
+    HASHABLE: a dict or list `voice` would otherwise pass a bare
+    `is not None` check and then raise `TypeError: unhashable type` at
+    `voice_names[s["voice"]]` on the very next line (issue #161 review) -
+    so this requires an int, float, or str scalar explicitly. `speaker`
+    itself may not be a dict (a malformed task list item) - guarded here so
+    the caller can skip on a single check.
+
+    Issue #161 second review round: `float` MUST stay in this tuple. A
+    float voice (e.g. `1.0`) is a perfectly good, hashable dict key -
+    `hash(1.0) == hash(1)` - and was accepted before this whole fix landed.
+    An earlier revision of this predicate excluded it, which was a
+    regression this fix would have shipped knowingly: a float-voice
+    speaker's NAME silently vanished (the transcript line still rendered,
+    falling back to `Speaker <id>`, so it was not a crash - just a quieter,
+    still-real loss of the speaker's identity).
+    """
+    if not isinstance(speaker, dict):
+        return False
+    value = speaker.get("voice")
+    return isinstance(value, (int, float, str)) and value != ""
+
+
+def _entry_snippet(entry: Any, max_len: int = 40) -> str:
+    """Best-effort ~40-char snippet of a skipped entry, for the WARNING.
+
+    Issue #161 review: on the healthy-parse path (no JSON parse failure) no
+    `.transcript.raw.txt` sidecar is written, so once `merge_transcript_json`
+    returns, a skipped entry's text exists nowhere else on disk - this
+    snippet is the ONLY recoverable trace of what was dropped. On the
+    chunked path (`merge_chunked_transcripts`) the entry's list index
+    points into an ephemeral, per-run merged list that no caller persists,
+    so there the snippet is the only usable identifier at all, not just the
+    most convenient one.
+    """
+    if isinstance(entry, dict):
+        text = entry.get("text")
+        if not (isinstance(text, str) and text.strip()):
+            text = entry.get("description")
+        if isinstance(text, str) and text.strip():
+            snippet = text.strip()
+            return snippet[:max_len] + ("..." if len(snippet) > max_len else "")
+    return repr(entry)[:max_len]
+
+
+def _log_skipped_entries(list_name: str, skipped: list[tuple[int, str]]) -> None:
+    """One WARNING per malformed task list, not per entry (issue #161).
+
+    A systematically malformed response could otherwise emit thousands of
+    log lines. `skipped` is a list of `(index, snippet)` pairs in encounter
+    order (see `_entry_snippet`); the message names the list, the total
+    count skipped, and up to the first 5 entries as ``[index] 'snippet'`` -
+    the snippet matters because the entry itself may exist nowhere else on
+    disk to go look up.
+    """
+    if not skipped:
+        return
+    plural = "y" if len(skipped) == 1 else "ies"
+    shown = ", ".join(f"[{idx}] {snippet!r}" for idx, snippet in skipped[:5])
+    log.warning(
+        "merge_transcript_json: skipped %d malformed %s entr%s: %s%s",
+        len(skipped),
+        list_name,
+        plural,
+        shown,
+        " (+more)" if len(skipped) > 5 else "",
+    )
+
+
+def _usable_task_list(raw_json: dict, key: str) -> list:
+    """Return ``raw_json[key]`` only if it is actually a list; otherwise log
+    ONE clear WARNING naming the real problem and return ``[]``.
+
+    Issue #161 second review round: without this guard, a task VALUE that
+    is itself the wrong type (most concretely a string, e.g.
+    ``{"transcripts": "00:01 hello"}``) is still iterable, so
+    ``enumerate()`` happily walks it character by character and
+    ``_usable_timestamp``/``_usable_voice_id`` correctly reject every
+    "entry" (a single character has no dict shape). The OUTCOME was
+    already right (nothing merges, no crash) - but the diagnosis was
+    actively misleading: an operator would see a WARNING reading "skipped
+    11 malformed transcripts entries: [0] '0', [1] '0', [2] ':', ..." and
+    have no way to tell that the real problem is the whole task VALUE
+    being the wrong type, not eleven individually-malformed entries. A
+    dict task value (whose iteration would walk KEYS, not entries) is
+    caught the same way.
+    """
+    value = raw_json.get(key, [])
+    if isinstance(value, list):
+        return value
+    log.warning(
+        "merge_transcript_json: %r task value is %s, not a list - the whole task is "
+        "unusable (not entry-by-entry malformed); ignoring it.",
+        key,
+        type(value).__name__,
+    )
+    return []
+
+
 def merge_transcript_json(raw_json, speakers_map):
-    """Merge three-task JSON into a fused markdown transcript."""
+    """Merge three-task JSON into a fused markdown transcript.
+
+    Issue #161: a malformed entry (missing/blank `start` in `transcripts` or
+    `screen_content`, missing/unhashable `voice` in `speakers`, or a
+    non-dict item in any of the three lists) is skipped rather than raising
+    - a raw KeyError/TypeError used to destroy an entire already-paid
+    Gemini transcript call over one bad entry. A response where every entry
+    is malformed still does not raise; it produces a transcript with no
+    dialogue, which the existing #157 monolithic/blind-gap guards flag on
+    their own (this is why no new meta.json field was needed: once
+    `assess_transcript_artifact` shares this function's `_usable_timestamp`
+    predicate - issue #161 review, P1 - a systematically-malformed response
+    correctly trips `monolithic_severe` and lands `partial`, making the
+    corpus sweepable through the existing #157 fields). See
+    `_usable_timestamp`, `_usable_voice_id`.
+    """
     # Gemini sometimes wraps the response in an array
     if isinstance(raw_json, list):
         raw_json = raw_json[0] if raw_json else {}
+    if not isinstance(raw_json, dict):
+        return ""
 
     lines = []
 
-    # Build voice-to-name mapping
+    # Build voice-to-name mapping. A speaker missing a usable voice id is
+    # skipped from this map only - it must never drop a transcript entry;
+    # those entries fall back to the existing voice_names.get(...) default.
     voice_names = {}
     evidence_notes = []
-    for s in raw_json.get("speakers", []):
+    skipped_speakers: list[tuple[int, str]] = []
+    for idx, s in enumerate(_usable_task_list(raw_json, "speakers")):
+        if not _usable_voice_id(s):
+            skipped_speakers.append((idx, _entry_snippet(s)))
+            continue
         voice_names[s["voice"]] = s.get("name", f"Speaker {s['voice']}")
         if s.get("evidence"):
             evidence_notes.append(f"- **{voice_names[s['voice']]}**: {s['evidence']}")
         if s.get("role"):
             voice_names[s["voice"]] += f" ({s['role']})"
+    _log_skipped_entries("speakers", skipped_speakers)
 
     # Merge transcripts and screen_content by timestamp
     entries = []
 
-    for t in raw_json.get("transcripts", []):
+    skipped_transcripts: list[tuple[int, str]] = []
+    for idx, t in enumerate(_usable_task_list(raw_json, "transcripts")):
+        if not _usable_timestamp(t, "start"):
+            skipped_transcripts.append((idx, _entry_snippet(t)))
+            continue
         entries.append(
             {
                 "type": "speech",
@@ -3976,20 +4175,27 @@ def merge_transcript_json(raw_json, speakers_map):
                 "text": t.get("text", ""),
             }
         )
+    _log_skipped_entries("transcripts", skipped_transcripts)
 
-    for sc in raw_json.get("screen_content", []):
+    skipped_screen_content: list[tuple[int, str]] = []
+    for idx, sc in enumerate(_usable_task_list(raw_json, "screen_content")):
+        if not _usable_timestamp(sc, "start"):
+            skipped_screen_content.append((idx, _entry_snippet(sc)))
+            continue
+        start_val = sc["start"]
         entries.append(
             {
                 "type": "screen",
-                "start": sc["start"],
-                "end": sc.get("end", sc["start"]),
-                "sort_key": timestamp_to_seconds(sc["start"]),
+                "start": start_val,
+                "end": sc.get("end", start_val),
+                "sort_key": timestamp_to_seconds(start_val),
                 "screen_type": sc.get("type", "other"),
                 "description": sc.get("description", ""),
                 "code": sc.get("code"),
                 "transcribed_text": sc.get("transcribed_text"),
             }
         )
+    _log_skipped_entries("screen_content", skipped_screen_content)
 
     entries.sort(key=lambda e: e["sort_key"])
 
@@ -4028,14 +4234,23 @@ def timestamp_to_seconds(ts):
     "00:00". Use int(float(...)) on the seconds field to strip the decimal,
     and wrap the whole parse in try/except so any future timestamp variant
     falls through to 0 instead of crashing the merge sort.
+
+    Issue #161 review (P1): the split() call used to sit OUTSIDE the
+    try/except, so this docstring's own "wrap the whole parse" contract was
+    not actually honored - a non-string ts (dict/list/int/None, surfaced by
+    _run_chunked_transcript_url pre-sorting merged["transcripts"] on a
+    chunk whose _classify_and_offset_timestamp now correctly passes such a
+    value through unchanged) raised AttributeError from .split() before the
+    try block was ever entered. The whole parse - split included - is now
+    inside the try, and AttributeError joins the caught set.
     """
-    parts = ts.split(":")
     try:
+        parts = ts.split(":")
         if len(parts) == 2:
             return int(parts[0]) * 60 + int(float(parts[1]))
         elif len(parts) == 3:
             return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(float(parts[2]))
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, AttributeError):
         return 0
     return 0
 
