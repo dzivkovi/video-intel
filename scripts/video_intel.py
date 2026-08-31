@@ -2056,6 +2056,18 @@ def resolve_chunk_minutes(channel_config: dict, config: dict, cli_override: int 
     for candidate in (cli_override, channel_config.get("chunk_minutes"), config.get("chunk_minutes")):
         if candidate is None:
             continue
+        # Issue #168: reject bool before the int() coercion below. PyYAML types
+        # an unquoted `yes`/`true` as Python True, bool subclasses int, and
+        # int(True) == 1 - so `chunk_minutes: yes` used to silently resolve to
+        # a 1-minute chunk size (~60 Gemini calls on an hour-long video instead
+        # of 2), raising nothing and logging nothing. isinstance(True, int) is
+        # also True, so this check MUST run before the int() branch below or
+        # it never fires.
+        if isinstance(candidate, bool):
+            raise ValueError(
+                f"chunk_minutes must be an integer, got {candidate!r} "
+                "(an unquoted YAML 'yes'/'true' parses as a boolean)"
+            )
         try:
             value = int(candidate)
         except (TypeError, ValueError):
@@ -6351,14 +6363,28 @@ def cmd_scan(args, config):
             # Issue #128: same precedence as every other knob here. Conference
             # channels can lower this so their dense talks chunk before they hit
             # the output cap.
+            # Issue #168: widened to (ValueError, TypeError) to match the
+            # resolve_transcript_source guard above (belt-and-braces -
+            # resolve_chunk_minutes already maps TypeError onto ValueError
+            # internally) and to append to `errors` so a typo'd channel shows
+            # up in the end-of-scan failure summary instead of leaving the scan
+            # to report "Done." and exit 0 with a channel silently dropped.
             try:
                 chunk_minutes = resolve_chunk_minutes(ch, config, getattr(args, "chunk_minutes", None))
-            except ValueError as e:
+            except (ValueError, TypeError) as e:
                 # Matches the defensive pattern for bad playlists/keywords a few
                 # lines up: one channel's config typo must not abort the whole
                 # scan after quota and Gemini spend are already sunk, and
                 # --dry-run returns before this point so it cannot catch it.
-                log.error("[%s] invalid chunk_minutes (%s); skipping channel", ch_name, e)
+                # The WHOLE channel is skipped here, not just the transcript
+                # step - disabling only transcript would flip mindmap_source=
+                # auto onto the ~10x more expensive mindmap-from-video path.
+                log.error(
+                    "[%s] invalid chunk_minutes (%s); skipping entire channel (mindmap and concepts too)",
+                    ch_name,
+                    e,
+                )
+                errors.append((ch_name, ch_name, f"error: {e}"))
                 continue
             transcript_videos: list[dict] = []
             for v in videos:
@@ -7219,7 +7245,15 @@ def _cmd_transcript_impl(args, config):
     # Issue #128 review: one resolver for all four chunking sites, so a channel
     # that sets chunk_minutes: 20 gets 20 from scan AND from this command - the
     # documented recovery for the exact failure the knob exists for.
-    chunk_minutes = resolve_chunk_minutes(channel_cfg, config, getattr(args, "chunk_minutes", None))
+    # Issue #168: same log-and-exit(1) shape as the resolve_transcript_source
+    # guard above. (ValueError, TypeError): resolve_chunk_minutes already maps
+    # TypeError onto ValueError internally, so this is belt-and-braces for
+    # consistency with the other config-knob guards, not a distinct hole.
+    try:
+        chunk_minutes = resolve_chunk_minutes(channel_cfg, config, getattr(args, "chunk_minutes", None))
+    except (ValueError, TypeError) as e:
+        log.error("Invalid chunk_minutes: %s", e)
+        sys.exit(1)
     manual_segment = start_offset is not None or end_offset is not None
     # Issue #60: yt-captions never needs chunking (the caption track is returned
     # whole regardless of length), so route it to the single-shot path which
@@ -7589,7 +7623,17 @@ def _cmd_process_url(args, config):
     # would skip mindmap entirely - breaking the user's "mindmap always
     # runs" invariant (memory: feedback_long_video_keep_mindmap).
     log.info("  Step 1/3: transcript")
-    chunk_minutes = resolve_chunk_minutes(channel_cfg, config, getattr(args, "chunk_minutes", None))
+    # Issue #168: same log-and-exit(1) shape as the resolve_transcript_source
+    # guard above - the sharpest illustration from the issue was exactly this
+    # function: a transcript_source typo exited cleanly a few dozen lines up
+    # while this call raw-tracebacked on the SAME channel_cfg. (ValueError,
+    # TypeError): belt-and-braces, resolve_chunk_minutes maps TypeError onto
+    # ValueError internally.
+    try:
+        chunk_minutes = resolve_chunk_minutes(channel_cfg, config, getattr(args, "chunk_minutes", None))
+    except (ValueError, TypeError) as e:
+        log.error("Invalid chunk_minutes: %s", e)
+        sys.exit(1)
     try:
         # Issue #60: yt-captions never chunks (caption track is whole); route it
         # to the single-shot path which builds from captions.
@@ -7989,6 +8033,38 @@ def _cmd_process_impl(args, config):
         else:
             existing_meta = {}
 
+    # Resolve channel config (used by the mindmap_source resolver further down)
+    # and validate chunk_minutes HERE. The position is the fix on this path, not
+    # the try/except, and it is pinned between two things:
+    #
+    # BELOW the legacy `skip: true` early return above. A video the operator
+    # deliberately suppressed must still be a no-op exit 0, not an exit 1 about
+    # a config knob for work that was never going to happen. Validating above
+    # that return would turn "skip means skip" into a hard failure and break a
+    # caller looping over a mixed list of videos.
+    #
+    # ABOVE `upload_local_video` below. Issue #168, found by tracing the real
+    # call order rather than the diff: the upload used to run first, so a
+    # one-character `chunk_minutes` typo cost a full multi-minute MP4 upload to
+    # Gemini and THEN failed. Adding the guard without moving it would have
+    # improved only the error message, not the bill. This is the repo's standing
+    # "probe before you pay" rule (see the `probe_atomic_writes` guardrail).
+    # `resolve_chunk_minutes` is a pure function of the config, so nothing here
+    # depends on the upload or on identity resolution having happened.
+    #
+    # (ValueError, TypeError): belt-and-braces for consistency with the eight
+    # sibling config-knob guards - resolve_chunk_minutes maps TypeError onto
+    # ValueError internally.
+    channel_cfg: dict = next(
+        (c for c in config.get("channels", []) if c.get("name") == channel_name),
+        {},
+    )
+    try:
+        chunk_minutes = resolve_chunk_minutes(channel_cfg, config, getattr(args, "chunk_minutes", None))
+    except (ValueError, TypeError) as e:
+        log.error("Invalid chunk_minutes: %s", e)
+        sys.exit(1)
+
     # Lazy-upload decision: gated on meta.json modes_completed, not just filesystem.
     modes_done = set(existing_meta.get("modes_completed", []))
     mindmap_path = channel_dir / f"{prefix}.mindmap.md"
@@ -8077,12 +8153,6 @@ def _cmd_process_impl(args, config):
             result = call_fn(file_uri)
         return result
 
-    # Resolve channel config for the mindmap_source resolver below.
-    channel_cfg: dict = next(
-        (c for c in config.get("channels", []) if c.get("name") == channel_name),
-        {},
-    )
-    chunk_minutes = resolve_chunk_minutes(channel_cfg, config, getattr(args, "chunk_minutes", None))
     mindmap_from_transcript_prompt = load_prompt("mindmap-from-transcript")
 
     # ============================================================================
