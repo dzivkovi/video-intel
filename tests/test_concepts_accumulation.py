@@ -145,6 +145,48 @@ class TestAccumulateConceptsIntoTaxonomy:
         assert added == 1
         assert "ai.rag" in taxonomy["concepts"]
 
+    @pytest.mark.parametrize("bad_taxonomy_concepts", [[], "oops", 5, ["a"]])
+    def test_a_shape_corrupt_taxonomy_concepts_does_not_crash_the_paid_loop(
+        self, tmp_path, caplog, bad_taxonomy_concepts
+    ):
+        """Guard the dict we MUTATE, not only the file we read.
+
+        `taxonomy.setdefault("concepts", {})[cid] = ...` raises TypeError when
+        `taxonomy["concepts"]` is a list or a string. `process_concepts` only
+        json.dumps that dict, which tolerates any shape, so pre-#176 `cmd_scan`
+        never touched it - meaning a helper that validated only the FILE would
+        have ADDED a crash path to the scan rather than closing one. Found by
+        the executing adversarial pass, which reproduced it as a real
+        `cmd_scan` crash after one paid call.
+        """
+        concepts_path = tmp_path / "v.concepts.json"
+        concepts_path.write_text(
+            json.dumps({"concepts": [{"concept_id": "c1", "preferred_label": "C1"}]}), encoding="utf-8"
+        )
+        taxonomy = {"concepts": bad_taxonomy_concepts}
+
+        with caplog.at_level("WARNING"):
+            added = accumulate_concepts_into_taxonomy(taxonomy, concepts_path)
+
+        assert added == 0
+        assert taxonomy["concepts"] == bad_taxonomy_concepts, "a corrupt taxonomy must not be mutated"
+        assert any("not an object" in r.message for r in caplog.records)
+
+    def test_a_taxonomy_with_no_concepts_key_still_accumulates(self, tmp_path):
+        """A MISSING key is not a corrupt shape - setdefault creates the dict.
+
+        Locks the boundary so the guard above cannot be widened into rejecting
+        a fresh taxonomy, which would silently disable accumulation entirely.
+        """
+        concepts_path = tmp_path / "v.concepts.json"
+        concepts_path.write_text(
+            json.dumps({"concepts": [{"concept_id": "c1", "preferred_label": "C1"}]}), encoding="utf-8"
+        )
+        taxonomy: dict = {}
+
+        assert accumulate_concepts_into_taxonomy(taxonomy, concepts_path) == 1
+        assert "c1" in taxonomy["concepts"]
+
     @pytest.mark.parametrize(
         ("label", "body"),
         [
@@ -259,11 +301,6 @@ def _make_fake_mindmap(channel_dir_by_name):
         return prefix, "done"
 
     return fake_mindmap
-
-    # ---------------------------------------------------------------------------
-    # 2. The issue's own test contract: within one channel, video 2 must see
-    #    video 1's newly-minted concept id.
-    # ---------------------------------------------------------------------------
 
 
 class TestScanAccumulatesWithinOneChannel:

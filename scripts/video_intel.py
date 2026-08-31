@@ -681,6 +681,23 @@ def accumulate_concepts_into_taxonomy(taxonomy: dict, concepts_path: Path) -> in
         )
         return 0
 
+    # Guard the dict we MUTATE, not just the file we read. `taxonomy["concepts"]`
+    # is normally a dict, but a shape-corrupt taxonomy.json makes
+    # `setdefault("concepts", {})[cid] = ...` raise TypeError - and this helper's
+    # whole contract is that a bad shape degrades rather than crashing a loop that
+    # has already paid for a Gemini call. Pre-#176 `cmd_scan` never touched this
+    # dict (`process_concepts` only json.dumps it, which tolerates any shape), so
+    # validating only the file would have ADDED a crash path here rather than
+    # closing one. A missing key is fine: setdefault creates the dict.
+    existing_concepts = taxonomy.get("concepts")
+    if existing_concepts is not None and not isinstance(existing_concepts, dict):
+        log.warning(
+            "Taxonomy `concepts` is a %s, not an object; skipping accumulation for %s",
+            type(existing_concepts).__name__,
+            concepts_path,
+        )
+        return 0
+
     added = 0
     for c in concepts:
         if not isinstance(c, dict):

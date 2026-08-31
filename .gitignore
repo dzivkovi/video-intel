@@ -79,3 +79,6 @@ tests/evals/model-cards/_raw/
 # annotate each with the defect it exposes - a curated-watchlist extract.
 # The committed template is model_fixtures.yaml.example (mirrors config.yaml).
 tests/evals/model_fixtures.yaml
+
+# Gate 1 harness scratch output (can contain corpus copies)
+gate1_*_out/
