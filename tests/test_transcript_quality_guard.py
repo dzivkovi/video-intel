@@ -370,6 +370,75 @@ class TestSalvageNeverFalseAlarms:
         assert meta["transcript_quality_flags"] == []
 
 
+class TestSeverityIsOrderIndependentAndMalformedEntriesDegrade:
+    """Issue #159 dual-review item 3: `transcript_quality_flags_are_severe`
+    must reach the same verdict regardless of where a malformed entry sits
+    in the list, and must never raise on one.
+
+    Before the fix, `any(f in _SEVERE_QUALITY_FLAGS for f in flags)` would
+    raise `TypeError: unhashable type: 'dict'` the moment it reached an
+    unhashable entry - so `[{"x": 1}, "monolithic_severe"]` raised before
+    `any()` ever reached the genuine severe string, while the reordered
+    `["monolithic_severe", {"x": 1}]` returned True correctly. The verdict
+    depended on entry order, and dedupe's own wrapper had to catch the
+    TypeError to survive it. The fix filters to string entries before the
+    membership test, so no entry shape can raise and order cannot matter."""
+
+    def test_dict_before_severe_string_is_still_severe(self):
+        assert transcript_quality_flags_are_severe([{"x": 1}, "monolithic_severe"]) is True
+
+    def test_severe_string_before_dict_is_still_severe(self):
+        assert transcript_quality_flags_are_severe(["monolithic_severe", {"x": 1}]) is True
+
+    def test_dict_only_entries_are_clean(self):
+        assert transcript_quality_flags_are_severe([{"x": 1}, {"y": 2}]) is False
+
+    def test_none_entry_alongside_a_severe_string_is_still_severe(self):
+        assert transcript_quality_flags_are_severe([None, "monolithic_severe"]) is True
+        assert transcript_quality_flags_are_severe(["monolithic_severe", None]) is True
+
+    def test_nested_list_entry_does_not_crash(self):
+        assert transcript_quality_flags_are_severe([["nested"], "monolithic_severe"]) is True
+        assert transcript_quality_flags_are_severe([["nested"], "density_mild"]) is False
+
+    def test_mild_string_alongside_malformed_entries_stays_not_severe(self):
+        assert transcript_quality_flags_are_severe([{"x": 1}, "density_mild", None]) is False
+
+    def test_transcript_quality_severe_from_meta_also_inherits_the_hardened_helper(self, tmp_path):
+        """The standards-reviewer note: a malformed LIST entry inside
+        `transcript_quality_flags` must not raise, whether read through
+        `_transcript_quality_severe_from_meta` or the shared helper
+        directly - both now filter to string entries before the membership
+        test."""
+        meta_path = tmp_path / "video.meta.json"
+        meta_path.write_text(
+            json.dumps({"transcript_quality_flags": [{"x": 1}, "monolithic_severe"]}),
+            encoding="utf-8",
+        )
+        assert vi._transcript_quality_severe_from_meta(meta_path) is True
+
+    @pytest.mark.parametrize("scalar_flags", [7, "monolithic_severe", {"x": 1}])
+    def test_transcript_quality_severe_from_meta_scalar_shapes_degrade_without_raising(self, tmp_path, scalar_flags):
+        """Issue #159 dual-review ROUND 2, P3: `_transcript_quality_severe_
+        from_meta`'s docstring promised it never raises, but a non-list
+        `transcript_quality_flags` value (a scalar int, a bare string, a
+        dict) is not iterable the way `transcript_quality_flags_are_severe`
+        expects and raised TypeError before its entry filter could run -
+        on all four #157 containment call sites. It must now coerce a
+        non-list value to "no flags" the same way dedupe's own wrapper
+        already does, and return False without raising."""
+        meta_path = tmp_path / "video.meta.json"
+        meta_path.write_text(json.dumps({"transcript_quality_flags": scalar_flags}), encoding="utf-8")
+        assert vi._transcript_quality_severe_from_meta(meta_path) is False
+
+    def test_transcript_quality_severe_from_meta_real_severe_list_still_true(self, tmp_path):
+        """Regression lock alongside the scalar-degrade cases: a genuine
+        severe list must still be detected as severe."""
+        meta_path = tmp_path / "video.meta.json"
+        meta_path.write_text(json.dumps({"transcript_quality_flags": ["monolithic_severe"]}), encoding="utf-8")
+        assert vi._transcript_quality_severe_from_meta(meta_path) is True
+
+
 class TestChunkedWriterCatchesCrossChunkBlindGap:
     """The 12/44 real corpus case: every chunk individually 'ok', but the
     STITCHED transcript has a >=10min hole spanning (or hiding inside) a
