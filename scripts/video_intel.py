@@ -2240,6 +2240,18 @@ def merge_chunked_transcripts(
     slack = timestamp_tolerance(chunk_duration_seconds)
     chunk_window_violations: list[dict] = []
 
+    # Issue #171: aggregated across the WHOLE call (every chunk), not reset
+    # per chunk - _log_skipped_entries is called once per task list AFTER
+    # the loop below, so a systematically malformed multi-chunk run emits
+    # exactly 3 warnings (one per task list) instead of up to 3-per-chunk.
+    # Each label embeds its 1-based chunk index (matching the existing
+    # chunk_window_violations["chunk_index"] convention) because a bare
+    # list index is meaningless once entries from different chunks are
+    # aggregated together.
+    skipped_speakers: list[tuple[str, str]] = []
+    skipped_transcripts: list[tuple[str, str]] = []
+    skipped_screen_content: list[tuple[str, str]] = []
+
     # Dual-review addendum (adversarial P3, issue #158): a chunk_bounds list
     # that does not match chunks positionally would silently check each
     # chunk against the WRONG bounds (or none at all past the shorter
@@ -2257,6 +2269,7 @@ def merge_chunked_transcripts(
     for chunk_idx, (start_secs, chunk_json) in enumerate(chunks):
         if not isinstance(chunk_json, dict):
             continue
+        chunk_num = chunk_idx + 1
         bounds = chunk_bounds[chunk_idx] if chunk_bounds is not None and chunk_idx < len(chunk_bounds) else None
         window_lo = (bounds[0] if bounds is not None else start_secs) - slack
         window_hi = (bounds[1] if bounds is not None else start_secs + chunk_duration_seconds) + slack
@@ -2264,9 +2277,29 @@ def merge_chunked_transcripts(
         out_of_window = 0
         unparseable = 0
 
-        # Per-chunk (original_voice -> global_voice) map.
+        # Per-chunk (original_voice -> global_voice) map. Issue #171: a
+        # non-LIST "speakers" value (e.g. a bare string) is rejected as a
+        # whole via _usable_task_list - reusing the same helper
+        # merge_transcript_json uses - instead of being walked character by
+        # character. A non-dict ENTRY inside a genuine list (None, a bare
+        # string, an int, ...) mirrors the isinstance(entry, dict) guard
+        # already inside _usable_timestamp/_usable_voice_id: skip it and
+        # record it, rather than crashing on s.get("voice"). Deliberately
+        # NOT routed through _usable_voice_id itself - that predicate also
+        # requires a hashable `voice`, which is stricter than this loop's
+        # pre-#171 contract (a speaker with voice=None was always still
+        # added to merged["speakers"] via its name; only the remap step was
+        # skipped) - reusing it here would silently drop speakers that
+        # merge_chunked_transcripts has always kept.
+        speakers_notes: list[str] = []
+        chunk_speakers = _usable_task_list(chunk_json, "speakers", note_sink=speakers_notes)
+        for note in speakers_notes:
+            skipped_speakers.append((f"chunk {chunk_num}", note))
         voice_remap: dict[int, int] = {}
-        for s in chunk_json.get("speakers", []):
+        for entry_idx, s in enumerate(chunk_speakers):
+            if not isinstance(s, dict):
+                skipped_speakers.append((f"chunk {chunk_num} entry {entry_idx}", _entry_snippet(s)))
+                continue
             voice = s.get("voice")
             name = s.get("name") or f"Speaker {voice}"
             if name not in name_to_global:
@@ -2276,8 +2309,19 @@ def merge_chunked_transcripts(
             if voice is not None:
                 voice_remap[voice] = name_to_global[name]
 
-        # Per-timestamp absolute-vs-relative classification.
-        for t in chunk_json.get("transcripts", []):
+        # Per-timestamp absolute-vs-relative classification. Issue #171:
+        # `dict(t)` is the copy step, so a non-dict `t` (None -> TypeError,
+        # a bare string -> ValueError) must be skipped BEFORE this line -
+        # there is no way to carry it forward even in principle, unlike
+        # merge_transcript_json's final pass-through-on-degrade option.
+        transcripts_notes: list[str] = []
+        chunk_transcripts = _usable_task_list(chunk_json, "transcripts", note_sink=transcripts_notes)
+        for note in transcripts_notes:
+            skipped_transcripts.append((f"chunk {chunk_num}", note))
+        for entry_idx, t in enumerate(chunk_transcripts):
+            if not isinstance(t, dict):
+                skipped_transcripts.append((f"chunk {chunk_num} entry {entry_idx}", _entry_snippet(t)))
+                continue
             new_t = dict(t)
             if "start" in new_t:
                 new_t["start"] = _classify_and_offset_timestamp(new_t["start"], start_secs, chunk_duration_seconds)
@@ -2295,6 +2339,10 @@ def merge_chunked_transcripts(
                 # _safe_timestamp_to_seconds (returns None on failure,
                 # unlike timestamp_to_seconds's 0-fallback meant for sort
                 # keys) and gate BOTH counters on a successful parse.
+                #
+                # Issue #171: a SKIPPED entry (above) never reaches this
+                # block at all, so it cannot inflate classified_dialogue,
+                # out_of_window, or unparseable - it was never classified.
                 if bounds is not None and new_t["start"]:
                     classified_secs = _safe_timestamp_to_seconds(str(new_t["start"]))
                     if classified_secs is None:
@@ -2307,7 +2355,16 @@ def merge_chunked_transcripts(
                 new_t["voice"] = voice_remap[t["voice"]]
             merged["transcripts"].append(new_t)
 
-        for sc in chunk_json.get("screen_content", []):
+        # Issue #171: same treatment as transcripts above - non-list value
+        # rejected wholesale, non-dict entry skipped before dict(sc).
+        screen_notes: list[str] = []
+        chunk_screen_content = _usable_task_list(chunk_json, "screen_content", note_sink=screen_notes)
+        for note in screen_notes:
+            skipped_screen_content.append((f"chunk {chunk_num}", note))
+        for entry_idx, sc in enumerate(chunk_screen_content):
+            if not isinstance(sc, dict):
+                skipped_screen_content.append((f"chunk {chunk_num} entry {entry_idx}", _entry_snippet(sc)))
+                continue
             new_sc = dict(sc)
             if "start" in new_sc:
                 new_sc["start"] = _classify_and_offset_timestamp(new_sc["start"], start_secs, chunk_duration_seconds)
@@ -2318,12 +2375,19 @@ def merge_chunked_transcripts(
         if bounds is not None:
             chunk_window_violations.append(
                 {
-                    "chunk_index": chunk_idx + 1,
+                    "chunk_index": chunk_num,
                     "classified_dialogue": classified_dialogue,
                     "out_of_window": out_of_window,
                     "unparseable": unparseable,
                 }
             )
+
+    # Issue #171: one aggregated warning per task list for the WHOLE call,
+    # after every chunk has been processed - see the comment where the
+    # three skipped_* lists are initialized above.
+    _log_skipped_entries("speakers", skipped_speakers, caller="merge_chunked_transcripts")
+    _log_skipped_entries("transcripts", skipped_transcripts, caller="merge_chunked_transcripts")
+    _log_skipped_entries("screen_content", skipped_screen_content, caller="merge_chunked_transcripts")
 
     # Only added when chunk_bounds was supplied - a legacy 2-tuple caller
     # (existing tests, any future caller that doesn't opt in) gets the exact
@@ -4062,22 +4126,34 @@ def _entry_snippet(entry: Any, max_len: int = 40) -> str:
     return repr(entry)[:max_len]
 
 
-def _log_skipped_entries(list_name: str, skipped: list[tuple[int, str]]) -> None:
+def _log_skipped_entries(list_name: str, skipped: list[tuple[Any, str]], caller: str = "merge_transcript_json") -> None:
     """One WARNING per malformed task list, not per entry (issue #161).
 
     A systematically malformed response could otherwise emit thousands of
-    log lines. `skipped` is a list of `(index, snippet)` pairs in encounter
+    log lines. `skipped` is a list of `(label, snippet)` pairs in encounter
     order (see `_entry_snippet`); the message names the list, the total
-    count skipped, and up to the first 5 entries as ``[index] 'snippet'`` -
+    count skipped, and up to the first 5 entries as ``[label] 'snippet'`` -
     the snippet matters because the entry itself may exist nowhere else on
     disk to go look up.
+
+    Issue #171: `label` and `caller` are generalized (not duplicated) so
+    `merge_chunked_transcripts` can reuse this exact function. `label` was
+    a bare list index for the original (single-response) caller; the
+    chunked caller renders a composite label instead (e.g. ``"chunk 3
+    entry 7"``) because a bare index is meaningless once entries from
+    multiple chunks are aggregated into one warning - `str()` formats
+    either shape identically via the same ``f"[{label}] ..."`` template, so
+    existing callers and assertions are unaffected. `caller` names which
+    function is reporting, since two different merge stages now share this
+    helper.
     """
     if not skipped:
         return
     plural = "y" if len(skipped) == 1 else "ies"
-    shown = ", ".join(f"[{idx}] {snippet!r}" for idx, snippet in skipped[:5])
+    shown = ", ".join(f"[{label}] {snippet!r}" for label, snippet in skipped[:5])
     log.warning(
-        "merge_transcript_json: skipped %d malformed %s entr%s: %s%s",
+        "%s: skipped %d malformed %s entr%s: %s%s",
+        caller,
         len(skipped),
         list_name,
         plural,
@@ -4086,9 +4162,9 @@ def _log_skipped_entries(list_name: str, skipped: list[tuple[int, str]]) -> None
     )
 
 
-def _usable_task_list(raw_json: dict, key: str) -> list:
-    """Return ``raw_json[key]`` only if it is actually a list; otherwise log
-    ONE clear WARNING naming the real problem and return ``[]``.
+def _usable_task_list(raw_json: dict, key: str, note_sink: list[str] | None = None) -> list:
+    """Return ``raw_json[key]`` only if it is actually a list; otherwise
+    report ONE clear message naming the real problem and return ``[]``.
 
     Issue #161 second review round: without this guard, a task VALUE that
     is itself the wrong type (most concretely a string, e.g.
@@ -4103,16 +4179,27 @@ def _usable_task_list(raw_json: dict, key: str) -> list:
     being the wrong type, not eleven individually-malformed entries. A
     dict task value (whose iteration would walk KEYS, not entries) is
     caught the same way.
+
+    Issue #171: `note_sink` generalizes this for `merge_chunked_transcripts`,
+    which must warn ONCE per task list for the WHOLE (multi-chunk) call
+    rather than once per chunk. When `note_sink` is given, the detail
+    message is appended to it (for the caller to aggregate and log once
+    itself) instead of being logged immediately here. The default (`None`)
+    preserves the original single-response caller's behavior byte-for-byte
+    - `merge_transcript_json` never passes `note_sink`, so its warning text
+    and timing are unchanged.
     """
     value = raw_json.get(key, [])
     if isinstance(value, list):
         return value
-    log.warning(
-        "merge_transcript_json: %r task value is %s, not a list - the whole task is "
-        "unusable (not entry-by-entry malformed); ignoring it.",
-        key,
-        type(value).__name__,
+    detail = (
+        f"{key!r} task value is {type(value).__name__}, not a list - the whole task is "
+        "unusable (not entry-by-entry malformed); ignoring it."
     )
+    if note_sink is not None:
+        note_sink.append(detail)
+    else:
+        log.warning("merge_transcript_json: %s", detail)
     return []
 
 
