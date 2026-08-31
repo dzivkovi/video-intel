@@ -22,6 +22,7 @@ Idioms (fixtures, args builders, scan-stubbing pattern) are lifted from
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import ClassVar
 
@@ -362,6 +363,36 @@ class TestProcessFileChunkMinutesGuard:
         )
         monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
         return mp4
+
+    def test_a_deliberately_skipped_video_stays_a_no_op_exit_0(self, stubbed, monkeypatch, caplog):
+        """The guard is pinned between two things, and this is the lower pin.
+
+        A video the operator suppressed with legacy `skip: true` must stay a
+        no-op exit 0 even when the channel's chunk_minutes is a typo: the knob
+        governs work that was never going to happen, and failing here would turn
+        "skip means skip" into a hard error for a caller looping over a mixed
+        list of videos. The upper pin (above upload_local_video) is the test
+        below. Both must hold: the guard sits between the skip return and the
+        upload, and a diff that moves it to either side breaks one of them.
+        """
+        mp4 = stubbed
+        uploads: list[object] = []
+        monkeypatch.setattr(vi, "upload_local_video", lambda _c, p: uploads.append(p) or "files/xyz")
+        meta_path = mp4.parent / "alpha" / "2026-08-12-t.meta.json"
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(json.dumps({"video_id": "vid", "skip": True}), encoding="utf-8")
+        config = {"channels": [{"name": "alpha", "url": "https://youtube.com/@alpha", "chunk_minutes": "thirty"}]}
+
+        with caplog.at_level("INFO"):
+            vi.cmd_process(self._args(mp4), config)
+
+        assert uploads == [], "a skipped video must not upload"
+        assert any("skip=true" in r.message for r in caplog.records), (
+            "the skip must be honored and logged, not pre-empted by the config guard"
+        )
+        assert not [r for r in caplog.records if r.levelname == "ERROR"], (
+            "a suppressed video must not fail on a knob governing work it will never do"
+        )
 
     def test_guard_runs_before_the_gemini_upload_not_after(self, stubbed, monkeypatch, caplog):
         """Probe before you pay.

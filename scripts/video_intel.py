@@ -7991,32 +7991,6 @@ def _cmd_process_impl(args, config):
     mindmap_prompt = load_prompt(prompt_name)
     transcript_prompt = load_prompt("transcript")
 
-    # Resolve channel config (used by the mindmap_source resolver further down)
-    # and validate chunk_minutes HERE, above the upload.
-    #
-    # Issue #168, found by tracing the real call order rather than the diff:
-    # `upload_local_video` runs BEFORE the old position of this guard, so a
-    # one-character `chunk_minutes` typo used to cost a full multi-minute MP4
-    # upload to Gemini and THEN fail. Adding the guard without moving it would
-    # have improved only the error message, not the bill. This is the repo's
-    # standing "probe before you pay" rule (see the `probe_atomic_writes`
-    # guardrail): a config typo must be rejected before the first paid call,
-    # not after it. `resolve_chunk_minutes` is a pure function of the config,
-    # so nothing here depends on the upload having happened.
-    #
-    # (ValueError, TypeError): belt-and-braces for consistency with the eight
-    # sibling config-knob guards - resolve_chunk_minutes maps TypeError onto
-    # ValueError internally.
-    channel_cfg: dict = next(
-        (c for c in config.get("channels", []) if c.get("name") == channel_name),
-        {},
-    )
-    try:
-        chunk_minutes = resolve_chunk_minutes(channel_cfg, config, getattr(args, "chunk_minutes", None))
-    except (ValueError, TypeError) as e:
-        log.error("Invalid chunk_minutes: %s", e)
-        sys.exit(1)
-
     if channel_name:
         channel_dir_hint = output_dir / channel_name
         identity = resolve_local_file_identity(
@@ -8058,6 +8032,38 @@ def _cmd_process_impl(args, config):
             existing_meta = _read_meta_best_effort(meta_path, raise_on_os_error=False)
         else:
             existing_meta = {}
+
+    # Resolve channel config (used by the mindmap_source resolver further down)
+    # and validate chunk_minutes HERE. The position is the fix on this path, not
+    # the try/except, and it is pinned between two things:
+    #
+    # BELOW the legacy `skip: true` early return above. A video the operator
+    # deliberately suppressed must still be a no-op exit 0, not an exit 1 about
+    # a config knob for work that was never going to happen. Validating above
+    # that return would turn "skip means skip" into a hard failure and break a
+    # caller looping over a mixed list of videos.
+    #
+    # ABOVE `upload_local_video` below. Issue #168, found by tracing the real
+    # call order rather than the diff: the upload used to run first, so a
+    # one-character `chunk_minutes` typo cost a full multi-minute MP4 upload to
+    # Gemini and THEN failed. Adding the guard without moving it would have
+    # improved only the error message, not the bill. This is the repo's standing
+    # "probe before you pay" rule (see the `probe_atomic_writes` guardrail).
+    # `resolve_chunk_minutes` is a pure function of the config, so nothing here
+    # depends on the upload or on identity resolution having happened.
+    #
+    # (ValueError, TypeError): belt-and-braces for consistency with the eight
+    # sibling config-knob guards - resolve_chunk_minutes maps TypeError onto
+    # ValueError internally.
+    channel_cfg: dict = next(
+        (c for c in config.get("channels", []) if c.get("name") == channel_name),
+        {},
+    )
+    try:
+        chunk_minutes = resolve_chunk_minutes(channel_cfg, config, getattr(args, "chunk_minutes", None))
+    except (ValueError, TypeError) as e:
+        log.error("Invalid chunk_minutes: %s", e)
+        sys.exit(1)
 
     # Lazy-upload decision: gated on meta.json modes_completed, not just filesystem.
     modes_done = set(existing_meta.get("modes_completed", []))
