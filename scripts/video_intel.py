@@ -1744,31 +1744,40 @@ def _find_canonical_meta_by_video_id(channel_dir: Path, video_id: str) -> Path |
     Per plan F11 uniqueness invariant, at most one such file should exist per
     {channel, video_id}. If more than one is found, emit a WARNING log (the
     situation is a pre-existing data integrity issue worth surfacing) and
-    deterministically return the lexicographically-first filename so the
-    resolver can still make progress. Do not fail hard: blocking recovery on
-    a pre-existing data issue is worse than proceeding with a well-defined
-    pick.
+    deterministically pick one so the resolver can still make progress. Do
+    not fail hard: blocking recovery on a pre-existing data issue is worse
+    than proceeding with a well-defined pick.
+
+    Issue #165: the pick is severity-first (`meta_transcript_is_severe`,
+    the shared predicate) - a non-severe match beats a severe one, even a
+    lexicographically-earlier one. Within one severity bucket, the
+    pre-#165 rule is unchanged: lexicographically-first filename (`matches`
+    is built from a sorted glob).
     """
     if not channel_dir.exists() or not video_id:
         return None
-    matches: list[Path] = []
+    matches: list[tuple[Path, dict]] = []
     for meta_file in sorted(channel_dir.glob("*.meta.json")):
         try:
             meta = json.loads(meta_file.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             continue
         if meta.get("video_id") == video_id:
-            matches.append(meta_file)
+            matches.append((meta_file, meta))
+    if not matches:
+        return None
+    non_severe = [m for m in matches if not meta_transcript_is_severe(m[1])]
+    chosen_path, _chosen_meta = non_severe[0] if non_severe else matches[0]
     if len(matches) > 1:
         log.warning(
             "Multiple canonical meta.json files share video_id=%s in %s: %s. "
-            "Picking the first (%s). Investigate and remove duplicates to honor F11.",
+            "Picking %s. Investigate and remove duplicates to honor F11.",
             video_id,
             channel_dir,
-            [m.name for m in matches],
-            matches[0].name,
+            [m[0].name for m in matches],
+            chosen_path.name,
         )
-    return matches[0] if matches else None
+    return chosen_path
 
 
 def resolve_local_file_identity(
@@ -1952,13 +1961,30 @@ def _load_video_id_index(channel_dir: Path) -> dict[str, str]:
     Cached per channel for the lifetime of the process. If the directory does
     not exist, returns an empty dict (cached so we do not re-stat on misses).
     Malformed meta.json files are skipped, not fatal - the index is advisory.
+
+    Issue #165: the glob is sorted (it previously was not, so the winner for
+    a duplicate video_id was filesystem-order dependent - not even
+    deterministic run to run) and severity-first: a non-severe meta
+    (`meta_transcript_is_severe`, the shared predicate) beats a severe one
+    for the same video_id, even one that sorts earlier. Within one severity
+    bucket the rule is unchanged - first-wins on the now-sorted order.
+    Severity now leads, ahead of the old "first prefix seen" rule, so this
+    cached hot path (feeding `is_processed()` and
+    `record_alt_title_if_rotated()`) does not point processed-state lookups
+    at a known-severe duplicate when a clean one exists. This is NOT the
+    same ordering `_pick_canonical` (dedupe's true canonical, by
+    processed-timestamp) uses within a severity bucket - see the "shared
+    severity, not shared ordering" guardrail in CLAUDE.md. The severity
+    check is a dict lookup plus a frozenset test on metas this function
+    already reads off disk, so it adds no I/O.
     """
     key = str(channel_dir)
     if key in _VIDEO_ID_CACHE:
         return _VIDEO_ID_CACHE[key]
     index: dict[str, str] = {}
+    severe_by_id: dict[str, bool] = {}
     if channel_dir.exists():
-        for meta_path in channel_dir.glob("*.meta.json"):
+        for meta_path in sorted(channel_dir.glob("*.meta.json")):
             try:
                 data = json.loads(meta_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
@@ -1966,10 +1992,15 @@ def _load_video_id_index(channel_dir: Path) -> dict[str, str]:
             vid = data.get("video_id")
             if vid:
                 prefix = meta_path.name.removesuffix(".meta.json")
-                # First-wins: earliest prefix seen for this video_id stays
-                # canonical from the prevention path's perspective. dedupe
-                # picks the true canonical separately by processed-timestamp.
-                index.setdefault(vid, prefix)
+                is_severe = meta_transcript_is_severe(data)
+                if vid not in index:
+                    index[vid] = prefix
+                    severe_by_id[vid] = is_severe
+                elif severe_by_id.get(vid, False) and not is_severe:
+                    # A non-severe meta beats a severe one already recorded
+                    # for this video_id, even though it sorts later.
+                    index[vid] = prefix
+                    severe_by_id[vid] = is_severe
     _VIDEO_ID_CACHE[key] = index
     return index
 
@@ -3750,7 +3781,7 @@ def _transcript_quality_severe_from_meta(meta_path: Path) -> bool:
     protects against malformed LIST entries, but a non-list value at all is
     not iterable and raised TypeError before that filter ever runs, on
     every one of this helper's four #157 containment call sites. Coerced
-    here the same way `_dedupe_meta_is_severe` already coerces it for
+    here the same way `meta_transcript_is_severe` already coerces it for
     dedupe: a `transcript_quality_flags` value that isn't a `list` (a
     scalar int, a bare string, a dict, ...) degrades to "no flags" rather
     than being passed through.
@@ -9472,17 +9503,26 @@ _MODE_ARTIFACT_PATTERNS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _dedupe_meta_is_severe(meta_data: dict) -> bool:
-    """Whether one dedupe-group member's transcript carries a severe quality
-    flag, for canonical selection (issue #159).
+def meta_transcript_is_severe(meta_data: dict) -> bool:
+    """Whether one meta's transcript carries a severe quality flag.
+
+    Issue #165: this is the ONE shared severity predicate for FOUR
+    duplicate-selection sites - `_pick_canonical` (dedupe), `_load_video_id_index`
+    (the processed-state cache), `collect_corpus_videos` (briefing-record
+    provenance), and `_find_canonical_meta_by_video_id` (local-file identity
+    resolution). Originally issue #159's dedupe-only helper (named
+    `_dedupe_meta_is_severe`); renamed here because it is no longer
+    dedupe-specific. Each site still keeps its OWN secondary ordering
+    underneath this predicate - see the "shared severity, not shared
+    ordering" guardrail in CLAUDE.md for why that split is deliberate.
 
     Delegates entirely to `transcript_quality_flags_are_severe()` (the
     #157/#158 severity test, hardened against malformed list entries by the
     #159 dual-review) - this never re-implements severity, it only guards
     the call against a malformed on-disk *shape* so a corrupt or hand-edited
-    meta degrades to "not severe" instead of crashing the dedupe sort. A
-    `transcript_quality_flags` value that isn't a list at all (e.g. a bare
-    string) is treated as absent rather than passed through: a scalar
+    meta degrades to "not severe" instead of crashing a duplicate-selection
+    sort. A `transcript_quality_flags` value that isn't a list at all (e.g. a
+    bare string) is treated as absent rather than passed through: a scalar
     string happening to equal a severe flag's name is not the documented
     list shape the helper expects, and iterating its characters is not a
     meaningful severity signal either way. Malformed *entries within* a list
@@ -9501,7 +9541,7 @@ def _pick_canonical(metas: list[tuple[Path, dict]]) -> tuple[Path, dict]:
     modes_completed, prefix).
 
     Issue #159: a meta whose transcript tripped a severe quality flag
-    (`_dedupe_meta_is_severe`, reusing `transcript_quality_flags_are_severe`)
+    (`meta_transcript_is_severe`, reusing `transcript_quality_flags_are_severe`)
     never outranks a clean duplicate, even a much older one - a severe rerun
     is worse, not better, regardless of recency. Within one severity bucket
     (both clean or both severe) the pre-#159 order is unchanged: reverse-sort
@@ -9512,7 +9552,7 @@ def _pick_canonical(metas: list[tuple[Path, dict]]) -> tuple[Path, dict]:
     def sort_key(item: tuple[Path, dict]) -> tuple[bool, str, int, str]:
         path, data = item
         return (
-            not _dedupe_meta_is_severe(data),
+            not meta_transcript_is_severe(data),
             data.get("processed", ""),
             len(data.get("modes_completed", [])),
             path.name,
@@ -9828,7 +9868,7 @@ def cmd_dedupe(args, config):
 
         for vid, metas in sorted(dup_groups.items()):
             canonical_path, canonical_data = _pick_canonical(metas)
-            canonical_standing = "severe" if _dedupe_meta_is_severe(canonical_data) else "clean"
+            canonical_standing = "severe" if meta_transcript_is_severe(canonical_data) else "clean"
             log.info("  video_id=%s", vid)
             log.info(
                 "    canonical: %s  [%s]  '%s'  processed=%s",
@@ -9840,7 +9880,7 @@ def cmd_dedupe(args, config):
             for loser_path, loser_data in metas:
                 if loser_path == canonical_path:
                     continue
-                loser_standing = "severe" if _dedupe_meta_is_severe(loser_data) else "clean"
+                loser_standing = "severe" if meta_transcript_is_severe(loser_data) else "clean"
                 log.info(
                     "    loser:     %s  [%s]  '%s'  processed=%s",
                     loser_path.name,
@@ -10503,10 +10543,21 @@ def collect_corpus_videos(output_dir: Path) -> list[dict]:
     Skips dot-dirs and underscore-dirs (e.g. _briefings) so human-note folders
     are never mistaken for channels. Each record carries the catch-up fields
     plus paths to the mindmap/concepts siblings (None when absent). When a
-    video_id has duplicate metas (title-rotation, pre-dedupe), the most complete
-    record wins so a video is never surfaced twice in one briefing.
+    video_id has duplicate metas (title-rotation, pre-dedupe), the winner is
+    chosen severity-first, then most complete (issue #165): a non-severe
+    meta (`meta_transcript_is_severe`, the shared predicate) beats a severe
+    one, even a more "complete" one - and within one severity bucket the
+    pre-#165 rule is unchanged, `_artifact_count` (mindmap/concepts present
+    ON DISK) decides. This deliberately does NOT switch to
+    `len(modes_completed)` (dedupe's secondary key): `modes_completed` is a
+    claim about what RAN, not what is on disk (issue #159 documented a case
+    where an operator deleted an artifact by hand and the meta still claimed
+    the mode), and downstream briefing ranking scores a record with no
+    concepts.json on disk at zero regardless of what its meta claims. See
+    the "shared severity, not shared ordering" guardrail in CLAUDE.md.
     """
     by_id: dict[str, dict] = {}
+    severe_by_id: dict[str, bool] = {}
     if not output_dir.is_dir():
         return []
     channel_dirs = [
@@ -10572,17 +10623,30 @@ def collect_corpus_videos(output_dir: Path) -> list[dict]:
             }
             # Dedupe by video_id - title-rotation can leave >1 meta per id, and a
             # set-difference against prior briefings won't catch a same-corpus dup.
-            # Keep the most complete record so ranking has concepts to work with.
+            # Issue #165: severity leads, artifact count is the secondary key
+            # (see the docstring above for why this stays _artifact_count and
+            # not modes_completed). Topics are UNIONed regardless of which
+            # side wins - see the union sites below, both are load-bearing.
+            record_severe = meta_transcript_is_severe(meta)
             existing = by_id.get(video_id)
-            if existing is None or _artifact_count(record) > _artifact_count(existing):
-                if existing is not None:
-                    # Topics are UNIONed across duplicate metas rather than
-                    # inherited from the completeness winner. An operator can
-                    # stamp --topic before a title rotation, leaving the tag on
-                    # the meta that later loses the tie-break; taking only the
-                    # winner's list would silently delete that membership.
-                    record["topics"] = sorted(set(record["topics"]) | set(existing["topics"]))
+            if existing is None:
                 by_id[video_id] = record
+                severe_by_id[video_id] = record_severe
+                continue
+            existing_severe = severe_by_id.get(video_id, False)
+            record_key = (not record_severe, _artifact_count(record))
+            existing_key = (not existing_severe, _artifact_count(existing))
+            if record_key > existing_key:
+                # Topics are UNIONed across duplicate metas rather than
+                # inherited from the selection winner. An operator can
+                # stamp --topic before a title rotation, leaving the tag on
+                # the meta that later loses the tie-break; taking only the
+                # winner's list would silently delete that membership. This
+                # union is independent of the severity rule above and must
+                # stay that way (issue #146).
+                record["topics"] = sorted(set(record["topics"]) | set(existing["topics"]))
+                by_id[video_id] = record
+                severe_by_id[video_id] = record_severe
             elif record["topics"]:
                 existing["topics"] = sorted(set(existing["topics"]) | set(record["topics"]))
     return list(by_id.values())
