@@ -7506,20 +7506,36 @@ def _cmd_process_url(args, config):
     mindmap_text = mindmap_path.read_text(encoding="utf-8")
     taxonomy = load_taxonomy(output_dir)
     concepts_prompt_name = "mindmap-from-transcript" if resolved_source == "transcript" else prompt_name
-    concepts_prefix, concepts_status = process_concepts(
-        client,
-        types,
-        video,
-        mindmap_text,
-        taxonomy,
-        model,
-        output_dir,
-        channel_name,
-        source_file=mindmap_path.name,
-        source_prompt=concepts_prompt_name,
-        prefix=prefix,
-    )
-    log.info("    concepts [%s]: %s", concepts_prefix, concepts_status)
+    # Issue #173: force=args.force was missing here, so `process --url --force`
+    # left process_concepts's own `concepts_path.exists() and not force` early
+    # return (that guard is correct and shared with the lazy-fill `concepts
+    # --channel` path - do not touch it) in effect on every re-run, silently
+    # keeping concepts extracted from the PRE-force mindmap. Also wrapped in
+    # try/except + _record_concepts_error, matching the --file path's shape
+    # (~:7690-7709): without it, a concepts exception here propagated
+    # uncaught all the way through cmd_process to main()'s bare dispatch (no
+    # `except` there - see main()'s command dispatch), leaving no identity
+    # stamped and no concepts_status recorded (issue #66/#129).
+    try:
+        concepts_prefix, concepts_status = process_concepts(
+            client,
+            types,
+            video,
+            mindmap_text,
+            taxonomy,
+            model,
+            output_dir,
+            channel_name,
+            source_file=mindmap_path.name,
+            source_prompt=concepts_prompt_name,
+            force=args.force,
+            prefix=prefix,
+        )
+        log.info("    concepts [%s]: %s", concepts_prefix, concepts_status)
+    except Exception as exc:
+        concepts_status = f"error: {exc}"
+        log.warning("    concepts [%s] raised: %s (mindmap and transcript preserved)", prefix, exc)
+        _record_concepts_error(transcript_meta_path, video, channel_dir, str(exc))
     steps.append(
         {
             "label": "concepts",
