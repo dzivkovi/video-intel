@@ -6164,6 +6164,12 @@ def cmd_scan(args, config):
         # notification - useful for long-form podcasters (Lex Fridman) where
         # the user wants to cherry-pick episodes manually.
         auto_mindmap = ch.get("auto_mindmap", "all")
+        # Issue #173 review round 3: the prefixes this run actually asked the
+        # mindmap loop to (re)generate - the auto_concepts block below reads
+        # this under --force so a concepts re-extraction stays bounded to what
+        # THIS run touched, not the whole channel. Stays empty unless the
+        # mindmap loop below (the "else" branch) actually runs.
+        touched_prefixes: set[str] = set()
         if auto_mindmap == "none":
             if new_videos:
                 log.info(
@@ -6177,6 +6183,7 @@ def cmd_scan(args, config):
         elif not new_videos:
             log.info("  All mind maps up to date.")
         else:
+            touched_prefixes = {video_file_prefix(v) for v in new_videos}
             # Issue #54: per-video source resolution. Transcripts from Step 1
             # are now on disk (or absent if the threshold/skip filter rejected
             # them); resolve_mindmap_source() picks transcript vs video accordingly.
@@ -6310,10 +6317,28 @@ def cmd_scan(args, config):
             # fresh mindmaps with concepts extracted from the OLD ones, silently,
             # at exit 0. Same defect #173 fixed on process --url, on the path a
             # bulk remediation is most likely to actually use.
+            #
+            # Review round 3: the glob below is corpus-wide, for all time - it
+            # is NOT built from new_videos, so it is bounded by neither --since
+            # nor the fetch window, and "if not videos:" deliberately falls
+            # through for auto_concepts channels even when YouTube returned
+            # zero new videos. Simply honoring --force here (as the comment
+            # above did) therefore turned "redo what I just regenerated" into
+            # a FULL-CORPUS concepts re-extraction on every scan --force -
+            # money the fix above did not intend to spend. Under --force, the
+            # candidate loop is now bounded to touched_prefixes (this run's
+            # window-bounded, force-aware mindmap candidate set, computed
+            # above); corpus-wide re-extraction already has a correct home in
+            # `concepts --channel X --force`, so issue #172's remediation
+            # should point there, not here. Without --force the pre-filter
+            # below is unchanged (it is already bounded, by construction, to
+            # videos lacking a concepts.json).
             concept_candidates: list[tuple[dict, Path, str]] = []
             if channel_dir_for_concepts.exists():
                 for meta_file in sorted(channel_dir_for_concepts.glob("*.meta.json")):
                     prefix = meta_file.name[: -len(".meta.json")]
+                    if args.force and prefix not in touched_prefixes:
+                        continue
                     concepts_path = channel_dir_for_concepts / f"{prefix}.concepts.json"
                     if concepts_path.exists() and not args.force:
                         continue

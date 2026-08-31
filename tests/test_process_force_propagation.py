@@ -395,54 +395,124 @@ class TestScanAutoConceptsForcePropagation:
     received force=args.force on the call. This is the path a bulk
     remediation (issue #172) is most likely to actually use, since it is a
     single `scan --force` rather than N individual `process --url --force`
-    invocations."""
+    invocations.
+
+    Review round 3 found that simply honoring --force (as these tests were
+    originally written) is not enough: the candidate glob is corpus-wide, for
+    all time, not built from this run's window-bounded new_videos - so a
+    naive fix turned "redo what I just regenerated" into a full-corpus
+    concepts re-extraction on every scan --force. These are now CARDINALITY
+    tests over N historical (untouched) videos plus M videos this run
+    actually touches, specifically so "process_concepts got called" can no
+    longer read as success whether the scope is one video or the whole
+    channel."""
 
     @staticmethod
     def _scan_args(*, force, channel=None):
         return argparse.Namespace(channel=channel, since=None, force=force, dry_run=False, model=None)
 
     @staticmethod
-    def _prep_scan_channel(tmp_path, *, channel="everyinc", prefix="2026-04-10-canonical-talk"):
+    def _prep_historical_videos(tmp_path, *, channel="everyinc", n):
+        """N videos already fully processed (mindmap + concepts + meta) in a
+        prior run - NOT part of this run's fetch_channel_videos() result, so
+        they must never receive a concepts call under --force."""
         channel_dir = tmp_path / channel
         channel_dir.mkdir(parents=True, exist_ok=True)
-        (channel_dir / f"{prefix}.mindmap.md").write_text("# mindmap\n", encoding="utf-8")
-        (channel_dir / f"{prefix}.concepts.json").write_text(
-            json.dumps({"concepts": [{"id": "old-scan-concept"}]}), encoding="utf-8"
-        )
-        (channel_dir / f"{prefix}.meta.json").write_text(
-            json.dumps(
-                {
-                    "video_id": "scanVIDEOID1",
-                    "title": "Canonical Talk",
-                    "published": "2026-04-10",
-                    "channel": channel,
-                }
-            ),
-            encoding="utf-8",
-        )
-        return channel_dir, prefix
+        prefixes = []
+        for i in range(n):
+            prefix = f"2026-01-{i + 1:02d}-historical-{i}"
+            (channel_dir / f"{prefix}.mindmap.md").write_text("# mindmap\n", encoding="utf-8")
+            (channel_dir / f"{prefix}.concepts.json").write_text(
+                json.dumps({"concepts": [{"id": f"old-scan-concept-{i}"}]}), encoding="utf-8"
+            )
+            (channel_dir / f"{prefix}.meta.json").write_text(
+                json.dumps(
+                    {
+                        "video_id": f"histVID{i:04d}",
+                        "title": f"Historical Talk {i}",
+                        "published": f"2026-01-{i + 1:02d}",
+                        "channel": channel,
+                        "modes_completed": ["scan", "mindmap", "concepts"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            prefixes.append(prefix)
+        return channel_dir, prefixes
 
     @staticmethod
-    def _stub_scan_env(monkeypatch, tmp_path):
+    def _new_youtube_videos(n):
+        """M videos fetch_channel_videos() returns THIS run - no local
+        artifacts yet, so the mindmap loop (stubbed below) actually touches
+        them."""
+        return [
+            {
+                "video_id": f"newVID{j:04d}0",
+                "url": f"https://www.youtube.com/watch?v=newVID{j:04d}0",
+                "title": f"New Video {j}",
+                "published": "2026-08-30",
+                "duration_iso": "PT10M",
+            }
+            for j in range(n)
+        ]
+
+    @staticmethod
+    def _stub_scan_env(monkeypatch, tmp_path, new_videos):
         monkeypatch.setenv("GEMINI_API_KEY", "fake")
         monkeypatch.setenv("YOUTUBE_API_KEY", "fake")
         monkeypatch.setattr(video_intel, "require_gemini", lambda: (MagicMock(), MagicMock()))
         monkeypatch.setattr(video_intel, "require_youtube", lambda: MagicMock())
         monkeypatch.setattr(video_intel, "create_client", lambda _key: MagicMock())
+        monkeypatch.setattr(video_intel, "resolve_model", lambda *_a, **_kw: "stub-model")
         monkeypatch.setattr(video_intel, "resolve_output_dir", lambda _cfg: tmp_path)
+        monkeypatch.setattr(video_intel, "load_prompt", lambda name: f"prompt-for-{name}")
         monkeypatch.setattr(video_intel, "get_channel_id", lambda *a, **kw: ("UCfake", "Every"))
-        monkeypatch.setattr(video_intel, "fetch_channel_videos", lambda *a, **kw: [])  # no new YouTube videos
+        monkeypatch.setattr(video_intel, "fetch_channel_videos", lambda *a, **kw: [dict(v) for v in new_videos])
+        monkeypatch.setattr(
+            video_intel,
+            "enrich_with_durations",
+            lambda *a, **kw: {v["video_id"]: v["duration_iso"] for v in new_videos},
+        )
+        monkeypatch.setattr(video_intel, "fetch_preflight_status", lambda *a, **kw: {})
+        monkeypatch.setattr(video_intel, "is_short", lambda *a, **kw: False)
+        monkeypatch.setattr(video_intel, "record_alt_title_if_rotated", lambda *a, **kw: None)
         monkeypatch.setattr(video_intel, "load_taxonomy", lambda _od: {"version": 1, "concepts": {}})
 
-    def _run_scan_and_capture(self, tmp_path, monkeypatch, *, force):
-        self._stub_scan_env(monkeypatch, tmp_path)
-        _channel_dir, prefix = self._prep_scan_channel(tmp_path)
+    def _run_scan_and_capture(self, tmp_path, monkeypatch, *, force, n_historical, n_new):
+        new_videos = self._new_youtube_videos(n_new)
+        self._stub_scan_env(monkeypatch, tmp_path, new_videos)
+        channel_dir, historical_prefixes = self._prep_historical_videos(tmp_path, n=n_historical)
 
-        captured: dict = {"called": False, "force": None}
+        def fake_mindmap(*args, **kwargs):
+            video = args[2] if len(args) > 2 else kwargs.get("video")
+            prefix = kwargs.get("prefix") or video_intel.video_file_prefix(video)
+            (channel_dir / f"{prefix}.mindmap.md").write_text("# mindmap\n", encoding="utf-8")
+            # The real process_mindmap writes a meta.json too (identity +
+            # modes_completed) - the auto_concepts glob below enumerates via
+            # *.meta.json, so a stub that skips this leaves a touched video
+            # invisible to the concepts loop entirely.
+            (channel_dir / f"{prefix}.meta.json").write_text(
+                json.dumps(
+                    {
+                        "video_id": video.get("video_id", ""),
+                        "video_url": video.get("url", ""),
+                        "title": video.get("title", prefix),
+                        "published": video.get("published", ""),
+                        "channel": "everyinc",
+                        "modes_completed": ["scan", "mindmap"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return prefix, "done"
+
+        monkeypatch.setattr(video_intel, "process_mindmap", fake_mindmap)
+
+        concepts_calls: list[dict] = []
 
         def fake_process_concepts(*args, **kwargs):
-            captured["called"] = True
-            captured["force"] = kwargs.get("force")
+            prefix = kwargs.get("prefix")
+            concepts_calls.append({"prefix": prefix, "force": kwargs.get("force")})
             return prefix, "done"
 
         monkeypatch.setattr(video_intel, "process_concepts", fake_process_concepts)
@@ -453,27 +523,52 @@ class TestScanAutoConceptsForcePropagation:
             "auto_concepts": True,
         }
         video_intel.cmd_scan(self._scan_args(force=force, channel="everyinc"), config)
-        return captured
 
-    def test_prefilter_admits_existing_concepts_candidate_under_force(self, tmp_path, monkeypatch):
-        """Pre-filter half. RED against pre-fix: the filter excluded every
-        candidate with an existing concepts.json regardless of --force, so
-        process_concepts was never even called."""
-        captured = self._run_scan_and_capture(tmp_path, monkeypatch, force=True)
-        assert captured["called"] is True
+        new_prefixes = [video_intel.video_file_prefix(v) for v in new_videos]
+        return concepts_calls, historical_prefixes, new_prefixes
 
-    def test_prefilter_still_excludes_existing_concepts_without_force(self, tmp_path, monkeypatch):
-        """Not the always-on-force regression: without --force, an existing
-        concepts.json is still skipped by the pre-filter."""
-        captured = self._run_scan_and_capture(tmp_path, monkeypatch, force=False)
-        assert captured["called"] is False
+    def test_force_bounds_concepts_to_touched_prefixes_only(self, tmp_path, monkeypatch):
+        """Cardinality: 5 historical (untouched) + 2 videos this run touches.
+        Under scan --force, exactly the 2 touched prefixes get a concepts
+        call (force=True each); the 5 untouched historical ones get none.
+        RED against the round-2 commit (198e5a6): that revision made ALL 7
+        candidates eligible, since the pre-filter's only gate was
+        concepts_path.exists() and not force."""
+        concepts_calls, historical_prefixes, new_prefixes = self._run_scan_and_capture(
+            tmp_path, monkeypatch, force=True, n_historical=5, n_new=2
+        )
+        called_prefixes = {c["prefix"] for c in concepts_calls}
+        assert len(concepts_calls) == 2
+        assert called_prefixes == set(new_prefixes)
+        assert called_prefixes.isdisjoint(historical_prefixes)
+        assert all(c["force"] is True for c in concepts_calls)
 
-    def test_process_concepts_call_receives_force(self, tmp_path, monkeypatch):
-        """Call-site half. RED against pre-fix: even when the pre-filter
-        admits a candidate, the process_concepts call omitted force=
-        entirely."""
-        captured = self._run_scan_and_capture(tmp_path, monkeypatch, force=True)
-        assert captured["force"] is True
+    def test_force_with_zero_new_videos_touches_nothing(self, tmp_path, monkeypatch):
+        """The auto_concepts carve-out in `if not videos:` still lets the
+        sweep run when YouTube returns zero new videos - but under --force,
+        touched_prefixes is empty in that case (the mindmap loop never ran),
+        so zero concepts calls fire regardless of how many historical videos
+        exist. This is the exact shape of the reported bug: a channel where
+        YouTube returned nothing new must not trigger a corpus sweep."""
+        concepts_calls, _historical_prefixes, _new_prefixes = self._run_scan_and_capture(
+            tmp_path, monkeypatch, force=True, n_historical=5, n_new=0
+        )
+        assert concepts_calls == []
+
+    def test_without_force_makes_the_same_calls_as_before(self, tmp_path, monkeypatch):
+        """The no-force path is untouched by the round-3 bounding fix: the 5
+        historical candidates already have a concepts.json and are excluded
+        by the pre-existing exists()-and-not-force gate regardless of
+        touched_prefixes; the 2 new videos do not yet have one and are
+        processed - exactly the calls this path made before this fix."""
+        concepts_calls, historical_prefixes, new_prefixes = self._run_scan_and_capture(
+            tmp_path, monkeypatch, force=False, n_historical=5, n_new=2
+        )
+        called_prefixes = {c["prefix"] for c in concepts_calls}
+        assert len(concepts_calls) == 2
+        assert called_prefixes == set(new_prefixes)
+        assert called_prefixes.isdisjoint(historical_prefixes)
+        assert all(c["force"] is False for c in concepts_calls)
 
 
 # ---------------------------------------------------------------------------
