@@ -6164,6 +6164,12 @@ def cmd_scan(args, config):
         # notification - useful for long-form podcasters (Lex Fridman) where
         # the user wants to cherry-pick episodes manually.
         auto_mindmap = ch.get("auto_mindmap", "all")
+        # Issue #173 review round 3: the prefixes this run actually asked the
+        # mindmap loop to (re)generate - the auto_concepts block below reads
+        # this under --force so a concepts re-extraction stays bounded to what
+        # THIS run touched, not the whole channel. Stays empty unless the
+        # mindmap loop below (the "else" branch) actually runs.
+        touched_prefixes: set[str] = set()
         if auto_mindmap == "none":
             if new_videos:
                 log.info(
@@ -6177,6 +6183,7 @@ def cmd_scan(args, config):
         elif not new_videos:
             log.info("  All mind maps up to date.")
         else:
+            touched_prefixes = {video_file_prefix(v) for v in new_videos}
             # Issue #54: per-video source resolution. Transcripts from Step 1
             # are now on disk (or absent if the threshold/skip filter rejected
             # them); resolve_mindmap_source() picks transcript vs video accordingly.
@@ -6299,12 +6306,41 @@ def cmd_scan(args, config):
             taxonomy = load_taxonomy(output_dir)
             prompt_name = ch.get("prompt") or config.get("default_prompt", "mindmap-knowledge")
             channel_dir_for_concepts = output_dir / ch_name
+            # Issue #173 (scan half): this pre-filter and the process_concepts
+            # call below must both honor args.force, mirroring cmd_concepts's
+            # gate (~:7774/:7824). Pre-fix, scan --force --channel X regenerated
+            # every mindmap (force=args.force at ~:5952/:5966 -- see the drop of
+            # is_processed for the whole channel at ~:5710) but this filter still
+            # excluded every video with an existing concepts.json, and even a
+            # candidate that DID make it through never received force=args.force
+            # on the call below -- so a bulk remediation run (issue #172) paired
+            # fresh mindmaps with concepts extracted from the OLD ones, silently,
+            # at exit 0. Same defect #173 fixed on process --url, on the path a
+            # bulk remediation is most likely to actually use.
+            #
+            # Review round 3: the glob below is corpus-wide, for all time - it
+            # is NOT built from new_videos, so it is bounded by neither --since
+            # nor the fetch window, and "if not videos:" deliberately falls
+            # through for auto_concepts channels even when YouTube returned
+            # zero new videos. Simply honoring --force here (as the comment
+            # above did) therefore turned "redo what I just regenerated" into
+            # a FULL-CORPUS concepts re-extraction on every scan --force -
+            # money the fix above did not intend to spend. Under --force, the
+            # candidate loop is now bounded to touched_prefixes (this run's
+            # window-bounded, force-aware mindmap candidate set, computed
+            # above); corpus-wide re-extraction already has a correct home in
+            # `concepts --channel X --force`, so issue #172's remediation
+            # should point there, not here. Without --force the pre-filter
+            # below is unchanged (it is already bounded, by construction, to
+            # videos lacking a concepts.json).
             concept_candidates: list[tuple[dict, Path, str]] = []
             if channel_dir_for_concepts.exists():
                 for meta_file in sorted(channel_dir_for_concepts.glob("*.meta.json")):
                     prefix = meta_file.name[: -len(".meta.json")]
+                    if args.force and prefix not in touched_prefixes:
+                        continue
                     concepts_path = channel_dir_for_concepts / f"{prefix}.concepts.json"
-                    if concepts_path.exists():
+                    if concepts_path.exists() and not args.force:
                         continue
                     mindmap_path = find_mindmap_source(channel_dir_for_concepts, prefix)
                     if not mindmap_path:
@@ -6339,6 +6375,7 @@ def cmd_scan(args, config):
                         ch_name,
                         source_file=mindmap_path.name,
                         source_prompt=prompt_name,
+                        force=args.force,
                         prefix=prefix,
                     )
                     log.info("    %s: %s", out_prefix, status)
@@ -7503,23 +7540,46 @@ def _cmd_process_url(args, config):
         log.warning("    Mindmap not on disk; skipping concepts.")
         finish_pipeline_run(steps, label=prefix)
         return
-    mindmap_text = mindmap_path.read_text(encoding="utf-8")
-    taxonomy = load_taxonomy(output_dir)
     concepts_prompt_name = "mindmap-from-transcript" if resolved_source == "transcript" else prompt_name
-    concepts_prefix, concepts_status = process_concepts(
-        client,
-        types,
-        video,
-        mindmap_text,
-        taxonomy,
-        model,
-        output_dir,
-        channel_name,
-        source_file=mindmap_path.name,
-        source_prompt=concepts_prompt_name,
-        prefix=prefix,
-    )
-    log.info("    concepts [%s]: %s", concepts_prefix, concepts_status)
+    # Issue #173: force=args.force was missing here, so `process --url --force`
+    # left process_concepts's own `concepts_path.exists() and not force` early
+    # return (that guard is correct and shared with the lazy-fill `concepts
+    # --channel` path - do not touch it) in effect on every re-run, silently
+    # keeping concepts extracted from the PRE-force mindmap. Also wrapped in
+    # try/except + _record_concepts_error, matching the --file path's shape
+    # (~:7728-7749): without it, a concepts exception here propagated
+    # uncaught all the way through cmd_process to main()'s bare dispatch (no
+    # `except` there - see main()'s command dispatch), leaving no identity
+    # stamped and no concepts_status recorded (issue #66/#129).
+    #
+    # Review round 2: mindmap_text/taxonomy MUST be read inside this try, not
+    # staged above it. A read that raises (UnicodeDecodeError on a Cyrillic/BCS
+    # mindmap, OSError on a cloud mount, a corrupt taxonomy.json) is the exact
+    # pre-fix failure mode this block exists to close - uncaught, no identity
+    # stamped, no concepts_status, no exit 3 - so it has to be inside the same
+    # net as the process_concepts() call itself.
+    try:
+        mindmap_text = mindmap_path.read_text(encoding="utf-8")
+        taxonomy = load_taxonomy(output_dir)
+        concepts_prefix, concepts_status = process_concepts(
+            client,
+            types,
+            video,
+            mindmap_text,
+            taxonomy,
+            model,
+            output_dir,
+            channel_name,
+            source_file=mindmap_path.name,
+            source_prompt=concepts_prompt_name,
+            force=args.force,
+            prefix=prefix,
+        )
+        log.info("    concepts [%s]: %s", concepts_prefix, concepts_status)
+    except Exception as exc:
+        concepts_status = f"error: {exc}"
+        log.error("    concepts [%s] raised: %s (mindmap and transcript preserved)", prefix, exc)
+        _record_concepts_error(transcript_meta_path, video, channel_dir, str(exc))
     steps.append(
         {
             "label": "concepts",
@@ -7979,9 +8039,14 @@ def _cmd_process_impl(args, config):
         finish_pipeline_run(steps, label=prefix)
         return
 
-    mindmap_text = mindmap_path.read_text(encoding="utf-8")
-    taxonomy = load_taxonomy(output_dir)
+    # Issue #173 review round 2: mindmap_text/taxonomy must be read INSIDE the
+    # try below, not staged above it - a read that raises (UnicodeDecodeError
+    # on a Cyrillic/BCS mindmap, OSError on a cloud mount, a corrupt
+    # taxonomy.json) previously took the exact uncaught path this try/except
+    # exists to close. Mirrors the --url site (~:7242-7263).
     try:
+        mindmap_text = mindmap_path.read_text(encoding="utf-8")
+        taxonomy = load_taxonomy(output_dir)
         _, concepts_status = process_concepts(
             client,
             types,
@@ -7999,7 +8064,7 @@ def _cmd_process_impl(args, config):
         log.info("  concepts [%s]: %s", prefix, concepts_status)
     except Exception as e:
         concepts_status = f"error: {e}"
-        log.warning("Concepts failed for %s: %s (mindmap and transcript preserved)", prefix, e)
+        log.error("Concepts failed for %s: %s (mindmap and transcript preserved)", prefix, e)
         _record_concepts_error(meta_path, video, channel_dir, str(e))
     steps.append(
         {
