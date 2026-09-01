@@ -230,24 +230,59 @@ In order of impact and ease:
 The index is a derived artifact. To rebuild from scratch:
 
 ```bash
-python scripts/video_intel.py index          # full rebuild
-python scripts/video_intel.py index --force   # drop + rebuild
+python scripts/video_intel.py index                      # full rebuild
+python scripts/video_intel.py index --force              # drop + rebuild
+python scripts/video_intel.py index --channel natebjones # incremental: just this channel
 ```
 
 Rebuilding is safe and idempotent. The `.lancedb/` directory can be deleted at any time.
 
-> **Do NOT run `index --channel X` (issue #183).** Despite the flag's name and its
-> help text, it is not scoped: `build_search_index` filters *collection* to channel X
-> and then does an unconditional `create_table(..., mode="overwrite")`, so it replaces
-> the whole shared table with only that channel's chunks. Roughly 98% of the index
-> disappears, the command still prints `Indexed N chunks` and exits 0, and every later
-> search silently returns single-channel results. A *mistyped* channel name is harmless
-> (the `if not all_records` guard returns before the overwrite) - only a valid one
-> destroys the index. Until #183 lands, the only safe rebuild is a full `index`.
+`--channel` is the only **incremental** primitive the tool has, and it is what makes
+the re-index that `dedupe` and `prune-shorts` both ask for affordable. Plain `index`
+re-embeds the entire corpus every run - there is no embedding reuse anywhere in
+`build_search_index` - so on a large corpus a scoped run is the difference between a
+few cents and a full re-embed.
+
+Three limits worth knowing:
+
+- **A scoped run REPLACES a channel's rows; it never retires them.** A channel whose
+  transcripts were all removed (say by `prune-shorts --apply`) hits the
+  no-records guard before the delete, so its stale rows stay in the index and keep
+  answering searches. The command warns and names the surviving row count; retiring
+  them needs a whole-corpus `index --force`.
+- **`delete` and `add` are separate commits.** A failure between them leaves the
+  channel with zero rows while every other channel is intact; the command exits
+  non-zero and names the channel and the `index --force` recovery. A vector-dimension
+  change is checked for explicitly beforehand, because that is the one drift the
+  column-name check cannot see.
+- **Concurrency is untested.** Two sequential scoped runs on different channels
+  compose. Two *concurrent* runs rely on lance's optimistic-concurrency commit path,
+  which this project has not exercised; the standing convention is one agent per
+  worktree. A scoped run racing a full run can duplicate or briefly drop one channel,
+  recoverable with `index --force` - still strictly better than the pre-fix behaviour,
+  where the same race lost the whole table.
+
+Under scoped semantics `--channel X --force` means "re-embed X" and never drops the
+table; a whole-corpus `--force` is `index --force` with no `--channel`. A scoped run
+against a database with no index at all is **refused before any Voyage call**, because
+an index born holding one channel reproduces the same silent single-channel-search
+window, unbounded.
+
+> **History (issue #183, fixed 2026-09-01).** `--channel` used to be destructive:
+> `build_search_index` filtered *collection* to channel X and then ran an unconditional
+> `create_table(..., mode="overwrite")`, replacing the whole shared table with one
+> channel's chunks. Roughly 98% of the index disappeared, the command still printed
+> `Indexed N chunks` and exited 0, and every later search silently returned
+> single-channel results. A *mistyped* channel name was harmless (the
+> `if not all_records` guard returned before the overwrite) - only a **valid** one
+> destroyed the index, which is what made it rare and confusing. Measured on a
+> two-channel scratch corpus before the fix: `index --channel aidotengineer` left 35
+> rows and silently deleted all 28 rows of the other channel, exit 0.
 >
-> This section previously listed `index --channel natebjones  # single channel` as a
-> normal rebuild option. It was wrong, and CLAUDE.md points every agent here before
-> touching search, so the bad advice had reach. Removed 2026-08-31.
+> This section also once listed `index --channel natebjones  # single channel` as a
+> normal rebuild option while the behaviour was destructive. CLAUDE.md points every
+> agent here before touching search, so the bad advice had reach. It is listed again
+> above only because the behaviour now matches the name.
 
 ## Related Documents
 
