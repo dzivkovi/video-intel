@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 
@@ -249,38 +250,83 @@ class TestFieldInventoryCannotDrift:
     stale on this path. The inventory is derived from the module, not restated,
     so the two cannot disagree."""
 
-    def test_every_transcript_field_another_writer_persists_is_written_or_dropped_here(self) -> None:
+    # Keys that are NOT meta fields describing a transcript artifact, and so
+    # are correctly absent from the inventory. Every entry needs a reason -
+    # this is the conscious-classification list a new field has to pass
+    # through, and padding it is how the guarantee would be lost.
+    NOT_ARTIFACT_FIELDS: ClassVar[set[str]] = {
+        # The operator's own hand-written annotation. Dropping it is data loss.
+        "transcript_quality_note",
+        # Config knobs and function parameters, never persisted to meta.json.
+        "transcript_source_cli",
+        "transcript_timeout_seconds",
+        "transcript_max_duration_seconds",
+    }
+
+    def test_every_transcript_meta_key_in_the_module_is_classified(self) -> None:
+        """The inventory is derived from the module, not restated beside it.
+
+        An earlier version of this test walked only `transcript_*` constants
+        appearing SYNTACTICALLY INSIDE an `update_meta(...)` call node. The
+        chunked and salvage writers build `meta_fields = {...}` as a variable
+        and pass the name, so their keys were invisible: the walk saw 7 fields,
+        all from the two inline dict literals - the captions writer compared
+        against itself. It was a tautology, and it is why four real fields
+        (`transcript_confabulation_note`, `transcript_recovery`,
+        `transcript_parse_error`, `transcript_warning`) were missing from the
+        inventory while the suite stayed green.
+
+        This version collects every `transcript_*`/`captions_*` string used as
+        a DICT KEY anywhere in the module, which no writer can dodge, and
+        requires each to be either in the inventory or consciously classified
+        as not-an-artifact-field.
+        """
         import ast
         import inspect
 
-        source = inspect.getsource(vi)
-        tree = ast.parse(source)
-        persisted: set[str] = set()
+        tree = ast.parse(inspect.getsource(vi))
+        keys: set[str] = set()
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
+            if not isinstance(node, ast.Dict):
                 continue
-            func = node.func
-            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
-            if name not in {"update_meta", "_record_transcript_error"}:
-                continue
-            for arg in list(node.args) + [kw.value for kw in node.keywords]:
-                for sub in ast.walk(arg):
-                    if (
-                        isinstance(sub, ast.Constant)
-                        and isinstance(sub.value, str)
-                        and (sub.value.startswith("transcript_") or sub.value == "captions_is_generated")
-                    ):
-                        persisted.add(sub.value)
+            for key in node.keys:
+                if (
+                    isinstance(key, ast.Constant)
+                    and isinstance(key.value, str)
+                    and (key.value.startswith("transcript_") or key.value.startswith("captions_"))
+                ):
+                    keys.add(key.value)
 
-        # Fields describing the operator's own annotations are deliberately out
-        # of scope - dropping a hand-written note would be data loss.
-        persisted.discard("transcript_quality_note")
-        unaccounted = sorted(persisted - set(vi.TRANSCRIPT_ARTIFACT_FIELDS))
+        unaccounted = sorted(keys - set(vi.TRANSCRIPT_ARTIFACT_FIELDS) - self.NOT_ARTIFACT_FIELDS)
         assert not unaccounted, (
-            "these transcript_* meta fields are persisted somewhere but are neither "
-            "written nor dropped by the captions writer, so they can go stale on a "
-            f"captions recovery: {unaccounted}"
+            "these transcript_*/captions_* meta keys are written somewhere in the module "
+            "but are neither in TRANSCRIPT_ARTIFACT_FIELDS nor classified as "
+            "not-an-artifact-field, so they can go stale on a captions recovery: "
+            f"{unaccounted}"
         )
+
+    def test_the_walk_actually_sees_the_writers_it_claims_to_watch(self) -> None:
+        """Guard against the tautology returning. If the extraction stops
+        seeing the chunked and salvage writers' variable-built dicts, this
+        test goes red BEFORE the inventory test can quietly start passing for
+        the wrong reason."""
+        import ast
+        import inspect
+
+        tree = ast.parse(inspect.getsource(vi))
+        keys: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Dict):
+                for key in node.keys:
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                        keys.add(key.value)
+
+        # Written only by the chunked writer, and only inside a variable-built dict.
+        assert "transcript_chunks" in keys
+        assert "transcript_confabulated_chunks" in keys
+        # Written only by the salvage writer, likewise.
+        assert "transcript_recovery" in keys
+        assert "transcript_parse_error" in keys
 
     def test_no_inventory_field_keeps_the_previous_attempts_value(self, paths, monkeypatch) -> None:
         """Written-or-dropped, with nothing falling between the two. The
@@ -297,6 +343,152 @@ class TestFieldInventoryCannotDrift:
 
         stale = [f for f in vi.TRANSCRIPT_ARTIFACT_FIELDS if f in before and f in after and before[f] == after[f]]
         assert not stale, f"these kept the previous attempt's value: {stale}"
+
+
+class TestEveryCallSiteThreadsTheDuration:
+    """A call site that drops `duration_seconds` silently downgrades that path's
+    assessment to metrics-only - gap, density and monolithic are all skipped, so
+    a five-cues-over-three-hours track is stamped `complete`, `flags: []`.
+
+    The first cut of this PR missed one of the TEN sites (the `_cmd_process_url`
+    chunked-failover one) while claiming nine, and nothing caught it - every
+    other test calls the writer directly and hands the duration in. Deriving the
+    inventory from the source is what closes that."""
+
+    def test_no_call_site_omits_duration_seconds(self) -> None:
+        import ast
+        import inspect
+
+        tree = ast.parse(inspect.getsource(vi))
+        missing = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+            if name != "_try_captions_transcript":
+                continue
+            if not any(kw.arg == "duration_seconds" for kw in node.keywords):
+                missing.append(node.lineno)
+        assert not missing, (
+            "these _try_captions_transcript call sites do not pass duration_seconds, so the "
+            f"quality assessment silently degrades to metrics-only on those paths: lines {missing}"
+        )
+
+    def test_the_walk_finds_the_call_sites_it_claims_to_check(self) -> None:
+        """Guard the guard: if the extraction stops finding call sites, the test
+        above passes vacuously."""
+        import ast
+        import inspect
+
+        tree = ast.parse(inspect.getsource(vi))
+        sites = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and (n.func.attr if isinstance(n.func, ast.Attribute) else getattr(n.func, "id", None))
+            == "_try_captions_transcript"
+        ]
+        assert len(sites) >= 9, f"expected the module's captions call sites, found {len(sites)}"
+
+
+class TestALeadingGapInACaptionTrackIsNotSevere:
+    """A caption track is ASR ground truth about SPEECH, so silence before the
+    first cue means nobody had spoken - not that a model skipped content. A
+    livestream pre-show is the common shape, and #120 routes that population
+    here on purpose. Measured: the two largest leading gaps in the corpus are
+    576s and 558s, both within 4% of the 600s severe threshold."""
+
+    def test_a_long_pre_show_silence_is_mild_not_severe(self, paths, monkeypatch) -> None:
+        # Nothing said for the first 15 minutes, then a healthy hour.
+        snippets = [(900 + i * 20, f"line {i}") for i in range(180)]
+        _stub_captions(monkeypatch, snippets)
+
+        vi._try_captions_transcript(_video(), paths.transcript, paths.meta, paths.prefix, duration_seconds=4500)
+
+        meta = json.loads(paths.meta.read_text(encoding="utf-8"))
+        assert vi.QUALITY_FLAG_CAPTIONS_LEADING_GAP_MILD in meta["transcript_quality_flags"]
+        assert vi.transcript_quality_flags_are_severe(meta["transcript_quality_flags"]) is False
+        assert meta["transcript_status"] == "complete"
+
+    def test_an_internal_hole_is_still_severe(self, monkeypatch, paths) -> None:
+        """Only LEADING is demoted. An internal hole could be a music segment
+        or a genuine caption failure, and the evidence does not separate them."""
+        snippets = [(i * 20, f"early {i}") for i in range(20)] + [(1400 + i * 20, f"late {i}") for i in range(20)]
+        _stub_captions(monkeypatch, snippets)
+
+        vi._try_captions_transcript(_video(), paths.transcript, paths.meta, paths.prefix, duration_seconds=2000)
+
+        meta = json.loads(paths.meta.read_text(encoding="utf-8"))
+        assert vi.transcript_quality_flags_are_severe(meta["transcript_quality_flags"]) is True
+
+
+class TestASevereCaptionTrackIsVisibleToAReader:
+    def test_the_transcript_markdown_carries_the_warning(self, paths, monkeypatch) -> None:
+        """A status that lives only in meta.json is invisible to the person who
+        opens the transcript, who is the primary consumer."""
+        _stub_captions(monkeypatch, [(5, "the whole three hour talk in one cue")])
+
+        vi._try_captions_transcript(_video(), paths.transcript, paths.meta, paths.prefix, duration_seconds=10800)
+
+        body = paths.transcript.read_text(encoding="utf-8")
+        assert "Quality guard flagged this caption track" in body
+
+    def test_a_healthy_track_gets_no_warning_block(self, paths, monkeypatch) -> None:
+        _stub_captions(monkeypatch, _healthy_snippets())
+        vi._try_captions_transcript(_video(), paths.transcript, paths.meta, paths.prefix, duration_seconds=1200)
+        assert "Quality guard flagged" not in paths.transcript.read_text(encoding="utf-8")
+
+    def test_the_returned_status_distinguishes_a_demotion_from_a_clean_success(self, paths, monkeypatch) -> None:
+        """#157 invariant 6: a caller reading the status string, not the meta,
+        must be able to tell the two apart."""
+        _stub_captions(monkeypatch, [(5, "one cue for everything")])
+        _, status = vi._try_captions_transcript(
+            _video(), paths.transcript, paths.meta, paths.prefix, duration_seconds=10800
+        )
+        assert status == "partial (captions quality guard)"
+
+        paths.transcript.unlink()
+        _stub_captions(monkeypatch, _healthy_snippets())
+        _, ok_status = vi._try_captions_transcript(
+            _video(), paths.transcript, paths.meta, paths.prefix, duration_seconds=1200
+        )
+        assert ok_status == "done (captions)"
+
+
+class TestTheRuleAppliesToEveryTranscriptWriter:
+    """CLAUDE.md states the rule universally, so it must be universally applied
+    - not just on the captions path that prompted it."""
+
+    def test_retired_transcript_fields_is_the_inventory_minus_what_is_written(self) -> None:
+        written = {"transcript_status": "complete", "transcript_source": "gemini"}
+        retired = vi.retired_transcript_fields(written)
+        assert "transcript_status" not in retired
+        assert "transcript_chunks" in retired
+        assert set(retired) | set(written) >= set(vi.TRANSCRIPT_ARTIFACT_FIELDS)
+
+    def test_every_transcript_writer_retires_what_it_does_not_write(self) -> None:
+        import ast
+        import inspect
+
+        tree = ast.parse(inspect.getsource(vi))
+        unguarded = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+            if name != "update_meta":
+                continue
+            args = [ast.unparse(a) for a in node.args] + [f"{kw.arg}={ast.unparse(kw.value)}" for kw in node.keywords]
+            joined = " ".join(args)
+            is_transcript_write = '"transcript"' in joined or "'transcript'" in joined
+            if is_transcript_write and "drop_fields" not in joined:
+                unguarded.append(node.lineno)
+        assert not unguarded, (
+            "these update_meta(..., 'transcript') writers do not retire the artifact fields "
+            f"they are not setting, so a predecessor's metrics can survive: lines {unguarded}"
+        )
 
 
 class TestUpdateMetaDropFields:

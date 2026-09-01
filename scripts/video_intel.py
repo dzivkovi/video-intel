@@ -585,6 +585,19 @@ def _read_meta_best_effort(meta_path: Path, *, raise_on_os_error: bool) -> dict:
     return data
 
 
+def retired_transcript_fields(fields: dict) -> tuple[str, ...]:
+    """Artifact-describing keys a transcript writer is NOT setting this time.
+
+    The rule (issue #182): every writer that REPLACES a transcript owns every
+    field that describes that transcript. Since `update_meta` merges, a writer
+    that only sets its own fields leaves its predecessor's metrics describing
+    an artifact that is gone. Each writer passes its own field dict here and
+    retires the difference, so the rule is one expression rather than four
+    hand-maintained lists that can drift apart.
+    """
+    return tuple(f for f in TRANSCRIPT_ARTIFACT_FIELDS if f not in fields)
+
+
 def update_meta(meta_path: Path, fields: dict, mode: str, *, drop_fields: tuple[str, ...] = ()) -> None:
     """Read existing meta.json, merge fields, ensure mode in modes_completed, write back.
 
@@ -3129,7 +3142,12 @@ def _run_chunked_transcript_url(
         meta_fields["transcript_confabulation_note"] = (
             f"{confabulated_chunks} of {len(chunks)} chunks reported prompt=0 and were discarded"
         )
-    update_meta(channel_dir / f"{prefix}.meta.json", meta_fields, mode="transcript")
+    update_meta(
+        channel_dir / f"{prefix}.meta.json",
+        meta_fields,
+        mode="transcript",
+        drop_fields=retired_transcript_fields(meta_fields),
+    )
     return "partial" if is_partial else "done"
 
 
@@ -5408,7 +5426,47 @@ TRANSCRIPT_ARTIFACT_FIELDS: tuple[str, ...] = (
     "transcript_confabulated_chunks",
     "transcript_failover_reason",
     "captions_is_generated",
+    # These four describe a Gemini attempt's own recovery story. A captions
+    # recovery that let `transcript_confabulation_note` survive would answer
+    # "which transcripts have a fabricated hole?" (the question issue #123 made
+    # answerable from meta.json instead of by grepping logs) with a claim about
+    # a transcript that no longer exists.
+    "transcript_confabulation_note",
+    "transcript_recovery",
+    "transcript_parse_error",
+    "transcript_warning",
 )
+
+
+#: A caption track is ASR ground truth about SPEECH: it emits cues wherever
+#: anyone talks, so silence before the first cue means nobody had spoken yet -
+#: not that a model skipped content, which is what a leading gap means in a
+#: Gemini transcript. A livestream pre-show or waiting screen is the common
+#: shape, and issue #120 routes exactly that population here on purpose.
+#:
+#: Measured across all 83 captions transcripts in the corpus: 0 currently
+#: exceed the 600s severe threshold, but the two largest leading gaps are 576s
+#: and 558s - both livestream Q&A/AMA videos, both within 4% of the line. So
+#: this is a real near-miss, not a theoretical one, and a false severe here
+#: costs exactly what #182 was filed about: mindmap-from-video instead of
+#: mindmap-from-transcript, a permanent EXIT_PARTIAL, and a dedupe penalty.
+#:
+#: Deliberately LEADING only. An INTERNAL hole could be a music or demo
+#: segment, but it could equally be a genuine caption-track failure, and the
+#: evidence does not separate them (largest observed internal gap: 243s, well
+#: under threshold). Monolithic collapse is untouched. Widening this to
+#: internal gaps needs its own evidence.
+QUALITY_FLAG_CAPTIONS_LEADING_GAP_MILD = "captions_leading_gap_mild"
+
+
+def _demote_captions_leading_gap(metrics: dict) -> tuple[list[str], list[str]]:
+    """Severe/mild flag lists with a captions LEADING blind gap downgraded."""
+    severe = list(metrics["severe"])
+    mild = list(metrics["mild"])
+    if metrics.get("blind_gap_kind") == "leading" and QUALITY_FLAG_BLIND_GAP_SEVERE in severe:
+        severe.remove(QUALITY_FLAG_BLIND_GAP_SEVERE)
+        mild.append(QUALITY_FLAG_CAPTIONS_LEADING_GAP_MILD)
+    return severe, mild
 
 
 def _captions_dialogue_entries(snippets) -> list[dict]:
@@ -5475,13 +5533,6 @@ def _try_captions_transcript(
     if not body.strip():
         log.info("  %s: caption track present but empty after dedup/clip - not usable", prefix)
         return None
-    _write_transcript_md(
-        transcript_path,
-        video,
-        body,
-        status="Captions (YouTube auto-generated)" if captions.is_generated else "Captions (manual)",
-        transcript_source=TRANSCRIPT_SOURCE_CAPTIONS,
-    )
     # Issue #182: this writer replaced the transcript, so it owns every field
     # that describes one. Assess the caption track the same way the Gemini
     # writers assess theirs (a genuinely bad caption track - five cues over
@@ -5501,8 +5552,25 @@ def _try_captions_transcript(
         None if window is not None else duration_seconds,
         window=window,
     )
-    quality_flags = sorted(set(quality_metrics["severe"]) | set(quality_metrics["mild"]))
+    severe_flags, mild_flags = _demote_captions_leading_gap(quality_metrics)
+    quality_flags = sorted(set(severe_flags) | set(mild_flags))
     quality_severe = transcript_quality_flags_are_severe(quality_flags)
+    # The markdown is written AFTER the verdict so a severe track carries the
+    # same visible warning block every other partial-producing path writes.
+    # A reader who opens the transcript is the primary consumer; a status that
+    # lives only in meta.json is invisible to them.
+    _write_transcript_md(
+        transcript_path,
+        video,
+        body,
+        status="Captions (YouTube auto-generated)" if captions.is_generated else "Captions (manual)",
+        transcript_source=TRANSCRIPT_SOURCE_CAPTIONS,
+        warning=(
+            f"Quality guard flagged this caption track ({', '.join(quality_flags)}). It may be missing content."
+            if quality_severe
+            else None
+        ),
+    )
     fields = {
         **_transcript_identity_fields(video, meta_path.parent),
         "processed": datetime.now(UTC).isoformat(),
@@ -5523,7 +5591,7 @@ def _try_captions_transcript(
         meta_path,
         fields,
         "transcript",
-        drop_fields=tuple(f for f in TRANSCRIPT_ARTIFACT_FIELDS if f not in fields),
+        drop_fields=retired_transcript_fields(fields),
     )
     log.info(
         "  %s: transcript from YouTube captions (%d cues, %s)",
@@ -5537,6 +5605,12 @@ def _try_captions_transcript(
             prefix,
             ", ".join(quality_flags),
         )
+        # Distinct return literal, matching the single-shot writer (#157
+        # invariant 6): a caller reading the status string, not the persisted
+        # meta, must be able to tell a quality-guard demotion from a clean
+        # success. Without this a scan prints "done (captions)" for a track the
+        # code just judged severe.
+        return prefix, "partial (captions quality guard)"
     return prefix, "done (captions)"
 
 
@@ -5810,20 +5884,22 @@ def process_transcript(
             )
             quality_flags = sorted(set(quality_metrics["severe"]) | set(quality_metrics["mild"]))
             quality_severe = transcript_quality_flags_are_severe(quality_flags)
+            success_fields = {
+                **_transcript_identity_fields(video, channel_dir),
+                "processed": datetime.now(UTC).isoformat(),
+                "transcript_status": "partial" if quality_severe else "complete",
+                "transcript_source": TRANSCRIPT_SOURCE_GEMINI,
+                "transcript_quality_flags": quality_flags,
+                "transcript_max_blind_gap_seconds": quality_metrics["max_blind_gap_seconds"],
+                "transcript_blind_gap_at_seconds": quality_metrics["blind_gap_at_seconds"],
+                "transcript_last_dialogue_fraction": quality_metrics["last_dialogue_fraction"],
+                "transcript_dialogue_entries": quality_metrics["dialogue_entries"],
+            }
             update_meta(
                 meta_path,
-                {
-                    **_transcript_identity_fields(video, channel_dir),
-                    "processed": datetime.now(UTC).isoformat(),
-                    "transcript_status": "partial" if quality_severe else "complete",
-                    "transcript_source": TRANSCRIPT_SOURCE_GEMINI,
-                    "transcript_quality_flags": quality_flags,
-                    "transcript_max_blind_gap_seconds": quality_metrics["max_blind_gap_seconds"],
-                    "transcript_blind_gap_at_seconds": quality_metrics["blind_gap_at_seconds"],
-                    "transcript_last_dialogue_fraction": quality_metrics["last_dialogue_fraction"],
-                    "transcript_dialogue_entries": quality_metrics["dialogue_entries"],
-                },
+                success_fields,
                 "transcript",
+                drop_fields=retired_transcript_fields(success_fields),
             )
             if quality_severe:
                 log.warning(
@@ -5906,7 +5982,12 @@ def process_transcript(
                     finish_capture.get("reason"),
                     video.get("url", ""),
                 )
-            update_meta(meta_path, salvage_fields, "transcript")
+            update_meta(
+                meta_path,
+                salvage_fields,
+                "transcript",
+                drop_fields=retired_transcript_fields(salvage_fields),
+            )
             log.info("  %s: salvaged partial transcript (%d speech entries)", prefix, speech_count)
             status_word = TRANSCRIPT_STATUS_TRUNCATED if truncated else "partial"
             return prefix, f"{status_word} ({speech_count} entries salvaged)"
@@ -7938,6 +8019,7 @@ def _cmd_process_url(args, config):
                         prefix,
                         reason=f"chunked transcript failed: {transcript_status}",
                         force=args.force,
+                        duration_seconds=duration_seconds,
                     )
                     if fb is not None:
                         _, transcript_status = fb
