@@ -18,7 +18,10 @@ description: >
   for [claim]", "when did [creator] mention [Z]", "nugget brief on [X]",
   "consultant brief on [X]", "what do creators say about [X]", "agreements
   and disagreements on [X]", "synthesize insights across creators",
-  "mental models across creators", "find the nuggets about [X]", "show
+  "mental models across creators", "find the nuggets about [X]",
+  "which topics do I have", "list my topics", "show me everything tagged
+  [topic]", "what videos are in my [topic] thread", "everything I've
+  curated under [topic]", "show
   corpus status", "when was this last scanned", "what concepts are in my
   library", "what topics recur across channels", "summarize this video",
   "is this worth watching", "what should I watch",
@@ -34,7 +37,8 @@ description: >
   that produce it, and writes nothing. For scanning new
   videos, transcribing, generating mindmaps, rebuilding the index,
   persisting or initializing the profile, or any other write operation on the
-  corpus, use the video-intel skill
+  corpus - including generating a catch-up briefing (`briefings --unseen`)
+  or a curated topic briefing - use the video-intel skill
   from the plugin repo instead - those operations require channels
   configured and API keys the search skill does not need.
 ---
@@ -235,6 +239,14 @@ python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" status
 The output includes a per-channel topics rollup (the answer to "why is this
 channel in my corpus"), when `topics.json` has been built.
 
+### List which topics exist ("which topics do I have", "list my topics")
+
+Topic slugs are not free text - they come from the first-level folder names
+under `_briefings/` plus `--topic` stamps in per-video metas. To enumerate
+them, run `status`: its per-channel rollup lists every topic with its video
+count. If `status` reports no topics, `topics.json` has not been built yet -
+that is a curate operation (`topics-build`, video-intel skill).
+
 ### Filter a search to one topic
 
 ```bash
@@ -254,6 +266,8 @@ python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" search "discovery call
 | Summarize a video already scanned | **video-intel-search** (look up in corpus) |
 | See what is ranking briefings / the headline digest (`profile show`) | **video-intel-search** (this - read-only) |
 | Persist or scaffold the profile (`profile init`) | **video-intel** (curate - it writes files) |
+| Generate a catch-up briefing across the whole corpus (`briefings --unseen`) | **video-intel** (curate) |
+| Build a curated topic briefing (editorial synthesis) | **video-intel** (curate) |
 | Scan YouTube channels for new videos | **video-intel** (curate) |
 | Transcribe a video or local MP4 | **video-intel** (curate) |
 | Rebuild the index, taxonomy, or run dedupe | **video-intel** (curate) |

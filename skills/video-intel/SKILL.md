@@ -26,7 +26,14 @@ description: >
   Gemini fails", "this channel keeps hanging", "fix identity-less metas",
   "backfill missing video_id", "this video keeps getting re-transcribed",
   "set up my profile", "persist my profile", "personalize my briefings",
-  "save the inferred profile", "create my audience profile".
+  "save the inferred profile", "create my audience profile",
+  "catch me up on my videos", "what am I behind on", "what haven't I been
+  briefed on yet", "give me a catch-up briefing", "build me a briefing on
+  [topic]", "what should I know about [topic]", "open my video
+  wiki", "browse my creator atlas", "open the Obsidian wiki", "who talked
+  about [X] first, who followed", "who's ahead of the curve on [topic]",
+  "what's trending across my channels", "what's spiking this month",
+  "who has validated ties across my creators".
   Requires GEMINI_API_KEY, YOUTUBE_API_KEY, and
   `channels:` configured in config.yaml - this skill must run from the
   plugin repo checkout, not a globally-installed cache. Calls Gemini as
@@ -178,6 +185,7 @@ table is the canonical mapping — read it before picking a command.
 | "who leads on X", "who covers ideas first", "who's ahead of the curve on [topic]", "who follows whom" | `python scripts/lead_lag_report.py` (add `python scripts/lead_lag_viz.py --out <output_dir>/_reports/lead-lag.html` for the visual version) | **Intelligence layer (optional/experimental).** Coverage-corrected precedence: who covered a concept first, corrected so deep-backfill channels can't fake it. Needs the DuckDB store - if it's missing, run `python scripts/intel_graph.py load` first. Read-only, no Gemini. Lecture: `docs/intelligence-layer.md`. |
 | "what's spiking", "what just caught fire", "what's heating up in the corpus", "trending concepts this month" | `python scripts/burst_report.py` | **Intelligence layer (optional).** Kleinberg bursts: concepts jumping above their own baseline, with start date and rising/cooled status. Same store requirement (`intel_graph.py load`). Tell the user to read the corpus-volume table first - a big scan makes many concepts "burst" at once. No Gemini. |
 | "who has validated ties", "who clusters with whom", "which creators overlap more than chance", "the real creator network" | `python scripts/sdsm_network.py` | **Intelligence layer (optional).** SDSM-validated creator network: creator pairs sharing more concepts than a degree- AND popularity-preserving null expects. Prunes the naive-overlap noise (a topically homogeneous corpus makes almost every pair "overlap"). Same store requirement (`intel_graph.py load`). Undirected co-adoption ties, not influence - "who leads whom" is the lead-lag report. No Gemini. |
+| "open my video wiki", "show me the atlas", "let me look at what's already there" | `python scripts/register_obsidian_vault.py "<output_dir>/_wiki" --open --launch` | Opens an **already-built** wiki (Obsidian must be closed). If `_wiki/` doesn't exist yet, fall through to the build row below instead. |
 | "build the creator atlas", "make the wiki", "let me browse the findings", "generate the Obsidian wiki" | `python scripts/wiki_atlas.py --wiki-dir <output_dir>/_wiki` | **Intelligence layer (optional).** Writes a browsable wiki of the lead-lag findings. To open it in Obsidian when the GUI won't add the vault: `python scripts/register_obsidian_vault.py "<output_dir>/_wiki" --open --launch` (Obsidian must be closed). Same store requirement. No Gemini. |
 | "find videos about X", "search for Y", "nugget brief on Z", "corpus status", "verify quote", "fact-check claim against [creator]" | — | **Wrong skill.** These are read-only queries; use the **video-intel-search** skill. |
 
