@@ -47,10 +47,31 @@ writes to the repo root.
 | `metrics.py` | Four DeepEval `BaseMetric` subclasses: `RecallAtKMetric`, `MRRMetric` (non-gating), `ChannelCoverageMetric`, `TimestampPrecisionMetric`. All deterministic, no LLM judge. |
 | `_helpers.py` | `build_test_case()` — converts a gold entry + hybrid_search hits into a DeepEval `LLMTestCase`. Kept separate from `conftest.py` because pytest can't import conftest cross-package. |
 | `conftest.py` | Fixture loading the YAML once at session scope. |
-| `test_search_quality.py` | Parametrized pytest harness; one test per query. Gating metrics fail the test; `MRR` is informational. |
+| `test_search_quality.py` | Parametrized pytest harness; one test per query. Gating metrics fail the test; `MRR` is informational. Runs `hybrid_search(dedup_by_video=False)` so multi-window expectations are reachable — same videos, all their windows. |
+| `instrument.py` | Ceiling math for the measurability audit: what each gating metric can achieve at best, ignoring retrieval quality. Pure functions, no deepeval and no network. |
+| `test_instrument.py` | One test per query: fails when a gating threshold is mechanically unreachable. A failure here means the RULER is broken, not the retriever. |
 
 ## Baseline
 
-As of 2026-04-19: **1 of 25 queries passes.** Primary failure mode is
-vocabulary mismatch — see ADR-0017 for diagnosis and the staged-KB-layer
-plan that re-runs this harness at each stage.
+As of 2026-09-01 (post-#190, 2,360 videos / 80,297 chunks): **1 of 25 queries
+passes** (Q11). The same corpus scored 0/25 immediately before, with the
+instrument defect below still in place. Primary failure mode is now recall —
+19 of 25 queries retrieve none of their expected videos, and only 1 of the 22
+distinct golden videos is missing from the index, so this is genuine retrieval
+failure rather than corpus coverage.
+
+**Do not compare this number to the 2026-04-19 1/25.** Different corpus,
+different passing query, and a different instrument. See
+[`docs/testing.md`](../../docs/testing.md) → "Is the ruler intact?".
+
+## Run the measurability audit first
+
+```bash
+pytest tests/evals/test_instrument.py -v      # free: no Voyage call
+```
+
+`test_instrument.py` asks whether each golden query's gating thresholds are
+reachable **at all** given the harness configuration and the index on disk. A
+failure there is a broken ruler mark, not a retrieval result, and any N/25 read
+without checking it can silently contain instrument defects — which is exactly
+what happened between 2026-04-19 and 2026-09-01 (issue #190).

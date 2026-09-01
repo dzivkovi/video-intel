@@ -29,12 +29,21 @@ import yaml
 import video_intel as vi  # scripts/ is on sys.path via pyproject.toml pythonpath
 
 from ._helpers import build_test_case
+from .instrument import timestamp_precision_ceiling
 from .metrics import (
     ChannelCoverageMetric,
     MRRMetric,
     RecallAtKMetric,
     TimestampPrecisionMetric,
 )
+
+# The harness reads every retrieved window inside a selected video, not just
+# each video's single best chunk (issue #190). The video SET and ORDER are
+# identical either way — `dedup_by_video` only decides how many chunks per
+# video come back — so this measures the same videos the product surface would
+# have shown, with the multi-window expectations in golden_dataset.yaml
+# actually reachable. Product callers keep the dedup=True default.
+HARNESS_DEDUP_BY_VIDEO = False
 
 # --- load dataset once at module import so parametrize can see it -----------
 GOLDEN_PATH = Path(__file__).parent / "golden_dataset.yaml"
@@ -115,6 +124,7 @@ def test_retrieval_quality(
         config=config,
         expand=_EXPAND_ENABLED,
         return_diagnostics=True,
+        dedup_by_video=HARNESS_DEDUP_BY_VIDEO,
     )
 
     # Append the per-query expansion record to the JSONL run log. This is the
@@ -151,6 +161,12 @@ def test_retrieval_quality(
     # Always print the full per-metric report for visibility
     header = f"\n[{gold['id']} / {gold['query_type']}] {gold['query'][:80]}"
     print(header)
+    n_videos = len({v for v in test_case.additional_metadata["retrieved_video_ids"]})
+    print(
+        f"  ..    {len(hits)} chunks across {n_videos} videos "
+        f"(dedup_by_video={HARNESS_DEDUP_BY_VIDEO}); "
+        f"timestamp_precision ceiling {timestamp_precision_ceiling(gold, dedup_by_video=HARNESS_DEDUP_BY_VIDEO):.3f}"
+    )
     for name, (score, success, reason) in scores.items():
         flag = "PASS" if success else "FAIL"
         print(f"  {flag}  {name:<35} score={score:.3f}  {reason}")

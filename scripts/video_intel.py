@@ -9057,6 +9057,7 @@ def hybrid_search(
     config: dict[str, Any] | None = None,
     expand: bool = True,
     return_diagnostics: bool = False,
+    dedup_by_video: bool = True,
 ) -> list[dict] | tuple[list[dict], dict]:
     """Search the LanceDB index with hybrid BM25 + vector + RRF fusion.
 
@@ -9073,6 +9074,21 @@ def hybrid_search(
     `expansion_record` is `{"expand_enabled": bool, "original_query": str,
     "expanded_query": str, "matches": [...]}`. Eval harness uses this to
     write per-query JSONL logs independent of logging configuration.
+
+    `dedup_by_video` selects how the top-`limit` videos are rendered, never
+    WHICH videos they are (issue #190). `True` (the product default, unchanged)
+    returns one chunk per video - each video's best-scoring chunk. `False`
+    returns every chunk belonging to those same videos, grouped by video in the
+    same video order, best chunk first within each video. The retrieval eval
+    harness uses `False` because a golden query can expect several distinct
+    timestamp windows inside one video, and one-chunk-per-video caps such a
+    query below its own threshold no matter how good retrieval is.
+
+    "Every chunk" means every chunk in the FETCHED CANDIDATE POOL
+    (`max(50, limit * 5)` rows), not every chunk in the index. A window whose
+    chunk never entered that pool is a genuine ranking failure, not an
+    instrument artifact, and the pool is deliberately left at the product's own
+    depth so the eval keeps measuring what the product would actually surface.
     """
     lancedb = require_lancedb()
     voyageai = require_voyageai()
@@ -9157,25 +9173,52 @@ def hybrid_search(
             }
         )
 
-    hits = _dedup_by_video(raw_hits, limit)
+    hits = _select_hits_by_video(raw_hits, limit, dedup=dedup_by_video)
     if return_diagnostics:
         return hits, diagnostics
     return hits
 
 
+def _hit_video_key(hit: dict) -> str:
+    """Identity a hit is grouped under: `video_id`, falling back to `source_file`."""
+    return hit.get("video_id", "") or hit.get("source_file", "")
+
+
 def _dedup_by_video(hits: list[dict], limit: int) -> list[dict]:
     """Keep only the best-scoring chunk per video_id, return top `limit` videos."""
+    return _select_hits_by_video(hits, limit, dedup=True)
+
+
+def _select_hits_by_video(hits: list[dict], limit: int, *, dedup: bool = True) -> list[dict]:
+    """Restrict raw chunk hits to the top-`limit` videos by best chunk score.
+
+    The video SET and the video ORDER are identical in both modes - `dedup` only
+    decides how many chunks per video come back (issue #190):
+
+    * ``dedup=True``  - one chunk per video, its best-scoring one. This is the
+      product/CLI behaviour and is byte-identical to the pre-#190 function.
+    * ``dedup=False`` - every retrieved chunk belonging to those same videos,
+      grouped by video in the same video order, best chunk first within a video.
+
+    Keeping the video ranking in one place is what lets the retrieval eval run
+    with ``dedup=False`` and still measure the same videos the product surface
+    would have shown - only with all of each video's matching windows visible.
+    """
     best_per_video: dict[str, dict] = {}
     for hit in hits:
-        vid = hit.get("video_id", "")
-        if not vid:
-            vid = hit.get("source_file", "")  # fallback key
+        vid = _hit_video_key(hit)
         score = hit["relevance"]
         if vid not in best_per_video or score > best_per_video[vid]["relevance"]:
             best_per_video[vid] = hit
 
-    deduped = sorted(best_per_video.values(), key=lambda h: h["relevance"], reverse=True)
-    return deduped[:limit]
+    ranked = sorted(best_per_video.values(), key=lambda h: h["relevance"], reverse=True)[:limit]
+    if dedup:
+        return ranked
+
+    video_rank = {_hit_video_key(h): i for i, h in enumerate(ranked)}
+    kept = [h for h in hits if _hit_video_key(h) in video_rank]
+    kept.sort(key=lambda h: (video_rank[_hit_video_key(h)], -h["relevance"]))
+    return kept
 
 
 def cmd_index(args, config):
