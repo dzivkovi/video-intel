@@ -10,12 +10,25 @@ from typing import Any
 
 from deepeval.test_case import LLMTestCase
 
+import video_intel as vi
+
 
 def build_test_case(gold: dict[str, Any], hits: list[dict]) -> LLMTestCase:
     """Convert a gold entry + hybrid_search hits into a DeepEval LLMTestCase.
 
     The `additional_metadata` field is our side-channel for retrieval-level
     data that doesn't fit DeepEval's LLM-output-centric model.
+
+    `retrieved_video_ids` uses `vi._hit_video_key` - the SAME identity the
+    selector groups by - not a bare `video_id` read. Roughly 750 chunks in the
+    live index carry a blank `video_id` and are separated by `source_file`
+    instead; reading `video_id` alone collapses all of them into one `""`
+    identity, and since `RecallAtKMetric` and `MRRMetric` now count distinct
+    videos, that collapse would stop genuinely distinct videos from consuming a
+    `k` slot or advancing MRR rank. The error is always inflation - measured at
+    `RecallAt5` 0.000 -> 1.000 for an expected video sitting behind five
+    identity-less ones. Reviewers: a diff that reverts this to
+    `h.get("video_id", "")` reintroduces it silently.
     """
     actual_output_lines = [
         f"- [{h['channel']}] {h.get('title', '')} @ {h.get('timestamp', '?')} (score={h['relevance']:.3f})"
@@ -30,7 +43,7 @@ def build_test_case(gold: dict[str, Any], hits: list[dict]) -> LLMTestCase:
         additional_metadata={
             "query_id": gold["id"],
             "query_type": gold["query_type"],
-            "retrieved_video_ids": [h.get("video_id", "") for h in hits],
+            "retrieved_video_ids": [vi._hit_video_key(h) for h in hits],
             "retrieved_channels": [h.get("channel", "") for h in hits],
             "retrieved_timestamps": [h.get("timestamp_seconds", 0) for h in hits],
             "expected_hits": gold["expected_hits"],

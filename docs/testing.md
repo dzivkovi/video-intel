@@ -1,17 +1,20 @@
 # Testing
 
 Operational reference for how this project is tested. For *why* DeepEval
-was chosen and *why* the retrieval baseline is 1/25, see
-[ADR-0017](adr/ADR-0017-kb-layer-strategy.md).
+was chosen and the original diagnosis behind the retrieval baseline, see
+[ADR-0017](adr/ADR-0017-kb-layer-strategy.md) — read it alongside
+"Is the ruler intact?" below, which explains why the historic 1/25 figure
+quoted there was never purely a retrieval measurement (issue #190).
 
-Last verified: 2026-04-19
+Last verified: 2026-09-01
 
 ## Two Test Suites, Two Different Guarantees
 
 | Suite | Directory | What it guarantees | How to run |
 |-------|-----------|--------------------|------------|
 | Unit / integration | [`tests/`](../tests/) | Code correctness — parsing, idempotency, error handling, CLI flags. Runs in seconds. | `pytest tests/ --ignore=tests/evals -v` |
-| Retrieval eval | [`tests/evals/`](../tests/evals/) | Retrieval **quality** against 25 frozen grounded queries. Runs Voyage API, ~1 min and a few cents. | `pytest tests/evals/ -v -s` |
+| Measurability audit | [`tests/evals/test_instrument.py`](../tests/evals/test_instrument.py) | That each golden query's gating thresholds are **reachable at all**. Free — one LanceDB column scan, no Voyage call. | `pytest tests/evals/test_instrument.py -v` |
+| Retrieval eval | [`tests/evals/test_search_quality.py`](../tests/evals/test_search_quality.py) | Retrieval **quality** against 25 frozen grounded queries. Runs Voyage API, ~1 min and a few cents. | `pytest tests/evals/test_search_quality.py -v -s` |
 | Search CLI smoke grid | [`evals/search-eval-queries.md`](../evals/search-eval-queries.md) | Human-run sanity grid for CLI features (`--preview`, `--min-similarity`, `--limit`, dedup). Prose benchmark, not pytest. | Read the file, run queries manually, score 0/1/2. |
 
 The first two are machine-graded. The third is narrative — an eyeball-test
@@ -128,12 +131,53 @@ Metric thresholds are per-query (in `dimensions`), not global. This lets
 the dataset calibrate by query type — baselines expect higher recall
 than synthesis queries.
 
-## Current Baseline (2026-04-19)
+## Is the ruler intact? (`tests/evals/test_instrument.py`)
 
-**1 of 25 queries pass all gating metrics.** Q15 ("Opus 4.7, Gemma 4,
-Sonnet 4.6") is the only passing query — exact model-name overlap between
-query and content lets BM25 dominate and hybrid win. Full diagnosis in
-[ADR-0017](adr/ADR-0017-kb-layer-strategy.md).
+Run this before reading any N/25. It is a separate suite from the retrieval
+eval, costs nothing (no Voyage call — one LanceDB column scan), and answers a
+question the retrieval eval structurally cannot: **can this golden query's
+gating thresholds be reached at all**, by any retriever, given the harness
+configuration and the index actually on disk?
+
+A failure here is a broken ruler mark, not a retrieval result. Issue #190 found
+two of them hiding inside one number for over a year:
+
+1. `hybrid_search` returned one chunk per video, so a query expecting several
+   timestamp windows inside a single video was capped at
+   `distinct videos / expected hits` on `timestamp_precision` — below its own
+   threshold for **5 of the 25 queries (Q01, Q02, Q03, Q04, Q11)**, which could
+   therefore never pass no matter how good retrieval was. Fixed by running the
+   harness with `dedup_by_video=False` (see `docs/search-internals.md`).
+2. A golden `video_id` left the corpus, making one query's `recall_at_k`
+   threshold unreachable against any index.
+
+Because both scored exactly like retrieval failures, **the historic 1/25
+baseline was never purely a retrieval measurement.** Keep the two suites apart;
+folding an instrument defect back into the retrieval score is how this rotted
+unnoticed.
+
+## Current Baseline (2026-09-01, post-#190)
+
+**1 of 25 queries pass all gating metrics** (Q11), measured on a
+2,360-video / 80,297-chunk index with the instrument defect above removed.
+
+The number happens to match the 2026-04-19 headline but is not the same
+measurement, and the two are not comparable: the corpus grew roughly 15x, the
+passing query changed from Q15 to Q11, and the metric ceilings moved. The
+immediately preceding run on the same corpus with the capped instrument scored
+**0/25**. Treat 2026-09-01 as the new baseline and do not compare across it.
+
+Primary failure mode is now unambiguous: **19 of 25 queries score 0.000 on
+recall** — the expected videos are not retrieved at all. Only 1 of the 22
+distinct golden videos is missing from the index, so this is genuine retrieval
+failure, not corpus coverage. Full diagnosis of the original vocabulary-mismatch
+theory in [ADR-0017](adr/ADR-0017-kb-layer-strategy.md).
+
+### Historic baseline (2026-04-19, capped instrument)
+
+**1 of 25.** Q15 ("Opus 4.7, Gemma 4, Sonnet 4.6") was the only passing query —
+exact model-name overlap between query and content let BM25 dominate. Retained
+for lineage; read it knowing 5 of the 25 queries could not pass.
 
 Query-type breakdown:
 

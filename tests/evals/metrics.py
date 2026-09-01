@@ -18,19 +18,39 @@ from __future__ import annotations
 from deepeval.metrics import BaseMetric
 from deepeval.test_case import LLMTestCase
 
+# scripts/ is on sys.path via pyproject.toml pythonpath. timestamp_utils is the
+# single home for timestamp parsing per CLAUDE.md; a local copy here was the
+# duplication that guardrail exists to prevent.
+from timestamp_utils import parse_time_to_seconds
+
+
+def distinct_videos_in_order(video_ids: list[str]) -> list[str]:
+    """Collapse a chunk-level video_id list to first-appearance video order.
+
+    `k` and `rank` in these metrics mean VIDEOS, not array positions. That
+    distinction was invisible while `hybrid_search` returned exactly one chunk
+    per video; once the harness asks for every window inside a video (issue
+    #190), an array-position reading of `k` would silently shrink recall.
+
+    On a one-chunk-per-video list this is the identity function, so the
+    generalization changes no historic number.
+    """
+    seen: list[str] = []
+    seen_set: set[str] = set()
+    for vid in video_ids:
+        if vid not in seen_set:
+            seen_set.add(vid)
+            seen.append(vid)
+    return seen
+
 
 def _parse_ts(ts: str) -> int:
-    """Convert '04:56' or '1:23:45' to seconds."""
-    parts = [int(p) for p in ts.split(":")]
-    if len(parts) == 2:
-        return parts[0] * 60 + parts[1]
-    if len(parts) == 3:
-        return parts[0] * 3600 + parts[1] * 60 + parts[2]
-    raise ValueError(f"Unexpected timestamp format: {ts!r}")
+    """Convert '04:56' or '1:23:45' to seconds (kept as the local spelling)."""
+    return parse_time_to_seconds(ts)
 
 
 class RecallAtKMetric(BaseMetric):
-    """Fraction of expected video_ids that appear in top-k retrieved results.
+    """Fraction of expected video_ids that appear among the top-k retrieved VIDEOS.
 
     Does not require uniqueness — an expected video that doesn't appear drops
     the score; extra retrieved videos beyond the expected set do not penalize.
@@ -39,6 +59,11 @@ class RecallAtKMetric(BaseMetric):
     gating: bool = True
 
     def __init__(self, k: int, threshold: float):
+        if k <= 0:
+            # A non-positive k scores every query 0.0 while looking like a
+            # configured threshold. Refuse it at construction rather than
+            # emitting a plausible number nobody can interpret.
+            raise ValueError(f"RecallAtKMetric needs k >= 1, got {k!r}")
         self.k = k
         self.threshold = threshold
         self.score: float = 0.0
@@ -51,7 +76,8 @@ class RecallAtKMetric(BaseMetric):
 
     def measure(self, test_case: LLMTestCase) -> float:
         meta = test_case.additional_metadata or {}
-        retrieved = meta.get("retrieved_video_ids", [])[: self.k]
+        # k counts VIDEOS, not array positions - see distinct_videos_in_order.
+        retrieved = distinct_videos_in_order(meta.get("retrieved_video_ids", []))[: self.k]
         expected = {h["video_id"] for h in meta.get("expected_hits", [])}
 
         if not expected:
@@ -63,7 +89,7 @@ class RecallAtKMetric(BaseMetric):
         found = sum(1 for v in set(retrieved) if v in expected)
         self.score = found / len(expected)
         self.success = self.score >= self.threshold
-        self.reason = f"Found {found}/{len(expected)} expected video_ids in top-{self.k}"
+        self.reason = f"Found {found}/{len(expected)} expected video_ids in top-{self.k} videos"
         return self.score
 
     async def a_measure(self, test_case: LLMTestCase) -> float:
@@ -97,7 +123,8 @@ class MRRMetric(BaseMetric):
 
     def measure(self, test_case: LLMTestCase) -> float:
         meta = test_case.additional_metadata or {}
-        retrieved = meta.get("retrieved_video_ids", [])
+        # rank counts VIDEOS, not array positions - see distinct_videos_in_order.
+        retrieved = distinct_videos_in_order(meta.get("retrieved_video_ids", []))
         expected = {h["video_id"] for h in meta.get("expected_hits", [])}
 
         if not expected:
@@ -115,7 +142,7 @@ class MRRMetric(BaseMetric):
 
         self.score = 0.0
         self.success = False
-        self.reason = f"No expected video_id found in {len(retrieved)} retrieved results"
+        self.reason = f"No expected video_id found in {len(retrieved)} retrieved videos"
         return self.score
 
     async def a_measure(self, test_case: LLMTestCase) -> float:

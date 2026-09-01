@@ -38,7 +38,7 @@ Transcripts → chunk_transcript() → Voyage embed → LanceDB table + FTS inde
 ### 2. Querying (`search "query" --vector`)
 
 ```
-Query → Voyage embed (lite) → LanceDB hybrid (BM25 + vector + RRF) → dedup by video → filter → display
+Query → Voyage embed (lite) → LanceDB hybrid (BM25 + vector + RRF) → select top-N videos → filter → display
 ```
 
 Step by step:
@@ -52,9 +52,26 @@ Step by step:
    - RRF merges both ranked lists: `score(doc) = Σ 1/(K + rank)`
    - Fetches `max(50, limit * 5)` raw candidates for dedup headroom
 
-3. **Dedup by video** — keep only the best-scoring chunk per `video_id`
-   - Source: `_dedup_by_video()` in `video_intel.py`
-   - "Best" = highest `_relevance_score`
+3. **Select the top-`limit` videos** — `_select_hits_by_video()` in `video_intel.py`
+   - Ranks videos by their best chunk's `_relevance_score` and keeps the top `limit`
+   - `dedup_by_video=True` (the default, and what every product caller uses) returns
+     one chunk per video: that video's best-scoring chunk. `_dedup_by_video()` is
+     retained as a thin alias of this mode.
+   - `dedup_by_video=False` returns every chunk of those same videos, grouped by
+     video, best chunk first inside each video. **The video set and video order
+     are identical either way** — the switch only decides how many windows per
+     video come back. Only the retrieval eval uses it (issue #190): a golden query
+     can expect several distinct timestamp windows inside one video, and
+     one-chunk-per-video capped such a query below its own threshold no matter how
+     good retrieval was.
+   - Do not flip the default. `search --vector` prints one line per video and
+     `nugget` bills Gemini per chunk, so both are length-sensitive; the contract is
+     locked by `tests/test_hybrid_search_dedup.py::TestProductionCallSitesKeepDedup`.
+   - "Every chunk" means every chunk in the fetched candidate pool
+     (`max(50, limit * 5)` rows), not every chunk in the index. A window whose chunk
+     never entered that pool is a genuine ranking failure, and the pool is
+     deliberately left at the product's own depth so the eval keeps measuring what
+     the product would actually surface.
 
 4. **Filter by `--min-relevance`** — drop results below threshold
 
@@ -196,7 +213,7 @@ Production RAG benchmarks show ~62% → ~84% retrieval precision when adding BM2
 | query model | `voyage-4-lite` | 1024 dims, $0.02/M tokens |
 | RRF K | 60 | LanceDB default, near-optimal per Cormack et al. |
 | FTS columns | `title`, `text` | Two separate FTS indexes |
-| candidate multiplier | `max(50, limit * 5)` | Fetched before video-level dedup |
+| candidate multiplier | `max(50, limit * 5)` | Fetched before video selection; also bounds how many windows per video `dedup_by_video=False` can expose |
 
 ## Tuning Levers
 

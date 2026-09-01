@@ -29,6 +29,12 @@ import yaml
 import video_intel as vi  # scripts/ is on sys.path via pyproject.toml pythonpath
 
 from ._helpers import build_test_case
+from .instrument import (
+    GOLDEN_PATH,
+    HARNESS_DEDUP_BY_VIDEO,
+    harness_limit,
+    timestamp_precision_ceiling,
+)
 from .metrics import (
     ChannelCoverageMetric,
     MRRMetric,
@@ -37,7 +43,6 @@ from .metrics import (
 )
 
 # --- load dataset once at module import so parametrize can see it -----------
-GOLDEN_PATH = Path(__file__).parent / "golden_dataset.yaml"
 _data = yaml.safe_load(GOLDEN_PATH.read_text(encoding="utf-8"))
 _all_queries: list[dict[str, Any]] = _data["queries"]
 
@@ -102,11 +107,9 @@ def test_retrieval_quality(
 
     # Use the most-demanding k across the query's dimensions so we have enough
     # candidates for every metric (recall@15 needs 15 results; smaller k metrics
-    # will only look at the prefix they need).
-    limit = max(
-        [gold["dimensions"].get("recall_at_k", {}).get("k", 10), 10],
-        default=10,
-    )
+    # will only look at the prefix they need). Shared with the measurability
+    # audit's ceiling math so the two cannot drift.
+    limit = harness_limit(gold)
 
     hits, diagnostics = vi.hybrid_search(
         output_dir,
@@ -115,6 +118,7 @@ def test_retrieval_quality(
         config=config,
         expand=_EXPAND_ENABLED,
         return_diagnostics=True,
+        dedup_by_video=HARNESS_DEDUP_BY_VIDEO,
     )
 
     # Append the per-query expansion record to the JSONL run log. This is the
@@ -151,6 +155,12 @@ def test_retrieval_quality(
     # Always print the full per-metric report for visibility
     header = f"\n[{gold['id']} / {gold['query_type']}] {gold['query'][:80]}"
     print(header)
+    n_videos = len({v for v in test_case.additional_metadata["retrieved_video_ids"]})
+    print(
+        f"  ..    {len(hits)} chunks across {n_videos} videos "
+        f"(dedup_by_video={HARNESS_DEDUP_BY_VIDEO}); "
+        f"timestamp_precision ceiling {timestamp_precision_ceiling(gold, dedup_by_video=HARNESS_DEDUP_BY_VIDEO):.3f}"
+    )
     for name, (score, success, reason) in scores.items():
         flag = "PASS" if success else "FAIL"
         print(f"  {flag}  {name:<35} score={score:.3f}  {reason}")
