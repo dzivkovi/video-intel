@@ -215,10 +215,22 @@ The index is a derived artifact. To rebuild from scratch:
 ```bash
 python scripts/video_intel.py index          # full rebuild
 python scripts/video_intel.py index --force   # drop + rebuild
-python scripts/video_intel.py index --channel natebjones  # single channel
 ```
 
 Rebuilding is safe and idempotent. The `.lancedb/` directory can be deleted at any time.
+
+> **Do NOT run `index --channel X` (issue #183).** Despite the flag's name and its
+> help text, it is not scoped: `build_search_index` filters *collection* to channel X
+> and then does an unconditional `create_table(..., mode="overwrite")`, so it replaces
+> the whole shared table with only that channel's chunks. Roughly 98% of the index
+> disappears, the command still prints `Indexed N chunks` and exits 0, and every later
+> search silently returns single-channel results. A *mistyped* channel name is harmless
+> (the `if not all_records` guard returns before the overwrite) - only a valid one
+> destroys the index. Until #183 lands, the only safe rebuild is a full `index`.
+>
+> This section previously listed `index --channel natebjones  # single channel` as a
+> normal rebuild option. It was wrong, and CLAUDE.md points every agent here before
+> touching search, so the bad advice had reach. Removed 2026-08-31.
 
 ## Related Documents
 
