@@ -585,7 +585,7 @@ def _read_meta_best_effort(meta_path: Path, *, raise_on_os_error: bool) -> dict:
     return data
 
 
-def update_meta(meta_path: Path, fields: dict, mode: str) -> None:
+def update_meta(meta_path: Path, fields: dict, mode: str, *, drop_fields: tuple[str, ...] = ()) -> None:
     """Read existing meta.json, merge fields, ensure mode in modes_completed, write back.
 
     The sentinel mode="identity" is a no-op for modes_completed: identity is metadata
@@ -596,8 +596,18 @@ def update_meta(meta_path: Path, fields: dict, mode: str) -> None:
     ``OSError`` propagates: this is the shared success-path writer, and
     overwriting a file we merely failed to read would destroy `alt_titles` and
     `skip_modes`, which exist nowhere else. See `_read_meta_best_effort`.
+
+    ``drop_fields`` REMOVES keys instead of merging them (issue #182). A plain
+    ``meta.update(fields)`` cannot express "this key no longer describes
+    anything": a writer that replaces an artifact but leaves another writer's
+    metrics behind produces a meta that describes something that is not on
+    disk. Dropping is deliberately opt-in and explicit - a writer names the
+    keys it is retiring - because a blanket sweep would also erase fields the
+    operator hand-wrote.
     """
     meta: dict = _read_meta_best_effort(meta_path, raise_on_os_error=True)
+    for key in drop_fields:
+        meta.pop(key, None)
     meta.update(fields)
     if mode != "identity":
         modes = meta.get("modes_completed", [])
@@ -3202,6 +3212,7 @@ def _scan_transcribe_one(
                 prefix,
                 reason=f"chunked transcript failed: {status}",
                 force=False,
+                duration_seconds=duration_seconds,
             )
             if fb is not None:
                 return fb
@@ -5084,19 +5095,35 @@ def _build_captions_transcript_body(captions: CaptionsResult) -> str:
     a little content loss for far fewer duplicate phrases; the artifact is
     already flagged speech-only and is replaceable via ``process --file``.
     """
-    seen: dict[int, tuple[int, str]] = {}
-    for start, text in captions.snippets:
+    return "\n".join(
+        f'[{_captions_timestamp(start)}] "{clean}"' for start, clean in dedup_caption_cues(captions.snippets)
+    )
+
+
+def _captions_timestamp(seconds: int) -> str:
+    """`MM:SS` with minutes allowed past 59, matching the rendered transcript."""
+    mm, ss = divmod(seconds, 60)
+    return f"{mm:02d}:{ss:02d}"
+
+
+def dedup_caption_cues(snippets) -> list[tuple[int, str]]:
+    """The caption cues that actually reach the transcript, in order.
+
+    Rolling-window ASR repeats the same words across adjacent cues, so cues are
+    collapsed to one per start-second, keeping the longest text. Shared by the
+    body renderer and the quality assessment (issue #182) so the metrics
+    describe what is on disk rather than the raw pre-dedup track - the same
+    checker-must-use-the-writer's-own-output rule that governs path checks.
+    """
+    seen: dict[int, str] = {}
+    for start, text in snippets:
         clean = " ".join(text.split())
         if not clean:
             continue
         key = round(start)
-        if key not in seen or len(clean) > len(seen[key][1]):
-            seen[key] = (key, clean)
-    lines = []
-    for start, clean in (seen[k] for k in sorted(seen)):
-        mm, ss = divmod(start, 60)
-        lines.append(f'[{mm:02d}:{ss:02d}] "{clean}"')
-    return "\n".join(lines)
+        if key not in seen or len(clean) > len(seen[key]):
+            seen[key] = clean
+    return [(k, seen[k]) for k in sorted(seen)]
 
 
 def _write_transcript_md(
@@ -5340,6 +5367,62 @@ def _identity_from_transcript_header(transcript_path: Path) -> dict | None:
     return fields
 
 
+#: Every meta.json key that DESCRIBES a transcript artifact, as opposed to
+#: describing the video (identity) or the operator's intent (`skip_modes`,
+#: `alt_titles`, a hand-written `transcript_quality_note`).
+#:
+#: Issue #182: `_try_captions_transcript` was the only transcript writer that
+#: replaced the artifact and left another writer's metrics behind. Because
+#: `update_meta` merges, a captions recovery after a flagged Gemini attempt
+#: produced a meta reading `transcript_status: complete`,
+#: `transcript_source: youtube_captions` and
+#: `transcript_quality_flags: ["monolithic_severe"]` at the same time -
+#: describing a transcript that no longer existed on disk. Measured cost: four
+#: recovered videos each paid for mindmap-from-video (up to 411k prompt tokens)
+#: with a healthy transcript sitting next to them, because
+#: `resolve_mindmap_source(..., transcript_severe=True)` correctly treated the
+#: stale flag as real.
+#:
+#: The rule this encodes: **every writer that replaces a transcript owns every
+#: field that describes that transcript.** A writer either writes a field or
+#: retires it; leaving a predecessor's value to merge through is the defect.
+#:
+#: `tests/test_captions_quality_flags.py::TestFieldInventoryCannotDrift` scans
+#: the module for the keys the OTHER transcript writers persist and fails if
+#: one is neither written nor dropped here - so a new quality field cannot be
+#: added to the Gemini writers and silently go stale on this path.
+TRANSCRIPT_ARTIFACT_FIELDS: tuple[str, ...] = (
+    "transcript_status",
+    "transcript_source",
+    "transcript_quality_flags",
+    "transcript_max_blind_gap_seconds",
+    "transcript_blind_gap_at_seconds",
+    "transcript_last_dialogue_fraction",
+    "transcript_dialogue_entries",
+    "transcript_chunk_window_violations",
+    "transcript_output_tokens",
+    "transcript_finish_reason",
+    "transcript_chunks",
+    "transcript_chunk_minutes",
+    "transcript_thin_chunks",
+    "transcript_confabulated_chunks",
+    "transcript_failover_reason",
+    "captions_is_generated",
+)
+
+
+def _captions_dialogue_entries(snippets) -> list[dict]:
+    """Reshape caption cues into the assessor's dialogue-entry contract.
+
+    `assess_transcript_artifact` takes `{"start": "MM:SS"}` dicts, which is what
+    a caption track already is once the seconds are formatted - no
+    reconstruction from rendered markdown, and no second timestamp parser. Built
+    from `dedup_caption_cues` so the assessment describes the cues that actually
+    reached the transcript.
+    """
+    return [{"start": _captions_timestamp(start), "text": text} for start, text in dedup_caption_cues(snippets)]
+
+
 def _try_captions_transcript(
     video: dict,
     transcript_path: Path,
@@ -5350,6 +5433,7 @@ def _try_captions_transcript(
     start_offset: int | None = None,
     end_offset: int | None = None,
     force: bool = False,
+    duration_seconds: int | None = None,
 ) -> tuple[str, str] | None:
     """Build a transcript from the YouTube English caption track (issue #60).
 
@@ -5398,22 +5482,61 @@ def _try_captions_transcript(
         status="Captions (YouTube auto-generated)" if captions.is_generated else "Captions (manual)",
         transcript_source=TRANSCRIPT_SOURCE_CAPTIONS,
     )
+    # Issue #182: this writer replaced the transcript, so it owns every field
+    # that describes one. Assess the caption track the same way the Gemini
+    # writers assess theirs (a genuinely bad caption track - five cues over
+    # three hours - is exactly what the #157 machinery exists to catch), and
+    # RETIRE the predecessor's fields rather than letting them merge through.
+    # Clearing alone would have been the minimal correct fix; assessing keeps
+    # the guarantee that every transcript on disk has been judged.
+    window = None
+    if start_offset is not None or end_offset is not None:
+        # A clipped segment is assessed against its own span, not the whole
+        # video - otherwise every segment reads as one enormous blind gap.
+        lo = start_offset or 0
+        hi = end_offset if end_offset is not None else (duration_seconds if duration_seconds else None)
+        window = (lo, hi) if hi is not None and hi > lo else None
+    quality_metrics = assess_transcript_artifact(
+        _captions_dialogue_entries(snippets),
+        None if window is not None else duration_seconds,
+        window=window,
+    )
+    quality_flags = sorted(set(quality_metrics["severe"]) | set(quality_metrics["mild"]))
+    quality_severe = transcript_quality_flags_are_severe(quality_flags)
     fields = {
         **_transcript_identity_fields(video, meta_path.parent),
         "processed": datetime.now(UTC).isoformat(),
-        "transcript_status": "complete",
+        "transcript_status": "partial" if quality_severe else "complete",
         "transcript_source": TRANSCRIPT_SOURCE_CAPTIONS,
         "captions_is_generated": bool(captions.is_generated),
+        "transcript_quality_flags": quality_flags,
+        "transcript_max_blind_gap_seconds": quality_metrics["max_blind_gap_seconds"],
+        "transcript_blind_gap_at_seconds": quality_metrics["blind_gap_at_seconds"],
+        "transcript_last_dialogue_fraction": quality_metrics["last_dialogue_fraction"],
+        "transcript_dialogue_entries": quality_metrics["dialogue_entries"],
     }
     if reason:
         fields["transcript_failover_reason"] = reason
-    update_meta(meta_path, fields, "transcript")
+    # Whatever this writer did not just set is a description of an artifact that
+    # is gone. Drop it rather than merging it forward.
+    update_meta(
+        meta_path,
+        fields,
+        "transcript",
+        drop_fields=tuple(f for f in TRANSCRIPT_ARTIFACT_FIELDS if f not in fields),
+    )
     log.info(
         "  %s: transcript from YouTube captions (%d cues, %s)",
         prefix,
         len(snippets),
         "auto-gen" if captions.is_generated else "manual",
     )
+    if quality_severe:
+        log.warning(
+            "  %s: quality guard flagged the caption track (%s) - transcript_status set to partial.",
+            prefix,
+            ", ".join(quality_flags),
+        )
     return prefix, "done (captions)"
 
 
@@ -5482,7 +5605,14 @@ def process_transcript(
     # speech-only). Fails when no captions exist - the caller chose this source.
     if transcript_source == "yt-captions":
         captioned = _try_captions_transcript(
-            video, transcript_path, meta_path, prefix, start_offset=start_offset, end_offset=end_offset, force=force
+            video,
+            transcript_path,
+            meta_path,
+            prefix,
+            start_offset=start_offset,
+            end_offset=end_offset,
+            force=force,
+            duration_seconds=duration_seconds,
         )
         if captioned is not None:
             return captioned
@@ -5507,6 +5637,7 @@ def process_transcript(
             start_offset=start_offset,
             end_offset=end_offset,
             force=force,
+            duration_seconds=duration_seconds,
         )
         if captioned is not None:
             return captioned
@@ -5592,6 +5723,7 @@ def process_transcript(
                     start_offset=start_offset,
                     end_offset=end_offset,
                     force=force,
+                    duration_seconds=duration_seconds,
                 )
                 if fb is not None:
                     return fb
@@ -5617,6 +5749,7 @@ def process_transcript(
                     start_offset=start_offset,
                     end_offset=end_offset,
                     force=force,
+                    duration_seconds=duration_seconds,
                 )
                 if fb is not None:
                     return fb
@@ -5795,6 +5928,7 @@ def process_transcript(
             start_offset=start_offset,
             end_offset=end_offset,
             force=force,
+            duration_seconds=duration_seconds,
         )
         if fb is not None:
             return fb
@@ -7393,6 +7527,7 @@ def _cmd_transcript_impl(args, config):
                     prefix,
                     reason=LIVESTREAM_CAPTIONS_FIRST_REASON,
                     force=args.force,
+                    duration_seconds=duration_seconds,
                 )
                 if fb is not None:
                     _, captions_status = fb
@@ -7434,6 +7569,7 @@ def _cmd_transcript_impl(args, config):
                     prefix,
                     reason=f"chunked transcript failed: {status}",
                     force=args.force,
+                    duration_seconds=duration_seconds,
                 )
                 if fb is not None:
                     _, status = fb
@@ -7761,6 +7897,7 @@ def _cmd_process_url(args, config):
                     prefix,
                     reason=LIVESTREAM_CAPTIONS_FIRST_REASON,
                     force=args.force,
+                    duration_seconds=duration_seconds,
                 )
                 if vod_captions_first
                 else None
