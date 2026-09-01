@@ -18,8 +18,11 @@ export VOYAGE_API_KEY=...
 export GEMINI_API_KEY=...          # reserved for future G-Eval metrics
 python scripts/video_intel.py index   # if LanceDB index doesn't exist
 
-# full eval, ~1 min and a few cents of Voyage tokens
-pytest tests/evals/ -v -s
+# full eval, ~1 min and a few cents of Voyage tokens.
+# Name the module, not the directory - the measurability audit's deliberate
+# failures would otherwise share the summary line and the N/25 stops being
+# derivable from it.
+pytest tests/evals/test_search_quality.py -v -s
 
 # smoke (Q01 only, ~3s, for iterating on the harness)
 VIDEO_INTEL_EVAL_SMOKE=1 pytest tests/evals/ -v -s

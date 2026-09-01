@@ -13,7 +13,8 @@ Last verified: 2026-09-01
 | Suite | Directory | What it guarantees | How to run |
 |-------|-----------|--------------------|------------|
 | Unit / integration | [`tests/`](../tests/) | Code correctness — parsing, idempotency, error handling, CLI flags. Runs in seconds. | `pytest tests/ --ignore=tests/evals -v` |
-| Retrieval eval | [`tests/evals/`](../tests/evals/) | Retrieval **quality** against 25 frozen grounded queries. Runs Voyage API, ~1 min and a few cents. | `pytest tests/evals/ -v -s` |
+| Measurability audit | [`tests/evals/test_instrument.py`](../tests/evals/test_instrument.py) | That each golden query's gating thresholds are **reachable at all**. Free — one LanceDB column scan, no Voyage call. | `pytest tests/evals/test_instrument.py -v` |
+| Retrieval eval | [`tests/evals/test_search_quality.py`](../tests/evals/test_search_quality.py) | Retrieval **quality** against 25 frozen grounded queries. Runs Voyage API, ~1 min and a few cents. | `pytest tests/evals/test_search_quality.py -v -s` |
 | Search CLI smoke grid | [`evals/search-eval-queries.md`](../evals/search-eval-queries.md) | Human-run sanity grid for CLI features (`--preview`, `--min-similarity`, `--limit`, dedup). Prose benchmark, not pytest. | Read the file, run queries manually, score 0/1/2. |
 
 The first two are machine-graded. The third is narrative — an eyeball-test

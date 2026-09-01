@@ -127,3 +127,60 @@ class TestDistinctVideoSemantics:
     def test_channel_coverage_is_untouched_by_chunk_multiplicity(self) -> None:
         m = ChannelCoverageMetric(min_channels=1, threshold=1.0)
         assert m.measure(_case(["a", "a", "a"], ["a"])) == 1.0
+
+
+class TestIdentitylessVideosDoNotInflateScores:
+    """Roughly 750 chunks in the live index carry a blank `video_id` and are
+    separated by `source_file` instead. `build_test_case` must record the SAME
+    identity the selector groups by; reading `video_id` alone collapses every
+    identity-less video into one `""` slot, and because k and rank now count
+    distinct videos, that collapse stops real videos from consuming a k slot.
+    The error is always inflation, so it cannot be caught by a spot check that
+    only looks for things going missing."""
+
+    def test_build_test_case_uses_the_selectors_identity(self) -> None:
+        import video_intel as vi
+
+        from ._helpers import build_test_case
+
+        hits = [
+            {
+                "text": "t",
+                "timestamp": "00:01",
+                "timestamp_seconds": 1,
+                "video_id": "",
+                "channel": "ch",
+                "title": "x",
+                "published": "2026-01-01",
+                "source_file": f"file{i}.md",
+                "relevance": 1.0 - i / 10,
+            }
+            for i in range(5)
+        ] + [
+            {
+                "text": "t",
+                "timestamp": "00:01",
+                "timestamp_seconds": 1,
+                "video_id": "EXPECTED",
+                "channel": "ch",
+                "title": "x",
+                "published": "2026-01-01",
+                "source_file": "file9.md",
+                "relevance": 0.1,
+            }
+        ]
+        gold = {
+            "id": "QXX",
+            "query": "q",
+            "query_type": "t",
+            "known_good_answer": "a",
+            "expected_hits": [{"video_id": "EXPECTED", "channel": "ch", "timestamp_range": ["00:00", "00:10"]}],
+        }
+        tc = build_test_case(gold, hits)
+        ids = tc.additional_metadata["retrieved_video_ids"]
+        assert ids == [vi._hit_video_key(h) for h in hits]
+        # Six genuinely distinct videos, so the expected one sits at rank 6 and
+        # must NOT be inside top-5.
+        assert len(distinct_videos_in_order(ids)) == 6
+        assert RecallAtKMetric(k=5, threshold=0.5).measure(tc) == 0.0
+        assert MRRMetric(threshold=0.25).measure(tc) == pytest.approx(1 / 6)

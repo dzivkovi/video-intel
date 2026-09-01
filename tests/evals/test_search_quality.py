@@ -29,7 +29,12 @@ import yaml
 import video_intel as vi  # scripts/ is on sys.path via pyproject.toml pythonpath
 
 from ._helpers import build_test_case
-from .instrument import timestamp_precision_ceiling
+from .instrument import (
+    GOLDEN_PATH,
+    HARNESS_DEDUP_BY_VIDEO,
+    harness_limit,
+    timestamp_precision_ceiling,
+)
 from .metrics import (
     ChannelCoverageMetric,
     MRRMetric,
@@ -37,16 +42,7 @@ from .metrics import (
     TimestampPrecisionMetric,
 )
 
-# The harness reads every retrieved window inside a selected video, not just
-# each video's single best chunk (issue #190). The video SET and ORDER are
-# identical either way — `dedup_by_video` only decides how many chunks per
-# video come back — so this measures the same videos the product surface would
-# have shown, with the multi-window expectations in golden_dataset.yaml
-# actually reachable. Product callers keep the dedup=True default.
-HARNESS_DEDUP_BY_VIDEO = False
-
 # --- load dataset once at module import so parametrize can see it -----------
-GOLDEN_PATH = Path(__file__).parent / "golden_dataset.yaml"
 _data = yaml.safe_load(GOLDEN_PATH.read_text(encoding="utf-8"))
 _all_queries: list[dict[str, Any]] = _data["queries"]
 
@@ -111,11 +107,9 @@ def test_retrieval_quality(
 
     # Use the most-demanding k across the query's dimensions so we have enough
     # candidates for every metric (recall@15 needs 15 results; smaller k metrics
-    # will only look at the prefix they need).
-    limit = max(
-        [gold["dimensions"].get("recall_at_k", {}).get("k", 10), 10],
-        default=10,
-    )
+    # will only look at the prefix they need). Shared with the measurability
+    # audit's ceiling math so the two cannot drift.
+    limit = harness_limit(gold)
 
     hits, diagnostics = vi.hybrid_search(
         output_dir,

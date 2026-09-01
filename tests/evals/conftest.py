@@ -41,7 +41,19 @@ def index_view() -> IndexView:
         pytest.skip("no LanceDB index on disk; run `video_intel.py index` first")
 
     table = db.open_table(vi.LANCEDB_TABLE)
+    expected_rows = table.count_rows()
     arrow = table.search().select(["video_id", "timestamp_seconds", "channel"]).limit(0).to_arrow()
+    # `limit(0)` means "no limit" on lancedb 0.30.2 and returns the whole table
+    # (verified: 80,297 rows == count_rows()). If a future version reinterprets
+    # it as a page size, a partial projection would make the audit report
+    # healthy videos as "not in the index" - a false UNMEASURABLE verdict, the
+    # worst outcome this feature has. Fail loudly instead of quietly lying.
+    if arrow.num_rows != expected_rows:
+        pytest.fail(
+            f"index projection returned {arrow.num_rows} of {expected_rows} rows; "
+            "the measurability audit cannot run on a truncated view of the index"
+        )
+
     by_video: dict[str, list[int]] = {}
     channels: set[str] = set()
     for vid, secs, channel in zip(
@@ -53,4 +65,7 @@ def index_view() -> IndexView:
         by_video.setdefault(vid, []).append(int(secs or 0))
         if channel:
             channels.add(channel)
+    # A projected-but-empty channel set is a real fact (channel data lost), not
+    # the same as "no projection supplied" - IndexView keeps them apart, so pass
+    # the frozenset unconditionally rather than defaulting to None.
     return IndexView(chunk_seconds_by_video=by_video, channels=frozenset(channels))
