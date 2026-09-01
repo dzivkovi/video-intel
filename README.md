@@ -155,6 +155,19 @@ channel config, taxonomy, or meta files. The integration point is a file handoff
 for context-heavy videos, `translate-bcs` reads a rich transcript that `video-intel`
 produced. Claude orchestrates both CLI steps in a single conversation.
 
+## A worked learning path: from watchlist to a talk
+
+A real example of the full loop, exactly as it ran on 2026-09-01, preparing a 1-hour internal talk ("AI as a Thinking Partner") for a mixed developer + PM audience. Useful as a template for turning a corpus into teaching material - and honest about which surface did which job.
+
+1. **Curation had already paid forward.** A `thinking-partner` topic existed from earlier briefings (17 videos, 8 channels). `search "thinking partner" --topic thinking-partner` listed the curated set instantly.
+2. **Synthesis found the shape of the argument.** `nugget "Using AI as a thinking partner rather than an answer machine ... where do they disagree?"` produced a cross-creator brief: where practitioners agree (models mirror you unless told to push back), where they genuinely split (critique via live steering vs up-front contracts), every claim cited to a timestamped video moment.
+3. **Hybrid search recovered primary sources.** Vector queries on a named person ("Boris Cherny prompting") surfaced first-hand clips across four videos - stronger than any secondhand summary. Short abstract phrases ("levels of prompting") were noisy; full questions worked.
+4. **A mindmap supplied the spine.** The strongest single asset was a hand-indexed mindmap branch (a conference talk's known/unknown-knowns/unknowns matrix, deep-linked to 9:20-14:00) - found by reading the corpus's own artifacts, not by searching.
+5. **The blind-spot catch.** The corpus surfaced a five-level teaching pyramid from a creator the operator follows personally, asks advice from, and had still missed. That is the point of the discovery layer: it watches what you do not.
+6. **The deliverable inherits provenance.** The talk outline cites a timestamped source for every claim - which doubles as the talk's closing slide: "here is how this session was researched."
+
+The pattern generalizes: curate topics as you go (they are cheap), let `nugget` argue both sides, use vector search for named people and full questions, and read the mindmaps - they are the corpus's own notes to you.
+
 ## Quick Start
 
 ```bash
