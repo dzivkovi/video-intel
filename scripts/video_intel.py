@@ -8954,6 +8954,44 @@ def _embed_batch(vo_client, texts: list[str], model: str, input_type: str) -> li
     return all_embeddings
 
 
+def escape_sql_string_literal(value: str) -> str:
+    """Escape a value for use inside a single-quoted LanceDB SQL string literal.
+
+    LanceDB predicates are SQL text, so a bare apostrophe in a channel name
+    terminates the literal and raises. Doubling is the SQL escape - verified
+    against lancedb 0.30.2, where `channel = 'o'brien'` raises RuntimeError and
+    `channel = 'o''brien'` matches correctly.
+
+    One helper for every site that interpolates a value into a predicate, so a
+    fix at one site cannot leave the other broken.
+    """
+    return value.replace("'", "''")
+
+
+def index_schema_mismatch(table: Any, record_fields: set[str]) -> str | None:
+    """Describe how an existing index's schema differs from new records, if it does.
+
+    LanceDB does NOT reliably reject a mismatched `add`: measured on 0.30.2, a
+    record MISSING a column is accepted and the column is silently null-filled,
+    while a record with an EXTRA column raises. Relying on `add` to complain
+    would therefore let a scoped run quietly write half-populated rows into an
+    index built by older code. The check is explicit, and it runs BEFORE any
+    Voyage call so a mismatch costs nothing.
+    """
+    table_fields = {f.name for f in table.schema}
+    expected = record_fields | {"vector"}
+    missing = sorted(table_fields - expected)
+    extra = sorted(expected - table_fields)
+    if not missing and not extra:
+        return None
+    parts = []
+    if extra:
+        parts.append(f"new columns not in the index: {extra}")
+    if missing:
+        parts.append(f"index columns the new records do not supply: {missing}")
+    return "; ".join(parts)
+
+
 def build_search_index(
     output_dir: Path,
     *,
@@ -8964,6 +9002,16 @@ def build_search_index(
     """Build or rebuild the LanceDB vector index from transcripts + concepts.
 
     Returns the number of chunks indexed.
+
+    Without `channel_filter` this is a whole-corpus rebuild: every transcript is
+    re-embedded and the table is replaced.
+
+    With `channel_filter` it is INCREMENTAL (issue #183): only that channel's
+    chunks are embedded, that channel's existing rows are deleted, and the new
+    ones are appended - every other channel's rows survive untouched. Before
+    this, a scoped collect fed an unconditional whole-table overwrite, so
+    `index --channel X` silently replaced a ~40-channel index with one channel,
+    printed a chunk count and exited 0.
     """
     lancedb = require_lancedb()
     voyageai = require_voyageai()
@@ -8982,10 +9030,28 @@ def build_search_index(
 
     vo = voyageai.Client()
     db = lancedb.connect(str(db_path))
+    table_exists = LANCEDB_TABLE in db.list_tables().tables
 
-    # Drop existing table if force rebuild
-    if force and LANCEDB_TABLE in db.list_tables().tables:
+    # A scoped run ADDS to an existing index. Born onto an empty database it
+    # would reproduce the very defect this refusal exists to prevent - an index
+    # holding one channel while `search` silently answers corpus-wide questions
+    # from it. Refuse here, above the Voyage call, so a mistake costs nothing
+    # (same probe-before-you-pay placement as probe_atomic_writes).
+    if channel_filter and not table_exists:
+        log.error(
+            "No existing index at %s, so there is nothing for --channel %s to update.",
+            db_path,
+            channel_filter,
+        )
+        log.error("Build the whole corpus first: video_intel.py index")
+        sys.exit(1)
+
+    # Force-drop is a WHOLE-CORPUS operation. Under incremental semantics
+    # `--channel X --force` already means "re-embed X", and dropping the table
+    # there would destroy every other channel - the exact damage #183 reports.
+    if force and not channel_filter and table_exists:
         db.drop_table(LANCEDB_TABLE)
+        table_exists = False
         log.info("Dropped existing table '%s' for rebuild", LANCEDB_TABLE)
 
     # Collect all transcript chunks
@@ -9026,6 +9092,15 @@ def build_search_index(
         log.warning("No transcript chunks found to index.")
         return 0
 
+    # Probe before you pay: a schema mismatch is knowable without embeddings.
+    if channel_filter:
+        existing = db.open_table(LANCEDB_TABLE)
+        mismatch = index_schema_mismatch(existing, set(all_records[0]))
+        if mismatch:
+            log.error("Existing index schema does not match the current record shape (%s).", mismatch)
+            log.error("Rebuild the whole corpus: video_intel.py index --force")
+            sys.exit(1)
+
     log.info("Embedding %d chunks with %s...", len(all_records), VOYAGE_DOC_MODEL)
     texts = [r["text"] for r in all_records]
     embeddings = _embed_batch(vo, texts, VOYAGE_DOC_MODEL, input_type="document")
@@ -9033,6 +9108,25 @@ def build_search_index(
     # Attach vectors to records
     for rec, vec in zip(all_records, embeddings, strict=True):
         rec["vector"] = vec
+
+    if channel_filter:
+        # Delete AFTER the embeddings are in hand, never before: the promise
+        # that a mid-embed failure leaves the previous index intact has to hold
+        # on the scoped path too, and _embed_batch's own failure log says so.
+        table = db.open_table(LANCEDB_TABLE)
+        predicate = f"channel = '{escape_sql_string_literal(channel_filter)}'"
+        table.delete(predicate)
+        table.add(all_records)
+        # Appended rows are brute-force searched, and the FTS indexes do not see
+        # them, until the table is compacted.
+        table.optimize()
+        log.info(
+            "Indexed %d chunks for channel '%s' into %s (other channels untouched)",
+            len(all_records),
+            channel_filter,
+            db_path,
+        )
+        return len(all_records)
 
     # Create or overwrite table
     table = db.create_table(LANCEDB_TABLE, data=all_records, mode="overwrite")
@@ -9147,7 +9241,7 @@ def hybrid_search(
     )
     where_clauses = []
     if channel_filter:
-        where_clauses.append(f"channel = '{channel_filter}'")
+        where_clauses.append(f"channel = '{escape_sql_string_literal(channel_filter)}'")
     if since_iso:
         where_clauses.append(f"published >= '{since_iso}'")
     if where_clauses:
@@ -9232,7 +9326,11 @@ def cmd_index(args, config):
         print("No transcripts found to index.")
     else:
         mins, secs = divmod(int(elapsed), 60)
-        print(f"Indexed {count} chunks in {mins}m {secs:02d}s.")
+        # Name the scope. "Indexed N chunks" on a scoped run reads as a
+        # whole-corpus result and is how #183's silent single-channel index went
+        # unnoticed.
+        scope = f" for channel '{args.channel}' (other channels preserved)" if args.channel else ""
+        print(f"Indexed {count} chunks{scope} in {mins}m {secs:02d}s.")
         print(f"  Index: {resolve_vector_db_dir(config, output_dir)}")
         print("  Run 'search --vector \"query\"' to search.")
 
@@ -12678,7 +12776,14 @@ Examples:
 
     # index command
     index_parser = subparsers.add_parser("index", help="Build vector search index from transcripts")
-    index_parser.add_argument("--channel", help="Index only this channel")
+    index_parser.add_argument(
+        "--channel",
+        help=(
+            "Incrementally re-index just this channel: only its chunks are "
+            "embedded, its old rows are replaced, and every other channel's "
+            "rows are preserved. Requires an existing index."
+        ),
+    )
     index_parser.add_argument("--force", action="store_true", help="Rebuild index from scratch")
 
     # nugget command
