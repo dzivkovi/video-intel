@@ -491,6 +491,63 @@ class TestTheRuleAppliesToEveryTranscriptWriter:
         )
 
 
+class TestTheAssessmentWindowTreatsOffsetsAsUntrusted:
+    """`--start`/`--end` are operator input, validated nowhere upstream. A
+    window wider than the real content manufactures a severe verdict on a
+    healthy transcript - the Codex peer review's concrete case: 10 cues over a
+    real 20 minutes is 0.5/min and healthy, but assessed over a claimed 120
+    minutes it is 0.083/min and trips monolithic_severe."""
+
+    def test_an_end_beyond_a_known_duration_is_clamped(self) -> None:
+        assert vi._captions_assessment_window(0, 7200, 1200) == (0, 1200)
+
+    def test_an_end_within_a_known_duration_is_kept(self) -> None:
+        assert vi._captions_assessment_window(60, 600, 1200) == (60, 600)
+
+    def test_no_offsets_means_no_window(self) -> None:
+        assert vi._captions_assessment_window(None, None, 1200) is None
+
+    def test_a_start_only_window_runs_to_the_known_duration(self) -> None:
+        assert vi._captions_assessment_window(300, None, 1200) == (300, 1200)
+
+    def test_a_start_only_window_with_no_known_duration_is_none(self) -> None:
+        assert vi._captions_assessment_window(300, None, None) is None
+
+    def test_a_start_at_or_past_a_known_duration_is_rejected(self) -> None:
+        assert vi._captions_assessment_window(1200, None, 1200) is None
+        assert vi._captions_assessment_window(1500, None, 1200) is None
+
+    def test_negative_offsets_are_rejected_not_treated_as_zero(self) -> None:
+        """-1 is truthy, so a plain falsy check lets it through and
+        manufactures a leading gap."""
+        assert vi._captions_assessment_window(-60, 600, 1200) is None
+        assert vi._captions_assessment_window(0, -1, 1200) is None
+
+    def test_a_reversed_window_is_rejected(self) -> None:
+        assert vi._captions_assessment_window(600, 300, 1200) is None
+
+    def test_zero_start_is_a_real_offset_not_a_missing_one(self) -> None:
+        assert vi._captions_assessment_window(0, 600, 1200) == (0, 600)
+
+    def test_an_overwide_end_does_not_false_flag_a_healthy_track(self, paths, monkeypatch) -> None:
+        """The end-to-end version of the Codex case, through the real writer."""
+        snippets = [(i * 120, f"sparse but real line {i}") for i in range(10)]
+        _stub_captions(monkeypatch, snippets)
+
+        vi._try_captions_transcript(
+            _video(),
+            paths.transcript,
+            paths.meta,
+            paths.prefix,
+            start_offset=0,
+            end_offset=7200,
+            duration_seconds=1200,
+        )
+
+        meta = json.loads(paths.meta.read_text(encoding="utf-8"))
+        assert vi.transcript_quality_flags_are_severe(meta["transcript_quality_flags"]) is False
+
+
 class TestUpdateMetaDropFields:
     def test_drop_fields_removes_keys_and_defaults_to_a_no_op(self, tmp_path) -> None:
         meta_path = tmp_path / "x.meta.json"

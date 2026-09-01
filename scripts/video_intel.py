@@ -5459,6 +5459,48 @@ TRANSCRIPT_ARTIFACT_FIELDS: tuple[str, ...] = (
 QUALITY_FLAG_CAPTIONS_LEADING_GAP_MILD = "captions_leading_gap_mild"
 
 
+def _captions_assessment_window(
+    start_offset: int | None, end_offset: int | None, duration_seconds: int | None
+) -> tuple[int, int] | None:
+    """The span a clipped caption transcript should be judged against, or None.
+
+    A clipped segment is assessed against its OWN span, not the whole video -
+    otherwise every `--start`/`--end` segment reads as one enormous blind gap.
+    But an explicit offset is operator input and is not validated anywhere
+    upstream, so it has to be treated as untrusted here (Codex peer review of
+    PR #193). The concrete false positive: a 20-minute video with 10 cues is a
+    healthy 0.5 cues/min, but `--end 02:00:00` would assess those same cues
+    over 120 minutes - 0.083/min, which trips `monolithic_severe` on a
+    perfectly good transcript.
+
+    Returns `None` for any window that cannot describe real content, which
+    makes the caller fall back to duration-based (or metrics-only) assessment
+    rather than to a fabricated span:
+
+    * a negative start or end - `-1` is truthy, so a plain falsy check lets it
+      through and manufactures a leading gap;
+    * an end at or before the start;
+    * nothing clipped at all.
+
+    An explicit end beyond a KNOWN duration is clamped rather than rejected:
+    the operator asked for "to the end", just imprecisely.
+    """
+    if start_offset is None and end_offset is None:
+        return None
+    lo = start_offset if start_offset is not None else 0
+    known_duration = duration_seconds if isinstance(duration_seconds, int) and duration_seconds > 0 else None
+    hi = end_offset if end_offset is not None else known_duration
+    if hi is None:
+        return None
+    if lo < 0 or hi < 0:
+        return None
+    if known_duration is not None:
+        hi = min(hi, known_duration)
+    if hi <= lo:
+        return None
+    return (lo, hi)
+
+
 def _demote_captions_leading_gap(metrics: dict) -> tuple[list[str], list[str]]:
     """Severe/mild flag lists with a captions LEADING blind gap downgraded."""
     severe = list(metrics["severe"])
@@ -5540,13 +5582,7 @@ def _try_captions_transcript(
     # RETIRE the predecessor's fields rather than letting them merge through.
     # Clearing alone would have been the minimal correct fix; assessing keeps
     # the guarantee that every transcript on disk has been judged.
-    window = None
-    if start_offset is not None or end_offset is not None:
-        # A clipped segment is assessed against its own span, not the whole
-        # video - otherwise every segment reads as one enormous blind gap.
-        lo = start_offset or 0
-        hi = end_offset if end_offset is not None else (duration_seconds if duration_seconds else None)
-        window = (lo, hi) if hi is not None and hi > lo else None
+    window = _captions_assessment_window(start_offset, end_offset, duration_seconds)
     quality_metrics = assess_transcript_artifact(
         _captions_dialogue_entries(snippets),
         None if window is not None else duration_seconds,
