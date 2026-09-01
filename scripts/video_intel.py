@@ -8992,6 +8992,52 @@ def index_schema_mismatch(table: Any, record_fields: set[str]) -> str | None:
     return "; ".join(parts)
 
 
+def _count_indexed_rows_for_channel(db: Any, channel: str) -> int | None:
+    """Rows currently indexed for a channel, or None if the count is unreadable.
+
+    Only used to make a warning specific. A failure here must never change
+    control flow - a diagnostic that raises is worse than a vague one.
+    """
+    try:
+        if LANCEDB_TABLE not in db.list_tables().tables:
+            return None
+        table = db.open_table(LANCEDB_TABLE)
+        predicate = f"channel = '{escape_sql_string_literal(channel)}'"
+        return table.search().where(predicate).select(["channel"]).limit(0).to_arrow().num_rows
+    except Exception:
+        return None
+
+
+def vector_dimension_mismatch(table: Any, embeddings: list) -> str | None:
+    """Describe a vector-width disagreement between the index and new embeddings.
+
+    `index_schema_mismatch` compares column NAMES and runs before embedding, so
+    it is free but structurally blind to a dimension change - a new embedding
+    model keeps every column name identical. That blind spot is destructive on
+    the scoped path: `delete` commits, then `add` raises an Arrow cast error,
+    and the channel is gone from the index with a re-run failing the same way
+    forever. This check is the price of catching it - it needs the real vectors,
+    so it runs after embedding, but still before anything is deleted.
+
+    Returns None when the width cannot be read (an unindexed shape, an older
+    LanceDB): an unreadable schema is not evidence of drift, and refusing on it
+    would block healthy runs.
+    """
+    if not embeddings:
+        return None
+    try:
+        field = table.schema.field("vector")
+        width = field.type.list_size
+    except Exception:
+        return None
+    if not isinstance(width, int) or width <= 0:
+        return None
+    actual = len(embeddings[0])
+    if actual == width:
+        return None
+    return f"the index stores {width}-dimensional vectors but the new embeddings are {actual}-dimensional"
+
+
 def build_search_index(
     output_dir: Path,
     *,
@@ -9049,6 +9095,15 @@ def build_search_index(
     # Force-drop is a WHOLE-CORPUS operation. Under incremental semantics
     # `--channel X --force` already means "re-embed X", and dropping the table
     # there would destroy every other channel - the exact damage #183 reports.
+    # Say so rather than ignoring the flag: on a ticket about a flag that did
+    # something other than its name, a silently-ignored flag is the same sin.
+    if force and channel_filter:
+        log.info(
+            "--force with --channel %s means 're-embed %s'; it does not drop the index. "
+            "For a whole-corpus rebuild, run: video_intel.py index --force",
+            channel_filter,
+            channel_filter,
+        )
     if force and not channel_filter and table_exists:
         db.drop_table(LANCEDB_TABLE)
         table_exists = False
@@ -9090,6 +9145,23 @@ def build_search_index(
 
     if not all_records:
         log.warning("No transcript chunks found to index.")
+        # A scoped run can only ever REPLACE a channel's rows, never retire them
+        # - this guard sits before the delete, which is what keeps a mistyped
+        # channel harmless. But a channel whose transcripts were genuinely
+        # removed (e.g. by `prune-shorts --apply`) takes the identical path, and
+        # its stale rows keep answering searches with nothing saying so. Tell
+        # the operator, using the folder's existence to tell the two apart so a
+        # typo does not raise a false alarm.
+        if channel_filter and (output_dir / channel_filter).is_dir():
+            stale = _count_indexed_rows_for_channel(db, channel_filter)
+            log.warning(
+                "Channel '%s' exists but has no transcripts, so nothing was replaced. "
+                "Its %s previously-indexed row(s) are still in the index and still "
+                "answering searches. Rebuild the whole corpus to retire them: "
+                "video_intel.py index --force",
+                channel_filter,
+                "an unknown number of" if stale is None else stale,
+            )
         return 0
 
     # Probe before you pay: a schema mismatch is knowable without embeddings.
@@ -9114,12 +9186,43 @@ def build_search_index(
         # that a mid-embed failure leaves the previous index intact has to hold
         # on the scoped path too, and _embed_batch's own failure log says so.
         table = db.open_table(LANCEDB_TABLE)
+
+        # LAST check before the destructive step, and the only one that can see
+        # the actual vectors. The column-name guard above cannot catch a vector
+        # DIMENSION change (a new embedding model, or Voyage changing a model's
+        # default width): the names are identical, so it passes, and then
+        # `delete` commits and `add` raises an Arrow cast error - erasing the
+        # channel from the index, with a re-run failing identically forever.
+        # Measured on real lancedb 0.30.2, not inferred.
+        dim_mismatch = vector_dimension_mismatch(table, embeddings)
+        if dim_mismatch:
+            log.error("Refusing to update channel '%s': %s", channel_filter, dim_mismatch)
+            log.error("Nothing was deleted. Rebuild the whole corpus: video_intel.py index --force")
+            sys.exit(1)
+
         predicate = f"channel = '{escape_sql_string_literal(channel_filter)}'"
-        table.delete(predicate)
-        table.add(all_records)
-        # Appended rows are brute-force searched, and the FTS indexes do not see
-        # them, until the table is compacted.
-        table.optimize()
+        try:
+            table.delete(predicate)
+            table.add(all_records)
+            # Appended rows are brute-force searched, and the FTS indexes do not
+            # see them, until the table is compacted.
+            table.optimize()
+        except Exception:
+            # delete and add are separate commits, so a raise here can leave the
+            # channel with zero rows while every other channel is fine - a
+            # silent hole of exactly the shape #183 is about, just inverted. The
+            # exception still propagates (non-zero exit), but it must never
+            # propagate without naming the channel and the recovery.
+            log.error(
+                "Scoped index update for channel '%s' failed partway through. Its rows may now be "
+                "MISSING from the index while other channels are intact, and re-running "
+                "--channel %s can fail the same way.",
+                channel_filter,
+                channel_filter,
+            )
+            log.error("Recover with a whole-corpus rebuild: video_intel.py index --force")
+            raise
+
         log.info(
             "Indexed %d chunks for channel '%s' into %s (other channels untouched)",
             len(all_records),
@@ -12784,7 +12887,14 @@ Examples:
             "rows are preserved. Requires an existing index."
         ),
     )
-    index_parser.add_argument("--force", action="store_true", help="Rebuild index from scratch")
+    index_parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Rebuild the whole index from scratch. Ignored with --channel, where "
+            "a run already re-embeds that channel and must never drop the table."
+        ),
+    )
 
     # nugget command
     nugget_parser = subparsers.add_parser(

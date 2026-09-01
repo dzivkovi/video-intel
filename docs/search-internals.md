@@ -241,8 +241,26 @@ Rebuilding is safe and idempotent. The `.lancedb/` directory can be deleted at a
 the re-index that `dedupe` and `prune-shorts` both ask for affordable. Plain `index`
 re-embeds the entire corpus every run - there is no embedding reuse anywhere in
 `build_search_index` - so on a large corpus a scoped run is the difference between a
-few cents and a full re-embed. Scoped runs from two sessions targeting different
-channels compose rather than clobbering each other.
+few cents and a full re-embed.
+
+Three limits worth knowing:
+
+- **A scoped run REPLACES a channel's rows; it never retires them.** A channel whose
+  transcripts were all removed (say by `prune-shorts --apply`) hits the
+  no-records guard before the delete, so its stale rows stay in the index and keep
+  answering searches. The command warns and names the surviving row count; retiring
+  them needs a whole-corpus `index --force`.
+- **`delete` and `add` are separate commits.** A failure between them leaves the
+  channel with zero rows while every other channel is intact; the command exits
+  non-zero and names the channel and the `index --force` recovery. A vector-dimension
+  change is checked for explicitly beforehand, because that is the one drift the
+  column-name check cannot see.
+- **Concurrency is untested.** Two sequential scoped runs on different channels
+  compose. Two *concurrent* runs rely on lance's optimistic-concurrency commit path,
+  which this project has not exercised; the standing convention is one agent per
+  worktree. A scoped run racing a full run can duplicate or briefly drop one channel,
+  recoverable with `index --force` - still strictly better than the pre-fix behaviour,
+  where the same race lost the whole table.
 
 Under scoped semantics `--channel X --force` means "re-embed X" and never drops the
 table; a whole-corpus `--force` is `index --force` with no `--channel`. A scoped run

@@ -218,6 +218,123 @@ class TestSchemaGuard:
         assert corpus.voyage.embedded == [], "schema refusal must precede the paid Voyage call"
 
 
+class TestTheDestructiveWindowBetweenDeleteAndAdd:
+    """`delete` and `add` are separate commits. A raise between them leaves the
+    channel with ZERO rows while every other channel is fine - a silent hole of
+    exactly the shape #183 is about, inverted. Both review layers found this;
+    the in-family one reproduced it against real LanceDB."""
+
+    def test_a_vector_dimension_change_refuses_before_deleting_anything(self, corpus, monkeypatch) -> None:
+        """The live trigger: a new embedding model keeps every column NAME
+        identical, so the name-only guard passes, `delete` commits and `add`
+        raises an Arrow cast error - erasing the channel, with a re-run failing
+        identically forever."""
+        vi.build_search_index(corpus.output_dir, config=corpus.config)
+        before = _rows(corpus.db_path)
+        assert [r for r in before if r["channel"] == "alpha"]
+
+        class _WiderVoyage(_RecordingVoyage):
+            def embed(self, texts, *a, **k):
+                out = super().embed(texts, *a, **k)
+                return SimpleNamespace(embeddings=[[0.1] * 8 for _ in out.embeddings])
+
+        monkeypatch.setattr(vi, "require_voyageai", lambda: SimpleNamespace(Client=_WiderVoyage))
+        with pytest.raises(SystemExit) as exc:
+            vi.build_search_index(corpus.output_dir, channel_filter="alpha", config=corpus.config)
+        assert exc.value.code == 1
+
+        after = _rows(corpus.db_path)
+        assert len(after) == len(before), "nothing may be deleted when the update cannot land"
+        assert {r["channel"] for r in after} == {"alpha", "beta"}
+
+    def test_vector_dimension_mismatch_reads_the_real_lancedb_schema(self, corpus) -> None:
+        """The detector against a REAL table, not a SimpleNamespace that agrees
+        with it by construction."""
+        vi.build_search_index(corpus.output_dir, config=corpus.config)
+        db = lancedb.connect(str(corpus.db_path))
+        table = db.open_table(vi.LANCEDB_TABLE)
+        assert vi.vector_dimension_mismatch(table, [[0.0] * 4]) is None
+        assert "8-dimensional" in vi.vector_dimension_mismatch(table, [[0.0] * 8])
+        assert vi.vector_dimension_mismatch(table, []) is None
+
+    def test_index_schema_mismatch_reads_the_real_lancedb_schema(self, corpus) -> None:
+        vi.build_search_index(corpus.output_dir, config=corpus.config)
+        db = lancedb.connect(str(corpus.db_path))
+        table = db.open_table(vi.LANCEDB_TABLE)
+        healthy = {
+            "text",
+            "timestamp",
+            "timestamp_seconds",
+            "video_id",
+            "channel",
+            "title",
+            "published",
+            "concept_ids",
+            "source_file",
+        }
+        assert vi.index_schema_mismatch(table, healthy) is None
+        assert vi.index_schema_mismatch(table, healthy | {"brand_new"})
+        assert vi.index_schema_mismatch(table, healthy - {"title"})
+
+    def test_a_failure_after_delete_names_the_channel_and_the_recovery(self, corpus, monkeypatch, caplog) -> None:
+        """The exception still propagates, but it must never propagate without
+        telling the operator which channel is now missing and how to recover."""
+        vi.build_search_index(corpus.output_dir, config=corpus.config)
+
+        class _Boom(Exception):
+            pass
+
+        db = lancedb.connect(str(corpus.db_path))
+        table = db.open_table(vi.LANCEDB_TABLE)
+        original_add = type(table).add
+
+        def exploding_add(self, *a, **k):
+            raise _Boom("add rejected the batch")
+
+        monkeypatch.setattr(type(table), "add", exploding_add)
+        with caplog.at_level("ERROR"), pytest.raises(_Boom):
+            vi.build_search_index(corpus.output_dir, channel_filter="alpha", config=corpus.config)
+        monkeypatch.setattr(type(table), "add", original_add)
+
+        text = caplog.text
+        assert "alpha" in text
+        assert "MISSING" in text
+        assert "index --force" in text
+
+
+class TestAnEmptiedChannelIsNotSilent:
+    """A scoped run can only REPLACE rows, never retire them - the empty-records
+    guard sits before the delete, which is what keeps a typo harmless. But a
+    channel emptied by `prune-shorts --apply` takes the identical path and its
+    stale rows keep answering searches."""
+
+    def test_a_channel_with_no_transcripts_left_warns_about_its_stale_rows(self, corpus, caplog) -> None:
+        vi.build_search_index(corpus.output_dir, config=corpus.config)
+        for tx in (corpus.output_dir / "alpha").glob("*.transcript.md"):
+            tx.unlink()
+
+        with caplog.at_level("WARNING"):
+            assert vi.build_search_index(corpus.output_dir, channel_filter="alpha", config=corpus.config) == 0
+
+        assert "still in the index" in caplog.text
+        assert "index --force" in caplog.text
+        assert {r["channel"] for r in _rows(corpus.db_path)} == {"alpha", "beta"}
+
+    def test_a_mistyped_channel_does_not_raise_that_false_alarm(self, corpus, caplog) -> None:
+        vi.build_search_index(corpus.output_dir, config=corpus.config)
+        with caplog.at_level("WARNING"):
+            assert vi.build_search_index(corpus.output_dir, channel_filter="alfa", config=corpus.config) == 0
+        assert "still in the index" not in caplog.text
+
+
+class TestForceWithChannelIsNotSilentlyIgnored:
+    def test_force_plus_channel_says_what_force_did(self, corpus, caplog) -> None:
+        vi.build_search_index(corpus.output_dir, config=corpus.config)
+        with caplog.at_level("INFO"):
+            vi.build_search_index(corpus.output_dir, channel_filter="alpha", force=True, config=corpus.config)
+        assert "does not drop the index" in caplog.text
+
+
 class TestEscapeSqlStringLiteral:
     def test_doubles_single_quotes(self) -> None:
         assert vi.escape_sql_string_literal("o'brien") == "o''brien"
