@@ -12,10 +12,21 @@ coverage was `tests/test_utils.py`'s bare `pytest.raises(SystemExit)`, which
 `SystemExit(0)` satisfies just as happily as `SystemExit(1)`. A test that
 cannot tell success from failure is not coverage of an exit code.
 
-These tests assert the CODE, cover both commands (only `transcript` had any),
-and assert the ORDERING - a guard that fires after the upload would still exit
-1 while charging the operator a multi-minute upload for a rejected file, which
-is the repo's standing probe-before-you-pay rule.
+Two things a reviewer caught about the FIRST version of this file, both of
+which made tests pass for the wrong reason, and both of which are the same
+class of defect as the one being tested:
+
+* `_cmd_process_impl` wraps `upload_local_video` in a broad
+  `except Exception: ... sys.exit(1)`. So on the process side an exit-code-only
+  assertion passes even if the size guard is DELETED - execution simply falls
+  through to an upload that fails and exits 1 anyway. Every exit-code test here
+  therefore also asserts that the upload was never reached; the two assertions
+  together are what pin the guard as the cause.
+* Both commands `sys.exit(1)` on a missing `GEMINI_API_KEY` BEFORE the size
+  guard runs, and `_cmd_process_impl` calls `resolve_output_dir` before it too
+  (which mkdirs `~/video-intel` for an empty config). Without stubbing both,
+  these tests would pass vacuously in any environment without the key, and
+  would write to the real home directory. `_isolated` handles both.
 """
 
 from __future__ import annotations
@@ -29,6 +40,19 @@ import pytest
 import video_intel as vi
 
 
+def _isolated(monkeypatch, tmp_path) -> None:
+    """Reach the guard under test, and touch nothing outside tmp_path.
+
+    Both commands exit 1 on a missing GEMINI_API_KEY before the size guard, and
+    `_cmd_process_impl` resolves (and creates) the output dir before it. Either
+    would make these tests pass for a reason unrelated to the guard.
+    """
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+    monkeypatch.setattr(vi, "resolve_output_dir", lambda _cfg: tmp_path / "corpus")
+    monkeypatch.setattr(vi, "require_gemini", lambda: (SimpleNamespace(), None))
+    monkeypatch.setattr(vi, "create_client", lambda *a, **k: SimpleNamespace())
+
+
 def _oversized(monkeypatch, path: Path) -> None:
     """Report a file as over the threshold without writing a gigabyte."""
     path.write_bytes(b"placeholder")
@@ -37,28 +61,25 @@ def _oversized(monkeypatch, path: Path) -> None:
     def fake_stat(self, *a, **kw):
         st = real_stat(self, *a, **kw)
         if self == path:
-            return SimpleNamespace(
-                st_size=vi.LARGE_FILE_THRESHOLD_BYTES + 1,
-                st_mtime=st.st_mtime,
-            )
+            return SimpleNamespace(st_size=vi.LARGE_FILE_THRESHOLD_BYTES + 1, st_mtime=st.st_mtime)
         return st
 
     monkeypatch.setattr(Path, "stat", fake_stat)
 
 
-def _refuse_upload(monkeypatch) -> dict:
-    """Make any upload attempt loudly visible to the assertions."""
+def _watch_upload(monkeypatch) -> dict:
+    """Record any upload attempt without raising, so the ORDER is observable."""
     seen = {"uploads": 0}
 
-    def _boom(*_a, **_kw):
+    def _record(*_a, **_kw):
         seen["uploads"] += 1
-        raise AssertionError("upload attempted for a file the size guard should have rejected")
+        raise RuntimeError("upload reached")
 
-    monkeypatch.setattr(vi, "upload_local_video", _boom)
+    monkeypatch.setattr(vi, "upload_local_video", _record)
     return seen
 
 
-def _transcript_args(mp4: Path, **over) -> argparse.Namespace:
+def _args(mp4: Path, **over) -> argparse.Namespace:
     base = dict(
         model=None,
         url=None,
@@ -80,100 +101,103 @@ def _transcript_args(mp4: Path, **over) -> argparse.Namespace:
     return argparse.Namespace(**base)
 
 
-def _process_args(mp4: Path, **over) -> argparse.Namespace:
-    return _transcript_args(mp4, **over)
+class TestTheSizeGuardExitsOneAndIsTheReason:
+    """`SystemExit` alone is not the contract - a batch driver reads the CODE.
 
+    And on the process side the code alone is not enough either: an unrelated
+    downstream failure also exits 1, so each test pairs the exit code with
+    proof that the upload was never reached.
+    """
 
-class TestTheSizeGuardExitsOne:
-    """`SystemExit` alone is not the contract - a batch driver reads the CODE."""
-
-    def test_transcript_file_exits_1(self, monkeypatch, tmp_path) -> None:
+    def test_transcript_file_exits_1_without_uploading(self, monkeypatch, tmp_path) -> None:
         mp4 = tmp_path / "huge.mp4"
+        _isolated(monkeypatch, tmp_path)
         _oversized(monkeypatch, mp4)
-        monkeypatch.setattr(vi, "require_gemini", lambda: (SimpleNamespace(), None))
-        monkeypatch.setattr(vi, "create_client", lambda *a, **k: SimpleNamespace())
+        seen = _watch_upload(monkeypatch)
 
         with pytest.raises(SystemExit) as exc:
-            vi.cmd_transcript(_transcript_args(mp4), {})
+            vi.cmd_transcript(_args(mp4), {})
         assert exc.value.code == 1, "an ERROR that exits 0 is the false-success shape #129 forbids"
+        assert seen["uploads"] == 0, "the size guard, not a downstream failure, must be the cause"
 
-    def test_process_file_exits_1(self, monkeypatch, tmp_path) -> None:
-        """`process --file` had no exit-code coverage at all before #185."""
+    def test_process_file_exits_1_without_uploading(self, monkeypatch, tmp_path) -> None:
+        """`process --file` had no exit-code coverage at all before #185, and
+        its broad `except Exception -> sys.exit(1)` around the upload means the
+        exit code by itself proves nothing."""
         mp4 = tmp_path / "huge.mp4"
+        _isolated(monkeypatch, tmp_path)
         _oversized(monkeypatch, mp4)
-        monkeypatch.setattr(vi, "require_gemini", lambda: (SimpleNamespace(), None))
-        monkeypatch.setattr(vi, "create_client", lambda *a, **k: SimpleNamespace())
+        seen = _watch_upload(monkeypatch)
 
         with pytest.raises(SystemExit) as exc:
-            vi.cmd_process(_process_args(mp4), {})
+            vi.cmd_process(_args(mp4), {})
         assert exc.value.code == 1
+        assert seen["uploads"] == 0, "the size guard, not the upload handler, must be the cause"
 
 
-class TestTheGuardRunsBeforeTheUpload:
-    """Probe before you pay: a guard that fires after the upload still exits 1
-    while charging a multi-minute upload for a file it was always going to
-    reject. The ORDERING is the assertion - the exit code passes either way."""
-
-    def test_transcript_file_uploads_nothing(self, monkeypatch, tmp_path) -> None:
-        mp4 = tmp_path / "huge.mp4"
-        _oversized(monkeypatch, mp4)
-        seen = _refuse_upload(monkeypatch)
-        monkeypatch.setattr(vi, "require_gemini", lambda: (SimpleNamespace(), None))
-        monkeypatch.setattr(vi, "create_client", lambda *a, **k: SimpleNamespace())
-
-        with pytest.raises(SystemExit):
-            vi.cmd_transcript(_transcript_args(mp4), {})
-        assert seen["uploads"] == 0
-
-    def test_process_file_uploads_nothing(self, monkeypatch, tmp_path) -> None:
-        mp4 = tmp_path / "huge.mp4"
-        _oversized(monkeypatch, mp4)
-        seen = _refuse_upload(monkeypatch)
-        monkeypatch.setattr(vi, "require_gemini", lambda: (SimpleNamespace(), None))
-        monkeypatch.setattr(vi, "create_client", lambda *a, **k: SimpleNamespace())
-
-        with pytest.raises(SystemExit):
-            vi.cmd_process(_process_args(mp4), {})
-        assert seen["uploads"] == 0
-
-
-class TestASegmentStillBypassesTheGuardOnPurpose:
+class TestTheSegmentBypassIsDeliberate:
     """`--start`/`--end` is the documented escape hatch: the operator has said
     which slice to send, so the whole-file size stops being the question. The
-    bypass must stay - a test that locks the guard's exit code could otherwise
-    be 'tightened' into breaking the only way to process a large local file."""
+    bypass must stay for BOTH commands - a test that locks the guard's exit
+    code could otherwise be 'tightened' into breaking the only way to process a
+    large local file."""
 
-    def test_an_oversized_file_with_a_segment_is_not_rejected_by_the_guard(self, monkeypatch, tmp_path) -> None:
+    def test_process_reaches_the_upload_with_a_segment(self, monkeypatch, tmp_path) -> None:
         mp4 = tmp_path / "huge.mp4"
+        _isolated(monkeypatch, tmp_path)
         _oversized(monkeypatch, mp4)
-        reached = {"upload": 0}
-
-        def _stop_after_guard(*_a, **_kw):
-            reached["upload"] += 1
-            raise RuntimeError("reached the upload, so the size guard did not reject this")
-
-        monkeypatch.setattr(vi, "upload_local_video", _stop_after_guard)
-        monkeypatch.setattr(vi, "require_gemini", lambda: (SimpleNamespace(), None))
-        monkeypatch.setattr(vi, "create_client", lambda *a, **k: SimpleNamespace())
+        seen = _watch_upload(monkeypatch)
 
         with pytest.raises((RuntimeError, SystemExit)):
-            vi.cmd_process(_process_args(mp4, start="00:00", end="00:10"), {})
-        assert reached["upload"] == 1, "the segment escape hatch must still reach the upload"
+            vi.cmd_process(_args(mp4, start="00:00", end="00:10"), {})
+        assert seen["uploads"] == 1, "the segment escape hatch must still reach the upload"
+
+    def test_transcript_reaches_the_upload_with_a_segment(self, monkeypatch, tmp_path) -> None:
+        """The two guards are separate code with separate messages, so covering
+        one proves nothing about the other."""
+        mp4 = tmp_path / "huge.mp4"
+        _isolated(monkeypatch, tmp_path)
+        _oversized(monkeypatch, mp4)
+        seen = _watch_upload(monkeypatch)
+
+        with pytest.raises((RuntimeError, SystemExit)):
+            vi.cmd_transcript(_args(mp4, start="00:00", end="00:10"), {})
+        assert seen["uploads"] == 1
 
 
 class TestTheMissingFileGuardExitsOneToo:
     """The sibling guard a few lines up, same class."""
 
     def test_transcript_missing_file_exits_1(self, monkeypatch, tmp_path) -> None:
-        monkeypatch.setattr(vi, "require_gemini", lambda: (SimpleNamespace(), None))
-        monkeypatch.setattr(vi, "create_client", lambda *a, **k: SimpleNamespace())
+        _isolated(monkeypatch, tmp_path)
+        seen = _watch_upload(monkeypatch)
         with pytest.raises(SystemExit) as exc:
-            vi.cmd_transcript(_transcript_args(tmp_path / "nope.mp4"), {})
+            vi.cmd_transcript(_args(tmp_path / "nope.mp4"), {})
         assert exc.value.code == 1
+        assert seen["uploads"] == 0
 
     def test_process_missing_file_exits_1(self, monkeypatch, tmp_path) -> None:
-        monkeypatch.setattr(vi, "require_gemini", lambda: (SimpleNamespace(), None))
-        monkeypatch.setattr(vi, "create_client", lambda *a, **k: SimpleNamespace())
+        _isolated(monkeypatch, tmp_path)
+        seen = _watch_upload(monkeypatch)
         with pytest.raises(SystemExit) as exc:
-            vi.cmd_process(_process_args(tmp_path / "nope.mp4"), {})
+            vi.cmd_process(_args(tmp_path / "nope.mp4"), {})
         assert exc.value.code == 1
+        assert seen["uploads"] == 0
+
+
+class TestTheseTestsReachTheGuardTheyClaimToTest:
+    """Guard the guards: if an earlier check starts short-circuiting these
+    paths, every test above would pass vacuously. This one fails instead."""
+
+    def test_a_normal_sized_file_is_not_rejected_by_the_size_guard(self, monkeypatch, tmp_path) -> None:
+        mp4 = tmp_path / "fine.mp4"
+        mp4.write_bytes(b"small enough")
+        _isolated(monkeypatch, tmp_path)
+        seen = _watch_upload(monkeypatch)
+
+        with pytest.raises((RuntimeError, SystemExit)):
+            vi.cmd_process(_args(mp4), {})
+        assert seen["uploads"] == 1, (
+            "an under-threshold file must reach the upload; if it does not, the tests above "
+            "are passing on an earlier check rather than on the size guard"
+        )
