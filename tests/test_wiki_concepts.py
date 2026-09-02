@@ -316,6 +316,15 @@ class TestMindmapTimestampParsing:
         entries = parse_mindmap_timestamps(text)
         assert entries[0].seconds == 6018
 
+    @pytest.mark.parametrize("garbage", ["100:180", "100:18:99:22", "1234:5"])
+    def test_a_malformed_token_anchors_nothing_rather_than_something_wrong(self, garbage):
+        """Codex peer-review case: an unanchored findall would fabricate a
+        plausible anchor out of a malformed value ("100:180" -> "100:18").
+        The contract is None -> render without &t=, never a wrong anchor."""
+        text = f"## H\n\n* **S**\n  - malformed bullet ({garbage})\n"
+        entries = parse_mindmap_timestamps(text)
+        assert entries[0].seconds is None
+
     def test_mention_link_falls_back_to_plain_url_without_fabricating_a_time(self):
         from wiki_concepts import Mention, VideoRecord
 

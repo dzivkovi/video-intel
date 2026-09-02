@@ -370,7 +370,15 @@ _BULLET_TIME_RE = re.compile(r"\(([\d:,\s]+)\)\s*$")
 # form was WORSE than a miss here - findall("100:18") matched "00:18" and
 # anchored the citation 100 minutes early, violating this module's own
 # never-fabricate-a-timestamp contract (invariant 4).
-_TIME_TOKEN_RE = re.compile(TIMESTAMP_TOKEN_PATTERN)
+# Codex peer-review addendum: the scan is an unanchored findall, so without
+# token boundaries a malformed value still fabricates a plausible anchor -
+# "100:180" matched "100:18" and "100:18:99:22" matched "100:18:99". The
+# lookarounds are this CONSUMER's context (chunk_transcript's regexes get
+# theirs from the surrounding [ ] / SCREEN syntax); the core shape stays the
+# one shared TIMESTAMP_TOKEN_PATTERN. A malformed token now matches nothing,
+# so the bullet renders without &t= instead of with a wrong one - exactly
+# this module's never-fabricate-a-timestamp contract (invariant 4).
+_TIME_TOKEN_RE = re.compile(rf"(?<![\d:]){TIMESTAMP_TOKEN_PATTERN}(?![\d:])")
 
 
 def _whole_token_pattern(term: str) -> re.Pattern[str]:
