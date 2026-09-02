@@ -122,7 +122,7 @@ Per-query expansion records are also available structurally: pass `return_diagno
 
 ### Scope
 
-Stage 1 touches **only** `hybrid_search()`. The concept-search path (`search_corpus()`) already does its own alias-aware retrieval with a `_match_score` gate and is intentionally untouched. ADR-0017's eval gate measures `--vector` only, so scoping to hybrid is sufficient.
+Stage 1 touches **only** `hybrid_search()`. The concept-search path (`search_corpus()`) already does its own alias-aware retrieval with a `_match_score` gate and is intentionally untouched by Stage 1. Its RANKING became specificity-first in issue #189: among concepts with equal bag scores, a whole-phrase match in one field (label or a single alias, boundary-aware via `_alias_boundary_pattern`), then best single-field term coverage, then tightness, and only then `video_count` - the old count-first tiebreak rewarded genericness because the bag concatenates every alias, letting each query term match a different one. ADR-0017's eval gate measures `--vector` only, so scoping to hybrid is sufficient.
 
 ## Display Design
 
