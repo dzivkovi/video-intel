@@ -171,6 +171,27 @@ def apply_timestamp_offset(line: str, offset_seconds: int, chunk_duration_second
     return f"[{h:02d}:{mm:02d}:{ss:02d}]{line[m.end() :]}"
 
 
+# Bracketed timestamp shapes, defined ONCE (issue #197, following issue #195's
+# precedent in video_intel.py). The MINUTE field is UNBOUNDED: a video-intel
+# transcript renders `MM:SS` verbatim from whatever the writer produced, so a
+# cue past 99:59 carries a `[100:30]`-style stamp, and 25 such files exist in
+# the corpus today. A `\d{1,2}` minute field does not merely mis-parse those -
+# it does not match at all, which is worse in three different ways: coverage
+# reported 0 instead of the real end (a guaranteed false truncation warning),
+# overshoot detection silently stopped detecting, and the `--from-transcript`
+# gate rejected a legitimate transcript as "not a transcript".
+#
+# The HOUR field stays `\d{1,2}` on purpose. It is hours, 99 is already absurd,
+# and widening it would let a legacy malformed `[120:05:30]` parse as 120 hours
+# instead of being caught. `normalize_timestamp` is what repairs that shape.
+TS_HOURS = r"\d{1,2}"
+TS_MINUTES = r"\d+"
+TS_SECONDS = r"\d{2}"
+# `[HH:MM:SS]` and `[MM:SS]`, as anchored line-start matches.
+HHMMSS_BRACKET_RE = re.compile(rf"\[({TS_HOURS}):({TS_SECONDS}):({TS_SECONDS})\]")
+MMSS_BRACKET_RE = re.compile(rf"\[({TS_MINUTES}):({TS_SECONDS})\]")
+
+
 def extract_last_timestamp_seconds(text: str) -> int | None:
     """Return the last parseable timestamp in `text`, in seconds.
 
@@ -181,11 +202,11 @@ def extract_last_timestamp_seconds(text: str) -> int | None:
     last: int | None = None
     for raw in text.splitlines():
         line = raw.lstrip("\ufeff").lstrip()
-        m = re.match(r"\[(\d{1,2}):(\d{2}):(\d{2})\]", line)
+        m = HHMMSS_BRACKET_RE.match(line)
         if m:
             last = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
             continue
-        m = re.match(r"\[(\d{1,2}):(\d{2})\]", line)
+        m = MMSS_BRACKET_RE.match(line)
         if m:
             last = int(m.group(1)) * 60 + int(m.group(2))
     return last
@@ -377,8 +398,8 @@ def detect_overshoot(
     timestamp are ignored entirely.
     """
     cutoff = last_input_seconds + tolerance_seconds
-    hhmmss = re.compile(r"^\[(\d\d):(\d\d):(\d\d)\]")
-    mmss = re.compile(r"^\[(\d\d):(\d\d)\]")
+    hhmmss = HHMMSS_BRACKET_RE
+    mmss = MMSS_BRACKET_RE
     first_over_line: int | None = None
     last_seconds = 0
     ts_line_number = 0
@@ -1610,7 +1631,7 @@ def _translate_via_captions(
 
 
 TRANSCRIPT_MAX_BYTES = 500_000
-TRANSCRIPT_TIMESTAMP_RE = re.compile(r"^\[(?:\d{1,2}:)?\d{1,2}:\d{2}\]", re.MULTILINE)
+TRANSCRIPT_TIMESTAMP_RE = re.compile(rf"^\[(?:{TS_HOURS}:)?{TS_MINUTES}:{TS_SECONDS}\]", re.MULTILINE)
 
 
 def parse_transcript_header(text: str) -> dict[str, str]:
