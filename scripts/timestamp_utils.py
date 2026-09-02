@@ -28,6 +28,14 @@ group before assuming an argument shape:
 * **Link construction** - `timestamped_url`, which appends a `t=<seconds>`
   deep link to a video URL. Moved here from `intel_graph.py`, which
   re-exports it.
+* **Token shape** - `TIMESTAMP_TOKEN_PATTERN`, the one regex source for what a
+  rendered timestamp token looks like: an UNBOUNDED minute-or-hour field, then
+  `:SS`, then an optional second `:SS`. Unbounded because the captions renderer
+  emits `MM:SS` with minutes past 59 (issue #195: `[100:30]` at 1h40m30s), so
+  any consumer capping the first field at `\\d{1,2}` either misses the token or
+  - worse, in an unanchored `findall` - matches a WRONG substring (`00:18` out
+  of `100:18`). `video_intel.py` builds its chunk-boundary regexes from this,
+  and `wiki_concepts.py` its bullet time-token scan.
 
 Imported by `translate_video.py` (SRT chunk stitching) and `video_intel.py`
 (chunked transcript classifier) as well; `translate_video.py` stays
@@ -36,6 +44,10 @@ seam safe.
 """
 
 import re
+
+# The one definition of a rendered timestamp token's shape (issue #195). See
+# the module docstring's "Token shape" entry for why the first field is \d+.
+TIMESTAMP_TOKEN_PATTERN = r"\d+:\d{2}(?::\d{2})?"
 
 
 def normalize_timestamp(line: str) -> str:
