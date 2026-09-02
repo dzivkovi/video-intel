@@ -1,0 +1,25 @@
+{
+  "video_url": "https://www.youtube.com/watch?v=ATvaLhozcq0",
+  "video_id": "ATvaLhozcq0",
+  "channel": "_standalone",
+  "title": "Iran, War, AI, God, Consciousness & Global War | Professor Jiang",
+  "published": "2026-08-27",
+  "model": "gemini-3.7-flash",
+  "transcript_status": "ok",
+  "transcript_chunks": 4,
+  "transcript_chunk_minutes": 30,
+  "transcript_thin_chunks": 0,
+  "transcript_confabulated_chunks": 0,
+  "transcript_quality_flags": [
+    "backward_jump_mild"
+  ],
+  "transcript_max_blind_gap_seconds": 250,
+  "transcript_blind_gap_at_seconds": 4254,
+  "transcript_last_dialogue_fraction": 0.9994391475042064,
+  "transcript_dialogue_entries": 683,
+  "transcript_chunk_window_violations": 0,
+  "modes_completed": [
+    "transcript"
+  ],
+  "last_error": null
+}
