@@ -954,7 +954,37 @@ def channel_config_by_name(config: dict, channel_name: str | None) -> dict:
     """
     if not channel_name or channel_name == STANDALONE_CHANNEL:
         return {}
-    return next((c for c in (config.get("channels") or []) if c.get("name") == channel_name), {})
+    # `isinstance(c, dict)` is not defensive padding: three ordinary YAML
+    # mistakes reach here as a non-dict - `channels:` written as a mapping
+    # (dashes omitted), `channels:` given a bare string, and a scalar list
+    # entry (`- natebjones` instead of `- name: natebjones`). Each raised
+    # AttributeError on `c.get`, killing every manual --url command. The
+    # `or []` beside it covers the fourth: `channels:` with nothing under it
+    # parses as None. Resolving the channel is a CONVENIENCE - `_standalone`
+    # is always an available answer - so a malformed watchlist must degrade
+    # to "no configured channel", never abort the run.
+    matches = [c for c in (config.get("channels") or []) if isinstance(c, dict) and c.get("name") == channel_name]
+    if len(matches) > 1:
+        # Two rows sharing a name is a config error with a QUIET failure
+        # mode, which is why it warns rather than being left to the
+        # operator to notice. `match_configured_channel` matches a row by
+        # URL but returns its NAME, and this function then re-finds the
+        # FIRST row with that name - so a video from the second row's
+        # channel is written to the right folder while silently inheriting
+        # the first row's `transcript_source`, `chunk_minutes` and
+        # `mindmap_source`. That is issue #127's failure class, found by
+        # the Codex peer pass on issue #205 and reproduced.
+        #
+        # Warning, not raising: the name IS the output folder, so two rows
+        # sharing one are already writing to the same place and the run is
+        # still the best available answer. Naming the ambiguity is what
+        # turns a silent mis-route into a fixable one.
+        log.warning(
+            "config lists %d channels named %r; using the first. Their transcript_source / chunk_minutes / mindmap_source may differ, and a video matched by URL to a later one will silently get the first row's settings. Give each channel a unique name.",
+            len(matches),
+            channel_name,
+        )
+    return matches[0] if matches else {}
 
 
 def resolve_mindmap_source(channel_config: dict, *, transcript_available: bool, transcript_severe: bool = False) -> str:
@@ -7308,12 +7338,7 @@ def _cmd_mindmap_impl(args, config):
                 title = title or unescape(snippet["title"])
                 date = date or snippet["publishedAt"][:10]
                 if not channel_name:
-                    yt_channel_id = snippet["channelId"]
-                    for ch in config.get("channels", []):
-                        ch_id, _ = get_channel_id(youtube, ch["url"])
-                        if ch_id == yt_channel_id:
-                            channel_name = ch["name"]
-                            break
+                    channel_name = match_configured_channel(youtube, config, snippet.get("channelId"))
                     if not channel_name:
                         channel_name = slugify(snippet["channelTitle"])
 
@@ -7359,10 +7384,7 @@ def _cmd_mindmap_impl(args, config):
         if transcript_available
         else False
     )
-    channel_cfg: dict = next(
-        (c for c in config.get("channels", []) if c.get("name") == channel_name),
-        {},
-    )
+    channel_cfg: dict = channel_config_by_name(config, channel_name)
     try:
         resolved_source = resolve_mindmap_source(
             channel_cfg, transcript_available=transcript_available, transcript_severe=transcript_severe
@@ -7600,13 +7622,9 @@ def _cmd_transcript_impl(args, config):
                     title = title or unescape(snippet["title"])
                     date = date or snippet["publishedAt"][:10]
                     if not channel_name:
-                        # Match against configured channels by channel ID
-                        yt_channel_id = snippet["channelId"]
-                        for ch in config.get("channels", []):
-                            ch_id, _ = get_channel_id(youtube, ch["url"])
-                            if ch_id == yt_channel_id:
-                                channel_name = ch["name"]
-                                break
+                        # Match against configured channels by channel ID.
+                        # Issue #205: one shared, guarded, cached matcher.
+                        channel_name = match_configured_channel(youtube, config, snippet.get("channelId"))
                         if not channel_name:
                             channel_name = slugify(snippet["channelTitle"])
 
@@ -8000,12 +8018,7 @@ def _cmd_process_url(args, config):
                 title = title or unescape(snippet["title"])
                 date = date or snippet["publishedAt"][:10]
                 if not channel_name:
-                    yt_channel_id = snippet["channelId"]
-                    for ch in config.get("channels", []):
-                        ch_id, _ = get_channel_id(yt, ch["url"])
-                        if ch_id == yt_channel_id:
-                            channel_name = ch["name"]
-                            break
+                    channel_name = match_configured_channel(yt, config, snippet.get("channelId"))
                     if not channel_name:
                         channel_name = slugify(snippet["channelTitle"])
     channel_name = channel_name or "_standalone"
@@ -8523,10 +8536,7 @@ def _cmd_process_impl(args, config):
     # (ValueError, TypeError): belt-and-braces for consistency with the eight
     # sibling config-knob guards - resolve_chunk_minutes maps TypeError onto
     # ValueError internally.
-    channel_cfg: dict = next(
-        (c for c in config.get("channels", []) if c.get("name") == channel_name),
-        {},
-    )
+    channel_cfg: dict = channel_config_by_name(config, channel_name)
     try:
         chunk_minutes = resolve_chunk_minutes(channel_cfg, config, getattr(args, "chunk_minutes", None))
     except (ValueError, TypeError) as e:
@@ -11768,6 +11778,103 @@ def rank_unseen(unseen: list[dict], profile: dict | InterestModel) -> list[dict]
 # ---------------------------------------------------------------------------
 # Headline digest - peripheral vision over unfollowed channels (issue #113)
 # ---------------------------------------------------------------------------
+
+
+# --- manual --url channel matching (issue #205) ----------------------------
+
+
+def _configured_channel_id(youtube, channel_config: dict, cache: dict) -> str | None:
+    """Resolve one configured channel to its `UC...` id, or None.
+
+    Three things this must keep doing:
+
+    * **`.get("url")`, never `ch["url"]`.** An `enabled: false` placeholder for
+      a non-YouTube source (Skool, Vimeo) legitimately carries no `url` key -
+      that shape is documented and supported - and the pre-#205 matcher read it
+      unconditionally, so ONE such channel crashed every manual `--url` run
+      with `KeyError: 'url'` before `channel_name` could fall back to the
+      slugified title or `_standalone`.
+    * **Shape-check BEFORE the API call.** `get_channel_id()` submits the last
+      path segment to the YouTube API for ANY host, so a non-YouTube url costs
+      a quota unit and returns nothing useful. Same probe-before-you-pay rule
+      as the issue #113 headline gate, which is why it reuses that gate's
+      `_is_youtube_channel_source`.
+    * **A config-supplied `UC...` id short-circuits the call entirely**, and
+      every lookup is cached per run. The matcher used to spend one API unit
+      PER CONFIGURED CHANNEL on every manual run - roughly 75 units to answer
+      "which channel is this video from", repeated for each of the three
+      commands that asked.
+    """
+    url = channel_config.get("url")
+    if not _is_youtube_channel_source(url):
+        return None
+    if url in cache:
+        return cache[url]
+    # A bare `UC...` id in the config needs no lookup at all.
+    if _UC_CHANNEL_ID_RE.match(url.strip()):
+        cache[url] = url.strip()
+        return cache[url]
+    try:
+        ch_id, _ = get_channel_id(youtube, url)
+    except Exception as e:  # one bad channel must not kill the run
+        log.warning("Could not resolve channel id for %s: %s", url, e)
+        # Record that identity could not be ESTABLISHED, which is not the
+        # same claim as identity being ABSENT (Codex peer pass). A
+        # request-wide failure - quotaExceeded, a bad key - makes every
+        # lookup fail, and the caller would otherwise conclude the video
+        # is from an unconfigured channel, slugify its title, write into a
+        # brand-new folder and use default routing knobs. Still no raise
+        # (this is a convenience lookup), but the caller gets told.
+        cache["__failed__"] = True
+        ch_id = None
+    cache[url] = ch_id
+    return ch_id
+
+
+def match_configured_channel(youtube, config: dict, yt_channel_id: str | None) -> str | None:
+    """Name of the configured channel owning `yt_channel_id`, or None.
+
+    ONE definition, three callers (`cmd_transcript`, `cmd_mindmap`,
+    `_cmd_process_url`). The loop was copy-pasted three times before issue
+    #205, which is how all three carried the identical crash and the identical
+    per-channel quota cost. A fourth `--url` command must reuse this rather
+    than paste a fourth copy.
+    """
+    if not yt_channel_id:
+        return None
+    cache: dict = {}
+    # `channels:` with nothing under it parses as None, not [], and
+    # `config.get("channels", [])` hands that None straight to `for` - caught by
+    # Gate 1 on this very fix, not by reading it.
+    channels = config.get("channels") or []
+    if not isinstance(channels, list):
+        log.warning("config 'channels' is %s, not a list; cannot match by channel id", type(channels).__name__)
+        return None
+    for ch in channels:
+        if not isinstance(ch, dict):
+            continue
+        if _configured_channel_id(youtube, ch, cache) == yt_channel_id:
+            name = ch.get("name")
+            if isinstance(name, str) and name:
+                return name
+            # `continue`, not `return None` - the same rule as the url-less
+            # skip above, and for the same reason. A nameless entry sitting
+            # ABOVE a real one would otherwise hide it, which is the quieter
+            # half of the bug this whole helper exists to fix. Reviewed and
+            # reproduced: nameless-first, real-second returned None.
+            log.warning("Configured channel matched %s but has no usable name; ignoring", yt_channel_id)
+            continue
+    if cache.get("__failed__"):
+        # No match, but at least one lookup RAISED - so this is not evidence
+        # the channel is unconfigured, and the caller is about to act as if
+        # it were: slugify the title into a new folder and drop this
+        # channel's configured routing knobs (issue #127). One line, so the
+        # operator can tell a genuinely-new creator from a quota blip.
+        log.warning(
+            "Could not determine the channel for %s: at least one channel lookup failed, so an unmatched result is not proof this video is from an unconfigured channel. Pass --channel <name> to be certain of the routing.",
+            yt_channel_id,
+        )
+    return None
 
 
 def _is_youtube_channel_source(url: str | None) -> bool:
