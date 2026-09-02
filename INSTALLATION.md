@@ -241,7 +241,7 @@ Edit `config.yaml` at the repo root to add your YouTube channels:
 output_dir: ~/video-intel        # Where output files are saved
 default_since: 10d               # How far back to look for new videos
 default_prompt: mindmap-light    # Which prompt to use
-model: gemini-3-flash-preview    # Gemini model
+model: gemini-3.7-flash          # Gemini model
 
 channels:
   - name: samwitteveenai

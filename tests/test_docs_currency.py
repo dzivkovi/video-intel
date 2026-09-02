@@ -1,0 +1,183 @@
+"""The docs must not drift from the CLI (issue #204).
+
+A documentation audit on 2026-09-02 found four claims that would make an agent
+following the docs literally do the wrong thing: a model default two versions
+stale, a chunk default that issue #157 lowered on purpose, an eval command
+CLAUDE.md explicitly forbids, and a broken ADR link. Every one of them was
+mechanically checkable and nothing was checking.
+
+These tests are that check. They are deliberately cheap - no Gemini call, no
+network, no corpus read - because a guard that costs money to run stops being
+run. `--help` exits before any side effect, and the link check is a stat.
+
+Scope note: `docs/plans/`, `docs/adr/` and `docs/brainstorms/` are historical
+session artifacts under the repo's three-bucket rule, so they are NOT swept.
+A plan that recorded the model of its day is correct as history and must not be
+rewritten to match today's constant.
+"""
+
+from __future__ import annotations
+
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+REPO = Path(__file__).resolve().parent.parent
+SCRIPT = REPO / "scripts" / "video_intel.py"
+
+# The LIVING docs: what a user or agent reads to decide what to run.
+LIVING_DOCS = [
+    "README.md",
+    "INSTALLATION.md",
+    "docs/translate-bcs.md",
+    "docs/testing.md",
+    "docs/troubleshooting.md",
+    "skills/video-intel/SKILL.md",
+    "skills/video-intel-search/SKILL.md",
+    "skills/translate-bcs/SKILL.md",
+]
+
+
+def _source() -> str:
+    return SCRIPT.read_text(encoding="utf-8")
+
+
+def _registered_subcommands() -> set[str]:
+    """Every subcommand argparse knows about.
+
+    Anchored to `add_parser` rather than to the dispatch chain, for the same
+    reason `tests/test_config_backup.py` is: a subcommand cannot exist without
+    registering here, which makes the inventory undodgeable.
+    """
+    return set(re.findall(r'subparsers\.add_parser\(\s*"([a-z-]+)"', _source()))
+
+
+def _constant(name: str) -> str:
+    m = re.search(rf'^{name}\s*=\s*"?([^"\n]+)"?', _source(), re.M)
+    assert m, f"{name} not found in {SCRIPT.name}"
+    return m.group(1).strip()
+
+
+class TestEveryDocumentedCommandParses:
+    """The one test a docs change can actually run."""
+
+    @pytest.mark.parametrize("cmd", sorted(_registered_subcommands()))
+    def test_subcommand_help_exits_zero(self, cmd):
+        r = subprocess.run(
+            [sys.executable, str(SCRIPT), cmd, "--help"],
+            capture_output=True,
+            text=True,
+            cwd=str(REPO),
+        )
+        assert r.returncode == 0, f"`{cmd} --help` exited {r.returncode}: {r.stderr[-400:]}"
+
+    def test_the_registry_is_not_empty(self):
+        """Companion against a vacuous parametrization: if the `add_parser`
+        regex ever stops matching, the test above silently becomes zero cases
+        and passes forever. Same tautology class as the issue #182 field walk.
+        """
+        assert len(_registered_subcommands()) >= 15
+
+
+class TestNoStaleDefaultsInLivingDocs:
+    """The two defaults issue #204 found stale, pinned to the real constants."""
+
+    def test_no_doc_names_a_model_other_than_the_real_default(self):
+        default = _constant("DEFAULT_MODEL")
+        assert default == "gemini-3.7-flash", "update this test with the new measured default"
+        # NO exclusion list, deliberately. The first cut of this test skipped
+        # lines containing "measured"/"scorecard"/" vs " on the theory that A/B
+        # prose legitimately names the model that lost - and that exclusion made
+        # the README's own model row immune, because the row cites the
+        # scorecards. Falsification caught it: an injected stale-model row
+        # passed. Zero living docs need to name the superseded model at all (the
+        # A/B evidence lives in docs/plans and tests/evals/model-cards, which are
+        # historical and not swept here), so the check is absolute. If a living
+        # doc ever genuinely needs to name a superseded model, narrow this
+        # deliberately and RE-FALSIFY - never widen a blanket skip.
+        offenders = [
+            f"{doc}:{lineno}"
+            for doc in LIVING_DOCS
+            for lineno, line in enumerate((REPO / doc).read_text(encoding="utf-8").split("\n"), 1)
+            if "gemini-3-flash-preview" in line
+        ]
+        assert not offenders, f"stale model default in living docs: {offenders}"
+
+    def test_the_cli_help_text_names_the_real_default(self):
+        """The `--model` help string is itself documentation, and it was two
+        versions stale. Built from `DEFAULT_MODEL` now, so it cannot drift."""
+        r = subprocess.run([sys.executable, str(SCRIPT), "--help"], capture_output=True, text=True, cwd=str(REPO))
+        assert r.returncode == 0
+        assert _constant("DEFAULT_MODEL") in r.stdout
+        assert "gemini-3-flash-preview" not in r.stdout
+
+    def test_no_doc_offers_the_old_fifty_minute_chunk_default(self):
+        """Issue #157 lowered the default from 50 to 30 because a 50-minute
+        chunk let the seed case fold back into an effectively single-shot call.
+        A doc that restates 50 as the default, or offers `--chunk-minutes 50`
+        as the example value, walks an agent straight back into that shape.
+        """
+        assert int(_constant("TRANSCRIPT_CHUNK_MINUTES_DEFAULT")) == 30
+        offenders = []
+        for doc in LIVING_DOCS:
+            for lineno, line in enumerate((REPO / doc).read_text(encoding="utf-8").split("\n"), 1):
+                if re.search(r"chunk[- _]minutes[`\s]*[,;]?\s*(?:default\s*)?50\b", line, re.I):
+                    # A historical diagnosis may name the threshold of its day,
+                    # as long as it says so.
+                    if "at the time" in line:
+                        continue
+                    offenders.append(f"{doc}:{lineno}")
+        assert not offenders, f"stale chunk default in living docs: {offenders}"
+
+
+class TestNoDocTeachesTheForbiddenEvalCommand:
+    """CLAUDE.md: run the eval module BY NAME, never the directory, or the
+    instrument's deliberate failures share the summary line and the N/25 stops
+    being derivable. Three living docs taught the directory form anyway."""
+
+    def test_no_living_doc_runs_the_evals_directory(self):
+        offenders = []
+        for doc in LIVING_DOCS:
+            for lineno, line in enumerate((REPO / doc).read_text(encoding="utf-8").split("\n"), 1):
+                if re.search(r"pytest\s+tests/evals/\s", line):
+                    offenders.append(f"{doc}:{lineno}: {line.strip()}")
+        assert not offenders, f"directory-wide eval command in living docs: {offenders}"
+
+
+class TestRelativeLinksResolve:
+    """A broken relative link is a silent dead end, and moving a section
+    between directories breaks every root-relative link inside it - which is
+    exactly what happened when the BCS section moved from README into docs/."""
+
+    def test_every_relative_link_in_the_living_docs_exists(self):
+        offenders = []
+        for doc in LIVING_DOCS:
+            p = REPO / doc
+            for m in re.finditer(r"\[[^\]]+\]\(([^)\s]+)\)", p.read_text(encoding="utf-8")):
+                target = m.group(1)
+                if target.startswith(("http://", "https://", "#", "mailto:")):
+                    continue
+                if target == "url":  # prose ABOUT markdown syntax, not a link
+                    continue
+                path_part = target.split("#", 1)[0]
+                if not path_part:
+                    continue
+                if not (p.parent / path_part).resolve().exists():
+                    offenders.append(f"{doc} -> {target}")
+        assert not offenders, f"broken relative links: {offenders}"
+
+
+class TestSkillSurfaceMatchesTheCliSurface:
+    """Skill-parity, mechanically. Every subcommand a user could be told to
+    run should be reachable from the docs, not just from `--help`."""
+
+    def test_every_subcommand_is_named_somewhere_in_the_living_docs(self):
+        registered = _registered_subcommands()
+        text = "\n".join((REPO / d).read_text(encoding="utf-8") for d in LIVING_DOCS)
+        named = {
+            cmd for cmd in registered if re.search(rf"video_intel\.py\s+(?:--\S+\s+\S+\s+)*{re.escape(cmd)}\b", text)
+        }
+        assert not (registered - named), f"subcommands documented nowhere: {sorted(registered - named)}"

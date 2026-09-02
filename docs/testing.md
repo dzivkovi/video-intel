@@ -97,8 +97,13 @@ require ADR-grade justification.
 ### Full run (~1 minute, a few cents of Voyage tokens)
 
 ```bash
-pytest tests/evals/ -v -s
+pytest tests/evals/test_search_quality.py -v -s
 ```
+
+Name the module, never the `tests/evals/` directory. The measurability audit in
+`test_instrument.py` fails on purpose when a golden query is unmeasurable, so
+running the directory puts those deliberate failures in the same summary line
+and the N/25 stops being derivable.
 
 The `-s` flag is important — the harness prints a per-metric report for
 each query. Suppressing stdout (pytest's default) hides the diagnostic
@@ -107,7 +112,7 @@ that tells you *why* a query failed, not just that it did.
 ### Smoke mode (Q01 only, ~3 seconds)
 
 ```bash
-VIDEO_INTEL_EVAL_SMOKE=1 pytest tests/evals/ -v -s
+VIDEO_INTEL_EVAL_SMOKE=1 pytest tests/evals/test_search_quality.py -v -s
 ```
 
 Use while iterating on the harness itself, not on retrieval quality.
@@ -160,10 +165,13 @@ baseline was never purely a retrieval measurement.** Keep the two suites apart;
 folding an instrument defect back into the retrieval score is how this rotted
 unnoticed.
 
-## Current Baseline (2026-09-01, post-#190)
+## Current Baseline (2026-09-02, post-#195 re-index)
 
 **1 of 25 queries pass all gating metrics** (Q11), measured on a
-2,360-video / 80,297-chunk index with the instrument defect above removed.
+2,360-video / 85,854-chunk index with the instrument defect above removed.
+The chunk count moved because the #195 boundary-regex fix re-chunked ten
+channels; the N/25 and the passing query did not change across that re-index,
+and the instrument stayed 50/50.
 
 The number happens to match the 2026-04-19 headline but is not the same
 measurement, and the two are not comparable: the corpus grew roughly 15x, the

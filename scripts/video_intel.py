@@ -13263,7 +13263,7 @@ Examples:
         default=None,
         help=(
             "Gemini model override (default: config.yaml model field, "
-            "or gemini-3-flash-preview). "
+            f"or {DEFAULT_MODEL}). "
             "Gemini 3.x Flash: best for video understanding (mindmaps, screen content). "
             "Gemini 2.5 Pro: more reliable structured JSON output, higher token limit "
             "- prefer for transcripts when Flash truncates. "

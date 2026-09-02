@@ -157,8 +157,8 @@ table is the canonical mapping — read it before picking a command.
 | User says (intent) | Run | Notes |
 |---|---|---|
 | "transcribe this video" + URL | `transcript --url URL --channel <NAME>` | Single video. Grep log for `PERMISSION_DENIED` before reporting success. |
-| "scan this single video" + URL, "process this URL", "full pipeline on this URL", "do everything on [URL]" | `process --url URL --channel <NAME>` | Single-shot URL pipeline. **Issue #54 ordering**: transcript first (auto-chunked at 50-min default for 2h+ videos) → mindmap built FROM the on-disk transcript text (text-only Gemini, ~10× cheaper than mindmap-from-video, no 10800-frame cap) → concepts. Resolver picks mindmap source per channel: `mindmap_source: auto` (default) uses transcript, falls back to video when transcript fails. Same exit-code contract as `process --file`: **0** = every requested step left an artifact, **3** = the run finished but a requested step produced nothing, **1** = hard failure (mindmap/upload/config). After the run, **grep log for `PERMISSION_DENIED`** — exit 0 lies on gated content. |
-| "fully index this 3-hour talk", "transcribe this conference recording", "process this Lex Fridman episode" | `process --url URL --channel <NAME> --chunk-minutes 50` | Long-form ergonomic. Same issue #54 ordering — transcript first (auto-chunks via `--chunk-minutes`, default 50; each chunk → one Gemini call → merged into single `.transcript.md` with offset-applied timestamps and a coverage-table header) then mindmap-from-transcript (one fast text call no matter how long the video) then concepts. Failure mode: per-chunk failures land as `.transcript.raw.chunkN-START-END.txt` sidecars; meta.json carries `transcript_status: partial` if any chunk failed; the resulting mindmap inherits `mindmap_source_status: partial` and a `<!-- source: partial transcript -->` HTML comment header. |
+| "scan this single video" + URL, "process this URL", "full pipeline on this URL", "do everything on [URL]" | `process --url URL --channel <NAME>` | Single-shot URL pipeline. **Issue #54 ordering**: transcript first (auto-chunked at the 30-min default on anything longer) → mindmap built FROM the on-disk transcript text (text-only Gemini, ~10× cheaper than mindmap-from-video, no 10800-frame cap) → concepts. Resolver picks mindmap source per channel: `mindmap_source: auto` (default) uses transcript, falls back to video when transcript fails. Same exit-code contract as `process --file`: **0** = every requested step left an artifact, **3** = the run finished but a requested step produced nothing, **1** = hard failure (mindmap/upload/config). After the run, **grep log for `PERMISSION_DENIED`** — exit 0 lies on gated content. |
+| "fully index this 3-hour talk", "transcribe this conference recording", "process this Lex Fridman episode" | `process --url URL --channel <NAME> --chunk-minutes 20` | Long-form ergonomic. Same issue #54 ordering — transcript first (auto-chunks via `--chunk-minutes`, default 30; pass a lower value on dense material, never a higher one - issue #157 lowered the default from 50 on purpose; each chunk → one Gemini call → merged into single `.transcript.md` with offset-applied timestamps and a coverage-table header) then mindmap-from-transcript (one fast text call no matter how long the video) then concepts. Failure mode: per-chunk failures land as `.transcript.raw.chunkN-START-END.txt` sidecars; meta.json carries `transcript_status: partial` if any chunk failed; the resulting mindmap inherits `mindmap_source_status: partial` and a `<!-- source: partial transcript -->` HTML comment header. |
 | "run full pipeline on [local file]", "mindmap + transcript + concepts on one upload", "process this MP4" | `process --file PATH` | Local video only; single upload, lazy-skipped when artifacts already exist. **Stays on legacy mindmap-from-video** because chunking would multiply uploads (one-upload guarantee). For local files exceeding the chunk threshold, manual `--start`/`--end` segments are still the workaround. |
 | "regenerate mindmap on [URL]", "redo the mindmap for [video]", "mindmap from transcript instead of video" | `mindmap --url URL --channel <NAME>` (with on-disk transcript) | Issue #54: when a transcript is already on disk for the URL, `mindmap --url` automatically routes to the cheap text-only path. Pass `--force` to overwrite an existing mindmap. Per-channel `mindmap_source: video` forces the legacy video path even when transcript exists. |
 | "scan", "what's new", "check for new videos" | `scan` | All channels, configured `since` |
@@ -232,7 +232,7 @@ meta.json fields these reference are in [`docs/meta-json-schema.md`](../../docs/
 |---|---|---|
 | Scan never finds a video that exists | **Unlisted** (not in the uploads feed - a hard YouTube Data API limit) | manual `process --url`/`--file`, or `--transcript-source yt-captions` for a cheap captions index |
 | `403 PERMISSION_DENIED` (grep every URL run for it) | **Members-only / gated** | download via membership, then `process --file` |
-| `400 INVALID_ARGUMENT`, fails fast | **Token cap** on a long video | `process --url --chunk-minutes 50`, or set `transcript_source: auto` (captions failover) |
+| `400 INVALID_ARGUMENT`, fails fast | **Token cap** on a long video | `process --url --chunk-minutes 20` (below the default 30), or set `transcript_source: auto` (captions failover) |
 | Transcript lands `partial` with **no** API error, `meta.transcript_status: truncated_output` | **Output cap** on a short-but-dense video - the response hit 65536 output tokens and the JSON stopped mid-object | `process --url URL --chunk-minutes 20 --force`, or set a lower `chunk_minutes` on that channel so `scan` chunks it next time. `meta.transcript_output_tokens` / `transcript_finish_reason` record the evidence, and the salvaged text is often nearly complete - check before paying for a re-run |
 | Transcript hangs for many minutes | **Gemini stall** | Auto-capped per transcript (`transcript_timeout_seconds`, default 600s, issue #74) -> failover under `transcript_source: auto`; `mark-skip --mode transcript` or `skip_video_ids` as backup |
 | Tiny `prompt=0` transcript that looked "complete" | **Future/scheduled premiere** confabulated | the issue #60 confab guard now discards it; delete any old stub |
@@ -245,12 +245,12 @@ things that will happen** - skip future/scheduled premieres (`liveBroadcastConte
 
 ## Model Selection
 
-The default model (`gemini-3-flash-preview` from config.yaml) works for most
+The default model (`gemini-3.7-flash` from config.yaml) works for most
 operations. Override with `--model` / `-m` when needed:
 
 | Scenario | Model | Why |
 |----------|-------|-----|
-| Default (transcripts, mindmaps, concepts, scan) | `gemini-3-flash-preview` | Best deep video understanding for the transcript step; cheap text-only model for mindmap+concepts |
+| Default (transcripts, mindmaps, concepts, scan) | `gemini-3.7-flash` | Best deep video understanding for the transcript step; cheap text-only model for mindmap+concepts |
 | Transcripts failing with JSON errors | `gemini-2.5-pro` | More reliable structured JSON, higher output token limit |
 | Gemini 3.x backend unreliable / 503s | `gemini-2.5-pro` | Stable fallback |
 | Long videos (>60 min transcripts) | `gemini-2.5-pro` | Less likely to truncate mid-output |
@@ -263,7 +263,7 @@ python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" --model gemini-2.5-pro
 python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" --model gemini-2.5-pro scan --channel natebjones
 ```
 
-Precedence: `--model` flag > `config.yaml` `model` field > `gemini-3-flash-preview`.
+Precedence: `--model` flag > `config.yaml` `model` field > `gemini-3.7-flash`.
 
 ## Query Workflow (Different Skill)
 
@@ -436,7 +436,7 @@ python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" process \
 How `process --file` works:
 
 - **Pipeline ordering: transcript first, then mindmap, then concepts.**
-  Step 1 transcribes the video (chunked into ~50-min windows on long files,
+  Step 1 transcribes the video (chunked into ~30-min windows on long files,
   single-shot otherwise). Step 2 generates the mindmap by reading the on-disk
   transcript via a cheap text-only Gemini call (~10× cheaper than reading
   video frames again, no 10800-frame cap). Step 3 extracts concepts from
@@ -444,7 +444,7 @@ How `process --file` works:
   transcript can't be produced (e.g., transcript step fails entirely) fall
   back to mindmap-from-video automatically via the `mindmap_source` resolver.
 - **Long-video chunking.** Transcripts on videos longer than `--chunk-minutes`
-  (default 50) auto-chunk into uniform windows. `scan` chunks too, and takes the
+  (default 30) auto-chunk into uniform windows. `scan` chunks too, and takes the
   size from `chunk_minutes` (per-channel, then top-level, then the default) or a
   `--chunk-minutes` flag. Lower it for channels whose talks are *dense* rather
   than long: density, not duration, is what blows the 65536-token OUTPUT cap, so
@@ -865,7 +865,7 @@ output_dir: ~/video-intel          # Where output files are saved
 default_since: 10d                 # Default lookback window
 default_prompt: mindmap-knowledge  # Which prompt to use by default
 auto_concepts: true                # Extract concepts after mindmap generation
-model: gemini-3-flash-preview     # Gemini model (overridable via --model)
+model: gemini-3.7-flash           # Gemini model (overridable via --model)
 transcript_max_duration_seconds: 7200   # Skip transcripts on videos longer than this
                                         # (issue #42). Default 2 hours - leaves headroom
                                         # for technical talks. Mindmap phase is
