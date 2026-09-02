@@ -74,7 +74,22 @@ Five commands against the pre-built corpus:
    with `--channel`, `--since` and `--vector`. Answers "which videos belong
    to my FDE thread". Reads only the derived `topics.json`; when that file
    is absent or unreadable it says so and names `topics-build`, rather than
-   returning a misleading empty result.
+   returning a misleading empty result. The query is OPTIONAL with `--topic`:
+   `search --topic fde` alone lists the topic's members (newest first, with
+   channel, date and video link) straight from `topics.json` - no retrieval,
+   no index needed. That is the command for "show me everything I tagged
+   [topic]" / "everything I've curated under [topic]". `--vector` still
+   requires a query (there is nothing to embed without one).
+
+   `nugget` accepts the same `--topic <slug>` to scope its retrieval to a
+   curated thread - "nugget brief on X from my [topic] videos" - so curation
+   feeds synthesis instead of competing with corpus-wide ranking. The scope
+   applies at the search index itself, so every topic member competes fairly
+   for the excerpt slots; pass `--limit` at or above the topic's video count
+   (shown by the query-less listing) to give every member a slot. Same
+   narrowing contract (filters, never reorders), and a scoped brief records
+   `topic: <slug>` in its front matter so the narrowed evidence base is
+   visible provenance.
 4. **`status`** - report on corpus freshness (last scan per channel, video
    counts, taxonomy size). No API calls.
 
