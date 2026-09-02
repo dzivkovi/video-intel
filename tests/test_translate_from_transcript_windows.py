@@ -58,25 +58,44 @@ class Recorder:
     and can fail on the Nth call while writing a partial to `tmp_file` exactly
     as the real `_stream_with_timeouts` does."""
 
-    def __init__(self, fail_at: int | None = None):
+    def __init__(self, fail_at: int | None = None, empty_windows: set[int] | None = None):
         self.payloads: list[str] = []
         self.fail_at = fail_at
+        self.empty_windows = empty_windows or set()
 
     def __call__(self, client, model, contents, config, tmp_file=None):
         self.payloads.append(contents)
         n = len(self.payloads)
+        # Write a UNIQUE marker on EVERY call, the way the real
+        # `_stream_with_timeouts` streams each window's text as it arrives.
+        # The first cut wrote only on the failing call, which made the tmp
+        # handle untestable: reopening it per window (truncating away windows
+        # 1..N-1) left the whole suite green while destroying two thirds of a
+        # billed translation. A stub that only exercises the failure path
+        # cannot detect a defect on the success path.
+        if tmp_file:
+            tmp_file.write(f"<<W{n}>>")
+            tmp_file.flush()
         if self.fail_at is not None and n == self.fail_at:
-            if tmp_file:
-                tmp_file.write("PARTIAL" * 50)
-                tmp_file.flush()
             raise RuntimeError("503 UNAVAILABLE. The request timed out.")
+        if n in self.empty_windows:
+            return ("", {"total_token_count": 5}, "STOP")
         return (f"[BCS window {n}] 00:00", {"total_token_count": 1000}, "STOP")
 
 
 @pytest.fixture
 def harness(monkeypatch):
-    def _run(tmp_path, *, minutes=118, chunk_minutes=20, start=None, end=None, fail_at=None):
-        rec = Recorder(fail_at=fail_at)
+    def _run(
+        tmp_path,
+        *,
+        minutes=118,
+        chunk_minutes=20,
+        start=None,
+        end=None,
+        fail_at=None,
+        empty_windows=None,
+    ):
+        rec = Recorder(fail_at=fail_at, empty_windows=empty_windows)
         monkeypatch.setattr(tv, "_stream_with_timeouts", rec)
         monkeypatch.setattr(tv, "translate_title", lambda c, m, t: "BCS::" + t)
         monkeypatch.setattr(tv, "create_client", lambda k: object())
@@ -149,7 +168,12 @@ class TestDefectTwoStartEndIgnored:
         rec, _out, error = harness(tmp_path, minutes=118, chunk_minutes=20, start=30, end=45)
         assert error is None
         seen = sorted({int(t.split()[0].rstrip('."')) for p in rec.payloads for t in p.split("Line at minute ")[1:]})
-        assert seen == list(range(30, 46)), "the range was ignored or applied off-by-one"
+        # The end is EXCLUSIVE: `--end 45` stops before the 45:00 cue, so that
+        # a following `--start 45` picks it up exactly once. Consecutive ranges
+        # must tile, because the documented recovery for a missing window is a
+        # series of adjacent ranges - an inclusive end would duplicate every
+        # boundary cue across two runs.
+        assert seen == list(range(30, 45)), "the range was ignored or applied off-by-one"
 
     def test_start_alone_runs_to_the_end(self, tmp_path, harness):
         rec, _out, _error = harness(tmp_path, minutes=60, chunk_minutes=20, start=50)
@@ -180,7 +204,15 @@ class TestDefectThreeThePartialMessageWasFalse:
         assert len(rec.payloads) == 3, "the run should stop at the failing window"
         tmps = list(out.glob("*.txt.tmp"))
         assert tmps, "the log promised a .txt.tmp and there is none - the original defect"
-        assert tmps[0].stat().st_size > 0
+        preserved = tmps[0].read_text(encoding="utf-8")
+        # Not merely "non-empty" - that passes for a handle reopened per window,
+        # which would hold ONLY the failing window's partial and have silently
+        # thrown away two thirds of a billed translation. Name every window that
+        # must still be there.
+        assert "<<W1>>" in preserved and "<<W2>>" in preserved, (
+            f"earlier windows were lost from the tmp file: {preserved!r}"
+        )
+        assert "<<W3>>" in preserved, "the failing window's own partial was not preserved"
 
     def test_the_stream_handler_receives_a_live_handle_on_every_window(self, tmp_path, harness):
         """Not just on the first call. A tmp opened per-window, or only for
@@ -258,12 +290,21 @@ class TestWindowingHelpers:
         for _s, _e, text in windows:
             assert text.count("detail") == text.count("] ")
 
-    def test_one_long_gap_does_not_produce_a_run_of_empty_windows(self):
-        """A 3-hour gap at 20-minute windows must not emit nine empty ones."""
-        body = "[00:00:00] a\n[03:00:00] b\n"
+    def test_a_long_gap_does_not_start_a_new_window_per_later_cue(self):
+        """The first cut asserted "no empty windows", which the splitter cannot
+        produce (a window is only emitted when it has content), so the test
+        guarded nothing - deleting the boundary-advance loop left it green. The
+        real property is about COST: after a three-hour silence, the boundary
+        must catch up in one step, or every subsequent cue starts its own
+        window and a transcript with one break becomes N Gemini calls.
+        """
+        body = "[00:00:00] a\n\n[03:00:00] b\n\n[03:01:00] c\n\n[03:02:00] d\n\n"
         windows = tv.split_transcript_into_windows(body, 20)
-        assert len(windows) == 2
-        assert all(text.strip() for _s, _e, text in windows)
+        assert len(windows) == 2, (
+            f"the three post-gap cues should share one window, got {len(windows)}: {[(w[0], w[1]) for w in windows]}"
+        )
+        # And nothing was lost putting them there.
+        assert "".join(w[2] for w in windows) == body
 
     def test_a_body_with_no_timestamps_is_one_window(self):
         windows = tv.split_transcript_into_windows("just prose\n", 20)
@@ -296,3 +337,186 @@ class TestOperationalSeparation:
                 imported.add(node.module.split(".")[0])
         assert "video_intel" not in imported
         assert "timestamp_utils" in imported, "the AST walk found no imports at all"
+
+
+class TestTheCliActuallyReachesTheFeature:
+    """The P0 the first cut shipped, and the reason the other 18 tests could not
+    see it: every one of them called `_translate_from_transcript` DIRECTLY.
+
+    The function honored `--chunk-minutes` / `--start` / `--end` perfectly while
+    `main()` still carried three `parser.error(...)` refusals for those exact
+    flags, left over from when this path had nowhere to apply them. So the whole
+    feature was unreachable from the CLI and the suite was green.
+
+    Same class as the standing "a helper tested but never proven called" rule,
+    one layer up: there the wiring was a missing call, here it was an argument
+    parser rejecting the call before it happened. These tests drive `main()`.
+    """
+
+    def _run_main(self, monkeypatch, tmp_path, argv, recorder=None):
+        rec = recorder or Recorder()
+        monkeypatch.setattr(tv, "_stream_with_timeouts", rec)
+        monkeypatch.setattr(tv, "translate_title", lambda c, m, t: "BCS::" + t)
+        monkeypatch.setattr(tv, "create_client", lambda k: object())
+        monkeypatch.setattr(tv, "require_gemini", lambda: (None, _Types))
+        monkeypatch.setattr(tv, "build_permissive_safety_settings", lambda types: [])
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+
+        src = tmp_path / "long.transcript.md"
+        src.write_text(make_transcript(118), encoding="utf-8")
+        out = tmp_path / "out"
+        full = ["translate_video.py", "--from-transcript", str(src), "--output-dir", str(out), "--force"]
+        monkeypatch.setattr(sys, "argv", full + argv)
+        code = 0
+        try:
+            tv.main()
+        except SystemExit as e:
+            code = e.code if e.code is not None else 0
+        return rec, out, code
+
+    def test_chunk_minutes_is_not_refused(self, monkeypatch, tmp_path):
+        """Pre-fix: exit 2, zero Gemini calls, "mutually exclusive"."""
+        rec, _out, code = self._run_main(monkeypatch, tmp_path, ["--chunk-minutes", "30"])
+        assert code == 0, f"the CLI refused --chunk-minutes (exit {code})"
+        # 118 minutes at 30-minute windows is 4, not the default 20's 6.
+        assert len(rec.payloads) == 4, f"--chunk-minutes did not take effect: {len(rec.payloads)} calls"
+
+    def test_start_and_end_are_not_refused_and_actually_narrow_the_work(self, monkeypatch, tmp_path):
+        rec, _out, code = self._run_main(monkeypatch, tmp_path, ["--start", "30", "--end", "45"])
+        assert code == 0, f"the CLI refused --start/--end (exit {code})"
+        joined = "".join(rec.payloads)
+        minutes = sorted({int(t.split()[0].rstrip('."')) for t in joined.split("Line at minute ")[1:]})
+        assert minutes and min(minutes) >= 30 and max(minutes) < 45, (
+            f"the range was accepted but not applied: {minutes[:3]}..{minutes[-3:]}"
+        )
+
+    def test_a_nonpositive_chunk_minutes_is_refused_before_any_gemini_call(self, monkeypatch, tmp_path):
+        """Rejected at the PARSER, not inside the splitter. The splitter runs
+        after `translate_title`, which is a paid call - so a library caller
+        would get a traceback AND a bill. Probe before you pay.
+        """
+        rec, _out, code = self._run_main(monkeypatch, tmp_path, ["--chunk-minutes", "0"])
+        assert code == 2, f"expected argparse exit 2, got {code}"
+        assert rec.payloads == [], "a bad --chunk-minutes reached Gemini"
+
+
+class TestAnEmptyWindowIsNeverSilent:
+    """A window that returns nothing is a HOLE. The first cut logged it and
+    carried on to exit 0 with a "Written to ..." line, so a 20-minute gap in the
+    middle of an interview left no trace in the file, its header, or the exit
+    code - a NEW failure mode this feature introduced (pre-#206 a single empty
+    response was `sys.exit(1)`).
+
+    Continuing is still right: the other windows are real, billed translation.
+    But the gap must be visible on every surface a reader or a batch driver
+    looks at.
+    """
+
+    def test_the_body_carries_a_marker_where_the_content_should_be(self, tmp_path, harness):
+        _rec, out, error = harness(tmp_path, minutes=118, chunk_minutes=20, empty_windows={3})
+        assert isinstance(error, SystemExit), f"expected a non-zero exit, got {error!r}"
+        written = list(out.glob("*.translate-bcs.txt"))
+        assert written, "the surviving windows must still be written"
+        text = written[0].read_text(encoding="utf-8")
+        assert "MISSING: window 3/6" in text, "the gap left no trace in the body"
+        assert "[BCS window 2]" in text and "[BCS window 4]" in text, "the windows either side of the gap were lost"
+
+    def test_the_exit_code_says_incomplete_not_success(self, tmp_path, harness):
+        _rec, _out, error = harness(tmp_path, minutes=118, chunk_minutes=20, empty_windows={3})
+        assert isinstance(error, SystemExit)
+        assert error.code == tv.EXIT_INCOMPLETE, f"a file with a hole in it exited {error.code}; pre-fix this was 0"
+
+    def test_the_header_records_it_and_a_later_good_window_cannot_erase_it(self, tmp_path, harness):
+        """Window 3 is empty and windows 4-6 succeed with STOP. If the reason
+        were simply overwritten by the last window, the header would claim a
+        clean run over a file with a hole in it."""
+        _rec, out, error = harness(tmp_path, minutes=118, chunk_minutes=20, empty_windows={3})
+        assert isinstance(error, SystemExit)
+        text = list(out.glob("*.translate-bcs.txt"))[0].read_text(encoding="utf-8")
+        header = text.split("[BCS window", 1)[0]
+        assert "Incomplete translation" in header, (
+            f"the header claims a clean run over a file with a hole in it:{chr(10)}{header}"
+        )
+        assert "window 3/6" in header, "the header does not say WHICH window is missing"
+        # The pre-existing truncation notice keys on an observed-vs-requested
+        # END ratio and structurally cannot see a hole in the MIDDLE - this run
+        # ends exactly where it should. That is why the gap gets its own notice
+        # rather than being folded into that one.
+        assert "--start" in header, "the header names no recovery"
+
+    def test_a_clean_run_is_still_exit_zero_with_no_marker(self, tmp_path, harness):
+        """The companion that keeps the three tests above from being satisfied
+        by a writer that always reports incomplete."""
+        _rec, out, error = harness(tmp_path, minutes=118, chunk_minutes=20)
+        assert error is None, f"a healthy run must not exit non-zero: {error!r}"
+        text = list(out.glob("*.translate-bcs.txt"))[0].read_text(encoding="utf-8")
+        assert "MISSING: window" not in text
+        assert tv.FINISH_REASON_INCOMPLETE_WINDOWS not in text
+
+
+class TestAnEmptyRangeCostsNoGeminiCallAtAll:
+    """The claim in the rules file is "costs no Gemini call". The first cut's
+    test asserted only that the STREAM stub was unused - but `translate_title`
+    is a separate Gemini call, was separately monkeypatched, and was never
+    counted. Measured: an empty range fired the title call and THEN exited 1.
+    """
+
+    def test_neither_the_stream_nor_the_title_call_fires(self, monkeypatch, tmp_path):
+        calls = {"stream": 0, "title": 0}
+
+        def stream(*a, **k):
+            calls["stream"] += 1
+            return ("x", None, "STOP")
+
+        def title(*a, **k):
+            calls["title"] += 1
+            return "BCS::x"
+
+        monkeypatch.setattr(tv, "_stream_with_timeouts", stream)
+        monkeypatch.setattr(tv, "translate_title", title)
+        monkeypatch.setattr(tv, "create_client", lambda k: object())
+        monkeypatch.setattr(tv, "require_gemini", lambda: (None, _Types))
+        monkeypatch.setattr(tv, "build_permissive_safety_settings", lambda types: [])
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+
+        src = tmp_path / "long.transcript.md"
+        src.write_text(make_transcript(60), encoding="utf-8")
+        with pytest.raises(SystemExit) as exc:
+            tv._translate_from_transcript(
+                transcript_path=src,
+                model_name="gemini-2.5-pro",
+                output_dir=tmp_path / "out",
+                use_stdout=False,
+                force=True,
+                chunk_minutes=20,
+                start_minutes=200,
+                end_minutes=210,
+            )
+        assert exc.value.code == 1
+        assert calls == {"stream": 0, "title": 0}, f"an empty range still paid: {calls}"
+
+
+class TestMergeUsage:
+    """Zero coverage in the first cut. The review mutated it to last-window-wins
+    - the exact under-report-by-N the rules file forbids - and 244 tests stayed
+    green, because the harness returns a token count nothing ever reads back.
+    """
+
+    def test_counts_from_every_window_are_summed(self):
+        total = None
+        for _ in range(3):
+            total = tv._merge_usage(total, {"total_token_count": 100, "prompt_token_count": 10})
+        assert total["total_token_count"] == 300, f"windows were not summed: {total}"
+        assert total["prompt_token_count"] == 30
+
+    def test_a_none_part_does_not_wipe_the_running_total(self):
+        total = tv._merge_usage(None, {"total_token_count": 100})
+        assert tv._merge_usage(total, None)["total_token_count"] == 100
+
+    def test_a_none_total_adopts_the_first_part(self):
+        assert tv._merge_usage(None, {"total_token_count": 7})["total_token_count"] == 7
+
+    def test_a_key_only_some_windows_report_still_accumulates(self):
+        total = tv._merge_usage({"total_token_count": 5}, {"total_token_count": 5, "thoughts_token_count": 2})
+        assert total["thoughts_token_count"] == 2
+        assert total["total_token_count"] == 10

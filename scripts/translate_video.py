@@ -187,6 +187,20 @@ def apply_timestamp_offset(line: str, offset_seconds: int, chunk_duration_second
 # The HOUR field stays `\d{1,2}` on purpose. It is hours, 99 is already absurd,
 # and widening it would let a legacy malformed `[120:05:30]` parse as 120 hours
 # instead of being caught. `normalize_timestamp` is what repairs that shape.
+# A window that returned nothing leaves a VISIBLE hole rather than a silent
+# one (issue #206 review). The marker goes in the body; the finish reason
+# goes in the header; the exit code goes to the caller. No surface may
+# claim a clean run over a gap.
+MISSING_WINDOW_MARKER = (
+    "<!-- MISSING: window {idx}/{total} [{start} - {end}] returned no translation. "
+    "Re-run with --start/--end over this range to fill it. -->"
+)
+FINISH_REASON_INCOMPLETE_WINDOWS = "INCOMPLETE_WINDOWS"
+# Mirrors video_intel.py's EXIT_PARTIAL (issue #129): the run finished, but
+# a requested piece of work produced nothing. Distinct from 1 (hard failure)
+# so a batch driver can tell them apart.
+EXIT_INCOMPLETE = 3
+
 TS_HOURS = r"\d{1,2}"
 TS_MINUTES = r"\d+"
 # Inside `[HH:MM:SS]` the minute field is two digits and cannot carry the
@@ -498,6 +512,7 @@ def build_header(
     segments_block: str | None = None,
     finish_reason: str | None = None,
     source_mode: str | None = None,
+    missing_windows: list[str] | None = None,
 ) -> str:
     """Build the metadata header for the translation file.
 
@@ -516,6 +531,13 @@ def build_header(
         Emitted as a `**Source mode:**` line so the reader knows whether the
         BCS came from a YouTube caption track or from direct video audio.
         None omits the line entirely (backward-compatible).
+    missing_windows: human-readable ranges (e.g. "window 3/6 [00:40:00 -
+        01:00:00]") that produced no translation. The existing truncation
+        notice keys on an observed-vs-requested END ratio, which cannot see a
+        hole in the MIDDLE - a run that loses window 3 of 6 still ends exactly
+        where it should. So this gets its own notice rather than being folded
+        into that one, and it renders on the transcript path, which supplies no
+        duration and therefore never reaches the ratio branch at all.
     """
     now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
     lines = [f"# Translation (BCS): {title}", ""]
@@ -553,6 +575,23 @@ def build_header(
     lines.append("")
     lines.append("---")
     lines.append("")
+
+    if missing_windows:
+        lines.append("## ⚠️ Incomplete translation")
+        lines.append("")
+        lines.append(
+            f"{len(missing_windows)} window(s) returned no translation and are MISSING "
+            "from the body below. Each gap is marked in place with an "
+            "`<!-- MISSING: ... -->` comment."
+        )
+        lines.append("")
+        for w in missing_windows:
+            lines.append(f"- {w}")
+        lines.append("")
+        lines.append("**Recovery:** re-run with `--start` / `--end` over each range above.")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
 
     # Visible incomplete-translation notice: a reader scanning the file must
     # not confuse the partial body for a complete translation. Append after
@@ -1760,7 +1799,7 @@ def filter_transcript_by_range(
     start_minutes: int | None,
     end_minutes: int | None,
 ) -> str:
-    """Keep only entries inside [start, end], in minutes (issue #206 defect 2).
+    """Keep only entries inside [start, end), in minutes (issue #206 defect 2).
 
     `--start`/`--end` were accepted by the parser and then silently dropped on
     this path - `main()` never passed them and the function had no parameter to
@@ -1781,7 +1820,13 @@ def filter_transcript_by_range(
     for line in body.splitlines(keepends=True):
         secs = transcript_line_seconds(line)
         if secs is not None:
-            keeping = secs >= lo and (hi is None or secs <= hi)
+            # The end is EXCLUSIVE, matching `split_transcript_into_windows`,
+            # where a cue exactly on a boundary starts the NEXT window. That is
+            # what makes consecutive ranges tile: `--end 45` then `--start 45`
+            # covers every cue exactly once. An inclusive end would emit the
+            # 45:00 cue in BOTH runs - and the recovery this feature documents
+            # for a missing window is precisely a series of adjacent ranges.
+            keeping = secs >= lo and (hi is None or secs < hi)
         if keeping:
             kept.append(line)
     return "".join(kept)
@@ -1825,6 +1870,31 @@ def split_transcript_into_windows(body: str, chunk_minutes: int) -> list[tuple[i
     if current:
         windows.append((window_start, last, "".join(current)))
     return windows
+
+
+def _exit_if_windows_missing(
+    empty_windows: list[tuple[int, int, int]],
+    output_path: Path | None,
+) -> None:
+    """Exit non-zero when any window produced nothing.
+
+    ONE definition, called from both the --stdout branch and the file
+    branch, because the two returns are what a caller sees and a hole must
+    not be reportable as success on either. `output_path` is None on the
+    stdout path, where there is no file to name.
+    """
+    if not empty_windows:
+        return
+    where = output_path.name if output_path is not None else "the output"
+    for idx, win_start, win_end in empty_windows:
+        log.error(
+            "INCOMPLETE: window %d [%s - %s] is missing from %s",
+            idx,
+            _format_hhmmss(win_start),
+            _format_hhmmss(win_end),
+            where,
+        )
+    sys.exit(EXIT_INCOMPLETE)
 
 
 def _translate_from_transcript(
@@ -1918,10 +1988,6 @@ def _translate_from_transcript(
     _, types = require_gemini()
     client = create_client(api_key)
 
-    # Translate the title to BCS for the output header (same helper the stitch path uses).
-    bcs_title = translate_title(client, model_name, title)
-    log.info("Title:     %s → %s", title, bcs_title)
-
     effective_budget = thinking_budget
     if effective_budget is None and "2.5-pro" in model_name:
         effective_budget = SRT_DEFAULT_THINKING_BUDGET
@@ -1932,6 +1998,11 @@ def _translate_from_transcript(
     if not use_stdout:
         log.info("Output:    %s", output_path)
 
+    # The range filter and its empty-range refusal run BEFORE `translate_title`,
+    # which is a Gemini call. The first cut of issue #206 had them the other way
+    # round, so `--start 200 --end 210` on a two-hour transcript paid for a title
+    # translation and THEN exited 1 with nothing to show for it. Standing
+    # probe-before-you-pay rule; the review pass measured the wasted call.
     preamble, body = split_transcript_preamble(text)
     body = filter_transcript_by_range(body, start_minutes, end_minutes)
     if (start_minutes is not None or end_minutes is not None) and not body.strip():
@@ -1941,6 +2012,10 @@ def _translate_from_transcript(
             end_minutes,
         )
         sys.exit(1)
+
+    # Translate the title to BCS for the output header (same helper the stitch path uses).
+    bcs_title = translate_title(client, model_name, title)
+    log.info("Title:     %s → %s", title, bcs_title)
 
     windows = split_transcript_into_windows(body, chunk_minutes)
     log.info(
@@ -1960,6 +2035,7 @@ def _translate_from_transcript(
     # before issue #206 that was simply false here: this path wrote its tmp
     # only after a successful return, so a 503 five minutes in discarded 52 KB
     # of billed translation while telling the operator the opposite.
+    empty_windows: list[tuple[int, int, int]] = []
     tmp_path = output_path.with_suffix(".txt.tmp")
     tmp_file = None
     if not use_stdout:
@@ -1990,7 +2066,13 @@ def _translate_from_transcript(
                 thinking_budget=effective_budget,
                 tmp_file=tmp_file,
             )
-            if part_reason and part_reason != "STOP":
+            if finish_reason == FINISH_REASON_INCOMPLETE_WINDOWS:
+                # An earlier window produced nothing. That verdict outranks
+                # any later window's own reason and must not be overwritten
+                # back to STOP by window N+1 succeeding - the header would
+                # then claim a clean run over a file with a hole in it.
+                pass
+            elif part_reason and part_reason != "STOP":
                 log.warning("Window %d finish_reason: %s (not STOP)", idx, part_reason)
                 finish_reason = part_reason
             elif finish_reason is None:
@@ -1999,7 +2081,27 @@ def _translate_from_transcript(
             if part and part.strip():
                 parts.append(part.rstrip("\n"))
             else:
+                # A window returning nothing is a HOLE, and the first cut of
+                # issue #206 logged it and carried on to a clean exit 0 with a
+                # "Written to ..." line - so a 20-minute gap in the middle of
+                # an interview left no trace in the file or its header. That is
+                # a NEW failure mode this feature introduced: pre-#206 a single
+                # empty response was sys.exit(1).
+                #
+                # Continuing is still right - the other windows are real,
+                # billed translation and must not be thrown away - but the gap
+                # has to be visible everywhere a reader looks.
                 log.error("Window %d/%d returned nothing; continuing", idx, len(windows))
+                empty_windows.append((idx, win_start, win_end))
+                parts.append(
+                    MISSING_WINDOW_MARKER.format(
+                        idx=idx,
+                        total=len(windows),
+                        start=_format_hhmmss(win_start),
+                        end=_format_hhmmss(win_end),
+                    )
+                )
+                finish_reason = FINISH_REASON_INCOMPLETE_WINDOWS
     finally:
         if tmp_file and not tmp_file.closed:
             tmp_file.close()
@@ -2023,6 +2125,7 @@ def _translate_from_transcript(
         print(translated)
         line_count = translated.count("\n") + 1
         log.info(format_stats(elapsed, line_count, usage))
+        _exit_if_windows_missing(empty_windows, None)
         return
 
     header_block = build_header(
@@ -2033,6 +2136,9 @@ def _translate_from_transcript(
         original_title=title,
         finish_reason=finish_reason,
         source_mode="transcript",
+        missing_windows=[
+            f"window {idx}/{len(windows)} [{_format_hhmmss(a)} - {_format_hhmmss(b)}]" for idx, a, b in empty_windows
+        ],
     )
     tmp_path.write_text(header_block + translated, encoding="utf-8")
     tmp_path.replace(output_path)
@@ -2040,6 +2146,7 @@ def _translate_from_transcript(
     line_count = translated.count("\n") + 1
     log.info("Written to %s", output_path)
     log.info(format_stats(elapsed, line_count, usage))
+    _exit_if_windows_missing(empty_windows, output_path)
 
 
 def translate_video(
@@ -2599,12 +2706,21 @@ Examples:
             parser.error("--from-transcript and --force-video are mutually exclusive")
         if args.stitch:
             parser.error("--from-transcript and --stitch are mutually exclusive")
-        if args.start is not None or args.end is not None:
-            parser.error("--from-transcript and --start/--end are mutually exclusive")
-        # --chunk-minutes has a non-None default (20), so compare against that
-        # to detect an actual user override rather than the argparse default.
-        if args.chunk_minutes != 20:
-            parser.error("--from-transcript and --chunk-minutes are mutually exclusive")
+        # `--start` / `--end` / `--chunk-minutes` used to be refused here,
+        # because the transcript path sent the whole file in one call and had
+        # nowhere to apply them. Issue #206 gave it windows and a range filter,
+        # so the refusals came out WITH the feature - a review pass caught that
+        # the first cut threaded all three through `_translate_from_transcript`
+        # and left these three `parser.error` calls standing, which made the
+        # whole feature unreachable from the CLI while every unit test passed
+        # (they all called the function directly). The guard against that
+        # recurring is `TestTheCliActuallyReachesTheFeature`, which drives
+        # `main()` rather than the helper.
+        if args.chunk_minutes is not None and args.chunk_minutes <= 0:
+            # Caught HERE, not inside the splitter: the splitter runs after the
+            # paid `translate_title` call, so a library caller gets a traceback
+            # and a bill. Probe before you pay.
+            parser.error("--chunk-minutes must be a positive number of minutes")
 
     # Validate --thinking-budget against the target model's allowed range.
     # Raises SystemExit with a clear message when misconfigured.
