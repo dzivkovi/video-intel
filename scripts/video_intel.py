@@ -9864,17 +9864,43 @@ def search_corpus(
     taxonomy = load_taxonomy(output_dir)
     query_lower = query.lower()
     query_terms = query_lower.split()
+    # Issue #189: phrase detection reuses the SAME punctuation-aware boundary
+    # the Stage-1 expander uses for taxonomy terms - one definition of "the
+    # query appears as a phrase", never two.
+    phrase_re = _alias_boundary_pattern(query_lower.strip()) if query_lower.strip() else None
 
     # Search concepts by preferred_label and aliases
     matching_concepts = []
     for cid, concept in taxonomy.get("concepts", {}).items():
         label = concept.get("preferred_label", "")
-        aliases = concept.get("aliases", [])
+        # A non-string alias (hand-edited or torn taxonomy.json) degrades to
+        # ignored, per the standing malformed-input rule - the pre-#189 bare
+        # join raised TypeError and killed the whole search over one entry.
+        aliases = [a for a in concept.get("aliases", []) if isinstance(a, str)]
         searchable = f"{label} {' '.join(aliases)}".lower()
 
-        # Score: count how many query terms match
+        # Score: count how many query terms match (bag over label + every
+        # alias - this is the SELECTION score and is deliberately unchanged
+        # by issue #189, so exactly the same concepts match as before).
         matched_terms = sum(1 for term in query_terms if term in searchable)
         if matched_terms > 0:
+            # Issue #189 specificity, computed per FIELD (the label, or ONE
+            # alias) because the bag lets each term match a DIFFERENT alias:
+            # measured live, "prompt engineering" gave 20 mega-concepts a
+            # perfect bag score from scattered alias words, burying the
+            # concept that carries the actual phrase at rank 21 of 111.
+            fields = [label.lower()] + [a.lower() for a in aliases]
+            phrase = any(phrase_re.search(f) for f in fields) if phrase_re else False
+            best_field_score = 0.0
+            tightness = 0.0
+            for f in fields:
+                hit = sum(1 for term in query_terms if term in f)
+                score = hit / len(query_terms)
+                if score > best_field_score:
+                    best_field_score = score
+                    tightness = 0.0
+                if score == best_field_score and f.split():
+                    tightness = max(tightness, len(query_terms) / len(f.split()))
             matching_concepts.append(
                 {
                     "concept_id": cid,
@@ -9883,11 +9909,28 @@ def search_corpus(
                     "video_count": concept.get("video_count", 0),
                     "domain": concept.get("domain", ""),
                     "_match_score": matched_terms / len(query_terms),  # 1.0 = all terms matched
+                    "_phrase": phrase,
+                    "_field_score": best_field_score,
+                    "_tightness": tightness,
                 }
             )
 
-    # Sort by match score (exact > partial), then video_count
-    matching_concepts.sort(key=lambda c: (-c["_match_score"], -c["video_count"]))
+    # Issue #189 ranking: specificity before popularity. Bag score keeps its
+    # old exact/partial SELECTION role; among equals, a whole-phrase match in
+    # one field beats scattered terms, a field holding more of the query beats
+    # one holding less, a tighter field (query terms as a larger share of the
+    # field's own words) beats a looser one, and only then does video_count
+    # break ties - the pre-#189 ordering rewarded genericness because count
+    # was the FIRST tiebreak.
+    matching_concepts.sort(
+        key=lambda c: (
+            -c["_match_score"],
+            -c["_phrase"],
+            -c["_field_score"],
+            -c["_tightness"],
+            -c["video_count"],
+        )
+    )
 
     # If we have exact matches (1.0), only use those for video lookup.
     # If no exact matches, fall back to partial matches (top 5 to limit noise).
