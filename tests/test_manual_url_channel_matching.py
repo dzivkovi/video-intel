@@ -420,3 +420,94 @@ class TestTheLookupIsSharedNotCopied:
     def test_the_walk_is_not_vacuous(self):
         assert callable(vi.channel_config_by_name)
         assert vi.channel_config_by_name({"channels": [{"name": "a", "x": 1}]}, "a") == {"name": "a", "x": 1}
+
+
+DUPES = {
+    "channels": [
+        {
+            "name": "dup",
+            "url": "https://youtube.com/@other",
+            "transcript_source": "gemini",
+            "chunk_minutes": 99,
+        },
+        {
+            "name": "dup",
+            "url": "https://youtube.com/@target",
+            "transcript_source": "yt-captions",
+            "chunk_minutes": 7,
+        },
+    ]
+}
+
+
+class TestADuplicateChannelNameIsNotSilent:
+    """Codex peer-pass P1, reproduced with its own fixture.
+
+    `match_configured_channel` matches a row by URL but returns its NAME, and
+    `channel_config_by_name` then re-finds the FIRST row carrying that name. So
+    a video from the SECOND row's channel is written to the right folder while
+    silently inheriting the FIRST row's `transcript_source`, `chunk_minutes`
+    and `mindmap_source` - issue #127's failure class, arriving through a
+    different door.
+
+    It warns rather than raising: the name IS the output folder, so two rows
+    sharing one are already writing to the same place, and the run is still the
+    best available answer. Naming the ambiguity is what turns a silent
+    mis-route into a fixable one.
+    """
+
+    def test_the_ambiguity_is_reported(self, caplog):
+        with caplog.at_level("WARNING"):
+            vi.channel_config_by_name(DUPES, "dup")
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "channels named" in joined and "dup" in joined, (
+            f"a duplicate channel name resolved silently; logs were: {joined!r}"
+        )
+
+    def test_the_residual_is_recorded_not_pretended_away(self, counted_lookup):
+        """The warning does NOT make the lookup correct - it still returns the
+        first row. Pinning that keeps the guardrail honest: a reader must not
+        infer from the warning that the wrong-knobs case was fixed."""
+        assert vi.match_configured_channel(object(), DUPES, "UC-for-target") == "dup"
+        assert vi.channel_config_by_name(DUPES, "dup")["chunk_minutes"] == 99
+
+    def test_a_unique_name_warns_about_nothing(self, caplog):
+        cfg = {"channels": [{"name": "solo", "url": "https://youtube.com/@solo"}]}
+        with caplog.at_level("WARNING"):
+            assert vi.channel_config_by_name(cfg, "solo")["name"] == "solo"
+        assert not caplog.records, f"a healthy config warned: {[r.message for r in caplog.records]}"
+
+
+class TestAFailedLookupIsNotEvidenceOfAnUnconfiguredChannel:
+    """Codex peer-pass P2, and the sharper half of it.
+
+    `except Exception` keeps one bad channel from killing the run - that part is
+    right and invariant 4 requires it. But a REQUEST-WIDE failure (quotaExceeded,
+    a bad key) makes EVERY lookup fail, and the matcher then returns None, which
+    the caller reads as "unconfigured": it slugifies the video's title into a
+    brand-new folder and drops that channel's routing knobs.
+
+    "Could not establish identity" is not "identity is absent". Still no raise -
+    this is a convenience lookup - but the caller is told, and told what to do.
+    """
+
+    def test_a_walk_where_every_lookup_raised_says_so(self, monkeypatch, caplog):
+        def raising(youtube, url):
+            raise RuntimeError("quotaExceeded")
+
+        monkeypatch.setattr(vi, "get_channel_id", raising)
+        with caplog.at_level("WARNING"):
+            assert vi.match_configured_channel(object(), LIVE_SHAPE, "UC-for-everyinc") is None
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "--channel" in joined, (
+            "a total lookup failure was reported as a plain 'no match', so the caller will "
+            f"slugify into a new folder with default knobs; logs were: {joined!r}"
+        )
+
+    def test_a_genuine_no_match_does_not_cry_wolf(self, counted_lookup, caplog):
+        """The companion. If every unmatched run carried this warning it would
+        fire on every legitimately-new creator and be ignored within a week."""
+        with caplog.at_level("WARNING"):
+            assert vi.match_configured_channel(object(), LIVE_SHAPE, "UC-for-nobody") is None
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "--channel" not in joined, f"a healthy unmatched walk raised a false alarm: {joined!r}"

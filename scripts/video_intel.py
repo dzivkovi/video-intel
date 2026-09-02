@@ -963,10 +963,28 @@ def channel_config_by_name(config: dict, channel_name: str | None) -> dict:
     # parses as None. Resolving the channel is a CONVENIENCE - `_standalone`
     # is always an available answer - so a malformed watchlist must degrade
     # to "no configured channel", never abort the run.
-    return next(
-        (c for c in (config.get("channels") or []) if isinstance(c, dict) and c.get("name") == channel_name),
-        {},
-    )
+    matches = [c for c in (config.get("channels") or []) if isinstance(c, dict) and c.get("name") == channel_name]
+    if len(matches) > 1:
+        # Two rows sharing a name is a config error with a QUIET failure
+        # mode, which is why it warns rather than being left to the
+        # operator to notice. `match_configured_channel` matches a row by
+        # URL but returns its NAME, and this function then re-finds the
+        # FIRST row with that name - so a video from the second row's
+        # channel is written to the right folder while silently inheriting
+        # the first row's `transcript_source`, `chunk_minutes` and
+        # `mindmap_source`. That is issue #127's failure class, found by
+        # the Codex peer pass on issue #205 and reproduced.
+        #
+        # Warning, not raising: the name IS the output folder, so two rows
+        # sharing one are already writing to the same place and the run is
+        # still the best available answer. Naming the ambiguity is what
+        # turns a silent mis-route into a fixable one.
+        log.warning(
+            "config lists %d channels named %r; using the first. Their transcript_source / chunk_minutes / mindmap_source may differ, and a video matched by URL to a later one will silently get the first row's settings. Give each channel a unique name.",
+            len(matches),
+            channel_name,
+        )
+    return matches[0] if matches else {}
 
 
 def resolve_mindmap_source(channel_config: dict, *, transcript_available: bool, transcript_severe: bool = False) -> str:
@@ -11800,6 +11818,14 @@ def _configured_channel_id(youtube, channel_config: dict, cache: dict) -> str | 
         ch_id, _ = get_channel_id(youtube, url)
     except Exception as e:  # one bad channel must not kill the run
         log.warning("Could not resolve channel id for %s: %s", url, e)
+        # Record that identity could not be ESTABLISHED, which is not the
+        # same claim as identity being ABSENT (Codex peer pass). A
+        # request-wide failure - quotaExceeded, a bad key - makes every
+        # lookup fail, and the caller would otherwise conclude the video
+        # is from an unconfigured channel, slugify its title, write into a
+        # brand-new folder and use default routing knobs. Still no raise
+        # (this is a convenience lookup), but the caller gets told.
+        cache["__failed__"] = True
         ch_id = None
     cache[url] = ch_id
     return ch_id
@@ -11838,6 +11864,16 @@ def match_configured_channel(youtube, config: dict, yt_channel_id: str | None) -
             # reproduced: nameless-first, real-second returned None.
             log.warning("Configured channel matched %s but has no usable name; ignoring", yt_channel_id)
             continue
+    if cache.get("__failed__"):
+        # No match, but at least one lookup RAISED - so this is not evidence
+        # the channel is unconfigured, and the caller is about to act as if
+        # it were: slugify the title into a new folder and drop this
+        # channel's configured routing knobs (issue #127). One line, so the
+        # operator can tell a genuinely-new creator from a quota blip.
+        log.warning(
+            "Could not determine the channel for %s: at least one channel lookup failed, so an unmatched result is not proof this video is from an unconfigured channel. Pass --channel <name> to be certain of the routing.",
+            yt_channel_id,
+        )
     return None
 
 
