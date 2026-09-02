@@ -395,8 +395,12 @@ python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" transcript \
 When the local filename is `<videoId>.mp4` (11-char YouTube ID), the tool
 matches it against an existing canonical scan-generated `.meta.json` in the
 channel folder and writes artifacts under the canonical `{YYYY-MM-DD}-{slug}`
-prefix, keeping a single meta.json per video. Otherwise the filename stem
-is used as both the title and the artifact prefix.
+prefix, keeping a single meta.json per video. When BOTH `--title` and `--date`
+are passed (and no sibling meta or canonical match claims the file), artifacts
+also follow the `{YYYY-MM-DD}-{slug}` convention, derived from those flags -
+so curated local ingests sort alongside scanned artifacts instead of landing
+under a raw filename stem. Otherwise the filename stem is used as both the
+title and the artifact prefix.
 
 Options:
 - `--url` - YouTube URL to transcribe (mutually exclusive with `--file`)

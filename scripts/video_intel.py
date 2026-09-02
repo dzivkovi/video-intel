@@ -1948,6 +1948,19 @@ def resolve_local_file_identity(
 
     url = f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
 
+    # Issue #186: when the operator asserted BOTH halves of the identity
+    # explicitly, the artifacts follow the same {date}-{slug} convention every
+    # scanned artifact uses - via the scan writer's own video_file_prefix, never
+    # a re-derived copy of its rule. One flag alone keeps the stem: a prefix
+    # built on the mtime-fallback date would change when the file is copied
+    # (new mtime -> new prefix -> duplicate artifacts on the next run), so the
+    # derived name requires both flags. Sibling-meta and G2 paths above are
+    # deliberately untouched - their prefixes carry existing artifacts.
+    if flag_title and flag_date:
+        prefix = video_file_prefix({"title": title, "published": published})
+    else:
+        prefix = stem
+
     return {
         "channel": channel_name,
         "video_id": video_id,
@@ -1955,9 +1968,9 @@ def resolve_local_file_identity(
         "title": title,
         "published": published,
         "published_source": published_source,
-        "prefix": stem,
+        "prefix": prefix,
         "channel_dir": effective_channel_dir,
-        "meta_path": effective_channel_dir / f"{stem}.meta.json",
+        "meta_path": effective_channel_dir / f"{prefix}.meta.json",
     }
 
 
