@@ -576,3 +576,69 @@ class TestCmdProcessCodeReviewRegressions:
 
         assert exc_info.value.code == EXIT_PARTIAL
         assert concepts_called == []  # error-parsing-JSON path must be recognized as failure
+
+
+class TestCmdProcessFileDerivedPrefix:
+    """Issue #186 review: cmd_process --file is the third caller of the changed
+    resolver and had no coverage of the derived prefix. Mirrors the transcript
+    coverage: artifacts land under {date}-{slug}, and an identical re-run
+    lazy-skips without paying a second upload."""
+
+    def _stub_pipeline(self, monkeypatch, channel_dir, upload_calls):
+        monkeypatch.setattr(
+            "video_intel.upload_local_video",
+            lambda _c, p: upload_calls.append(p) or "files/uploaded-once",
+        )
+
+        # Each stub also records its mode the way the real helper does, so the
+        # re-run's lazy-skip check sees the same modes_completed state the real
+        # pipeline leaves behind (the Gate-1 real run recorded exactly these).
+        import video_intel
+
+        def fake_mindmap(*args, **kwargs):
+            prefix = kwargs.get("prefix") or "video"
+            (channel_dir / f"{prefix}.mindmap.md").write_text("# mindmap", encoding="utf-8")
+            video_intel.update_meta(channel_dir / f"{prefix}.meta.json", {}, "scan")
+            return prefix, "done"
+
+        def fake_transcript(*args, **kwargs):
+            prefix = args[6] if len(args) > 6 else kwargs.get("prefix")
+            _write_stub_artifact_if_ok(channel_dir / f"{prefix}.transcript.md", "done", "# stub transcript\n")
+            video_intel.update_meta(channel_dir / f"{prefix}.meta.json", {}, "transcript")
+            return prefix, "done"
+
+        def fake_concepts(*args, **kwargs):
+            prefix = kwargs.get("prefix") or "video"
+            _write_stub_artifact_if_ok(channel_dir / f"{prefix}.concepts.json", "done", '{"concepts": []}')
+            video_intel.update_meta(channel_dir / f"{prefix}.meta.json", {}, "concepts")
+            return prefix, "done"
+
+        monkeypatch.setattr("video_intel.process_mindmap", fake_mindmap)
+        monkeypatch.setattr("video_intel.process_transcript", fake_transcript)
+        monkeypatch.setattr("video_intel.process_concepts", fake_concepts)
+
+    def test_artifacts_land_under_the_derived_prefix_and_rerun_lazy_skips(self, stub_env, monkeypatch, tmp_path):
+        mp4, channel_dir = _prep_mp4(tmp_path, name="gc720-hybrid-rag.mp4")
+        upload_calls: list = []
+        self._stub_pipeline(monkeypatch, channel_dir, upload_calls)
+
+        args = _make_args(
+            file=mp4, channel="everyinc", video_id="gc720hybrid", title="Hybrid RAG with Neo4j", date="2026-08-31"
+        )
+        cmd_process(args, _config())
+
+        derived = "2026-08-31-hybrid-rag-with-neo4j"
+        assert (channel_dir / f"{derived}.meta.json").exists()
+        assert (channel_dir / f"{derived}.transcript.md").exists()
+        assert not (channel_dir / "gc720-hybrid-rag.meta.json").exists()
+        assert len(upload_calls) == 1
+
+        # Identical re-run: same flags -> same derived prefix -> lazy-skip, no
+        # second upload. This is the idempotency the both-flags rule protects.
+        cmd_process(
+            _make_args(
+                file=mp4, channel="everyinc", video_id="gc720hybrid", title="Hybrid RAG with Neo4j", date="2026-08-31"
+            ),
+            _config(),
+        )
+        assert len(upload_calls) == 1, "a re-run with identical flags must not re-upload"
