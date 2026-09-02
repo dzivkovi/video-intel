@@ -31,7 +31,6 @@ import pytest
 import video_intel
 from video_intel import (
     CONFIG_BACKUP_COMMANDS,
-    TOPIC_FILTER_OVERFETCH,
     TOPICS_FILENAME,
     build_topics,
     cmd_search,
@@ -979,58 +978,62 @@ class TestSearchTopicFilter:
 
 
 # ---------------------------------------------------------------------------
-# Finding B (review of issue #146) - TOPIC_FILTER_OVERFETCH had zero coverage
+# Issue #203 - the topic scope is EXACT. `TOPIC_FILTER_OVERFETCH` is retired.
 # ---------------------------------------------------------------------------
 
 
-class TestTopicFilterOverfetchIsLoadBearing:
-    """Proved by mutation: setting `TOPIC_FILTER_OVERFETCH = 1` (disabling the
-    over-fetch multiplier) left every prior test in this module green. That
-    is possible because none of them ranked a topic member BELOW the plain
-    result cap - `_corpus` above only ever has one video per side, so a cap
-    of even 1 never truncates anything.
+class TestTopicScopeIsExactNotOverfetched:
+    """Replaces `TestTopicFilterOverfetchIsLoadBearing`, retired with the
+    constant it guarded (issue #203).
 
-    Each fixture here instead ranks several out-of-topic videos strictly
-    ABOVE the one topic member, far enough that a small `--limit` (applied
-    before the topic filter runs) drops the member from the unfiltered
-    candidate set entirely. Only over-fetching a wider candidate pool before
-    filtering - and THEN capping to the requested limit - can still surface
-    it. `TOPIC_FILTER_OVERFETCH` must stay large enough to matter for this
-    fixture to be meaningful; if a future edit shrinks it toward 1 this
-    assertion is the first thing that will need revisiting alongside these
-    tests.
+    That class proved the old mechanism was load-bearing: with the multiplier
+    mutated to 1, a topic member ranked 6th unfiltered vanished from a
+    `--limit 3` search. It could not prove the mechanism was SUFFICIENT, and it
+    was not - the multiplier is a probability improvement, so a member ranked
+    below `limit * 5` was still lost. On the live corpus that is exactly what
+    happened: a 19-member topic had to out-rank 2,300+ other videos for 25
+    pool slots and the scoped query returned nothing at all.
+
+    These tests assert the strictly stronger property the replacement gives:
+    the member's UNFILTERED rank does not matter at any depth, because the
+    scope is applied to retrieval itself rather than to a globally ranked pool.
+    Each fixture ranks the member DEAD LAST behind enough competitors that no
+    surviving multiplier could have reached it, so a diff that reintroduces an
+    over-fetch post-filter fails here rather than passing quietly.
     """
 
-    def test_overfetch_constant_still_multiplies_meaningfully(self):
-        assert TOPIC_FILTER_OVERFETCH >= 2
+    def test_the_retired_constant_is_gone_on_purpose(self):
+        """The constant existed only to compensate for a post-filter that no
+        longer exists. Leaving it behind would invite a future edit to
+        re-plumb the post-filter around it, which is the defect #203 fixed."""
+        assert not hasattr(video_intel, "TOPIC_FILTER_OVERFETCH")
 
-    def test_concept_mode_needs_overfetch_to_surface_a_low_ranked_member(self, tmp_path, capsys, monkeypatch):
-        # Four "agents" concepts: three (c.a1..c.a3) are shared by every
-        # out-of-topic video, so each of those ranks with 3 matched concepts;
-        # the topic member carries only c.a0, one matched concept. That gives
-        # the plain (-count, published) sort a hard cliff between the two
-        # groups regardless of published-date tie-breaking.
+    def test_concept_mode_surfaces_a_member_ranked_dead_last(self, tmp_path, capsys, monkeypatch):
+        """40 out-of-topic videos each match 3 concepts; the member matches 1,
+        so the `(-matched_concepts, published)` sort puts it 41st. At
+        `--limit 1` the old `limit * 5` window reached rank 5. The scope is
+        applied before the cap now, so rank is irrelevant."""
         concepts = {
             "c.a0": {"preferred_label": "agents overview", "aliases": [], "video_count": 1},
-            "c.a1": {"preferred_label": "agents basics", "aliases": [], "video_count": 5},
-            "c.a2": {"preferred_label": "agents patterns", "aliases": [], "video_count": 5},
-            "c.a3": {"preferred_label": "agents tooling", "aliases": [], "video_count": 5},
+            "c.a1": {"preferred_label": "agents basics", "aliases": [], "video_count": 40},
+            "c.a2": {"preferred_label": "agents patterns", "aliases": [], "video_count": 40},
+            "c.a3": {"preferred_label": "agents tooling", "aliases": [], "video_count": 40},
         }
         (tmp_path / "taxonomy.json").write_text(
-            json.dumps({"version": 1, "built_from": 6, "concepts": concepts}), encoding="utf-8"
+            json.dumps({"version": 1, "built_from": 41, "concepts": concepts}), encoding="utf-8"
         )
 
-        for i in range(5):
-            vid = f"outsidevid{i}"
+        for i in range(40):
+            vid = f"outsidevid{i:02d}"
             write_meta(
                 tmp_path,
                 "demo",
-                f"p-out{i}",
+                f"p-out{i:02d}",
                 video_id=vid,
                 title=f"outside talk {vid}",
-                published=f"2026-01-0{i + 1}",
+                published="2026-01-01",
             )
-            (tmp_path / "demo" / f"p-out{i}.concepts.json").write_text(
+            (tmp_path / "demo" / f"p-out{i:02d}.concepts.json").write_text(
                 json.dumps({"video_id": vid, "concepts": [{"concept_id": c} for c in ("c.a1", "c.a2", "c.a3")]}),
                 encoding="utf-8",
             )
@@ -1044,58 +1047,157 @@ class TestTopicFilterOverfetchIsLoadBearing:
         write_topics(tmp_path, build_topics(tmp_path))
 
         monkeypatch.setattr(video_intel, "resolve_output_dir", lambda _c, **_kw: tmp_path)
-        # limit=3 unfiltered keeps only the five (tied, count=3) outside
-        # videos' first three by published date - the member (count=1) never
-        # reaches the candidate set without over-fetch.
-        args = argparse.Namespace(query="agents", channel=None, limit=3, vector=False, since=None, topic="fde")
+        args = argparse.Namespace(query="agents", channel=None, limit=1, vector=False, since=None, topic="fde")
         cmd_search(args, {})
         out = capsys.readouterr().out
-        assert "topic talk" in out, "the topic member must survive even though it ranks 6th unfiltered"
+        assert "topic talk" in out, "an exact scope must reach a member at any unfiltered rank"
+        assert "outside talk" not in out
 
-    def test_vector_mode_needs_overfetch_to_surface_a_low_ranked_member(self, tmp_path, capsys, monkeypatch):
-        """Same shape, mirrored onto the LanceDB hybrid path.
+    def test_the_partial_concept_cut_is_the_remaining_cliff(self, tmp_path, capsys, monkeypatch):
+        """Scope honesty, in the shape of `test_does_not_claim_the_monolithic_early_stop_shape`.
 
-        `hybrid_search` is exercised for real (only the LanceDB connection and
-        the Voyage embed call are stubbed, same as `conftest.fake_lancedb`),
-        so this drives the actual `_dedup_by_video` ranking-then-truncation
-        logic that `TOPIC_FILTER_OVERFETCH` feeds `limit=` into - not a
-        pre-canned return from `hybrid_search` itself.
+        Issue #203 makes the VIDEO list exact. It does NOT widen concept
+        SELECTION: on the partial-match path `search_corpus` still feeds video
+        lookup from `matching_concepts[:5]` (the issue #189 rule, deliberately
+        untouched), and that cut runs BEFORE the topic scope. So a member whose
+        only matching concept ranks sixth stays unreachable at any `--limit`.
+
+        This test asserts the LIMITATION, not a fix. It exists so a future
+        reader cannot mistake "the scope is exact" for "concept search can
+        always reach a member", and so that widening the concept cut is a
+        deliberate decision against issue #189's frozen contract rather than an
+        accident. Found by an executing reviewer, not by reading the diff.
+        """
+        # The cut lives on the PARTIAL path only: when concepts match the query
+        # exactly, every exact match feeds video lookup and there is no cut at
+        # all. So the query carries a third term no concept has, making all six
+        # matches partial. Five of them are tighter labels (2 of 4 tokens are
+        # query terms) than the member's (2 of 5), so #189's tightness
+        # tie-break ranks the member's concept sixth, just past the cut.
+        concepts = {
+            f"c.d{i}": {
+                "preferred_label": f"agent design pattern {i}",
+                "aliases": [],
+                "video_count": 100 - i,
+            }
+            for i in range(5)
+        }
+        concepts["c.d9"] = {"preferred_label": "agent orchestration for solo builders", "aliases": [], "video_count": 1}
+        (tmp_path / "taxonomy.json").write_text(
+            json.dumps({"version": 1, "built_from": 6, "concepts": concepts}), encoding="utf-8"
+        )
+
+        for i in range(5):
+            vid = f"outsidevid{i:02d}"
+            write_meta(tmp_path, "demo", f"p-out{i}", video_id=vid, title=f"outside {vid}", published="2026-01-01")
+            (tmp_path / "demo" / f"p-out{i}.concepts.json").write_text(
+                json.dumps({"video_id": vid, "concepts": [{"concept_id": f"c.d{i}"}]}), encoding="utf-8"
+            )
+
+        member_id = "membervid01"
+        write_meta(tmp_path, "demo", "p-member", video_id=member_id, title="topic talk", published="2026-02-01")
+        (tmp_path / "demo" / "p-member.concepts.json").write_text(
+            json.dumps({"video_id": member_id, "concepts": [{"concept_id": "c.d9"}]}), encoding="utf-8"
+        )
+        write_briefing(tmp_path, "fde/2026-08-22-a.md", front_matter=f"video_ids:\n  - {member_id}\n")
+        write_topics(tmp_path, build_topics(tmp_path))
+
+        monkeypatch.setattr(video_intel, "resolve_output_dir", lambda _c, **_kw: tmp_path)
+        # Confirm the premise first: the member's concept really is outside the
+        # top five that feed video lookup. Without this the test could pass for
+        # the wrong reason if ranking ever promoted it.
+        unscoped = video_intel.search_corpus(tmp_path, "agent design orchestration", limit=50)
+        assert len(unscoped["concepts"]) > 5
+        assert not any(c["_match_score"] == 1.0 for c in unscoped["concepts"]), (
+            "the fixture must exercise the PARTIAL path - an exact match feeds every "
+            "matching concept to video lookup and there is no cut to demonstrate"
+        )
+        assert "c.d9" not in {c["concept_id"] for c in unscoped["concepts"][:5]}
+
+        args = argparse.Namespace(
+            query="agent design orchestration", channel=None, limit=50, vector=False, since=None, topic="fde"
+        )
+        cmd_search(args, {})
+        out = capsys.readouterr().out
+        assert "topic talk" not in out, (
+            "If this now passes, concept SELECTION was widened - that rewrites issue #189's "
+            "exact-vs-partial contract and needs its own decision, not a silent change here."
+        )
+
+    def test_concept_mode_scope_filters_without_reordering(self, tmp_path, capsys, monkeypatch):
+        """The #146 contract survives the mechanism change: two members keep
+        their relative `(-matched_concepts, published)` order under the scope.
+
+        The dates are deliberately set so that concept count and publish date
+        DISAGREE about the order. With the strong member also being the older
+        one, a stray ascending re-sort by `published` would produce the same
+        output as the correct key and the test would pass on a real regression
+        (found by an executing test reviewer). Here only the concept-count key
+        yields this order, so both a reversal and a date-only re-sort fail.
+        """
+        concepts = {
+            "c.a0": {"preferred_label": "agents overview", "aliases": [], "video_count": 2},
+            "c.a1": {"preferred_label": "agents basics", "aliases": [], "video_count": 2},
+        }
+        (tmp_path / "taxonomy.json").write_text(
+            json.dumps({"version": 1, "built_from": 2, "concepts": concepts}), encoding="utf-8"
+        )
+        # `strongvid001` matches two concepts, `weakvid00001` one, so the
+        # relevance sort must keep strong first inside the scope too - even
+        # though strong is the NEWER of the two.
+        write_meta(tmp_path, "demo", "p-strong", video_id="strongvid001", title="strong member", published="2026-09-01")
+        (tmp_path / "demo" / "p-strong.concepts.json").write_text(
+            json.dumps({"video_id": "strongvid001", "concepts": [{"concept_id": "c.a0"}, {"concept_id": "c.a1"}]}),
+            encoding="utf-8",
+        )
+        write_meta(tmp_path, "demo", "p-weak", video_id="weakvid00001", title="weak member", published="2026-01-01")
+        (tmp_path / "demo" / "p-weak.concepts.json").write_text(
+            json.dumps({"video_id": "weakvid00001", "concepts": [{"concept_id": "c.a0"}]}), encoding="utf-8"
+        )
+        write_briefing(tmp_path, "fde/2026-08-22-a.md", front_matter="video_ids:\n  - strongvid001\n  - weakvid00001\n")
+        write_topics(tmp_path, build_topics(tmp_path))
+
+        monkeypatch.setattr(video_intel, "resolve_output_dir", lambda _c, **_kw: tmp_path)
+        args = argparse.Namespace(query="agents", channel=None, limit=10, vector=False, since=None, topic="fde")
+        cmd_search(args, {})
+        out = capsys.readouterr().out
+        assert out.index("strong member") < out.index("weak member")
+
+    def test_vector_mode_pushes_the_scope_into_the_index_predicate(self, tmp_path, capsys, monkeypatch):
+        """Driven through the real `hybrid_search` with only the LanceDB
+        connection and the Voyage embed stubbed, so the `where` clause the
+        production code builds is the thing asserted - not a pre-canned return
+        from a stubbed `hybrid_search`.
+
+        The stub table returns the member row ONLY when the predicate names it,
+        which is what the real index does. A post-filter implementation would
+        pass no predicate, get every row back, and rank the member 41st behind
+        the out-of-topic chunks - failing at `--limit 1`.
         """
         member_id = "vecmember01"
         write_meta(tmp_path, "demo", "p-member", video_id=member_id, title="topic talk", published="2026-02-01")
         write_briefing(tmp_path, "fde/2026-08-22-a.md", front_matter=f"video_ids:\n  - {member_id}\n")
         write_topics(tmp_path, build_topics(tmp_path))
 
-        rows = [
-            {
-                "text": f"outside chunk {i}",
+        def _row(vid, title, relevance):
+            return {
+                "text": f"chunk for {vid}",
                 "timestamp": "00:00:00",
                 "timestamp_seconds": 0,
-                "video_id": f"vecoutside{i}",
+                "video_id": vid,
                 "channel": "demo",
-                "title": f"outside talk {i}",
+                "title": title,
                 "published": "2026-01-01",
-                "source_file": f"vecoutside{i}.transcript.md",
+                "source_file": f"{vid}.transcript.md",
                 "concept_ids": "[]",
-                "_relevance_score": 1.0 - i * 0.01,  # every outside chunk outranks the member below
+                "_relevance_score": relevance,
             }
-            for i in range(5)
-        ]
-        rows.append(
-            {
-                "text": "member chunk",
-                "timestamp": "00:00:00",
-                "timestamp_seconds": 0,
-                "video_id": member_id,
-                "channel": "demo",
-                "title": "topic talk",
-                "published": "2026-02-01",
-                "source_file": "p-member.transcript.md",
-                "concept_ids": "[]",
-                "_relevance_score": 0.5,
-            }
-        )
-        df = pd.DataFrame(rows)
+
+        # Every outside chunk outranks the member, and there are far more of
+        # them than any plausible multiplier would have covered.
+        all_rows = [_row(f"vecoutside{i:02d}", f"outside talk {i}", 1.0 - i * 0.001) for i in range(40)]
+        all_rows.append(_row(member_id, "topic talk", 0.5))
+        captured = {}
 
         class _RowBuilder:
             def vector(self, _v):
@@ -1104,14 +1206,20 @@ class TestTopicFilterOverfetchIsLoadBearing:
             def text(self, _q):
                 return self
 
-            def limit(self, _n):
+            def limit(self, n):
+                captured["limit"] = n
                 return self
 
-            def where(self, _c):
+            def where(self, clause):
+                captured["where"] = clause
                 return self
 
             def to_pandas(self):
-                return df
+                clause = captured.get("where")
+                if clause and "video_id IN" in clause:
+                    ids = {frag.strip().strip("'") for frag in clause.split("IN (", 1)[1].rstrip(")").split(",")}
+                    return pd.DataFrame([r for r in all_rows if r["video_id"] in ids])
+                return pd.DataFrame(all_rows)
 
         class _RowTable:
             def search(self, **_kw):
@@ -1140,7 +1248,7 @@ class TestTopicFilterOverfetchIsLoadBearing:
         args = argparse.Namespace(
             query="agents",
             channel=None,
-            limit=3,
+            limit=1,
             vector=True,
             since=None,
             topic="fde",
@@ -1150,7 +1258,318 @@ class TestTopicFilterOverfetchIsLoadBearing:
         )
         cmd_search(args, {})
         out = capsys.readouterr().out
-        assert "topic talk" in out, "the topic member must survive even though it ranks 6th unfiltered"
+        assert f"video_id IN ('{member_id}')" in captured["where"], "the scope must reach the index, not a post-filter"
+        assert "topic talk" in out
+        assert "outside talk" not in out
+
+    def test_vector_mode_passes_the_users_own_limit_with_no_multiplier(self, tmp_path, capsys, monkeypatch):
+        """R4: the limit reaching `hybrid_search` is the user's. Depth on the
+        scoped path comes from `hybrid_search`'s own scope-sized candidate pool
+        (issue #188), never from a caller-side multiplier."""
+        write_meta(tmp_path, "demo", "p1", video_id="insidevid12", title="Anchor talk", published="2026-08-01")
+        write_briefing(tmp_path, "fde/2026-08-22-a.md", front_matter="video_ids:\n  - insidevid12\n")
+        write_topics(tmp_path, build_topics(tmp_path))
+        monkeypatch.setattr(video_intel, "resolve_output_dir", lambda _c, **_kw: tmp_path)
+        captured = {}
+
+        def fake_hybrid(_out, _query, **kw):
+            captured.update(kw)
+            return [
+                {
+                    "video_id": "insidevid12",
+                    "channel": "demo",
+                    "title": "Anchor talk",
+                    "published": "2026-08-01",
+                    "timestamp": "01:00",
+                    "timestamp_seconds": 60,
+                    "relevance": 0.5,
+                    "text": "anchor chunk",
+                    "source_file": "demo/p1.transcript.md",
+                }
+            ]
+
+        monkeypatch.setattr(video_intel, "hybrid_search", fake_hybrid)
+        args = argparse.Namespace(
+            query="agents",
+            channel=None,
+            limit=7,
+            vector=True,
+            since=None,
+            topic="fde",
+            preview=False,
+            min_relevance=0.0,
+            no_expand=True,
+        )
+        cmd_search(args, {})
+        assert captured["limit"] == 7
+        assert captured["video_ids_filter"] == {"insidevid12"}
+
+    def test_without_a_topic_neither_mode_passes_a_filter(self, tmp_path, capsys, monkeypatch):
+        """The unscoped path must be byte-identical to pre-#203: no predicate,
+        no multiplier, the user's own limit."""
+        write_meta(tmp_path, "demo", "p1", video_id="insidevid12", title="Anchor talk", published="2026-08-01")
+        monkeypatch.setattr(video_intel, "resolve_output_dir", lambda _c, **_kw: tmp_path)
+        captured = {}
+
+        def fake_hybrid(_out, _query, **kw):
+            captured.update(kw)
+            return []
+
+        monkeypatch.setattr(video_intel, "hybrid_search", fake_hybrid)
+        args = argparse.Namespace(
+            query="agents",
+            channel=None,
+            limit=6,
+            vector=True,
+            since=None,
+            topic=None,
+            preview=False,
+            min_relevance=0.0,
+            no_expand=True,
+        )
+        cmd_search(args, {})
+        assert captured["limit"] == 6
+        assert captured["video_ids_filter"] is None
+        assert "Is the index built?" in capsys.readouterr().out
+
+
+class TestSearchVectorTopicBeltAndComposition:
+    """Caller-level coverage for the `search --vector --topic` surface.
+
+    Issue #203's KTD3 claims one belt shared with `nugget` so the two surfaces
+    cannot drift. `nugget` had a caller-level leak test since #188; `search`
+    did not, and an executing test reviewer proved the gap by DELETING the
+    `drop_topic_leaks` call from `cmd_search`'s vector branch and watching all
+    148 tests stay green. A helper that is unit-tested but never proven to be
+    CALLED is the same blind spot as a stub agreeing with its own assertion.
+    """
+
+    def _corpus(self, tmp_path):
+        write_meta(tmp_path, "demo", "p1", video_id="insidevid12", title="Anchor talk", published="2026-08-01")
+        write_meta(tmp_path, "other", "p2", video_id="outsidevid1", title="Louder talk", published="2026-07-01")
+        write_briefing(tmp_path, "fde/2026-08-22-a.md", front_matter="video_ids:\n  - insidevid12\n")
+        write_topics(tmp_path, build_topics(tmp_path))
+
+    def _hit(self, vid, channel, title, text, published="2026-08-01"):
+        return {
+            "video_id": vid,
+            "channel": channel,
+            "title": title,
+            "published": published,
+            "timestamp": "01:00",
+            "timestamp_seconds": 60,
+            "relevance": 0.5,
+            "text": text,
+            "source_file": f"{channel}/x.transcript.md",
+        }
+
+    def _args(self, **over):
+        base = dict(
+            query="thinking partner",
+            channel=None,
+            limit=5,
+            vector=True,
+            since=None,
+            topic="fde",
+            preview=True,
+            min_relevance=0.0,
+            no_expand=True,
+        )
+        base.update(over)
+        return argparse.Namespace(**base)
+
+    def test_a_leak_past_the_index_filter_is_dropped_with_a_warning(self, tmp_path, capsys, monkeypatch, caplog):
+        """Mirror of `TestNuggetTopicScoping::test_a_leak_past_the_index_filter_is_dropped_with_a_warning`.
+
+        The predicate owns membership, but if it ever silently stops filtering
+        the leak must not reach a result list the operator will read as "my
+        topic said this". Falsified by deleting the `drop_topic_leaks` call
+        from the vector branch: this test fails, the rest stay green.
+        """
+        self._corpus(tmp_path)
+        monkeypatch.setattr(video_intel, "resolve_output_dir", lambda _c, **_kw: tmp_path)
+        monkeypatch.setattr(
+            video_intel,
+            "hybrid_search",
+            lambda *_a, **_kw: [
+                self._hit("insidevid12", "demo", "Anchor talk", "anchor chunk"),
+                self._hit("outsidevid1", "other", "Louder talk", "leaked chunk"),
+            ],
+        )
+        with caplog.at_level("WARNING"):
+            cmd_search(self._args(), {})
+        out = capsys.readouterr().out
+        assert "Anchor talk" in out
+        assert "Louder talk" not in out, "a hit outside the topic must never render under a --topic search"
+        assert "leaked chunk" not in out
+        assert "outside the topic despite the index-level filter" in caplog.text
+
+    def test_a_total_leak_leaves_nothing_and_says_so_without_blaming_the_index(
+        self, tmp_path, capsys, monkeypatch, caplog
+    ):
+        """The belt runs BEFORE the empty check, so a fully-leaking retrieval
+        ends as an empty scoped result, not as a list of out-of-topic hits."""
+        self._corpus(tmp_path)
+        monkeypatch.setattr(video_intel, "resolve_output_dir", lambda _c, **_kw: tmp_path)
+        monkeypatch.setattr(
+            video_intel,
+            "hybrid_search",
+            lambda *_a, **_kw: [self._hit("outsidevid1", "other", "Louder talk", "leaked chunk")],
+        )
+        with caplog.at_level("WARNING"):
+            cmd_search(self._args(), {})
+        out = capsys.readouterr().out
+        assert "Louder talk" not in out
+        assert "No excerpts in topic 'fde'" in out
+        assert "Is the index built?" not in out
+        assert "outside the topic despite the index-level filter" in caplog.text
+
+    def test_topic_composes_with_channel_and_since_in_vector_mode(self, tmp_path, capsys, monkeypatch):
+        """SKILL.md promises `--topic` composes with `--channel` and `--since`.
+        The #203 refactor routes the topic scope through the same builder that
+        carries those two, so pin that all three reach `hybrid_search` together
+        rather than one silently replacing another."""
+        self._corpus(tmp_path)
+        monkeypatch.setattr(video_intel, "resolve_output_dir", lambda _c, **_kw: tmp_path)
+        captured = {}
+
+        def fake_hybrid(_out, _query, **kw):
+            captured.update(kw)
+            return [self._hit("insidevid12", "demo", "Anchor talk", "anchor chunk")]
+
+        monkeypatch.setattr(video_intel, "hybrid_search", fake_hybrid)
+        cmd_search(self._args(channel="demo", since="2026-01-01"), {})
+        assert captured["video_ids_filter"] == {"insidevid12"}
+        assert captured["channel_filter"] == "demo"
+        assert captured["since_iso"] == "2026-01-01"
+        assert captured["limit"] == 5
+
+    def test_topic_composes_with_channel_and_since_in_concept_mode(self, tmp_path, capsys, monkeypatch):
+        """Same promise on the concept surface, driven through the real
+        `search_corpus` rather than a stub: `--channel` and `--since` must
+        still narrow the scoped set, and `--since` must be applied before the
+        pre-scope count the emptied message reports."""
+        (tmp_path / "taxonomy.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "built_from": 3,
+                    "concepts": {"c.agents": {"preferred_label": "agents", "aliases": [], "video_count": 3}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        members = [
+            ("demo", "p-old", "oldmembervid", "old member", "2026-01-01"),
+            ("demo", "p-new", "newmembervid", "new member", "2026-08-01"),
+            ("other", "p-off", "offchannelvid", "other channel member", "2026-08-01"),
+        ]
+        for channel, prefix, vid, title, published in members:
+            write_meta(tmp_path, channel, prefix, video_id=vid, title=title, published=published)
+            (tmp_path / channel / f"{prefix}.concepts.json").write_text(
+                json.dumps({"video_id": vid, "concepts": [{"concept_id": "c.agents"}]}), encoding="utf-8"
+            )
+        ids = "".join(f"  - {m[2]}\n" for m in members)
+        write_briefing(tmp_path, "fde/2026-08-22-a.md", front_matter=f"video_ids:\n{ids}")
+        write_topics(tmp_path, build_topics(tmp_path))
+        monkeypatch.setattr(video_intel, "resolve_output_dir", lambda _c, **_kw: tmp_path)
+
+        cmd_search(
+            argparse.Namespace(query="agents", channel="demo", limit=10, vector=False, since="2026-06-01", topic="fde"),
+            {},
+        )
+        out = capsys.readouterr().out
+        assert "new member" in out
+        assert "old member" not in out, "--since must still narrow inside the topic scope"
+        assert "other channel member" not in out, "--channel must still narrow inside the topic scope"
+
+
+class TestSearchCorpusVideoIdsFilter:
+    """The concept-mode half of the #203 scope, at the function boundary."""
+
+    def _corpus(self, tmp_path):
+        (tmp_path / "taxonomy.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "built_from": 2,
+                    "concepts": {"c.agents": {"preferred_label": "agents", "aliases": [], "video_count": 2}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        for prefix, vid in (("p1", "insidevid12"), ("p2", "outsidevid1")):
+            write_meta(tmp_path, "demo", prefix, video_id=vid, title=f"talk {vid}", published="2026-05-01")
+            (tmp_path / "demo" / f"{prefix}.concepts.json").write_text(
+                json.dumps({"video_id": vid, "concepts": [{"concept_id": "c.agents"}]}), encoding="utf-8"
+            )
+
+    def test_none_means_no_filter(self, tmp_path):
+        self._corpus(tmp_path)
+        res = video_intel.search_corpus(tmp_path, "agents", video_ids_filter=None)
+        assert {v["video_id"] for v in res["videos"]} == {"insidevid12", "outsidevid1"}
+
+    def test_a_set_narrows_to_its_members(self, tmp_path):
+        self._corpus(tmp_path)
+        res = video_intel.search_corpus(tmp_path, "agents", video_ids_filter={"insidevid12"})
+        assert [v["video_id"] for v in res["videos"]] == ["insidevid12"]
+
+    def test_an_empty_set_matches_nothing_never_everything(self, tmp_path):
+        """Same convention as `video_ids_predicate`: "filter to no videos" must
+        never silently become "no filter"."""
+        self._corpus(tmp_path)
+        res = video_intel.search_corpus(tmp_path, "agents", video_ids_filter=set())
+        assert res["videos"] == []
+
+    def test_the_pre_scope_count_is_reported_for_the_emptied_message(self, tmp_path):
+        self._corpus(tmp_path)
+        res = video_intel.search_corpus(tmp_path, "agents", video_ids_filter={"absentvid12"})
+        assert res["videos"] == []
+        assert res["videos_before_topic_filter"] == 2
+
+    def test_the_scope_is_applied_before_the_limit_cap(self, tmp_path):
+        """The load-bearing ordering. With the cap applied first, a member
+        outside the top-`limit` would be gone before the scope ever ran - the
+        pre-#203 defect that the over-fetch multiplier only papered over."""
+        self._corpus(tmp_path)
+        capped = video_intel.search_corpus(tmp_path, "agents", limit=1)
+        assert [v["video_id"] for v in capped["videos"]] == ["insidevid12"]
+        scoped = video_intel.search_corpus(tmp_path, "agents", limit=1, video_ids_filter={"outsidevid1"})
+        assert [v["video_id"] for v in scoped["videos"]] == ["outsidevid1"]
+
+
+class TestSharedTopicScopeHelpers:
+    """One belt and one no-match message, shared by `search --vector` and
+    `nugget` (issue #203), for the same reason `resolve_topic_filter` is one
+    resolver: two copies drift."""
+
+    def _hit(self, vid):
+        return {"video_id": vid, "text": f"chunk {vid}"}
+
+    def test_no_leak_returns_the_hits_unchanged(self, caplog):
+        hits = [self._hit("insidevid12")]
+        with caplog.at_level("WARNING"):
+            assert video_intel.drop_topic_leaks(hits, {"insidevid12"}, "fde") == hits
+        assert "outside the topic" not in caplog.text
+
+    def test_a_leak_is_dropped_and_warned_about(self, caplog):
+        hits = [self._hit("insidevid12"), self._hit("outsidevid1")]
+        with caplog.at_level("WARNING"):
+            kept = video_intel.drop_topic_leaks(hits, {"insidevid12"}, "fde")
+        assert [h["video_id"] for h in kept] == ["insidevid12"]
+        assert (
+            "topic 'fde': 1 retrieved chunks were outside the topic despite the index-level filter; dropping them"
+            in caplog.text
+        )
+
+    def test_the_no_match_message_names_a_remedy_that_can_work(self):
+        msg = video_intel.topic_no_match_message("thinking partner", "fde")
+        assert "No excerpts in topic 'fde'" in msg
+        assert "search --topic fde" in msg
+        # An exact scope is applied before the cap, so a bigger cap cannot
+        # recover a member that did not match. Naming it would be false advice.
+        assert "--limit" not in msg
+        assert "index" not in msg
 
 
 # ---------------------------------------------------------------------------
@@ -1527,56 +1946,66 @@ class TestEmptyTopicResultNamesTheRightRemedy:
         return capsys.readouterr().out
 
     def test_concept_mode_distinguishes_the_two_empties(self, tmp_path, monkeypatch, capsys):
+        """Concept mode keeps this message after issue #203: it still matches
+        the whole corpus by concept and THEN narrows, so "the ranking found N,
+        none in this topic" remains both true and diagnostic there."""
         self._corpus(tmp_path)
         filtered = self._run(tmp_path, monkeypatch, capsys, topic="fde")
         assert "the topic filter removed all of them" in filtered
-        assert "--limit" in filtered
+        assert "search --topic fde" in filtered
         assert "topics-build" in filtered
 
         unfiltered = self._run(tmp_path, monkeypatch, capsys, topic=None)
         assert "the topic filter removed all of them" not in unfiltered
         assert filtered != unfiltered
 
+    def test_the_emptied_message_no_longer_offers_the_limit_remedy(self, tmp_path, monkeypatch, capsys):
+        """Retired with the over-fetch (issue #203). The scope is applied
+        before the cap now, so a bigger `--limit` cannot recover a member that
+        the scope already includes and the query did not match. Naming it would
+        be false advice - the same "trains them to distrust the message"
+        failure this whole class exists to prevent."""
+        self._corpus(tmp_path)
+        filtered = self._run(tmp_path, monkeypatch, capsys, topic="fde")
+        assert "--limit" not in filtered
+
     def test_vector_mode_does_not_blame_the_index(self, tmp_path, monkeypatch, capsys):
+        """Issue #203 changed WHAT an empty scoped vector search means, not
+        whether it blames the index. Retrieval is scoped at the index query
+        now, so there is no post-filter to report - an empty result means
+        nothing inside the topic matched. Both branches must stay
+        distinguishable and neither may point at a rebuild of the index that
+        just answered for the rest of the corpus.
+        """
         monkeypatch.setattr(video_intel, "resolve_output_dir", lambda _c, **_kw: tmp_path)
         write_meta(tmp_path, "demo", "p1", video_id="outsidevid1", title="talk outsidevid1")
         write_briefing(tmp_path, "fde/2026-08-22-a.md", front_matter="video_ids:\n  - absentvid12\n")
         write_topics(tmp_path, build_topics(tmp_path))
 
-        hit = {
-            "video_id": "outsidevid1",
-            "channel": "demo",
-            "title": "talk outsidevid1",
-            "published": "2026-05-01",
-            "timestamp": "00:00:00",
-            "timestamp_seconds": 0,
-            "relevance": 0.9,
-            "text": "chunk",
-            "source_file": "p1.transcript.md",
-        }
-        args = argparse.Namespace(
-            query="agents",
-            channel=None,
-            limit=None,
-            vector=True,
-            since=None,
-            topic="fde",
-            preview=False,
-            min_relevance=0.0,
-            no_expand=True,
-        )
-
-        monkeypatch.setattr(video_intel, "hybrid_search", lambda *_a, **_kw: [dict(hit)])
-        cmd_search(args, {})
-        filtered = capsys.readouterr().out
-        assert "Is the index built?" not in filtered
-        assert "the topic filter removed all of them" in filtered
+        def _args(topic):
+            return argparse.Namespace(
+                query="agents",
+                channel=None,
+                limit=None,
+                vector=True,
+                since=None,
+                topic=topic,
+                preview=False,
+                min_relevance=0.0,
+                no_expand=True,
+            )
 
         monkeypatch.setattr(video_intel, "hybrid_search", lambda *_a, **_kw: [])
-        cmd_search(args, {})
-        empty = capsys.readouterr().out
-        assert "Is the index built?" in empty
-        assert empty != filtered
+        cmd_search(_args("fde"), {})
+        scoped = capsys.readouterr().out
+        assert "Is the index built?" not in scoped
+        assert "the topic filter removed all of them" not in scoped
+        assert "No excerpts in topic 'fde'" in scoped
+
+        cmd_search(_args(None), {})
+        unscoped = capsys.readouterr().out
+        assert "Is the index built?" in unscoped
+        assert unscoped != scoped
 
     def test_the_helper_returns_none_for_a_genuinely_empty_ranking(self):
         assert video_intel.topic_filter_emptied_message("q", "fde", 0) is None
@@ -1894,8 +2323,10 @@ class TestVideoIdsPredicate:
 
 class TestNuggetTopicScoping:
     """`nugget --topic <slug>` narrows retrieval to the topic's members with
-    the SAME resolver, over-fetch multiplier and emptied-message shape as
-    search --topic (issue #146: a topic surface filters, never reorders)."""
+    the SAME resolver, belt check and no-match message as `search --vector
+    --topic` (issue #146: a topic surface filters, never reorders). Neither
+    surface has an over-fetch multiplier: nugget never did, and search's was
+    retired with the post-filter it compensated for (issue #203)."""
 
     def _corpus(self, tmp_path):
         write_meta(tmp_path, "demo", "p1", video_id="insidevid12", title="Anchor talk", published="2026-08-01")

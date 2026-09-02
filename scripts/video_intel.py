@@ -9861,12 +9861,28 @@ def search_corpus(
     channel_filter: str | None = None,
     since_iso: str | None = None,
     limit: int = 20,
+    video_ids_filter=None,
 ) -> dict:
     """Search taxonomy + concepts for matching videos. Returns structured results.
 
     `since_iso` (YYYY-MM-DD) post-filters matching videos to those with
     `published >= since_iso`. Concept data lives in JSON files, so this is
     a post-rank filter (unlike hybrid_search, which pushes the filter to LanceDB).
+
+    `video_ids_filter` (issue #203) narrows the returned videos to a video-id
+    set - the concept-mode half of scoping a `--topic` search AT THE SOURCE.
+    Same convention as `hybrid_search`: `None` means no filter, and an empty
+    set matches NOTHING, never everything. It is applied AFTER the relevance
+    sort and BEFORE the `limit` cap, which is what makes it EXACT rather than
+    a probability improvement: this function already materializes every
+    matching video in the corpus before truncating, so a member ranked last of
+    hundreds still survives. That exactness is why the pre-#203 over-fetch
+    multiplier could be retired outright instead of raised.
+
+    The returned `videos_before_topic_filter` count is the size of the ranked
+    set BEFORE that narrowing, so a caller can still tell "the query matched
+    nothing" apart from "the query matched, but nothing in this topic" - the
+    issue #146 Finding-6 contract, which survives the mechanism change.
     """
     taxonomy = load_taxonomy(output_dir)
     query_lower = query.lower()
@@ -10036,10 +10052,19 @@ def search_corpus(
     # Sort by number of matched concepts (most relevant first), then date
     matching_videos.sort(key=lambda v: (-len(v["matched_concepts"]), v.get("published", "")))
 
+    # Issue #203: the topic scope narrows AFTER the sort and BEFORE the cap, so
+    # it filters without reordering (the #146 contract) and no member is lost
+    # to rank. `is not None`, never a truthiness test - an empty set is a real
+    # answer meaning "no videos", not "no filter".
+    videos_before_topic_filter = len(matching_videos)
+    if video_ids_filter is not None:
+        matching_videos = [v for v in matching_videos if v.get("video_id") in video_ids_filter]
+
     return {
         "query": query,
         "concepts": matching_concepts[:limit],
         "videos": matching_videos[:limit],
+        "videos_before_topic_filter": videos_before_topic_filter,
     }
 
 
@@ -10058,9 +10083,16 @@ def cmd_search(args, config):
     # ONLY the derived topics.json and fails soft with one actionable message
     # naming topics-build (contract C8). Composable with --channel, --since and
     # --vector; it never reorders, it only filters.
+    #
+    # Issue #203: the narrowing now happens AT THE SOURCE in both modes - an
+    # index-level `video_id IN (...)` predicate for --vector (the mechanism
+    # nugget --topic has used since #188) and an exact pre-cap filter inside
+    # search_corpus for concept mode - instead of post-filtering a globally
+    # ranked pool. The user's --limit passes through untouched: there is no
+    # over-fetch multiplier on either surface any more, because an exact scope
+    # makes one meaningless.
     topic_slug = getattr(args, "topic", None)
     topic_ids: set[str] | None = None
-    fetch_limit = args.limit
 
     # Issue #188: `query` became optional so a topic can be LISTED without one.
     # Neither query nor topic is an unusable invocation and keeps the old
@@ -10079,11 +10111,6 @@ def cmd_search(args, config):
         if topic_problem:
             print(topic_problem)
             return
-        # Over-fetch before post-filtering, so a topic whose videos rank below
-        # the requested limit is not reported as empty. Both modes rank first
-        # and filter after (same shape as concept mode's --since filter), so
-        # without this the filter would silently truncate the topic.
-        fetch_limit = args.limit * TOPIC_FILTER_OVERFETCH
 
     if args.query is None and topic_slug:
         # Query-less listing: pure read + render from topics.json, no retrieval.
@@ -10104,16 +10131,21 @@ def cmd_search(args, config):
             args.query,
             channel_filter=args.channel,
             since_iso=since_iso,
-            limit=fetch_limit,
+            limit=args.limit,
             config=config,
             expand=not getattr(args, "no_expand", False),
+            video_ids_filter=topic_ids,
         )
-        ranked_before_topic_filter = len(hits)
         if topic_ids is not None:
-            hits = [h for h in hits if h.get("video_id") in topic_ids][: args.limit]
+            hits = drop_topic_leaks(hits, topic_ids, topic_slug)
         if not hits:
-            emptied = topic_filter_emptied_message(args.query, topic_slug, ranked_before_topic_filter)
-            print(emptied or f'No results for "{args.query}". Is the index built? Run: video_intel.py index')
+            # Scoped retrieval has no post-filter to blame, so an empty result
+            # means nothing IN the topic matched (issue #203). The unscoped
+            # branch keeps the pre-existing "is the index built?" line.
+            if topic_slug:
+                print(topic_no_match_message(args.query, topic_slug))
+            else:
+                print(f'No results for "{args.query}". Is the index built? Run: video_intel.py index')
             return
 
         # Filter out weak matches below relevance threshold
@@ -10158,12 +10190,10 @@ def cmd_search(args, config):
         args.query,
         channel_filter=args.channel,
         since_iso=since_iso,
-        limit=fetch_limit,
+        limit=args.limit,
+        video_ids_filter=topic_ids,
     )
-    ranked_before_topic_filter = len(results["videos"])
-    if topic_ids is not None:
-        results["videos"] = [v for v in results["videos"] if v.get("video_id") in topic_ids][: args.limit]
-        results["concepts"] = results["concepts"][: args.limit]
+    ranked_before_topic_filter = results["videos_before_topic_filter"]
 
     if not results["concepts"]:
         print(f'No concepts matching "{args.query}".')
@@ -10994,21 +11024,12 @@ def cmd_nugget(args, config):
     if topic_ids is not None:
         # Belt: the index-level predicate owns membership; a leak here means
         # that predicate silently stopped filtering, which must never pass
-        # through to the synthesis unnoticed.
-        leaked = [h for h in hits if h.get("video_id") not in topic_ids]
-        if leaked:
-            log.warning(
-                "topic '%s': %d retrieved chunks were outside the topic despite the index-level filter; dropping them",
-                topic_slug,
-                len(leaked),
-            )
-            hits = [h for h in hits if h.get("video_id") in topic_ids]
+        # through to the synthesis unnoticed. Shared with `search --vector`
+        # (issue #203) so the two scoped surfaces cannot drift.
+        hits = drop_topic_leaks(hits, topic_ids, topic_slug)
     if not hits:
         if topic_slug:
-            print(
-                f"No excerpts in topic '{topic_slug}' matched \"{args.query}\". "
-                f"Try a broader query, or list the members: search --topic {topic_slug}"
-            )
+            print(topic_no_match_message(args.query, topic_slug))
         else:
             print(f'No results for "{args.query}". Is the index built? Run: video_intel.py index')
         return
@@ -12479,14 +12500,18 @@ TOPICS_SCHEMA_VERSION = 1
 # topic would manufacture a phantom topic named after a command.
 RESERVED_BRIEFING_DIRS = frozenset({"nuggets"})
 
-# How many extra results to pull before applying a `--topic` post-filter, so a
-# topic whose videos rank below the requested limit is not silently empty.
-# A probability reduction, NOT a guarantee: a member ranked below
-# `limit * TOPIC_FILTER_OVERFETCH` is still lost to the filter. Making the
-# filter exact would mean pushing the topic id set into the ranking itself,
-# which v1 does not do; the compensation is that an emptied-by-filter result
-# says so and names `--limit` as a remedy instead of blaming the index.
-TOPIC_FILTER_OVERFETCH = 5
+# `TOPIC_FILTER_OVERFETCH = 5` lived here until issue #203 and is RETIRED ON
+# PURPOSE, not lost. It over-fetched `limit * 5` results before applying a
+# `--topic` post-filter - a probability reduction, never a guarantee, and it
+# starved in practice: a 19-member topic still had to out-rank 2,300+ other
+# videos for 25 slots, so the live reproduction returned nothing at all. The
+# replacement pushes the topic's id set into retrieval itself (an index-level
+# `video_id IN (...)` predicate for --vector, an exact pre-cap filter inside
+# `search_corpus` for concept mode), which is what the old comment here called
+# the thing "v1 does not do". An exact scope makes a multiplier meaningless, so
+# raising it was explicitly NOT the fix. `tests/test_topics.py` asserts the
+# constant is gone, so a future edit cannot quietly re-plumb a post-filter
+# around it.
 
 _TOPIC_SEPARATOR_RE = re.compile(r"[\s_/\\]+")
 _TOPIC_DASH_RUN_RE = re.compile(r"-{2,}")
@@ -12494,19 +12519,31 @@ _LEADING_DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
 
 
 def topic_filter_emptied_message(query: str, topic_slug: str | None, ranked_count: int) -> str | None:
-    """The line to print when the `--topic` post-filter, not the ranking, emptied a search.
+    """The line to print when the `--topic` scope, not the ranking, emptied a search.
 
     Returns None when the ranking itself came back empty, because the two are
     different problems with opposite remedies. Answering an emptied filter with
     "is the index built?" points the operator at rebuilding an index that just
     returned `ranked_count` results, and trains them to distrust the message.
+
+    Concept mode only since issue #203. Concept search still matches the whole
+    corpus by concept and then narrows to the topic, so "the ranking found
+    N videos, none of them in this topic" is both true and diagnostic there.
+    The `--vector` branch no longer has a post-filter to report - its retrieval
+    is scoped at the index query - and uses `topic_no_match_message` instead.
+
+    `Raise --limit` was dropped from the remedies in the same change: the scope
+    is applied before the cap now, so no member is lost to rank and a bigger
+    cap cannot recover one. A remedy that cannot work is worse than no remedy -
+    it is the same "trains them to distrust the message" failure this helper
+    exists to prevent, one layer in.
     """
     if not topic_slug or not ranked_count:
         return None
     return (
         f'No results for "{query}" in topic {topic_slug!r}. The ranking returned {ranked_count} '
-        f"result(s) and the topic filter removed all of them. Raise --limit, broaden the query, "
-        f"or re-run 'topics-build' if the topic membership is stale."
+        f"result(s) and the topic filter removed all of them. Broaden the query, list the members "
+        f"with 'search --topic {topic_slug}', or re-run 'topics-build' if the membership is stale."
     )
 
 
@@ -13061,6 +13098,47 @@ def resolve_topic_filter(output_dir: Path, topic_slug: str):
             f"(known: {known}). Re-run 'topics-build' after adding a briefing folder.",
         )
     return topic_ids, topics_data, None
+
+
+def drop_topic_leaks(hits: list[dict], topic_ids, topic_slug: str) -> list[dict]:
+    """Belt behind the index-level `video_id IN (...)` predicate (issue #188).
+
+    The predicate owns membership. A hit that arrives outside the topic anyway
+    means the predicate silently stopped filtering, and a filter that stops
+    filtering must never pass through unnoticed - to a synthesis (`nugget`) or
+    to a result list the operator will read as "my topic said this"
+    (`search --vector`). ONE definition shared by both surfaces (issue #203),
+    for the same reason `resolve_topic_filter` is one resolver: two copies of
+    "what a leak means" is how two surfaces drift apart about a slug.
+
+    Returns the hits unchanged when nothing leaked.
+    """
+    leaked = [h for h in hits if h.get("video_id") not in topic_ids]
+    if not leaked:
+        return hits
+    log.warning(
+        "topic '%s': %d retrieved chunks were outside the topic despite the index-level filter; dropping them",
+        topic_slug,
+        len(leaked),
+    )
+    return [h for h in hits if h.get("video_id") in topic_ids]
+
+
+def topic_no_match_message(query: str, topic_slug: str) -> str:
+    """What to print when a topic-SCOPED retrieval came back empty (issue #203).
+
+    Distinct from `topic_filter_emptied_message`, which reports a corpus-wide
+    ranking that a post-filter emptied. Once retrieval is scoped at the index
+    query there is no such post-filter to blame: an empty result means nothing
+    inside the topic matched, so the remedy is a broader query or a look at the
+    membership - never "raise --limit" (the scope is exact; a bigger cap cannot
+    conjure a member that did not match) and never "is the index built?" (the
+    same index just answered for the rest of the corpus).
+    """
+    return (
+        f"No excerpts in topic '{topic_slug}' matched \"{query}\". "
+        f"Try a broader query, or list the members: search --topic {topic_slug}"
+    )
 
 
 def render_topic_listing(

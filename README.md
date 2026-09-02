@@ -394,7 +394,7 @@ a16z: 1 mindmaps, 1 transcripts, 1 concepts
 
 `--topic <slug>` on `process` / `transcript` / `mindmap` covers the window before a briefing exists, and doubles as a backfill: on a video whose artifacts already exist every stage lazy-skips and the tag is still recorded, with no Gemini call. This is provenance only - it never influences ranking, and `taxonomy.json` (what a video *says*) stays entirely separate from `topics.json` (why you *pulled it in*).
 
-See **[docs/topics-layer.md](docs/topics-layer.md)** for the full guide: the removal path, the over-fetch behavior in `search --topic`, and what happens when you rename a topic folder.
+See **[docs/topics-layer.md](docs/topics-layer.md)** for the full guide: the removal path, how `search --topic` scopes retrieval itself instead of post-filtering ranked results, and what happens when you rename a topic folder.
 
 The `--pdf` flag is for reading on the go and sharing: it renders the ranked set as a one-page-friendly PDF whose video titles and timestamped moments are bold, accent-colored hyperlinks that open YouTube at the exact second. It is purely additive, the Markdown is always written and remains the record of what has been surfaced. The PDF writer is self-contained ([`scripts/briefing_pdf.py`](scripts/briefing_pdf.py), ~90 lines on top of `reportlab`), so anyone who installs the plugin gets it with no external service.
 
