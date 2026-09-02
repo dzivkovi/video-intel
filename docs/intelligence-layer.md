@@ -118,6 +118,6 @@ GROUP BY a.source_id ORDER BY first_covered;
 ## Where to go deeper (optional)
 
 - The science behind the tools, for developers without a stats background: [`intelligence-layer-math.md`](intelligence-layer-math.md). Five primitives (null models, p-values, false-discovery correction, rank correlation, bipartite graphs) that make every report here readable, each tool explained as "those primitives plus one twist," with links to the source papers and beginner-friendly videos.
-- Worked examples you can read without running anything: the generated reports in `docs/reports/`.
+- Worked examples you can read without running anything: the generated reports in `docs/reports/`. Two rendered pages there are meant for showing, not just reading: [`2026-09-02-receipts-book.html`](reports/2026-09-02-receipts-book.html) walks one curated topic through the search index, the topics layer and the DuckDB ledger side by side (open it in a browser), and [`2026-09-02-lead-lag-viz.html`](reports/2026-09-02-lead-lag-viz.html) is `lead_lag_viz.py`'s own interactive output on the same day's store.
 - The reasoning trail, if you want to see how these choices were made and why other paths were killed: the design notes in `docs/brainstorms/` (the 2026-07-11 weak-signal findings and the 2026-07-12 browsing-surface research are the load-bearing ones).
 - The retired Neo4j/GDS graph lens, kept for history: `docs/intelligence-layer-environment-setup.md`.

@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>The Receipts Book</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Serif:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --ground:#F2F4F6; --surface:#FFFFFF; --ink:#1C222B; --muted:#5B6570; --line:#DCE1E6;
+  --accent:#8B2E3C; --accent-soft:#F4E6E8;
+  --lance:#2F5D9E; --lance-soft:#E6EDF7; --topic:#B7791F; --topic-soft:#F8EFDC; --duck:#2E7D57; --duck-soft:#E3F1E9;
+  --term:#1E242C; --term-ink:#E6EAEE; --term-dim:#8E98A3; --term-cmd:#F2C572;
+  --good:#2E7D57; --warn:#B7791F;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --ground:#12161B; --surface:#1A2028; --ink:#E4E8EC; --muted:#97A2AD; --line:#2C353F;
+    --accent:#D9707F; --accent-soft:#3A2228;
+    --lance:#7FA7E0; --lance-soft:#1C2A3D; --topic:#E0B25A; --topic-soft:#382D18; --duck:#6CC496; --duck-soft:#183328;
+    --term:#0E1216; --term-ink:#DDE3E8; --term-dim:#7C8792; --term-cmd:#F2C572;
+    --good:#6CC496; --warn:#E0B25A;
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#12161B; --surface:#1A2028; --ink:#E4E8EC; --muted:#97A2AD; --line:#2C353F;
+  --accent:#D9707F; --accent-soft:#3A2228;
+  --lance:#7FA7E0; --lance-soft:#1C2A3D; --topic:#E0B25A; --topic-soft:#382D18; --duck:#6CC496; --duck-soft:#183328;
+  --term:#0E1216; --term-ink:#DDE3E8; --term-dim:#7C8792; --term-cmd:#F2C572;
+  --good:#6CC496; --warn:#E0B25A;
+}
+*{box-sizing:border-box;}
+body{background:var(--ground); color:var(--ink); font-family:"IBM Plex Sans",system-ui,sans-serif; font-size:16px; line-height:1.55; padding:0 20px 80px;}
+main{max-width:900px; margin:0 auto;}
+h1,h2,h3{font-family:"IBM Plex Serif",Georgia,serif; text-wrap:balance; line-height:1.15; font-weight:600;}
+h1{font-size:46px; margin:48px 0 8px;}
+h2{font-size:27px; margin:0 0 10px;}
+h3{font-size:19px; margin:0 0 6px;}
+main > h3{margin-top:26px;}
+p{max-width:68ch;}
+.sub{color:var(--muted); font-size:17px; margin:0 0 8px;}
+.eyebrow{font-family:"IBM Plex Mono",monospace; font-size:12px; letter-spacing:.14em; text-transform:uppercase; color:var(--accent); font-weight:500; margin:52px 0 6px;}
+section{margin-top:8px;}
+a{color:var(--accent);}
+b{font-weight:600;}
+code,.mono{font-family:"IBM Plex Mono",monospace; font-size:.92em;}
+.num{font-variant-numeric:tabular-nums;}
+
+/* correction ledger */
+.ledger{display:grid; grid-template-columns:1fr 1fr; gap:0; border:1px solid var(--line); border-radius:8px; overflow:hidden; background:var(--surface); margin:16px 0 6px;}
+.ledger > div{padding:16px 20px;}
+.ledger .posted{border-right:1px solid var(--line);}
+.ledger h3{font-size:13px; font-family:"IBM Plex Mono",monospace; letter-spacing:.12em; text-transform:uppercase; color:var(--muted); font-weight:500; margin-bottom:10px;}
+.ledger .true h3{color:var(--good);}
+.ledger p{margin:0 0 8px; font-size:15px;}
+.ledger .posted p{color:var(--muted); font-style:italic;}
+.stamp{display:inline-block; border:2px solid var(--accent); color:var(--accent); font-family:"IBM Plex Mono",monospace; font-size:11px; letter-spacing:.16em; text-transform:uppercase; padding:3px 8px; border-radius:3px; transform:rotate(-2deg); margin-top:4px;}
+
+/* the three-store diagram */
+.pile{border:1px dashed var(--line); border-radius:8px; padding:14px 18px; background:var(--surface); display:flex; justify-content:space-between; align-items:baseline; gap:16px; flex-wrap:wrap; margin-top:18px;}
+.pile .what{font-family:"IBM Plex Serif",Georgia,serif; font-size:18px;}
+.pile .facts{color:var(--muted); font-size:14px;}
+.arrows{display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin:6px 0;}
+.arrows div{text-align:center; color:var(--muted); font-family:"IBM Plex Mono",monospace; font-size:12px;}
+.stores{display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:14px;}
+.store{min-width:0;}
+.store{background:var(--surface); border:1px solid var(--line); border-top:4px solid var(--c); border-radius:8px; padding:16px 18px; display:flex; flex-direction:column; gap:8px;}
+.store .name{font-family:"IBM Plex Mono",monospace; font-size:13px; color:var(--c); font-weight:500;}
+.store .q{font-family:"IBM Plex Serif",Georgia,serif; font-size:21px; line-height:1.2;}
+.store .facts{color:var(--muted); font-size:14px; line-height:1.45;}
+.store .cmd{font-family:"IBM Plex Mono",monospace; font-size:12.5px; background:var(--soft); color:var(--ink); padding:6px 8px; border-radius:4px; margin-top:auto; overflow-x:auto; white-space:nowrap;}
+.store.lance{--c:var(--lance); --soft:var(--lance-soft);} .store.topic{--c:var(--topic); --soft:var(--topic-soft);} .store.duck{--c:var(--duck); --soft:var(--duck-soft);}
+
+/* terminal blocks */
+.term{background:var(--term); color:var(--term-ink); border-radius:8px; padding:14px 18px; font-family:"IBM Plex Mono",monospace; font-size:13px; line-height:1.55; overflow-x:auto; margin:12px 0 4px; white-space:pre;}
+.term .c{color:var(--term-cmd);} .term .d{color:var(--term-dim);} .term .hi{color:#9BD3AF;}
+.term .t{color:#F2C572;}
+.cap{color:var(--muted); font-size:14px; margin:6px 0 0;}
+.layer{display:inline-block; font-family:"IBM Plex Mono",monospace; font-size:11px; letter-spacing:.1em; text-transform:uppercase; padding:2px 7px; border-radius:3px; margin-right:6px; vertical-align:2px;}
+.layer{color:var(--surface);} .layer.l{background:var(--lance);} .layer.t{background:var(--topic);} .layer.d{background:var(--duck);}
+
+/* timeline */
+.tl{background:var(--surface); border:1px solid var(--line); border-radius:8px; padding:16px 18px 10px; margin:12px 0 4px;}
+.tl .axis{display:grid; grid-template-columns:150px 1fr; gap:10px; font-family:"IBM Plex Mono",monospace; font-size:11px; color:var(--muted); margin-bottom:6px;}
+.tl .axis .ticks{position:relative; height:14px; border-bottom:1px solid var(--line);}
+.tl .axis .ticks span{position:absolute; transform:translateX(-50%);}
+.row{display:grid; grid-template-columns:150px 1fr; gap:10px; align-items:center; height:22px;}
+.row .who{font-family:"IBM Plex Mono",monospace; font-size:12.5px; text-align:right; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+.row .track{position:relative; height:100%;}
+.row .dot{position:absolute; top:50%; width:11px; height:11px; border-radius:50%; background:var(--duck); transform:translate(-50%,-50%);}
+.row .dot.tp{background:var(--topic); box-shadow:0 0 0 2px var(--surface), 0 0 0 3px var(--topic);}
+.row .n{position:absolute; top:50%; transform:translateY(-50%); font-family:"IBM Plex Mono",monospace; font-size:11px; color:var(--muted); margin-left:10px; white-space:nowrap;}
+.row .n.left{margin-left:0; margin-right:10px; transform:translate(-100%,-50%);}
+.row .track,.tl .axis .ticks{margin-right:40px;}
+.tl .axis .ticks span{white-space:nowrap;}
+
+/* receipts */
+.receipts{display:grid; grid-template-columns:repeat(auto-fit,minmax(270px,1fr)); gap:14px; margin-top:12px;}
+.receipt{background:var(--surface); border:1px dashed var(--muted); border-radius:4px; padding:14px 16px; font-family:"IBM Plex Mono",monospace; font-size:12.5px; line-height:1.5;}
+.receipt .h{display:flex; justify-content:space-between; color:var(--muted); font-size:11px; letter-spacing:.08em; text-transform:uppercase; border-bottom:1px dashed var(--line); padding-bottom:6px; margin-bottom:8px;}
+.receipt .claim{font-family:"IBM Plex Sans",system-ui,sans-serif; font-size:14.5px; margin-bottom:8px;}
+.receipt .quote{color:var(--muted);}
+.receipt .tail{border-top:1px dashed var(--line); margin-top:8px; padding-top:6px; display:flex; justify-content:space-between; gap:8px; flex-wrap:wrap;}
+.receipt a{color:var(--duck); text-decoration:none; font-weight:500;} .receipt a:hover{text-decoration:underline;}
+
+/* tables */
+.tw{overflow-x:auto; background:var(--surface); border:1px solid var(--line); border-radius:8px; margin:12px 0 4px;}
+table{border-collapse:collapse; width:100%; font-size:14px; min-width:520px;}
+th,td{padding:7px 12px; text-align:left; border-top:1px solid var(--line); vertical-align:top;}
+thead th{border-top:none; font-family:"IBM Plex Mono",monospace; font-size:11.5px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); font-weight:500;}
+td.r,th.r{text-align:right;}
+td.mono{font-family:"IBM Plex Mono",monospace; font-size:13px;}
+.lift{font-family:"IBM Plex Mono",monospace; font-weight:500;}
+.lift.up{color:var(--good);} .lift.down{color:var(--accent);}
+
+/* questions */
+.qs{display:grid; grid-template-columns:minmax(0,1fr); gap:18px; margin-top:12px;}
+.q{min-width:0;}
+.q{background:var(--surface); border:1px solid var(--line); border-radius:8px; padding:18px 20px;}
+.q .top{display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; align-items:baseline;}
+.q .top .cmd{font-family:"IBM Plex Mono",monospace; font-size:12.5px; color:var(--muted);}
+.q p{margin:8px 0;}
+.q .term{margin:10px 0 0;}
+.warnbox{border-left:3px solid var(--warn); background:var(--topic-soft); padding:10px 14px; border-radius:0 6px 6px 0; font-size:14.5px; margin:12px 0;}
+.goodbox{border-left:3px solid var(--good); background:var(--duck-soft); padding:10px 14px; border-radius:0 6px 6px 0; font-size:14.5px; margin:12px 0;}
+
+ul{padding-left:22px;} li{margin:6px 0; max-width:70ch;}
+.teach{background:var(--surface); border:1px solid var(--line); border-left:4px solid var(--accent); border-radius:8px; padding:18px 22px;}
+.teach ol{padding-left:20px; margin:8px 0 0;} .teach li{margin:8px 0;}
+small.foot{display:block; color:var(--muted); margin-top:40px; font-size:13px; max-width:80ch;}
+@media (max-width:720px){ h1{font-size:34px;} .ledger,.stores,.arrows{grid-template-columns:1fr;} .ledger .posted{border-right:none; border-bottom:1px solid var(--line);} .row,.tl .axis{grid-template-columns:110px 1fr;} }
+@media (prefers-reduced-motion: reduce){ *{transition:none !important;} }
+</style>
+</head>
+<body>
+<main>
+<h1>The Receipts Book</h1>
+<p class="sub">Your corpus is a pile of transcripts. Three small stores are built from that pile, and each answers one kind of question. This page shows all three on one real subject, a curated topic called <code>thinking-partner</code>, using outputs generated 2026-09-02 against the live corpus, unedited.</p>
+
+<div class="eyebrow">The one picture</div>
+<h2>One pile, three derived stores</h2>
+<p>Every store below can be deleted and rebuilt from the markdown. That is what makes them cheap to trust: nothing in them is the only copy of anything.</p>
+<div class="pile">
+  <span class="what">The pile: markdown transcripts and mind maps on disk</span>
+  <span class="facts num">2,371 videos across 75 sources, 2021-09 to 2026-09</span>
+</div>
+<div class="arrows"><div>&#8595; index</div><div>&#8595; topics-build</div><div>&#8595; intel_graph.py load</div></div>
+<div class="stores">
+  <div class="store lance">
+    <span class="name">LanceDB index</span>
+    <span class="q">"Find me the passage."</span>
+    <span class="facts num">85,854 chunks, each carrying its <code>&amp;t=</code> second. Keyword and meaning search fused (BM25 + Voyage vectors, reciprocal-rank fusion).</span>
+    <span class="cmd">video_intel.py search "..." --vector</span>
+  </div>
+  <div class="store topic">
+    <span class="name">topics.json</span>
+    <span class="q">"Why did I keep this?"</span>
+    <span class="facts num">13 topics, 265 memberships. Curation, not extraction: a video is in a topic because you pulled it into a briefing folder or stamped it with <code>--topic</code>.</span>
+    <span class="cmd">video_intel.py search --topic &lt;slug&gt;</span>
+  </div>
+  <div class="store duck">
+    <span class="name">intel.duckdb</span>
+    <span class="q">"Who, when, how often, and show me the receipt."</span>
+    <span class="facts num">84,753 timestamped segments, 890 concepts, 15,882 claims, 1,467 verbatim quotes. A single file, no server.</span>
+    <span class="cmd">intel_graph.py load  (then the four reports)</span>
+  </div>
+</div>
+
+<div class="eyebrow">Worked example</div>
+<h2>One curated topic through all three layers</h2>
+<p>The subject is the <code>thinking-partner</code> topic, assembled while preparing a talk: 19 videos across 9 channels. Same subject, three different questions.</p>
+
+<h3><span class="layer t">topics</span>"What did I collect on this?"</h3>
+<div class="term"><span class="c">$ python scripts/video_intel.py search --topic thinking-partner</span>
+Topic 'thinking-partner': <span class="hi">19 videos, 9 channels</span>, first seen 2026-08-24
+  briefing: thinking-partner/2026-08-24-panel-consultant-brief.md
+  briefing: thinking-partner/2026-08-24-unknown-unknowns-research-thread.md
+
+  [austinmarchese] 2026-09-01  This Fixes Claude's Biggest Problem (Karpathy's Method)
+  [aidotengineer]  2026-07-15  Claude Fable, Claude Tag, and Anthropic's Culture (Cat Wu, Thariq Shihipar, Simon Willison)
+  [aidotengineer]  2026-07-06  Field Guide to Fable (Thariq Shihipar, Anthropic)
+  [everyinc]       2026-05-13  Claude Code Can Be Your Second Brain
+  [ramjad]         2026-03-02  The Top 0.01% User's Guide to Claude Code
+  [vanishinggradients] 2026-01-09  Beyond Vibe-Coding: Learn Effective AI-Assisted Coding in 4 minutes
+  <span class="d">... 13 more, each with its watch link</span></div>
+<p class="cap">No retrieval, no index, no model call: a pure read of topics.json. This is the list you would hand a colleague as "the reading list behind a talk".</p>
+
+<h3><span class="layer l">LanceDB</span>"Where did someone say the thing I mean?"</h3>
+<div class="term"><span class="c">$ python scripts/video_intel.py search "AI as a thinking partner, not an answer machine" --vector --limit 3</span>
+Hybrid results (3 videos):
+
+  [1] [natebjones] 2026-01-23  The Builders Who Figure This Out First Will Be Impossible to Catch.
+      Timestamp: <span class="t">[17:55]</span>  https://www.youtube.com/watch?v=5Di6o6zuMLc<span class="hi">&amp;t=1075</span>
+      "... we are moving from a world where prompting was a one-way street ..."
+
+  [3] [natebjones] 2026-05-21  Opus 4.7 and OpenAI 5.5 Made Your Prompting Style Obsolete.
+      Timestamp: <span class="t">[02:48]</span>  https://www.youtube.com/watch?v=ogTLWGBc3cE<span class="hi">&amp;t=168</span>
+      "AI now is like a senior partner on your team, not like a junior partner.
+       That is the biggest mental model shift ..."
+      SCREEN [02:55-02:57] [diagram]: 'Junior Helper' (2025) vs 'Senior Partner' (2026)</div>
+<p class="cap">The speaker never used your words; meaning search found the passage anyway, and the link opens at the second it was said. This is the layer most people already have.</p>
+
+<h3><span class="layer d">DuckDB</span>"Who got to this idea first, and who is following?"</h3>
+<p>Among the 19 videos, the concept they share most (after orchestration and evals) is <code>agent_memory</code>. Ask the ledger which creators covered it, earliest first. One SQL statement, whole corpus, under a second:</p>
+<div class="tl">
+  <div class="axis"><span></span><div class="ticks"><span style="left:0%">2024-05</span><span style="left:33%">2025-01</span><span style="left:66%">2025-09</span><span style="left:100%">2026-03</span></div></div>
+  <div class="row"><span class="who">mark_kashef</span><div class="track"><span class="dot tp" style="left:0%"></span><span class="n" style="left:0%">2024-05-22 &middot; 24 videos</span></div></div>
+  <div class="row"><span class="who">seankochel</span><div class="track"><span class="dot tp" style="left:41%"></span><span class="n" style="left:41%">2025-02-21 &middot; 17</span></div></div>
+  <div class="row"><span class="who">benai92</span><div class="track"><span class="dot" style="left:44%"></span><span class="n" style="left:44%">2025-03-15 &middot; 11</span></div></div>
+  <div class="row"><span class="who">engineerprompt</span><div class="track"><span class="dot" style="left:63%"></span><span class="n" style="left:63%">2025-07-17 &middot; 13</span></div></div>
+  <div class="row"><span class="who">neo4j</span><div class="track"><span class="dot" style="left:73%"></span><span class="n" style="left:73%">2025-09-25 &middot; 24</span></div></div>
+  <div class="row"><span class="who">natebjones</span><div class="track"><span class="dot tp" style="left:84%"></span><span class="n left" style="left:84%">2025-12-08 &middot; 30</span></div></div>
+  <div class="row"><span class="who">everyinc</span><div class="track"><span class="dot tp" style="left:86%"></span><span class="n left" style="left:86%">2025-12-19 &middot; 13</span></div></div>
+  <div class="row"><span class="who">vanishinggradients</span><div class="track"><span class="dot tp" style="left:92%"></span><span class="n left" style="left:92%">2026-01-27 &middot; 9</span></div></div>
+  <div class="row"><span class="who">ycombinator</span><div class="track"><span class="dot" style="left:94%"></span><span class="n left" style="left:94%">2026-02-07 &middot; 4</span></div></div>
+</div>
+<p class="cap">Ringed dots are channels in the thinking-partner topic. The burst report adds the tempo: <code>agent_memory</code> has been in a burst since 2026-01-20 and is still rising (225 videos, the strongest burst in the corpus). Read that with the caveat below: the corpus itself grew fast in 2026.</p>
+<div class="term"><span class="d">-- the exact SQL, runnable in `duckdb -readonly -ui ~/.cache/video-intel/intel.duckdb`</span>
+SELECT a.source_id, min(a.published_at::DATE) AS first_covered, count(*) AS videos
+FROM has_concept hc JOIN artifacts a USING (artifact_id)
+WHERE hc.concept_id = 'ai-engineering.agent_memory'
+GROUP BY 1 ORDER BY 2;</div>
+
+<h3><span class="layer d">DuckDB</span>"Show me the receipt."</h3>
+<p>Every claim in the ledger points back to a segment, and 1,467 of them carry the verbatim quote or the on-screen text. Two receipts from inside the 19 videos:</p>
+<div class="receipts">
+  <div class="receipt">
+    <div class="h"><span>claim</span><span>vizgFWixquE:37</span></div>
+    <div class="claim">mark_kashef discusses <b>Configuration Hierarchy</b> (as "configuration hierarchy")</div>
+    <div class="quote">SCREEN [18:40-18:57] [diagram]: "Setting Up Your World: THE CONFIGURATION HIERARCHY". Three layers: LAYER 1: USER-LEVEL (~/.claude/C...</div>
+    <div class="tail"><span>segment start 1,120 s</span><a href="https://www.youtube.com/watch?v=vizgFWixquE&t=1120">watch &amp;t=1120</a></div>
+  </div>
+  <div class="receipt">
+    <div class="h"><span>claim</span><span>AzmnaoVP8sk:42</span></div>
+    <div class="claim">ramjad discusses <b>Context Engineering</b> (as "context engineering")</div>
+    <div class="quote">SCREEN [23:18-23:22]: the 'Agentic Coding School' site showing class modules 'Master Claude Code', 'Master Codex CLI', 'Bonus Techniques' ...</div>
+    <div class="tail"><span>segment start 1,398 s</span><a href="https://www.youtube.com/watch?v=AzmnaoVP8sk&t=1398">watch &amp;t=1398</a></div>
+  </div>
+</div>
+<p class="cap">This is why it is a receipts book and not a "truth store": the number is never the end of the trail, the timestamped quote is.</p>
+
+<h3><span class="layer d">DuckDB</span>"Which of these creators actually move together?"</h3>
+<p>Nine channels in the topic make 36 possible pairs. Raw overlap would connect nearly all of them (everyone talks about Claude). The SDSM network keeps only pairs that share more concepts than their own prolificness and the concepts' popularity already explain. Among these nine: <b>two</b> ties survive.</p>
+<div class="tw"><table>
+<thead><tr><th>Creator A</th><th>Creator B</th><th class="r">shared</th><th class="r">expected</th><th class="r">multiple</th><th class="r">q-value</th></tr></thead>
+<tbody>
+<tr><td class="mono">claude</td><td class="mono">ramjad</td><td class="r num">43</td><td class="r num">28.6</td><td class="r lift up">1.5x</td><td class="r num">0.027</td></tr>
+<tr><td class="mono">ramjad</td><td class="mono">seankochel</td><td class="r num">60</td><td class="r num">42.2</td><td class="r lift up">1.4x</td><td class="r num">0.016</td></tr>
+</tbody></table></div>
+<p class="cap">Reading: ramjad tracks the official Claude channel and Sean Kochel more closely than chance. It says overlap, not influence; who led is the lead-lag question.</p>
+
+<div class="eyebrow">The prepared questions</div>
+<h2>Four commands, one ledger, all under two seconds</h2>
+<div class="qs">
+  <div class="q">
+    <div class="top"><h3>Who got to an idea first?</h3><span class="cmd">python scripts/lead_lag_report.py &nbsp;&middot;&nbsp; 1.5 s</span></div>
+    <p>The trick that makes it trustworthy: it corrects for when each channel joined the corpus and how often it posts, so a big, deeply indexed channel cannot fake being first. Naively, mark_kashef is "first" 125 times. Corrected for volume, the ranking flips:</p>
+    <div class="tw"><table>
+    <thead><tr><th>#</th><th>Creator</th><th class="r">Lift</th><th class="r">Firsts obs / exp</th><th class="r">Eligible</th><th>Read as</th></tr></thead>
+    <tbody>
+    <tr><td>1</td><td class="mono">lennyspodcast</td><td class="r lift up">8.48</td><td class="r num">8.0 / 0.9</td><td class="r num">16</td><td>the one result that survives the significance check</td></tr>
+    <tr><td>2</td><td class="mono">ramjad</td><td class="r lift up">6.11</td><td class="r num">3.0 / 0.5</td><td class="r num">6</td><td>small sample, one lucky call from noise</td></tr>
+    <tr><td>4</td><td class="mono">seankochel</td><td class="r lift up">1.68</td><td class="r num">17.0 / 10.1</td><td class="r num">36</td><td>robust: leads beyond volume on a real base</td></tr>
+    <tr><td>6</td><td class="mono">mark_kashef</td><td class="r lift up">1.39</td><td class="r num">33.0 / 23.7</td><td class="r num">84</td><td>still a leader, at a fraction of the naive claim</td></tr>
+    <tr><td>17</td><td class="mono">ycombinator</td><td class="r lift down">0.06</td><td class="r num">1.0 / 16.4</td><td class="r num">88</td><td>covers everything, after everyone</td></tr>
+    </tbody></table></div>
+    <p>Each finding ships as an adoption chain with the leader's quote. The top one this morning:</p>
+    <div class="term"><span class="hi">recursive_model_improvement</span>
+lennyspodcast(25-07-20) -> aidotengineer(25-07-29) -> mark_kashef(25-12-21) -> engineerprompt(26-01-08) -> ... -> gregisenberg(26-04-29)
+"So how do you do recursive self-improvement and make sure it's aligned at the same time? I think that's the name of the game."
+  Ben Mann on Lenny's Podcast, 2025-07-20, <span class="t">&amp;t=3230</span></div>
+  </div>
+
+  <div class="q">
+    <div class="top"><h3>What is suddenly heating up?</h3><span class="cmd">python scripts/burst_report.py &nbsp;&middot;&nbsp; 0.7 s</span></div>
+    <p>A burst is a jump against the concept's <i>own</i> usual rate, so a niche idea catching fire ranks next to a popular one. This morning: 161 bursts, 83 still rising. The report opens with a corpus-volume table on purpose:</p>
+    <div class="warnbox">Videos published per month climbed 53 (Oct 2025) to 364 (Jul 2026). When the whole book gets thicker, many concepts look like they are bursting at once. Check a burst's start date against that table before reading it as a topic catching fire.</div>
+    <div class="term"><span class="hi">open_weights_models</span>       began 2026-06-01, still rising (intensity 23.8, 57 videos) - first: samwitteveenai
+<span class="hi">collaborative_ai_workflows</span> began 2026-06-10, still rising (intensity 10.2, 26 videos) - first: everyinc, "How Anthropic Uses Claude Fable 5"
+<span class="hi">context_engineering</span>        began 2026-02-27, cooled 2026-08-13 (intensity 34.5, 119 videos) - first: natebjones
+<span class="hi">personal_knowledge_management</span> began 2026-03-31, cooled 2026-07-09 (41 videos) - first: chase_h_ai</div>
+    <p class="cap">Note the last two: "context engineering" and "second brain" both peaked and cooled this summer. A talk on this topic sits on the trailing edge of one wave and, per the collaborative-workflows burst, the leading edge of the next.</p>
+  </div>
+
+  <div class="q">
+    <div class="top"><h3>Which creators actually cluster together?</h3><span class="cmd">python scripts/sdsm_network.py &nbsp;&middot;&nbsp; 0.5 s</span></div>
+    <p>70 creators make 2,415 pairs. A naive overlap test flags 1,417 of them as connected. The degree-preserving null model prunes that to <b>51</b>. Strongest tie in the corpus: <span class="mono">a16z + southparkcommons</span>, 4 shared concepts where 0.5 were expected (7.5x). Strongest among the big channels: <span class="mono">mattpocockuk + ramjad</span>, 44 vs 25.9 expected (1.7x).</p>
+    <p class="cap">Read the 51 as a shortlist of "these two are worth comparing side by side", never as a map of influence.</p>
+  </div>
+
+  <div class="q">
+    <div class="top"><h3>Let me just wander the connections</h3><span class="cmd">python scripts/wiki_atlas.py --wiki-dir "&lt;output_dir&gt;/_wiki" &nbsp;&middot;&nbsp; 30 pages</span></div>
+    <p>A reading lens over the first two questions: one dossier per ranked creator, one adoption story per top concept, cross-linked only where the data validated a lead-follow relationship. On the reference corpus the <code>_wiki</code> already exists (index, 17 creator dossiers, 10 concept stories, plus 21 concept pages from <code>wiki_concepts.py</code>) and is registered as an Obsidian vault.</p>
+    <div class="term"><span class="d"># Obsidian refresher (vault is already registered; these are the only two commands)</span>
+<span class="c">$ python scripts/wiki_atlas.py --wiki-dir "<output_dir>/_wiki"</span>     <span class="d"># regenerate after `load`; Obsidian picks it up live</span>
+<span class="c">$ python scripts/register_obsidian_vault.py "<output_dir>/_wiki" --open --launch</span>   <span class="d"># only if the vault ever disappears from Obsidian's list; quit Obsidian first</span></div>
+    <p class="cap">Dossier pages carry a <code>[!todo] PROSE (agent)</code> callout: the numbers are generated, the two-paragraph judgment on each creator is left for a human or an agent pass. That is deliberate.</p>
+  </div>
+</div>
+
+<div class="eyebrow">Discipline</div>
+<h2>How not to fool yourself</h2>
+<ul>
+  <li><b>Small samples lie loudest.</b> ramjad's lift of 6.11 rests on 3 firsts against 0.5 expected. Trust lifts backed by expected firsts of 5 or more (seankochel, mark_kashef); treat the rest as leads.</li>
+  <li><b>Upload date is not idea date.</b> The ledger sees when something was published, never when it was first thought or said off-platform.</li>
+  <li><b>Corpus growth mimics topic fire.</b> The volume table comes first in the burst report for exactly this reason.</li>
+  <li><b>A link is a claim.</b> In the wiki, a <code>[[link]]</code> exists only where a lead-follow relationship was validated. Plain-text names are creators too small to rank.</li>
+  <li><b>The machine finds convergence; you supply the meaning.</b> On a corpus this size every row is a lead for a human to inspect, not a verdict.</li>
+</ul>
+
+<div class="eyebrow">Explaining it to others</div>
+<h2>How to teach it in sixty seconds</h2>
+<div class="teach">
+  <ol>
+    <li><b>Transcripts are the asset; everything else is derived.</b> Two thousand videos become markdown with timestamps once, paid once. Every store below is rebuilt from that markdown for free.</li>
+    <li><b>Search finds the passage.</b> LanceDB fuses keyword and meaning search and every hit opens the video at the second it was said. That is the "second brain" most people stop at.</li>
+    <li><b>The ledger answers the questions search cannot.</b> Who covered this first? Who follows whom? What is heating up right now? Which creators genuinely track the same ideas? Those are tables and timelines, not passages, so they live in DuckDB, beside the index, not on top of it.</li>
+    <li><b>Every number carries a receipt.</b> A claim points to a segment; the segment points to a quote and a timestamp. Rank is relevance, never truth; truth is the link you can click.</li>
+    <li><b>The tool is willing to say "cannot tell".</b> It corrects for corpus age and posting volume, prunes 1,417 naive ties to 51, and flags small samples. On a small corpus that modesty is the accuracy.</li>
+  </ol>
+</div>
+
+<small class="foot">Everything above was generated 2026-09-02 09:01-09:20 against the live corpus, read-only: <code>intel_graph.py load --force</code> (rebuilt overnight after the timestamp fix), then <code>lead_lag_report.py</code>, <code>burst_report.py</code>, <code>sdsm_network.py</code>, <code>wiki_atlas.py</code> (dry run), two <code>search</code> calls and three direct DuckDB queries. Not run: <code>intel_graph.py project</code> and <code>verify</code>, which need the Neo4j community-detection path retired in issue #95; <code>verify</code> exits with "no communities in DuckDB", as designed. One thing found while making this page: <code>search "..." --vector --topic thinking-partner</code> returned nothing, because that surface still post-filters a global pool of 25 (the starvation shape issue #188 fixed for <code>nugget --topic</code> but deliberately left in place for <code>search --topic</code>); the query-less listing and the unscoped search both worked.</small>
+</main>
+
+</body>
+</html>
