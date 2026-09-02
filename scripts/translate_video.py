@@ -139,10 +139,13 @@ def apply_timestamp_offset(line: str, offset_seconds: int, chunk_duration_second
     line = normalize_timestamp(line)
 
     # Try [HH:MM:SS] first (more specific), then [MM:SS]
+    # timestamp-literal-ok: runs AFTER normalize_timestamp above, so it must
+    # accept the repaired shape rather than the shape the shared patterns gate.
     m = re.match(r"\[(\d+):(\d{2}):(\d{2})\]", line)
     if m:
         total = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
     else:
+        # timestamp-literal-ok: same post-normalize position as the branch above.
         m = re.match(r"\[(\d+):(\d{2})\]", line)
         if not m:
             return line
@@ -186,9 +189,17 @@ def apply_timestamp_offset(line: str, offset_seconds: int, chunk_duration_second
 # instead of being caught. `normalize_timestamp` is what repairs that shape.
 TS_HOURS = r"\d{1,2}"
 TS_MINUTES = r"\d+"
+# Inside `[HH:MM:SS]` the minute field is two digits and cannot carry the
+# overflow - that is what the bare `[MM:SS]` shape is for. It gets its own
+# constant rather than borrowing TS_SECONDS, so a future change to the seconds
+# field cannot silently move the minute field with it. That coupling is the
+# exact class this whole change exists to prevent.
+TS_MINUTES_IN_HHMMSS = r"\d{2}"
 TS_SECONDS = r"\d{2}"
-# `[HH:MM:SS]` and `[MM:SS]`, as anchored line-start matches.
-HHMMSS_BRACKET_RE = re.compile(rf"\[({TS_HOURS}):({TS_SECONDS}):({TS_SECONDS})\]")
+# `[HH:MM:SS]` and `[MM:SS]`. NOT anchored - every current caller uses
+# `.match()`, which anchors at the caller. A future `.search()` would match
+# mid-line; add `^` here rather than relying on that.
+HHMMSS_BRACKET_RE = re.compile(rf"\[({TS_HOURS}):({TS_MINUTES_IN_HHMMSS}):({TS_SECONDS})\]")
 MMSS_BRACKET_RE = re.compile(rf"\[({TS_MINUTES}):({TS_SECONDS})\]")
 
 
@@ -741,6 +752,10 @@ def stitch_parts(
             adjusted = apply_timestamp_offset(line, offset_seconds, chunk_duration_seconds)
 
             # Check monotonic timestamps
+            # timestamp-literal-ok: reads the output of apply_timestamp_offset's
+            # own `f"[{h:02d}:{m:02d}:{s:02d}]"` writer, so it must match the
+            # WRITER's zero-padded shape - the checker-uses-the-writer's-shape
+            # rule, not a fourth copy of the input grammar.
             ts_match = re.match(r"\[(\d{2}):(\d{2}):(\d{2})\]", adjusted)
             if ts_match:
                 hh, mm, ss = int(ts_match.group(1)), int(ts_match.group(2)), int(ts_match.group(3))
