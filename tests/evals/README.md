@@ -59,9 +59,9 @@ writes to the repo root.
 As of 2026-09-01 (post-#190, 2,360 videos / 80,297 chunks): **1 of 25 queries
 passes** (Q11). The same corpus scored 0/25 immediately before, with the
 instrument defect below still in place. Primary failure mode is now recall —
-19 of 25 queries retrieve none of their expected videos, and only 1 of the 22
-distinct golden videos is missing from the index, so this is genuine retrieval
-failure rather than corpus coverage.
+19 of 25 queries retrieve none of their expected videos, and every one of the
+22 distinct golden videos is in the index, so this is genuine retrieval failure
+rather than corpus coverage.
 
 **Do not compare this number to the 2026-04-19 1/25.** Different corpus,
 different passing query, and a different instrument. See

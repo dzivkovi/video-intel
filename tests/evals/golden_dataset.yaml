@@ -15,6 +15,35 @@
 #   position_diversity   — G-Eval: did retrieved chunks expose distinct positions? (non-det.)
 #
 # For non-det dimensions, report as trend signal (not merge-blocking).
+#
+# ---------------------------------------------------------------------------
+# CHANGE LOG. This file is a frozen contract per ADR-0017: an edit needs
+# ADR-grade justification, and it is recorded here so a later reader can tell a
+# grounded correction from a quiet recalibration.
+#
+# 2026-09-02 - `JDAIOSWfPn0` -> `iG_CCjdyeX0` (6 occurrences, in Q02, Q20, Q23,
+#   Q25). Justification: the creator re-uploaded the video, so the original id
+#   is unaddressable - it is in no corpus and no index, which made Q02's
+#   `recall_at_k` threshold unreachable by ANY retriever and degraded three
+#   other queries. Surfaced by the issue #190 measurability audit, which fails
+#   on exactly this class.
+#
+#   Every timestamp_range was re-verified against the transcript actually on
+#   disk (natebjones/2026-01-07-why-pretty-good-on-first-pass-is-costing-you-
+#   thousands-how-to-fix-it-today) and NONE needed to move - the re-upload is
+#   the same recording:
+#     00:28-00:50  [00:28] "he does not let the model stop, and he keeps
+#                          feeding the model the prompt over and over"
+#     01:32-01:55  [01:48] "make our evaluations the steering wheel for the
+#                          entire process"
+#     02:02-02:30  [02:03]-[02:22] single-shot grading vs converging "when it's
+#                          forced to confront reality"
+#
+#   This is a correction of an unaddressable key, not a threshold or
+#   expectation change: no dimension, threshold, range or query text was
+#   touched. `key_phrase` and `position` are documentation - the metrics score
+#   only video_id, channel and timestamp_range.
+# ---------------------------------------------------------------------------
 
 version: 1
 snapshot_date: 2026-04-19
@@ -98,17 +127,17 @@ queries:
     steering mechanism. This is the opposite of how most teams build eval
     pipelines today (batch, offline, end-of-run).
   expected_hits:
-    - video_id: JDAIOSWfPn0
+    - video_id: iG_CCjdyeX0
       channel: natebjones
       timestamp_range: ["00:28", "00:50"]
       key_phrase: "force-feeds the prompt to the model and doesn't let it stop"
       position: force_feed_technique
-    - video_id: JDAIOSWfPn0
+    - video_id: iG_CCjdyeX0
       channel: natebjones
       timestamp_range: ["01:32", "01:55"]
       key_phrase: "make our evaluations the steering wheel for the entire process"
       position: evaluation_as_steering
-    - video_id: JDAIOSWfPn0
+    - video_id: iG_CCjdyeX0
       channel: natebjones
       timestamp_range: ["02:02", "02:30"]
       key_phrase: "What matters is whether the agent converges toward correctness"
@@ -1134,7 +1163,7 @@ queries:
       position: taste_problem
       provenance: manual_verified
       source: transcript
-    - video_id: JDAIOSWfPn0
+    - video_id: iG_CCjdyeX0
       channel: natebjones
       timestamp_range: ["01:32", "02:30"]
       key_phrase: "make our evaluations the steering wheel for the entire process"
@@ -1287,7 +1316,7 @@ queries:
       position: clarity_of_intent
       provenance: manual_verified   # re-used from Q11
       source: transcript
-    - video_id: JDAIOSWfPn0
+    - video_id: iG_CCjdyeX0
       channel: natebjones
       timestamp_range: ["01:32", "02:30"]
       key_phrase: "evaluations the steering wheel for the entire process"
@@ -1425,7 +1454,7 @@ queries:
       position: meta_work_context
       provenance: manual_verified   # re-used
       source: transcript
-    - video_id: JDAIOSWfPn0
+    - video_id: iG_CCjdyeX0
       channel: natebjones
       timestamp_range: ["01:32", "02:30"]
       key_phrase: "evaluations the steering wheel"

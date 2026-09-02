@@ -148,8 +148,12 @@ two of them hiding inside one number for over a year:
    threshold for **5 of the 25 queries (Q01, Q02, Q03, Q04, Q11)**, which could
    therefore never pass no matter how good retrieval was. Fixed by running the
    harness with `dedup_by_video=False` (see `docs/search-internals.md`).
-2. A golden `video_id` left the corpus, making one query's `recall_at_k`
-   threshold unreachable against any index.
+2. A golden `video_id` left the corpus (a creator re-upload), making one
+   query's `recall_at_k` threshold unreachable against any index. **Corrected
+   2026-09-02** - the audit is now fully green. That correction is the clearest
+   evidence the audit works: Q02's `recall_at_k` went 0.000 -> 1.000 the moment
+   the dataset pointed at the id that exists, so it was never a retrieval
+   failure at all. See the CHANGE LOG at the top of `golden_dataset.yaml`.
 
 Because both scored exactly like retrieval failures, **the historic 1/25
 baseline was never purely a retrieval measurement.** Keep the two suites apart;
@@ -168,8 +172,8 @@ immediately preceding run on the same corpus with the capped instrument scored
 **0/25**. Treat 2026-09-01 as the new baseline and do not compare across it.
 
 Primary failure mode is now unambiguous: **19 of 25 queries score 0.000 on
-recall** — the expected videos are not retrieved at all. Only 1 of the 22
-distinct golden videos is missing from the index, so this is genuine retrieval
+recall** — the expected videos are not retrieved at all. Every one of the 22
+distinct golden videos is now in the index, so this is genuine retrieval
 failure, not corpus coverage. Full diagnosis of the original vocabulary-mismatch
 theory in [ADR-0017](adr/ADR-0017-kb-layer-strategy.md).
 

@@ -9,7 +9,10 @@ were hiding inside that one number:
    (distinct videos / expected hits) on `timestamp_precision` — below its own
    threshold for 5 of the 25 queries, which therefore could never pass.
 2. A golden `video_id` left the corpus (creator re-upload), making one query's
-   `recall_at_k` threshold unreachable against any index.
+   `recall_at_k` threshold unreachable against any index. Corrected 2026-09-02;
+   that query's recall went 0.000 -> 1.000 on the swap alone, which is the
+   sharpest demonstration of why this audit is separate from the retrieval
+   eval - the number it had been contributing was never a retrieval result.
 
 Neither is a retrieval result, but both scored exactly like one. The functions
 here compute what each gating metric can achieve AT BEST given the harness
