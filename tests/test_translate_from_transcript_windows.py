@@ -520,3 +520,87 @@ class TestMergeUsage:
         total = tv._merge_usage({"total_token_count": 5}, {"total_token_count": 5, "thoughts_token_count": 2})
         assert total["thoughts_token_count"] == 2
         assert total["total_token_count"] == 10
+
+
+NL = chr(10)  # built with chr() so no shell heredoc can eat the escape
+
+
+class TestTheAdvertisedRecoveryActuallyWorks:
+    """Codex peer-pass P1. The marker and the header both tell the operator to
+    re-run "over this range", but window bounds are exact SECONDS from cue
+    timestamps while `--start`/`--end` take integer MINUTES - and `--end` is
+    exclusive while the final window's end IS its last cue.
+
+    So the naive instruction was untypeable at best (`[00:20:07 - 00:40:09]`)
+    and empty at worst (`--start 40 --end 40` selects nothing). A recovery that
+    cannot work is the same defect as the `Raise --limit` remedy issue #203
+    deleted: it teaches the operator to distrust the message.
+
+    These tests assert the ROUND TRIP - the range the marker prescribes, fed
+    back through the real filter, must recover every cue of the window.
+    """
+
+    def _round_trip(self, body, chunk_minutes, window_index):
+        windows = tv.split_transcript_into_windows(body, chunk_minutes)
+        win_start, win_end, win_text = windows[window_index]
+        lo, hi = tv.recovery_range_minutes(win_start, win_end)
+        recovered = tv.filter_transcript_by_range(body, lo, hi)
+        return win_text, recovered, (lo, hi)
+
+    def test_a_window_on_non_round_seconds_round_trips(self):
+        """Codex's first scenario: cues at 00:05, 20:07, 40:09."""
+        body = "[00:00:05] a" + NL + NL + "[00:20:07] b" + NL + NL + "[00:40:09] c" + NL + NL
+        for i in range(len(tv.split_transcript_into_windows(body, 20))):
+            win_text, recovered, rng = self._round_trip(body, 20, i)
+            for line in win_text.strip().splitlines():
+                assert line in recovered, f"window {i} range {rng} lost {line!r}"
+
+    def test_the_final_one_cue_window_is_not_an_empty_range(self):
+        """Codex's second scenario: a tail window whose start == end. The naive
+        `--start 40 --end 40` selects nothing under an exclusive end."""
+        body = "[00:00:00] a" + NL + NL + "[00:20:00] b" + NL + NL + "[00:40:00] c" + NL + NL
+        windows = tv.split_transcript_into_windows(body, 20)
+        win_start, win_end, _win_text = windows[-1]
+        assert win_start == win_end, "fixture no longer produces a single-cue tail window"
+        lo, hi = tv.recovery_range_minutes(win_start, win_end)
+        assert hi > lo, f"the prescribed range is empty: --start {lo} --end {hi}"
+        recovered = tv.filter_transcript_by_range(body, lo, hi)
+        assert "[00:40:00] c" in recovered, f"--start {lo} --end {hi} recovered nothing"
+
+    def test_the_marker_text_carries_the_usable_range_not_just_the_bounds(self, tmp_path, harness):
+        _rec, out, error = harness(tmp_path, minutes=118, chunk_minutes=20, empty_windows={3})
+        assert isinstance(error, SystemExit)
+        text = list(out.glob("*.translate-bcs.txt"))[0].read_text(encoding="utf-8")
+        assert "--start 40 --end 61" in text, (
+            "the inline marker does not name a range the CLI accepts: "
+            + [ln for ln in text.splitlines() if "MISSING" in ln][:1].__repr__()
+        )
+
+    def test_the_header_names_a_usable_range_too(self, tmp_path, harness):
+        _rec, out, error = harness(tmp_path, minutes=118, chunk_minutes=20, empty_windows={3})
+        assert isinstance(error, SystemExit)
+        header = list(out.glob("*.translate-bcs.txt"))[0].read_text(encoding="utf-8").split("[BCS window", 1)[0]
+        assert "--start 40" in header and "--end 61" in header, (
+            "the header's recovery line is not a runnable command:" + NL + header
+        )
+
+
+class TestAnEmptyWindowSurvivesALaterCrash:
+    """Codex peer-pass P2. An empty window records its marker into the in-memory
+    `parts` list - but if a LATER window raises, final assembly is never reached
+    and the surviving `.txt.tmp` holds only the later window's partial text,
+    with no record that an earlier window was missing entirely. That is a
+    surface claiming a clean run over a gap.
+    """
+
+    def test_the_tmp_file_records_the_hole_even_when_a_later_window_raises(self, tmp_path, harness):
+        # Window 2 is empty; window 4 then raises. Final assembly never runs.
+        rec, out, error = harness(tmp_path, minutes=118, chunk_minutes=20, empty_windows={2}, fail_at=4)
+        assert isinstance(error, RuntimeError), f"expected the raise to propagate, got {error!r}"
+        assert len(rec.payloads) == 4
+        tmps = list(out.glob("*.txt.tmp"))
+        assert tmps, "no partial was preserved at all"
+        preserved = tmps[0].read_text(encoding="utf-8")
+        assert "MISSING: window 2/6" in preserved, (
+            "the tmp file shows later windows but no trace of the earlier hole: " + repr(preserved[:300])
+        )

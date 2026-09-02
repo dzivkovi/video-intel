@@ -193,7 +193,7 @@ def apply_timestamp_offset(line: str, offset_seconds: int, chunk_duration_second
 # claim a clean run over a gap.
 MISSING_WINDOW_MARKER = (
     "<!-- MISSING: window {idx}/{total} [{start} - {end}] returned no translation. "
-    "Re-run with --start/--end over this range to fill it. -->"
+    "Re-run with --start {rs} --end {re} to fill it. -->"
 )
 FINISH_REASON_INCOMPLETE_WINDOWS = "INCOMPLETE_WINDOWS"
 # Mirrors video_intel.py's EXIT_PARTIAL (issue #129): the run finished, but
@@ -588,7 +588,7 @@ def build_header(
         for w in missing_windows:
             lines.append(f"- {w}")
         lines.append("")
-        lines.append("**Recovery:** re-run with `--start` / `--end` over each range above.")
+        lines.append("**Recovery:** re-run each `--start` / `--end` pair listed above.")
         lines.append("")
         lines.append("---")
         lines.append("")
@@ -1872,6 +1872,29 @@ def split_transcript_into_windows(body: str, chunk_minutes: int) -> list[tuple[i
     return windows
 
 
+def recovery_range_minutes(win_start: int, win_end: int) -> tuple[int, int]:
+    """Integer-minute `--start` / `--end` that fully covers [win_start, win_end].
+
+    Window bounds are exact SECONDS from cue timestamps, but both CLI flags
+    take integer MINUTES - so a window reported as `[00:20:07 - 00:40:09]`
+    cannot be typed back in without rounding, and rounding the wrong way
+    silently omits cues. Worse, `--end` is EXCLUSIVE while the final
+    window's end IS its last cue, so a naive `--start 40 --end 40` for a
+    one-cue tail window selects nothing at all.
+
+    Both were caught by the Codex peer pass, and both matter more than they
+    look: a recovery instruction that cannot work is the same failure as the
+    `Raise --limit` remedy issue #203 removed - it teaches the operator to
+    distrust the message, one layer in.
+
+    Floor the start, floor the end and add one, so `hi > win_end` always
+    holds and the range is never empty. It can over-cover slightly into the
+    neighbouring window, which is the safe direction: re-translating a few
+    cues costs a little, dropping them costs the content.
+    """
+    return win_start // 60, win_end // 60 + 1
+
+
 def _exit_if_windows_missing(
     empty_windows: list[tuple[int, int, int]],
     output_path: Path | None,
@@ -2093,14 +2116,25 @@ def _translate_from_transcript(
                 # has to be visible everywhere a reader looks.
                 log.error("Window %d/%d returned nothing; continuing", idx, len(windows))
                 empty_windows.append((idx, win_start, win_end))
-                parts.append(
-                    MISSING_WINDOW_MARKER.format(
-                        idx=idx,
-                        total=len(windows),
-                        start=_format_hhmmss(win_start),
-                        end=_format_hhmmss(win_end),
-                    )
+                _rs, _re = recovery_range_minutes(win_start, win_end)
+                marker = MISSING_WINDOW_MARKER.format(
+                    idx=idx,
+                    total=len(windows),
+                    start=_format_hhmmss(win_start),
+                    end=_format_hhmmss(win_end),
+                    rs=_rs,
+                    re=_re,
                 )
+                parts.append(marker)
+                # Also into the tmp file. Codex's P2: an empty window
+                # followed by a RAISE never reaches final assembly, so the
+                # surviving .txt.tmp would hold the later window's partial
+                # text with NO record that an earlier window was missing -
+                # a surface claiming a clean run over a gap, which is
+                # exactly what this mechanism exists to prevent.
+                if tmp_file:
+                    tmp_file.write(marker + "\n")
+                    tmp_file.flush()
                 finish_reason = FINISH_REASON_INCOMPLETE_WINDOWS
     finally:
         if tmp_file and not tmp_file.closed:
@@ -2137,7 +2171,9 @@ def _translate_from_transcript(
         finish_reason=finish_reason,
         source_mode="transcript",
         missing_windows=[
-            f"window {idx}/{len(windows)} [{_format_hhmmss(a)} - {_format_hhmmss(b)}]" for idx, a, b in empty_windows
+            f"window {idx}/{len(windows)} [{_format_hhmmss(a)} - {_format_hhmmss(b)}]"
+            f" - recover with `--start {recovery_range_minutes(a, b)[0]} --end {recovery_range_minutes(a, b)[1]}`"
+            for idx, a, b in empty_windows
         ],
     )
     tmp_path.write_text(header_block + translated, encoding="utf-8")
