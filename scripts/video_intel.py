@@ -9034,6 +9034,15 @@ def require_voyageai():
         sys.exit(1)
 
 
+# Issue #195: the minute (or hour) field is UNBOUNDED, because that is what the
+# writers emit. `_captions_timestamp` renders `MM:SS` with minutes past 59, so a
+# cue at 1h40m30s is `[100:30]`; a `\d{1,2}` field could not see it as a chunk
+# boundary and folded the whole tail of every multi-hour captions transcript
+# into one chunk carrying the last pre-100:00 timestamp. Both boundary regexes
+# in `chunk_transcript` build on this one pattern so they cannot drift apart.
+ENTRY_TIMESTAMP_PATTERN = r"\d+:\d{2}(?::\d{2})?"
+
+
 def _parse_timestamp_seconds(ts: str) -> int:
     """Convert 'MM:SS' or 'HH:MM:SS' to seconds."""
     parts = ts.split(":")
@@ -9059,10 +9068,11 @@ def chunk_transcript(transcript_path: Path, chunk_size: int = 5) -> list[dict]:
     current_ts = None
 
     for line in lines:
-        # Speech line: [MM:SS] Speaker: "text"
-        speech_match = re.match(r"^\[(\d{1,2}:\d{2}(?::\d{2})?)\]", line)
+        # Speech line: [MM:SS] Speaker: "text" - minutes unbounded, see
+        # ENTRY_TIMESTAMP_PATTERN (issue #195).
+        speech_match = re.match(rf"^\[({ENTRY_TIMESTAMP_PATTERN})\]", line)
         # Screen line:   SCREEN [MM:SS-MM:SS]
-        screen_match = re.match(r"^\s+SCREEN \[(\d{1,2}:\d{2}(?::\d{2})?)", line)
+        screen_match = re.match(rf"^\s+SCREEN \[({ENTRY_TIMESTAMP_PATTERN})", line)
 
         if speech_match or screen_match:
             # Save previous entry
