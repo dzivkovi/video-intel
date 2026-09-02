@@ -2176,7 +2176,13 @@ class TestCmdTranscriptFile:
         assert captured["end_offset"] == 1125
 
     def test_local_file_large_without_segment_exits(self, monkeypatch, tmp_path):
-        """File over threshold without --start/--end should sys.exit with error."""
+        """File over threshold without --start/--end should sys.exit(1).
+
+        Issue #185: this assertion used to be a bare `pytest.raises(SystemExit)`,
+        which `SystemExit(0)` satisfies just as happily - so it could not have
+        detected the exit-0 false success the issue reported. The exit CODE is
+        the contract; see tests/test_file_size_guard_exit.py for the full set.
+        """
         self._setup_common(monkeypatch, tmp_path)
 
         mp4 = tmp_path / "huge.mp4"
@@ -2204,8 +2210,9 @@ class TestCmdTranscriptFile:
             end=None,
         )
 
-        with pytest.raises(SystemExit):
+        with pytest.raises(SystemExit) as exc:
             cmd_transcript(args, {})
+        assert exc.value.code == 1
 
         # Restore
         monkeypatch.setattr(Path, "stat", original_stat)
