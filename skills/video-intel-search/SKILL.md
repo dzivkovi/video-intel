@@ -305,8 +305,8 @@ The repo ships a 25-query grounded golden dataset at
 `tests/evals/golden_dataset.yaml`. Run before/after changes that touch retrieval:
 
 ```bash
-pytest tests/evals/ -v -s
+pytest tests/evals/test_search_quality.py -v -s
 ```
 
-See `docs/search-internals.md`, `docs/adr/ADR-0013-hybrid-search-rrf.md`, and
+See `docs/search-internals.md`, `docs/adr/ADR-0013-hybrid-search-rrf-fusion.md`, and
 `docs/adr/ADR-0017-kb-layer-strategy.md` for the retrieval design.

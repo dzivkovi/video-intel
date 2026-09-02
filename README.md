@@ -28,65 +28,40 @@ Then, optionally, it turns that whole corpus into a small analytics store and as
 The architecture is a narrowing funnel - like fishing, where you look for
 birds before you cast a line and read the water before you commit to a spot.
 
-```text
-┌─────────────────────────────────────────────────────────────────┐
-│  SCAN (the birds)                          Cost: ~$0.20/video   │
-│  ┌───────────────┐    ┌───────────────────┐    ┌─────────────┐  │
-│  │ YouTube Data  │───>│ Gemini Multimodal │───>│ mindmap.md  │  │
-│  │ API: discover │    │ API: watch frames │    │ meta.json   │  │
-│  │ new videos    │    │ + audio (parallel)│    │ per video   │  │
-│  └───────────────┘    └───────────────────┘    └─────────────┘  │
-├─────────────────────────────────────────────────────────────────┤
-│  TRIAGE (the drop-off)                     Cost: $0 (no API)    │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │ You + Claude read mind maps. No Gemini needed.           │   │
-│  │ "Which of these 15 videos matter for agentic patterns?"  │   │
-│  └──────────────────────────────────────────────────────────┘   │
-├─────────────────────────────────────────────────────────────────┤
-│  TRANSCRIPT (the catch)                    Cost: ~$0.50/video   │
-│  ┌────────────────────┐    ┌─────────────────────────────────┐  │
-│  │ Gemini: 3-task     │───>│ transcript.md                   │  │
-│  │ decoupled prompt   │    │ Diarized speech interleaved     │  │
-│  │ (audio + vision +  │    │ with SCREEN sections describing │  │
-│  │  speaker ID)       │    │ slides, diagrams, code, demos   │  │
-│  └────────────────────┘    └─────────────────────────────────┘  │
-├─────────────────────────────────────────────────────────────────┤
-│  CONCEPTS (the index)                      Cost: ~$0.001/video  │
-│  ┌────────────────────┐    ┌─────────────────────────────────┐  │
-│  │ Gemini: text-only  │───>│ concepts.json per video         │  │
-│  │ reads mindmap.md + │    │ Canonical IDs + synonyms        │  │
-│  │ existing taxonomy  │    │                                 │  │
-│  └────────────────────┘    │ taxonomy.json (derived master)  │  │
-│                            └─────────────────────────────────┘  │
-├─────────────────────────────────────────────────────────────────┤
-│  SEARCH (the retrieval)                    Cost: ~$0.02/query   │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │ Concept search: taxonomy.json labels + aliases (free)     │  │
-│  │ Hybrid search: BM25 keyword + vector semantic + RRF fusion│  │
-│  │   Voyage AI embeds (voyage-4-large docs, voyage-4-lite    │  │
-│  │   queries), LanceDB stores + searches, BM25 matches exact │  │
-│  │   words in titles + text. Results include full transcript │  │
-│  │   passages + clickable YouTube URLs with timestamp links. │  │
-│  └───────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    Y["YouTube Data API<br/>discover new videos"] -->|"channel sets<br/><code>auto_transcript: all</code>"| T
+    Y -->|"otherwise"| M
+
+    subgraph scan["scan - one command, three loops in this order"]
+        direction TB
+        T["<b>1. TRANSCRIPT</b> (the catch)<br/><i>only when the channel opted in</i><br/>Gemini watches frames + hears audio<br/>3-task prompt: speech, screen, speakers<br/><i>~$0.33 per video-hour</i>"]
+        M["<b>2. MIND MAP</b> (the birds)<br/>text-only Gemini reads the transcript when one exists,<br/>else the old pass over the video itself<br/><i>text is ~10x cheaper</i>"]
+        C["<b>3. CONCEPTS</b> (the index)<br/>text-only Gemini, reads the mind map<br/><i>only when the channel opted in</i><br/>normalized against the taxonomy<br/><i>~$0.001 per video</i>"]
+        T --> M
+        M -->|"channel sets<br/><code>auto_concepts: true</code>"| C
+    end
+
+    T --> TR["<code>.transcript.md</code><br/>diarized speech interleaved with<br/>SCREEN sections: slides, code, demos"]
+    M --> MM["<code>.mindmap.md</code>"]
+    C --> CJ["<code>.concepts.json</code>"] --> TX["<code>taxonomy.json</code><br/>derived master vocabulary"]
+
+    MM --> TRIAGE["<b>TRIAGE</b> (the drop-off)<br/>you + Claude read mind maps<br/><i>no Gemini, no cost</i>"]
+
+    TR --> IDX["<code>index</code><br/>Voyage embeds, LanceDB stores"]
+    IDX --> S["<b>SEARCH</b> (the retrieval)<br/>concept search over the taxonomy: free<br/>hybrid BM25 + vector + RRF: ~$0.02/query<br/>every hit carries a <code>&amp;t=</code> deep link"]
+    TX --> S
+
+    style T fill:#fde68a,stroke:#b45309
+    style M fill:#bfdbfe,stroke:#1d4ed8
+    style C fill:#bfdbfe,stroke:#1d4ed8
+    style TRIAGE fill:#dcfce7,stroke:#15803d
+    style S fill:#e9d5ff,stroke:#7e22ce
 ```
 
-**scan** - Fetch new videos from configured channels, generate thematic mind
-maps in parallel via Gemini. Optionally auto-generate transcripts for channels
-where you want everything.
+**Read the order carefully - it inverted in issue #54 and the cost argument is why.** For any channel with `auto_transcript: all` (what the example config ships), `scan` transcribes first and then builds the mind map *from the transcript text*, not from the video. A text-only call against a 50 KB transcript costs roughly a tenth of a second pass over an hour of frames, and it has no frame cap. Only a channel with no transcript on disk falls back to the old mindmap-from-video path.
 
-**transcript** - Fused document for a single video: diarized speech interleaved
-with timestamped SCREEN sections describing slides, diagrams, code, and demos.
-Speaker names identified from visual cues with evidence.
-
-**concepts** - Extract and normalize key concepts from each mindmap against a
-growing canonical vocabulary. One video calls it "Agent-Centric Engineering,"
-another calls it "Multi-Agent Orchestration" — the concept layer resolves
-them to the same canonical ID.
-
-**taxonomy-build** - Rebuild the master vocabulary (`taxonomy.json`) from all
-per-video concept files. This is a derived artifact — always rebuildable,
-never manually edited.
+Three consequences worth knowing before you configure a channel: the expensive step now runs first, so a transcript bug surfaces before you have paid for anything downstream; the mind map inherits the transcript's quality, and a transcript flagged severe is treated as unavailable so the mind map falls back to video rather than propagating the damage; and `concepts` reads the mind map, never the video, so it is always the cheap step.
 
 **triage** - After scanning, ask Claude (no Gemini cost):
 
@@ -140,20 +115,18 @@ This repo is also a worked reference for a few patterns that carry to any corpus
 
 If you are scanning to decide whether this repo is worth studying: those three, plus the ADR log in [docs/adr/](docs/adr/), are the transferable core.
 
-## Plugin Contents — Two Skills
+## Plugin Contents: Three Skills
 
-As of v1.5.0, this repo ships as a **plugin** containing two independent skills.
-Both get installed together; Claude picks the right one based on what you ask.
+This repo ships as a **plugin** containing three independent skills. They install
+together; Claude picks the right one based on what you ask.
 
 | Skill | What it does | Trigger phrases |
 | ----- | ------------ | --------------- |
-| **video-intel** | Scan YouTube channels, generate mind maps, produce rich transcripts with on-screen content, extract concepts, hybrid search across the library | "scan my channels", "transcribe this video", "what videos cover X", "what should I watch" |
+| **video-intel** | **Curate.** Scan YouTube channels, produce rich transcripts with on-screen content, generate mind maps, extract concepts, build the search index, and run corpus maintenance. Every command that writes to the corpus lives here. | "scan my channels", "transcribe this video", "rebuild the index", "clean up duplicates" |
+| **video-intel-search** | **Query.** Search the corpus, retrieve evidence with timestamped deep links, synthesize a cross-creator brief, report corpus status. Read-only apart from the brief `nugget` saves. Safe to install globally and use from any project - see [INSTALLATION.md](INSTALLATION.md#claude-code-user-level-access-the-search-skill-from-any-project). | "what videos cover X", "what did [creator] say about Y", "nugget brief on X", "show me everything tagged [topic]" |
 | **translate-bcs** | Translate YouTube videos and rich transcripts into Bosnian/Croatian/Serbian (BCS) subtitles. Two paths: fast captions-first via YouTube SRT for short videos, or rich-transcript-first via video-intel for long videos where the SRT path drifts. Also downloads English SRT only on request. | "translate to Bosnian/Croatian/Serbian", "BCS subtitles", "titl na bosanski", "just give me the SRT" |
 
-The two skills stay operationally independent — `translate-bcs` does not read video-intel's
-channel config, taxonomy, or meta files. The integration point is a file handoff:
-for context-heavy videos, `translate-bcs` reads a rich transcript that `video-intel`
-produced. Claude orchestrates both CLI steps in a single conversation.
+The split between the first two is by **write scope**, not by topic: `video-intel-search` never mutates the corpus, which is what makes it safe to install once and query from anywhere. `translate-bcs` stays operationally independent of both - it does not read video-intel's channel config, taxonomy, or meta files. The integration point is a file handoff: for context-heavy videos, `translate-bcs` reads a rich transcript that `video-intel` produced, and Claude orchestrates both CLI steps in one conversation.
 
 ## A worked learning path: from watchlist to a talk
 
@@ -203,7 +176,7 @@ independently — interoperability with non-Claude-Code tools has not been verif
 by this repo.
 
 **Upgrading from v1.4.x or earlier:** The repo went from "single skill" to "plugin
-with two skills." If you previously installed by copying the repo into
+with three skills." If you previously installed by copying the repo into
 `~/.claude/skills/video-intel/`, remove that directory and re-install via one of
 the plugin paths above. Claude Code manages the actual on-disk plugin cache
 itself (under `~/.claude/plugins/cache/...`); users do not copy files there
@@ -217,9 +190,10 @@ directly.
 output_dir: ~/video-intel
 vector_db_dir: ~/.cache/video-intel/lancedb  # optional; see note below
 default_since: 10d
-default_prompt: mindmap-light
-model: gemini-3-flash-preview
+default_prompt: mindmap-knowledge
+model: gemini-3.7-flash
 max_parallel: 10
+auto_concepts: true
 
 channels:
   - name: natebjones
@@ -229,26 +203,50 @@ channels:
     since: 10d
 ```
 
+`config.yaml.example` is the maintained template - copy it rather than the
+snippet above, which is trimmed for readability.
+
 | Field | Default | Description |
 | ----- | ------- | ----------- |
 | output_dir | ~/video-intel | Where output files are saved |
 | vector_db_dir | output_dir/.lancedb | LanceDB index location. Set this to a local path if `output_dir` is on a cloud-synced mount (Google Drive File Stream, OneDrive, Dropbox) - those filesystems do not support the atomic rename LanceDB needs. The `index` command runs a pre-flight probe and aborts with an actionable diagnostic before spending Voyage tokens if the path is incompatible. See [ADR-0016](docs/adr/ADR-0016-vector-db-path-config.md). |
 | default_since | 10d | Default lookback window |
-| default_prompt | mindmap-light | Default prompt for mind maps |
-| model | gemini-3-flash-preview | Gemini model (overridable via `--model` CLI flag) |
+| default_prompt | the shipped template sets `mindmap-knowledge` | Default prompt for mind maps, overridable per channel. With the key absent the code fallback differs by command - `mindmap-light` on `scan` and `mindmap --url`, `mindmap-knowledge` on `process` - so set it explicitly rather than relying on it; copying `config.yaml.example` does that for you |
+| model | gemini-3.7-flash | Gemini model (overridable via `--model` CLI flag). Chosen by measurement, not spec sheet - see the model-card scorecards in `tests/evals/model-cards/` |
+| models | (unset) | Per-step model overrides, e.g. `models: {mindmap: ..., concepts: ...}`. Falls back to `model` for any step left out |
 | max_parallel | 10 | Concurrent Gemini requests (paid tier can go 50+) |
+| auto_concepts | false (the shipped template sets `true`) | Run the concepts step automatically after a scan. The code fallback when the key is absent is `false`, so a hand-written config that omits it gets no concepts; copy `config.yaml.example`, which turns it on |
+| transcript_max_duration_seconds | 7200 | Videos longer than this are dropped from the auto-transcript set with a WARNING naming the manual recipe. Mind maps are unaffected |
+| chunk_minutes | 30 | Split a transcript longer than this into per-window Gemini calls. Lower it on dense material; issue #157 lowered the default from 50 deliberately |
 
 ### Channel Settings
 
 | Field | Required | Description |
 | ----- | -------- | ----------- |
 | name | Yes | Folder name and identifier |
-| url | Yes | YouTube channel URL |
-| prompt | No | Override default prompt |
-| auto_transcript | No | "all" or "none" (default: none) |
+| url | Yes | YouTube channel URL. Optional on an `enabled: false` placeholder for a non-YouTube source |
+| prompt | No | Override `default_prompt` |
+| auto_transcript | No | `all` or `none` (default: `none`) |
 | since | No | Override default lookback window (additive in selective mode) |
 | playlists | No | List of playlist names to scan (enables selective mode) |
 | keywords | No | List of search terms to scan (enables selective mode) |
+| enabled | No | `false` drops the channel from `scan` entirely, including an explicit `scan --channel <name>`, while keeping it addressable for `transcript --url --channel`, the `--file` paths and `concepts --channel`. Use it for Skool, Vimeo, members-only YouTube, and one-off creators (default: `true`) |
+| headline_digest | No | `true` on an `enabled: false` channel includes it in the metadata-only "Other headlines" digest at the end of a full scan. No Gemini calls, no corpus artifacts (default: `false`) |
+| mindmap_source | No | `auto` (default) builds the mind map from the transcript when one is on disk and falls back to video otherwise; `transcript` demands one; `video` forces the old path; `none` skips the mind map |
+| transcript_source | No | `gemini` (multimodal), `yt-captions` (caption track only), or `auto` (Gemini first, captions on failure). Leave it unset unless you mean it - an explicit `gemini` also opts a livestream VOD out of captions-first routing |
+| chunk_minutes | No | Per-channel override of the top-level chunk size |
+| transcript_timeout_seconds | No | Per-transcript wall clock before the call is abandoned (default 600). It routes to the captions failover only under `transcript_source: auto`; under the default `gemini` the timeout is recorded as an error and nothing else is tried |
+| skip_shorts | No | `false` opts a substantive-Shorts creator back in. Shorts are dropped before any Gemini call (default: `true`) |
+| skip_video_ids | No | List of video ids to never process. Filtered before the duration lookup, so a blocklisted id costs no API call. Reactive by design: add ids after you see one fail |
+| min_duration_seconds | No | Drop videos shorter than this |
+| auto_mindmap | No | `none` skips the mind map for notify-only channels |
+
+Six of these are validated at `scan --dry-run` - `prompt`, `transcript_source`,
+`chunk_minutes`, `transcript_max_duration_seconds`, `transcript_timeout_seconds`
+and `mindmap_source` - which reports a typo'd knob with the consequence it would
+have (whole scan aborted, channel skipped, or just that stage failing) before
+spending any quota. The rest are not preflighted: a bad `skip_shorts`,
+`enabled`, or `min_duration_seconds` surfaces only when the scan reaches it.
 
 ### Selective Mode
 
@@ -355,6 +353,41 @@ python scripts/video_intel.py nugget "second brain patterns" --output brief.md
 ```
 
 See [`examples/nugget-lightrag-vs-openbrain-architectural-tension.md`](examples/nugget-lightrag-vs-openbrain-architectural-tension.md) for a sample output.
+
+### Corpus maintenance
+
+Four commands repair a corpus rather than grow one. The first three are **dry-run by default** and print exactly what they would touch; nothing changes until you add `--apply`. All three also take `--channel` to scope the pass.
+
+```bash
+# Same video, two filenames, because the creator A/B-tested the title.
+# Groups metas by video_id, keeps the best one, folds the loser's titles into
+# alt_titles and moves any artifact only the loser has.
+python scripts/video_intel.py dedupe
+python scripts/video_intel.py dedupe --apply
+
+# Shorts that landed before the scan-time filter existed.
+python scripts/video_intel.py prune-shorts
+python scripts/video_intel.py prune-shorts --apply
+
+# Backfill video_id / url / title / published into old transcript metas written
+# before identity was stamped on every write. Never overwrites a field that is
+# already there, and never invents identity for a non-YouTube source.
+python scripts/video_intel.py repair-metas
+python scripts/video_intel.py repair-metas --apply
+
+# Stop re-attempting one stage on one video, without blocking the others.
+# --mode is repeatable; --reason is recorded in the meta for your future self.
+python scripts/video_intel.py mark-skip --url "URL" --mode transcript --reason "2h+, truncates"
+```
+
+After `dedupe --apply` or `prune-shorts --apply`, rebuild the derived layers yourself - they are deliberately not auto-rebuilt, so the blast radius stays predictable:
+
+```bash
+python scripts/video_intel.py taxonomy-build
+python scripts/video_intel.py index --channel <affected-channel>   # incremental
+```
+
+`index --channel` is the only incremental primitive here: it re-embeds one channel and leaves every other channel's rows alone. Plain `index` re-embeds the whole corpus, so prefer the scoped form after a maintenance pass.
 
 ### Catch-up briefings (Markdown + PDF)
 
@@ -699,237 +732,33 @@ When a video does not process cleanly (unlisted, members-only, token-cap, hang, 
 
 ## Bosnian/Croatian/Serbian (BCS) Translation Utility
 
-A separate utility script for translating YouTube video audio into
-BCS subtitles. Not part of the video-intel
-pipeline, but shares the same Gemini API patterns and lives in this repo.
-
-**About BCS.** Bosnian, Croatian, and Serbian — collectively "BCS" — are
-mutually-intelligible South Slavic languages spoken across the former
-Yugoslavia (Bosnia, Serbia, Croatia, Montenegro, plus Serbian-speaking
-communities in Kosovo) and the diaspora. Same grammar, same core
-vocabulary; differences are dialect, script, and a few hundred preferred
-words. This script outputs Bosnian-neutral Latin-script ijekavica —
-natural across all four countries and readable by Serbian Cyrillic users
-without conversion.
-
-**Why this matters.** Many immigrants around the world don't speak English
-at all. Most long-form journalism, podcasts, and political interviews
-that shape global discourse are in English — especially in North America.
-For BCS speakers in diaspora communities, that means missing out.
-This script gives them a path to read those videos in their own language —
-about $0.50 for short videos via the captions-first path, or ~$0.90 per
-2-hour video via the rich-transcript path. Built for family, elders, and
-friends who live in North America but cannot benefit from English-language
-YouTube.
+`scripts/translate_video.py` translates YouTube audio, or a rich video-intel transcript, into Bosnian-neutral Latin-script BCS subtitles. It is a separate utility: it shares this repo and the same Gemini patterns, but reads none of video-intel's config, taxonomy or meta files, so a change to one cannot silently alter the other.
 
 ```bash
-# Translate a video to BCS (auto-detects title, saves to file)
-# Default behavior: tries YouTube English captions first, falls back to video
-python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID"
+# Captions-first: fast and cheap when YouTube has a usable track
+python scripts/translate_video.py "https://www.youtube.com/watch?v=XXXXX"
 
-# Save to a specific directory (e.g., the examples folder in this repo)
-python scripts/translate_video.py "https://www.youtube.com/watch?v=Sm7568B0BC8" \
-  --output-dir ./examples
-
-# Print to stdout instead of file
-python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" --stdout
-
-# Use a different model (default: gemini-2.5-pro)
-python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" \
-  --model gemini-2.5-flash
-
-# Force the video-understanding path even when captions are available
-# (useful for testing the fallback or when caption quality is known to be bad)
-python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" \
-  --force-video
+# Rich-transcript path: for long or context-heavy videos where the caption
+# track drifts. Run video-intel's transcript first, then translate from it.
+python scripts/translate_video.py --from-transcript "<...>.transcript.md"
 ```
 
-Output follows the same `{date}-{slug}` naming convention as video-intel
-artifacts. See [examples/2026-04-05-the-tide-has-turned-rejoice-in-this.translate-bcs.txt](examples/2026-04-05-the-tide-has-turned-rejoice-in-this.translate-bcs.txt)
-for a real translation output.
+**Full guide: [docs/translate-bcs.md](docs/translate-bcs.md)** - what BCS is and why one output serves all four countries, the two translation paths and when each is right, chunking and stitching for long videos, `--from-transcript`, cost, and the failure modes.
 
-**Translation strategy: SRT-first.** The script first checks YouTube for an
-English caption track via `youtube-transcript-api`, preferring manually
-authored captions over auto-generated. When a caption track exists, the
-text goes to Gemini as a single non-streaming request — completes in
-seconds, costs ~10-20K input tokens, and avoids the long-video safety-filter
-soft-stops we documented in
-[ADR-0015](docs/adr/ADR-0015-permissive-safety-filters-for-faithful-reporting.md).
-The output file's `**Source mode:**` field tells you exactly where the
-BCS came from: manual captions, auto-generated captions (with silent ASR
-cleanup), or direct video audio. When the captions track is auto-generated,
-the SRT prompt instructs Gemini to repair punctuation and capitalization
-as part of the translation pass.
-
-**Long videos: rich-transcript path.** For videos over ~90 minutes, or
-content where on-screen text and speaker changes carry meaning (lectures
-with slides, multi-speaker interviews, news-style overlays, OCR-heavy
-material), YouTube's SRT alone loses too much. Run two commands instead
-of one:
-
-```bash
-# Step 1 — produce a rich transcript via video-intel
-python scripts/video_intel.py transcript --url URL --channel <name>
-
-# Step 2 — translate the transcript to BCS
-python scripts/translate_video.py --from-transcript <path>
-```
-
-This path keeps speaker labels and on-screen content in the BCS output.
-Cost is roughly $0.50 (transcript) + $0.40 (translation) = ~$0.90 per
-2-hour video. The translate-bcs skill auto-routes long videos here. For
-the engineering rationale, see
-[docs/solutions/integration-issues/gemini-flash3-vs-pro25-chunked-transcription-20260427.md](docs/solutions/integration-issues/gemini-flash3-vs-pro25-chunked-transcription-20260427.md).
-
-**Video fallback (used when no captions exist):** Gemini's input limit is
-1M tokens. Translation reads audio only — the `translate-bcs` prompt never
-references on-screen text — so the script **defaults to low media resolution**
-(~100 tokens/sec, fits videos up to ~170 min in a single request). Audio
-quality is unaffected: `media_resolution` only controls video frame tokens,
-and audio is tokenized at a fixed 32 tokens/sec regardless. Pass
-`--high-res` (~300 tokens/sec, ~55 min per request) only when the prompt
-needs to read on-screen text such as slides or burned-in captions.
-
-**Long videos (resolution-aware threshold):** The chunking cutoff depends on
-which media resolution you're using. At the default low resolution, videos
-up to **150 minutes** run as a single request. With `--high-res`, the
-threshold drops to **50 minutes**. Above the threshold, the script
-auto-chunks into uniform `--chunk-minutes` (default 20) segments from the
-start, and each chunk produces a separate part file — these are the
-primary artifacts. Both single-request and chunked paths carry coverage
-diagnostics in the output header: single-request gets a TRUNCATED
-annotation if Gemini stops early, and stitched files include a
-per-segment coverage table plus `<!-- segment ... -->` dividers around
-non-ok chunks.
-
-Long-video workflow is two steps: **translate** (produces part files), then
-**stitch** (merges them). Part files use filenames for stable slug-based naming;
-the video title is translated to BCS during stitch via a single lightweight
-Gemini call. Timestamps within chunks are relative to the clip start — the
-stitcher applies absolute offsets from the filename and normalizes to `[HH:MM:SS]`.
-
-```bash
-# Any talking-head video up to ~2.5 hours — single pass, low-res default
-python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID"
-
-# Partial translation — e.g. first hour only, skip the interview segment
-python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" \
-  --end 63
-
-# Stitch auto-chunked parts (for videos past the resolution-aware threshold)
-python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" --stitch
-
-# Backfill a failed chunk
-python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" \
-  --start 40 --end 60
-
-# Slide-driven talk where on-screen terminology matters (rare)
-python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" --high-res
-
-# Override the auto-translated title
-python scripts/translate_video.py "https://www.youtube.com/watch?v=VIDEO_ID" \
-  --stitch --title "Moj Naslov"
-```
-
-**Partial translations:** When stitching a subset of a video (e.g., only
-the first hour of a 2h18m video), the output includes a `**Coverage:**`
-line in the header and a BCS reader note indicating what portion was
-translated. Full translations omit these — no clutter in the normal case.
-
-### Translating from a rich transcript (`--from-transcript`)
-
-Some videos carry meaning that YouTube's English captions cannot preserve:
-a journalist cutting between their own commentary and clips of other
-speakers, on-screen overlays labeling who is speaking, quoted text from
-documents or news tickers, footage with burned-in captions from another
-news outlet. The captions-first path sees none of that. The
-video-understanding fallback reads audio only. Both paths will translate
-what is said but lose *why it was shown*.
-
-The fix is to generate our own rich transcript first (speech + on-screen
-content + speaker identification), then translate that file. Two
-commands, run manually in sequence:
-
-```bash
-# Step 1 — rich transcript. One Gemini call, reads the video with vision
-# enabled, produces speakers, SCREEN sections, and On-screen text: lines
-# in English. Typical 10-minute video: 60-90 seconds, a few cents.
-python scripts/video_intel.py --log-level info transcript \
-  --url "https://www.youtube.com/watch?v=VIDEO_ID"
-# Output: ~/video-intel/{channel-or-_standalone}/{date}-{slug}.transcript.md
-
-# Step 2 — translate the transcript into BCS. Text-in / text-out. Preserves
-# timestamps, SCREEN markers, On-screen text labels, speaker names; translates
-# speech content, speaker role parentheticals, SCREEN descriptions, OCR text,
-# and the Speaker Identification Evidence footer.
-python scripts/translate_video.py --log-level info \
-  --from-transcript "path/to/{date}-{slug}.transcript.md"
-# Output: sibling file — same directory as the transcript, same base name,
-# `.translate-bcs.txt` extension.
-```
-
-**When to use this instead of the default path:**
-
-| Symptom | Use |
-| ------- | --- |
-| Plain talking head, long interview, single speaker, no overlays matter | **Default** (`translate_video.py URL`) — captions-first, fastest |
-| No English captions available but audio is enough | **Default** falls through to video understanding automatically |
-| Journalist cutting to clips of other speakers; overlays label who is speaking; OCR text matters; news tickers; multi-source edits | **`--from-transcript`** (run the two-step pipeline above) |
-
-**Real example.** Abby Martin / Double Down News, 10 minutes, heavy
-editorial cutting with labeled clips:
-
-```bash
-python scripts/video_intel.py --log-level info transcript \
-  --url "https://www.youtube.com/watch?v=hLQbPCvV8W8"
-# → video-intel/double-down-news/2026-04-07-abby-martin-went-to-israel-its-worse-than-you-think.transcript.md
-# (67s, 288 lines with SCREEN / On-screen text / speaker labels)
-
-python scripts/translate_video.py --log-level info \
-  --from-transcript "video-intel/double-down-news/2026-04-07-abby-martin-went-to-israel-its-worse-than-you-think.transcript.md"
-# → video-intel/double-down-news/2026-04-07-abby-martin-went-to-israel-its-worse-than-you-think.translate-bcs.txt
-# (1m 54s, 289 lines, 12K tokens, thinking_budget=128 auto-applied,
-#  timestamps / SCREEN / On-screen text counts preserved 1:1)
-```
-
-See [video-intel/double-down-news/...translate-bcs.txt](video-intel/double-down-news/2026-04-07-abby-martin-went-to-israel-its-worse-than-you-think.translate-bcs.txt)
-for the full output.
-
-**Design notes.** This is a *manual* two-step handoff, not an auto-chained
-pipeline — the intermediate transcript is a reviewable artifact, and the
-two scripts stay operationally independent per [CLAUDE.md](CLAUDE.md).
-The `--from-transcript` flag accepts any transcript-shaped markdown file;
-validation is permissive (file must exist, be under 500KB, and contain at
-least one `[MM:SS]` timestamp line — no required footer, no strict header
-format). The path inherits `SRT_DEFAULT_THINKING_BUDGET=128` on 2.5 Pro,
-the same hallucination mitigation used on the captions path. `--stdout`
-and `--force` work the same way as elsewhere.
-
-**Error handling:** The script retries automatically on Gemini server
-errors (408, 500, 502, 503, 504) with exponential backoff — up to 8
-retries over ~30 minutes. Rate limits (429) retry 3 times with shorter
-waits. A 20-minute read timeout prevents infinite hangs when Gemini
-accepts a request but never responds — the connection is aborted and
-your terminal is returned. All retries log progress with
-`(Ctrl+C to abort)`.
-
-**Note:** The Gemini Python SDK has a
-[known bug](https://github.com/googleapis/python-genai/issues/1893) where
-requests can stall at the socket level. If this happens, try `--ipv4` to
-force IPv4 connections as a workaround.
+For the agent-routing side (which phrasing triggers what), see [`skills/translate-bcs/SKILL.md`](skills/translate-bcs/SKILL.md).
 
 ## Cross-Platform Compatibility
 
 This repo ships as a Claude Code **plugin**: a `.claude-plugin/plugin.json`
-manifest plus a `skills/` directory holding two independent skills, with
+manifest plus a `skills/` directory holding three independent skills, with
 `scripts/` and `prompts/` shared at the plugin root. The `plugin.json` format
 and the plugin auto-discovery flow are Claude Code-specific.
 
-The two `SKILL.md` files themselves follow the open Agent Skills format
-(agentskills.io). Other tools that consume that spec — Gemini CLI, Cursor,
-Copilot, and others — *may* be able to use `skills/video-intel/` or
-`skills/translate-bcs/` as standalone skill folders, but this interoperability
-has not been verified by this repo. If you try a non-Claude-Code setup, results
+The three `SKILL.md` files themselves follow the open Agent Skills format
+(agentskills.io). Other tools that consume that spec (Gemini CLI, Cursor,
+Copilot, and others) *may* be able to use `skills/video-intel/`,
+`skills/video-intel-search/` or `skills/translate-bcs/` as standalone skill
+folders, but this interoperability has not been verified by this repo. If you try a non-Claude-Code setup, results
 welcome as feedback. API keys are read from environment variables in all cases.
 
 ## Packaging

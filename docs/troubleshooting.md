@@ -10,8 +10,8 @@ This table doubles as the project's **failure-mode registry**: the **Status** co
 |---|---|---|---|
 | Scan never finds a video that exists | **Unlisted** (not in the uploads feed) | manual `process --url`/`process --file`, or the SRT bridge below | manual (hard API limit) |
 | `403 PERMISSION_DENIED` | **Members-only / gated** | download via membership, then `process --file` | manual (needs your access) |
-| `400 INVALID_ARGUMENT`, fails fast | **Token cap** on a long video (single-shot transcript) | `transcript_source: auto` (captions fallback), or `process --url --chunk-minutes 50` | auto (#60) |
-| No API error, but `JSON parse failed` and the transcript lands as `partial` with `candidates` at/near 65536 | **Output cap on a short-but-dense video.** Duration is under every guard (2h threshold, 50-min chunk trigger) so nothing chunks it, but a dense monologue emits more structured JSON than `MAX_OUTPUT_TOKENS` allows and truncates mid-object | `process --url URL --chunk-minutes 20` (or lower). `scan` can now chunk too: set `chunk_minutes` on the channel (or top-level, or pass `--chunk-minutes`) so dense talks chunk before they truncate. Already-truncated files are findable - the salvage records `transcript_status: truncated_output` plus `transcript_output_tokens` and `transcript_finish_reason`, so the corpus is sweepable instead of indistinguishable from an ordinary malformed-JSON `partial`. Note the salvaged text is often nearly complete (the observed case covered 00:08-41:41 of 42:08), so check before paying for a re-run | auto (#128) |
+| `400 INVALID_ARGUMENT`, fails fast | **Token cap** on a long video (single-shot transcript) | `transcript_source: auto` (captions fallback), or `process --url --chunk-minutes 20` | auto (#60) |
+| No API error, but `JSON parse failed` and the transcript lands as `partial` with `candidates` at/near 65536 | **Output cap on a short-but-dense video.** Duration was under every guard at the time (2h threshold, and the 50-min chunk trigger this case caused to be lowered to 30) so nothing chunked it, but a dense monologue emits more structured JSON than `MAX_OUTPUT_TOKENS` allows and truncates mid-object | `process --url URL --chunk-minutes 20` (or lower). `scan` can now chunk too: set `chunk_minutes` on the channel (or top-level, or pass `--chunk-minutes`) so dense talks chunk before they truncate. Already-truncated files are findable - the salvage records `transcript_status: truncated_output` plus `transcript_output_tokens` and `transcript_finish_reason`, so the corpus is sweepable instead of indistinguishable from an ordinary malformed-JSON `partial`. Note the salvaged text is often nearly complete (the observed case covered 00:08-41:41 of 42:08), so check before paying for a re-run | auto (#128) |
 | Generic `400 INVALID_ARGUMENT` (no frame-cap text), or a confabulated mindmap, on a **past livestream** | **Completed livestream VOD** - Gemini's YouTube-URI ingestion fails on these far more often than on regular uploads (10 of 22 vs 0 of 377) | scan routes VODs captions-first, allows one guarded Gemini attempt, then skips the mindmap-from-video fallback and prints the local-file recipe | auto (#120) |
 | Transcript call hangs for many minutes | **Gemini stall** on a long/dense video | per-transcript wall-clock timeout -> failover under `auto`; `mark-skip`/blocklist as backup | auto (#74) |
 | Tiny transcript, `prompt=0`, looked "complete" | **Future/scheduled premiere** confabulated | confab guard discards it; pre-flight skips it before Gemini | auto (#60, #70); the **chunked** path is guarded too since #123 |
@@ -46,7 +46,7 @@ Recovery: download via membership to `output_dir/<channel>/<videoId>.mp4`, then 
 ### Token cap on long videos (`400 INVALID_ARGUMENT`, fails fast)
 
 A long video's single-shot structured-JSON transcript exceeds Gemini's input or output cap and is rejected immediately. Scan's transcript loop pre-filters videos over `transcript_max_duration_seconds` (default 2h). For manual runs:
-- **Chunk it:** `process --url URL --chunk-minutes 50` (each chunk is a separate Gemini call against the same upload, merged with offset-applied timestamps).
+- **Chunk it:** `process --url URL --chunk-minutes 20` (below the default 30; each chunk is a separate Gemini call against the same upload, merged with offset-applied timestamps).
 - **Or fail over to captions:** set `transcript_source: auto` on the channel - on a token-cap failure it falls back to the caption track (issue #60).
 
 ### Output cap on a short-but-dense video (silent truncation, no API error)
@@ -66,7 +66,7 @@ usage transcript prompt=230741 cached=0 thoughts=0 candidates=65522 total=296263
 | Guard | Threshold | Why it did not fire |
 |---|---|---|
 | `transcript_max_duration_seconds` | 7200s (2h) | 2528s is far under |
-| Chunk auto-trigger | `--chunk-minutes`, default 50 | 42m is under 50m, so single-shot |
+| Chunk auto-trigger | `--chunk-minutes`, default 50 at the time | 42m was under 50m, so single-shot. The default is **30** since issue #157, so this same video would chunk today |
 | Input token cap | ~1M | `prompt=230741`, comfortably under |
 
 **Recovery: chunk below the duration, not above it.** Set `--chunk-minutes` to roughly half the video length so each chunk's output fits well inside the cap:
@@ -79,7 +79,7 @@ python scripts/video_intel.py --log-level info process \
 
 `--force` is required - a `partial` transcript already on disk otherwise counts as processed. After it lands, re-run `index --force` (or a plain `index`) so the search layer picks up the full text rather than the truncated version.
 
-**The scan path reaches this since #128.** `scan` used to call `process_transcript` single-shot for every video under `transcript_max_duration_seconds`, so chunking existed only on `transcript --url`, `process --url`, and `process --file`, and any dense sub-50-minute video in a scanned channel truncated the same way and had to be found and re-run by hand. `scan` now takes `chunk_minutes` (per-channel > top-level > default 50) and a `--chunk-minutes` flag. Lower it on conference channels: density, not duration, is what blows the output cap, so a 42-minute keynote can truncate while a 90-minute interview does not. Note the trade: any scanned video over `chunk_minutes` now takes N Gemini calls instead of one, mitigated by implicit prompt caching across chunks.
+**The scan path reaches this since #128.** `scan` used to call `process_transcript` single-shot for every video under `transcript_max_duration_seconds`, so chunking existed only on `transcript --url`, `process --url`, and `process --file`, and any dense sub-50-minute video in a scanned channel truncated the same way and had to be found and re-run by hand. `scan` now takes `chunk_minutes` (per-channel > top-level > default 30) and a `--chunk-minutes` flag. Lower it on conference channels: density, not duration, is what blows the output cap, so a 42-minute keynote can truncate while a 90-minute interview does not. Note the trade: any scanned video over `chunk_minutes` now takes N Gemini calls instead of one, mitigated by implicit prompt caching across chunks.
 
 **Salvage quality is usually better than the banner suggests - verify before you re-run.** In the observed case the salvaged file covered 00:08 to 41:41 of a 42:08 video with no gap over 90 seconds and 21 intact `SCREEN` sections; the truncation cost the tail of the JSON, not the middle of the video. Check coverage before paying for a re-run:
 
