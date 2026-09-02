@@ -9902,6 +9902,14 @@ def search_corpus(
             # concept that carries the actual phrase at rank 21 of 111.
             fields = [label.lower()] + [a.lower() for a in aliases]
             phrase = any(phrase_re.search(f) for f in fields) if phrase_re else False
+            # Taste-lab addition (2026-09-02, staged for operator review): a
+            # concept whose own PREFERRED LABEL carries the query phrase is
+            # the concept NAMED for the query - it outranks alias-only
+            # matches. Measured on the 19-query adjudicated set: this is the
+            # tier that lets a mega-concept keep its own name ("agent
+            # configuration") while losing every contested alias it merely
+            # hoards ("prompt engineering").
+            label_phrase = bool(phrase_re.search(label.lower())) if phrase_re else False
             best_field_score = 0.0
             tightness = 0.0
             for f in fields:
@@ -9929,9 +9937,11 @@ def search_corpus(
                     "video_count": concept.get("video_count", 0),
                     "domain": concept.get("domain", ""),
                     "_match_score": matched_terms / len(query_terms),  # 1.0 = all terms matched
+                    "_label_phrase": label_phrase,
                     "_phrase": phrase,
                     "_field_score": best_field_score,
                     "_tightness": tightness,
+                    "_alias_count": len(aliases),
                 }
             )
 
@@ -9942,12 +9952,20 @@ def search_corpus(
     # field's own words) beats a looser one, and only then does video_count
     # break ties - the pre-#189 ordering rewarded genericness because count
     # was the FIRST tiebreak.
+    # Ranking chain (issue #189 + the 2026-09-02 taste lab): bag score keeps
+    # SELECTION; then label-phrase (the concept NAMED for the query), then
+    # phrase anywhere, field coverage, tightness; then FOCUS - among otherwise
+    # equal claims, fewer aliases wins, because a junk-drawer concept holding
+    # 400+ aliases has a weak claim on any one of them ("a concept that claims
+    # everything owns nothing in particular"); video_count stays last.
     matching_concepts.sort(
         key=lambda c: (
             -c["_match_score"],
+            -c["_label_phrase"],
             -c["_phrase"],
             -c["_field_score"],
             -c["_tightness"],
+            c["_alias_count"],
             -c["video_count"],
         )
     )
