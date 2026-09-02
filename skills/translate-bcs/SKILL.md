@@ -84,6 +84,8 @@ python ${CLAUDE_SKILL_DIR}/../../scripts/translate_video.py --log-level info \
   --from-transcript "<path from step 1>"
 ```
 
+A long transcript is translated in `--chunk-minutes` windows (default 20) and stitched, so a two-hour input does not go to Gemini in one call. `--start` / `--end` narrow it to a range first (the end is exclusive, so adjacent ranges tile). If a window returns nothing the run keeps the rest, marks the gap in place with an `<!-- MISSING: ... -->` comment plus a header notice, and exits 3 - re-run over that range to fill it.
+
 Note: `--log-level` goes **before** the subcommand for `video_intel.py`, anywhere for `translate_video.py`.
 
 ## Default Commands

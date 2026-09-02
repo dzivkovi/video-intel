@@ -200,6 +200,12 @@ That writes the full BCS output next to the transcript, as
 It is a corpus artifact, not a file in this repo, so there is nothing to link to here - look in your own
 `output_dir` after the run.
 
+**Windowing (issue #206).** A long transcript is split into `--chunk-minutes` windows (default 20) and translated one window per Gemini call, then stitched. A two-hour transcript is roughly 190 KB of text: sent in a single call it either truncates at the output-token cap or fails outright, and a mid-run failure used to lose everything. Windows are cut on cue boundaries, so an entry and its SCREEN block are never split, and the translated title header is sent with the first window only.
+
+`--start` and `--end` narrow the work **before** any Gemini call, so a range that selects nothing costs nothing. The end is **exclusive**: `--end 45` stops before the 45:00 cue and a following `--start 45` picks it up, so consecutive ranges tile without duplicating a boundary cue.
+
+If a window returns nothing, the run continues (the other windows are real, billed translation) but the gap is never silent: an `<!-- MISSING: ... -->` comment marks it in place, an "Incomplete translation" notice at the top of the header names each missing range, and the command exits **3** rather than 0. Recover with `--start` / `--end` over the named range.
+
 **Design notes.** This is a *manual* two-step handoff, not an auto-chained
 pipeline — the intermediate transcript is a reviewable artifact, and the
 two scripts stay operationally independent per [CLAUDE.md](../CLAUDE.md).
