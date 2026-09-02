@@ -170,7 +170,11 @@ def main() -> None:
     vault_id, was_new = register_vault(cfg, folder, args.open)
     write_registry_atomic(registry, cfg)
 
-    print(f"registered new vault (id {vault_id}): {folder}" if was_new else f"already registered (id {vault_id}); path unchanged")
+    print(
+        f"registered new vault (id {vault_id}): {folder}"
+        if was_new
+        else f"already registered (id {vault_id}); path unchanged"
+    )
     print(f"backup: {backup}")
     print("\nObsidian now knows these vaults:")
     for vid, v in cfg["vaults"].items():
