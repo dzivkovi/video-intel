@@ -51,6 +51,10 @@ def _isolated(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(vi, "resolve_output_dir", lambda _cfg: tmp_path / "corpus")
     monkeypatch.setattr(vi, "require_gemini", lambda: (SimpleNamespace(), None))
     monkeypatch.setattr(vi, "create_client", lambda *a, **k: SimpleNamespace())
+    # cmd_transcript loads its prompt before the size guard; a missing prompt
+    # file exits 1 there and would satisfy both the exit-code and the
+    # zero-upload assertion without the guard ever running.
+    monkeypatch.setattr(vi, "load_prompt", lambda _name: "stub prompt")
 
 
 def _oversized(monkeypatch, path: Path) -> None:
@@ -135,6 +139,16 @@ class TestTheSizeGuardExitsOneAndIsTheReason:
         assert seen["uploads"] == 0, "the size guard, not the upload handler, must be the cause"
 
 
+#: `has_segment` is `start is not None OR end is not None` - EITHER endpoint
+#: counts. Testing only the both-supplied case would leave `or` -> `and` green
+#: while breaking every valid `--start`-only and `--end`-only invocation.
+SEGMENTS = [
+    pytest.param({"start": "00:00", "end": "00:10"}, id="both"),
+    pytest.param({"start": "00:05"}, id="start-only"),
+    pytest.param({"end": "00:10"}, id="end-only"),
+]
+
+
 class TestTheSegmentBypassIsDeliberate:
     """`--start`/`--end` is the documented escape hatch: the operator has said
     which slice to send, so the whole-file size stops being the question. The
@@ -142,17 +156,19 @@ class TestTheSegmentBypassIsDeliberate:
     code could otherwise be 'tightened' into breaking the only way to process a
     large local file."""
 
-    def test_process_reaches_the_upload_with_a_segment(self, monkeypatch, tmp_path) -> None:
+    @pytest.mark.parametrize("segment", SEGMENTS)
+    def test_process_reaches_the_upload_with_a_segment(self, monkeypatch, tmp_path, segment) -> None:
         mp4 = tmp_path / "huge.mp4"
         _isolated(monkeypatch, tmp_path)
         _oversized(monkeypatch, mp4)
         seen = _watch_upload(monkeypatch)
 
         with pytest.raises((RuntimeError, SystemExit)):
-            vi.cmd_process(_args(mp4, start="00:00", end="00:10"), {})
+            vi.cmd_process(_args(mp4, **segment), {})
         assert seen["uploads"] == 1, "the segment escape hatch must still reach the upload"
 
-    def test_transcript_reaches_the_upload_with_a_segment(self, monkeypatch, tmp_path) -> None:
+    @pytest.mark.parametrize("segment", SEGMENTS)
+    def test_transcript_reaches_the_upload_with_a_segment(self, monkeypatch, tmp_path, segment) -> None:
         """The two guards are separate code with separate messages, so covering
         one proves nothing about the other."""
         mp4 = tmp_path / "huge.mp4"
@@ -161,7 +177,7 @@ class TestTheSegmentBypassIsDeliberate:
         seen = _watch_upload(monkeypatch)
 
         with pytest.raises((RuntimeError, SystemExit)):
-            vi.cmd_transcript(_args(mp4, start="00:00", end="00:10"), {})
+            vi.cmd_transcript(_args(mp4, **segment), {})
         assert seen["uploads"] == 1
 
 
@@ -189,14 +205,18 @@ class TestTheseTestsReachTheGuardTheyClaimToTest:
     """Guard the guards: if an earlier check starts short-circuiting these
     paths, every test above would pass vacuously. This one fails instead."""
 
-    def test_a_normal_sized_file_is_not_rejected_by_the_size_guard(self, monkeypatch, tmp_path) -> None:
+    @pytest.mark.parametrize("command", ["cmd_process", "cmd_transcript"])
+    def test_a_normal_sized_file_is_not_rejected_by_the_size_guard(self, monkeypatch, tmp_path, command) -> None:
+        """Both commands need their own canary: their pre-guard preambles are
+        different code (cmd_transcript loads a prompt, cmd_process resolves the
+        output dir), so one certifies nothing about the other."""
         mp4 = tmp_path / "fine.mp4"
         mp4.write_bytes(b"small enough")
         _isolated(monkeypatch, tmp_path)
         seen = _watch_upload(monkeypatch)
 
         with pytest.raises((RuntimeError, SystemExit)):
-            vi.cmd_process(_args(mp4), {})
+            getattr(vi, command)(_args(mp4), {})
         assert seen["uploads"] == 1, (
             "an under-threshold file must reach the upload; if it does not, the tests above "
             "are passing on an earlier check rather than on the size guard"
