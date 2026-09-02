@@ -858,7 +858,10 @@ class TestDirectCmdCallerFlushesPendingStamp:
         # cmd_mindmap itself can land this stamp.
         video_intel.cmd_mindmap(args, {"channels": [{"name": "demo", "url": "u"}]})
 
-        meta_path = channel_dir / "brandnew.meta.json"
+        # Issue #186: with both --title and --date the writer's prefix is the
+        # {date}-{slug} convention, and the pending stamp follows the writer's
+        # own (channel_dir, prefix) pair - so the stamp lands there too.
+        meta_path = channel_dir / "2026-08-22-brand-new-talk.meta.json"
         assert json.loads(meta_path.read_text(encoding="utf-8"))["topics"] == ["fde"]
         assert video_intel._PENDING_TOPIC_STAMPS == [], "the direct call must have drained the pending queue itself"
 

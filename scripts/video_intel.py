@@ -1736,6 +1736,21 @@ def video_file_prefix(video):
 # Used by local-file identity resolution to decide when a filename stem is a video_id.
 _VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
+# The one definition of an acceptable --date value (issue #186 review). The flag
+# feeds `published`, which is compared lexicographically against ISO dates and -
+# with --title - now BUILDS the artifact filename, so "2026/08/31" would put a
+# path separator into every artifact path. Enforced at the PARSER (argparse
+# `type=`), which runs before any upload or API call - probe before you pay -
+# and re-checked in `resolve_local_file_identity` for library callers.
+_ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def iso_date_arg(value: str) -> str:
+    """argparse type for --date: a strict YYYY-MM-DD string."""
+    if not _ISO_DATE_RE.fullmatch(value):
+        raise argparse.ArgumentTypeError(f"--date must be YYYY-MM-DD, got {value!r}")
+    return value
+
 
 def infer_channel_from_file_path(input_path: Path, output_dir: Path, config: dict) -> str | None:
     """Return the configured channel name if input_path lives directly under output_dir/<channel>/.
@@ -1799,6 +1814,47 @@ def _find_canonical_meta_by_video_id(channel_dir: Path, video_id: str) -> Path |
     return matches[0] if matches else None
 
 
+def _adoptable_channel_stem_meta(meta_path: Path, *, stem: str, args, channel_name: str | None) -> bool:
+    """Whether a stem-named meta in the TARGET channel dir may claim this file.
+
+    Codex peer-review P1 on the adoption: a same-basename meta can belong to a
+    DIFFERENT video, and adopting it returns at step 1 - before G2's video_id
+    matching can ever object - so an explicit conflicting ``--video-id`` (or an
+    id-shaped stem) and a conflicting stored ``channel`` must each REJECT the
+    candidate, loudly, and let resolution continue to G2/fallback. An
+    unreadable candidate is rejected the same way: adoption is an optimization,
+    and refusing costs one derived prefix, while adopting the wrong video's
+    meta corrupts identity. The true sibling next to the file keeps its
+    pre-existing adopt-with-flag-overrides contract - this guard is only for
+    the channel-dir candidate the #186 review round introduced.
+    """
+    meta = _read_meta_best_effort(meta_path, raise_on_os_error=False)
+    if not meta:
+        return False
+    candidate_id = getattr(args, "video_id", None) or (stem if _VIDEO_ID_RE.match(stem) else None)
+    stored_id = meta.get("video_id")
+    if candidate_id and stored_id and stored_id != candidate_id:
+        log.warning(
+            "%s: not adopting %s - its video_id %r conflicts with %r",
+            stem,
+            meta_path.name,
+            stored_id,
+            candidate_id,
+        )
+        return False
+    stored_channel = meta.get("channel")
+    if channel_name and stored_channel and stored_channel != channel_name:
+        log.warning(
+            "%s: not adopting %s - its channel %r conflicts with %r",
+            stem,
+            meta_path.name,
+            stored_channel,
+            channel_name,
+        )
+        return False
+    return True
+
+
 def resolve_local_file_identity(
     input_path: Path,
     *,
@@ -1837,6 +1893,19 @@ def resolve_local_file_identity(
     # input (`--video-id`, `--title`, `--date`). Only unflagged fields are adopted
     # verbatim. This mirrors the flag-override rule for step 2 (G2 canonical match).
     sibling_meta = input_path.with_suffix(".meta.json")
+    # Issue #186 review (P2): a stem-named meta in the TARGET channel dir is
+    # just as much a claim on this file's artifacts as one beside the file -
+    # a pre-#186 ingest from outside the corpus (`--file ~/Downloads/x.mp4
+    # --channel ch`) wrote `<ch>/x.meta.json`, and a re-run WITH --title/--date
+    # would otherwise miss it, derive a fresh prefix, and re-bill Gemini for a
+    # second full ingest of the same video. Same adopt-verbatim-except-flags
+    # semantics as the true sibling; the true sibling wins when both exist.
+    if not sibling_meta.exists() and channel_dir is not None and channel_dir != input_path.parent:
+        channel_stem_meta = channel_dir / f"{stem}.meta.json"
+        if channel_stem_meta.exists() and _adoptable_channel_stem_meta(
+            channel_stem_meta, stem=stem, args=args, channel_name=channel_name
+        ):
+            sibling_meta = channel_stem_meta
     if sibling_meta.exists():
         try:
             meta = json.loads(sibling_meta.read_text(encoding="utf-8"))
@@ -1869,7 +1938,10 @@ def resolve_local_file_identity(
                 "published": final_published,
                 "published_source": final_source,
                 "prefix": stem,
-                "channel_dir": input_path.parent,
+                # The meta's OWN directory, so an adopted channel-dir stem meta
+                # routes artifacts next to itself instead of splitting them from
+                # the meta. For a true sibling this IS input_path.parent.
+                "channel_dir": sibling_meta.parent,
                 "meta_path": sibling_meta,
             }
 
@@ -1948,6 +2020,31 @@ def resolve_local_file_identity(
 
     url = f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
 
+    # Issue #186: when the operator asserted BOTH halves of the identity
+    # explicitly, the artifacts follow the same {date}-{slug} convention every
+    # scanned artifact uses - via the scan writer's own video_file_prefix, never
+    # a re-derived copy of its rule. One flag alone keeps the stem: a prefix
+    # built on the mtime-fallback date would change when the file is copied
+    # (new mtime -> new prefix -> duplicate artifacts on the next run), so the
+    # derived name requires both flags. Sibling-meta and G2 paths above are
+    # deliberately untouched - their prefixes carry existing artifacts.
+    # Two belts for values the CLI's `iso_date_arg` cannot have let through but
+    # a library caller can: a non-ISO date (a "2026/08/31" would put a path
+    # separator into every artifact path) and a title whose slug is empty
+    # (prefix "2026-08-31-"). Both fall back to the stem WITH a warning -
+    # a silently different name is how split artifacts happen.
+    if flag_title and flag_date:
+        if not _ISO_DATE_RE.fullmatch(flag_date):
+            log.warning("%s: --date %r is not YYYY-MM-DD; keeping the stem prefix", input_path.name, flag_date)
+            prefix = stem
+        elif not slugify(title):
+            log.warning("%s: --title %r slugifies to nothing; keeping the stem prefix", input_path.name, title)
+            prefix = stem
+        else:
+            prefix = video_file_prefix({"title": title, "published": published})
+    else:
+        prefix = stem
+
     return {
         "channel": channel_name,
         "video_id": video_id,
@@ -1955,9 +2052,9 @@ def resolve_local_file_identity(
         "title": title,
         "published": published,
         "published_source": published_source,
-        "prefix": stem,
+        "prefix": prefix,
         "channel_dir": effective_channel_dir,
-        "meta_path": effective_channel_dir / f"{stem}.meta.json",
+        "meta_path": effective_channel_dir / f"{prefix}.meta.json",
     }
 
 
@@ -12888,6 +12985,7 @@ Examples:
     )
     mm_parser.add_argument(
         "--date",
+        type=iso_date_arg,
         help=(
             "Publish date YYYY-MM-DD. Defaults to today with --url; falls back to the file's "
             "mtime with --file when not given."
@@ -12943,6 +13041,7 @@ Examples:
     )
     tx_parser.add_argument(
         "--date",
+        type=iso_date_arg,
         help=(
             "Publish date YYYY-MM-DD. Defaults to today with --url; falls back to the file's "
             "mtime with --file when not given."
@@ -13029,6 +13128,7 @@ Examples:
     )
     process_parser.add_argument(
         "--date",
+        type=iso_date_arg,
         help="Publish date YYYY-MM-DD. Falls back to the file's mtime (--file) or YouTube publishedAt (--url).",
     )
     process_parser.add_argument("--start", help="Segment start time (MM:SS, HH:MM:SS, or raw seconds)")

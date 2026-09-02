@@ -48,8 +48,16 @@ def _run(tmp_path, source="gemini", **kw):
     chan = tmp_path / "mychannel"
     chan.mkdir(exist_ok=True)
     res = vi.process_transcript(
-        object(), None, _video(), "p", "stub-model", chan, prefix,
-        transcript_source=source, media_resolution="LOW", **kw,
+        object(),
+        None,
+        _video(),
+        "p",
+        "stub-model",
+        chan,
+        prefix,
+        transcript_source=source,
+        media_resolution="LOW",
+        **kw,
     )
     return res, chan / f"{prefix}.meta.json"
 
@@ -153,9 +161,7 @@ class TestIdentityFieldsDropFalsy:
 
 
 def _identity_less(chan, prefix="v"):
-    (chan / f"{prefix}.meta.json").write_text(
-        json.dumps({"transcript_status": "complete"}), encoding="utf-8"
-    )
+    (chan / f"{prefix}.meta.json").write_text(json.dumps({"transcript_status": "complete"}), encoding="utf-8")
     (chan / f"{prefix}.transcript.md").write_text(
         "# Transcript: T\n**Source:** https://youtu.be/abcDEF12345\n**Published:** 2026-06-01\n",
         encoding="utf-8",

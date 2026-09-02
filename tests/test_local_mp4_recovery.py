@@ -337,7 +337,12 @@ class TestResolveLocalFileIdentity:
         assert identity["meta_path"] == canonical
 
     def test_step_3_explicit_flags_without_canonical_meta(self, tmp_path):
-        """With all three flags, build identity without any meta.json lookup."""
+        """With all three flags, build identity without any meta.json lookup.
+
+        Issue #186: with BOTH --title and --date asserted, the prefix follows
+        the {date}-{slug} scan convention instead of the filename stem (the
+        pre-#186 expectation here was `"anything"`).
+        """
         channel_dir = tmp_path / "everyinc"
         channel_dir.mkdir()
         mp4 = channel_dir / "anything.mkv"
@@ -351,7 +356,7 @@ class TestResolveLocalFileIdentity:
         assert identity["published"] == "2026-04-01"
         assert identity["published_source"] == "cli_flag"
         assert identity["url"] == "https://www.youtube.com/watch?v=ab12CDef-_3"
-        assert identity["prefix"] == "anything"
+        assert identity["prefix"] == "2026-04-01-explicit-title"
         assert identity["channel"] == "everyinc"
 
     def test_step_5_stem_as_title_no_video_id(self, tmp_path):
@@ -641,7 +646,9 @@ class TestCmdTranscriptFileChannel:
         args = _make_args(file=mp4, channel="everyinc", title="Compound Engineering Camp", date="2026-04-17")
         cmd_transcript(args, {"channels": [{"name": "everyinc", "url": "u"}]})
 
-        meta_path = channel_dir / "lfML5OJc-CM.meta.json"
+        # Issue #186: with both --title and --date the artifacts land under the
+        # {date}-{slug} scan convention, not the id stem (pre-#186: lfML5OJc-CM.meta.json).
+        meta_path = channel_dir / "2026-04-17-compound-engineering-camp.meta.json"
         assert meta_path.exists()
         meta = json.loads(meta_path.read_text())
 
@@ -933,3 +940,338 @@ class TestScanConceptsGlobEnumeration:
 
         assert "Canonical Talk" in processed_prefixes
         assert "Compound Engineering Camp" in processed_prefixes
+
+
+# ---------------------------------------------------------------------------
+# Issue #186: explicit --title/--date derive the canonical {date}-{slug} prefix
+# ---------------------------------------------------------------------------
+
+
+class TestPrefixFromExplicitFlags:
+    """When the operator supplies BOTH --title and --date on the fallback path
+    (no sibling meta, no G2 canonical match), the artifact prefix follows the
+    same {date}-{slug} convention every scanned artifact uses, instead of the
+    filename stem. One flag alone changes nothing: a prefix derived from an
+    mtime-fallback date would drift when the file is copied (new mtime, new
+    prefix, duplicate artifacts), so the derived prefix requires the operator
+    to have asserted both halves explicitly.
+    """
+
+    def _mp4(self, tmp_path):
+        channel_dir = tmp_path / "neo4j"
+        channel_dir.mkdir()
+        mp4 = channel_dir / "gc720-hybrid-rag.mp4"
+        mp4.write_bytes(b"x")
+        return channel_dir, mp4
+
+    def test_both_flags_derive_the_scan_convention_prefix(self, tmp_path):
+        channel_dir, mp4 = self._mp4(tmp_path)
+        args = _make_args(title="Hybrid RAG with Neo4j", date="2026-08-31")
+
+        identity = resolve_local_file_identity(mp4, channel_name="neo4j", channel_dir=channel_dir, args=args)
+
+        # Independent literal, not derived through slugify/video_file_prefix.
+        assert identity["prefix"] == "2026-08-31-hybrid-rag-with-neo4j"
+        assert identity["title"] == "Hybrid RAG with Neo4j"
+        assert identity["published"] == "2026-08-31"
+        assert identity["published_source"] == "cli_flag"
+
+    def test_meta_path_follows_the_derived_prefix(self, tmp_path):
+        channel_dir, mp4 = self._mp4(tmp_path)
+        args = _make_args(title="Hybrid RAG with Neo4j", date="2026-08-31")
+
+        identity = resolve_local_file_identity(mp4, channel_name="neo4j", channel_dir=channel_dir, args=args)
+
+        assert identity["meta_path"] == identity["channel_dir"] / f"{identity['prefix']}.meta.json"
+
+    def test_title_alone_keeps_the_stem_prefix(self, tmp_path):
+        channel_dir, mp4 = self._mp4(tmp_path)
+        args = _make_args(title="Hybrid RAG with Neo4j")
+
+        identity = resolve_local_file_identity(mp4, channel_name="neo4j", channel_dir=channel_dir, args=args)
+
+        assert identity["prefix"] == "gc720-hybrid-rag"
+
+    def test_date_alone_keeps_the_stem_prefix(self, tmp_path):
+        channel_dir, mp4 = self._mp4(tmp_path)
+        args = _make_args(date="2026-08-31")
+
+        identity = resolve_local_file_identity(mp4, channel_name="neo4j", channel_dir=channel_dir, args=args)
+
+        assert identity["prefix"] == "gc720-hybrid-rag"
+
+    def test_no_flags_keeps_the_stem_prefix(self, tmp_path):
+        channel_dir, mp4 = self._mp4(tmp_path)
+        args = _make_args()
+
+        identity = resolve_local_file_identity(mp4, channel_name="neo4j", channel_dir=channel_dir, args=args)
+
+        assert identity["prefix"] == "gc720-hybrid-rag"
+
+    def test_sibling_meta_prefix_is_untouched_by_the_flags(self, tmp_path):
+        """Artifacts already exist under the sibling's stem; renaming them is
+        the manual follow-up issue #186 explicitly scopes OUT."""
+        channel_dir, mp4 = self._mp4(tmp_path)
+        (channel_dir / "gc720-hybrid-rag.meta.json").write_text(
+            json.dumps({"video_id": "abc123XYZ_-", "title": "Old", "published": "2026-08-30", "channel": "neo4j"})
+        )
+        args = _make_args(title="Hybrid RAG with Neo4j", date="2026-08-31")
+
+        identity = resolve_local_file_identity(mp4, channel_name="neo4j", channel_dir=channel_dir, args=args)
+
+        assert identity["prefix"] == "gc720-hybrid-rag"
+        assert identity["title"] == "Hybrid RAG with Neo4j"  # flags still override fields
+
+    def test_g2_canonical_prefix_is_untouched_by_the_flags(self, tmp_path):
+        """F11 uniqueness: a canonical scan meta's prefix always wins."""
+        channel_dir = tmp_path / "neo4j"
+        channel_dir.mkdir()
+        (channel_dir / "2026-04-17-real-scan-title.meta.json").write_text(
+            json.dumps({"video_id": "abc123XYZ_-", "title": "Real Scan Title", "published": "2026-04-17"})
+        )
+        mp4 = channel_dir / "abc123XYZ_-.mp4"
+        mp4.write_bytes(b"x")
+        args = _make_args(title="Hybrid RAG with Neo4j", date="2026-08-31")
+
+        identity = resolve_local_file_identity(mp4, channel_name="neo4j", channel_dir=channel_dir, args=args)
+
+        assert identity["prefix"] == "2026-04-17-real-scan-title"
+
+    def test_synthetic_video_id_with_both_flags_takes_the_derived_prefix(self, tmp_path):
+        """The Goldcast shape: --video-id names a synthetic id with no canonical
+        meta to match, so G2 falls through and the flags own the prefix."""
+        channel_dir, mp4 = self._mp4(tmp_path)
+        args = _make_args(video_id="gc720hybrid", title="Hybrid RAG with Neo4j", date="2026-08-31")
+
+        identity = resolve_local_file_identity(mp4, channel_name="neo4j", channel_dir=channel_dir, args=args)
+
+        assert identity["prefix"] == "2026-08-31-hybrid-rag-with-neo4j"
+        assert identity["video_id"] == "gc720hybrid"
+
+    def test_derived_prefix_matches_the_scan_writers_own_rule(self, tmp_path):
+        """Checker-uses-writer's-path: the derived prefix must equal what
+        video_file_prefix produces for the same identity, compared against the
+        REAL helper so the two rules cannot drift apart silently."""
+        from video_intel import video_file_prefix
+
+        channel_dir, mp4 = self._mp4(tmp_path)
+        args = _make_args(title="C++ & .NET: A (Weird) Pairing!", date="2026-07-04")
+
+        identity = resolve_local_file_identity(mp4, channel_name="neo4j", channel_dir=channel_dir, args=args)
+
+        assert identity["prefix"] == video_file_prefix({"title": args.title, "published": args.date})
+
+
+# ---------------------------------------------------------------------------
+# Issue #186 review round: date validation, channel-dir stem meta, belts
+# ---------------------------------------------------------------------------
+
+
+class TestDateFlagValidation:
+    """A malformed --date used to reach the artifact path unvalidated - and on
+    `mindmap --file` the Gemini upload was paid BEFORE the crash. `iso_date_arg`
+    rejects it at the PARSER, before any work (probe before you pay)."""
+
+    @pytest.mark.parametrize("bad", ["2026/08/31", "Aug 31, 2026", "0", "2026-8-31", "20260831"])
+    def test_parser_rejects_non_iso_dates(self, bad):
+        from video_intel import iso_date_arg
+
+        with pytest.raises(argparse.ArgumentTypeError):
+            iso_date_arg(bad)
+
+    def test_parser_accepts_iso(self):
+        from video_intel import iso_date_arg
+
+        assert iso_date_arg("2026-08-31") == "2026-08-31"
+
+    def test_every_date_flag_in_the_source_carries_the_validator(self):
+        """Walk the module source for every "--date" add_argument call and
+        require type=iso_date_arg on each - so a NEW subcommand adding the
+        flag cannot silently skip validation."""
+        import inspect
+
+        import video_intel as vi
+
+        source = inspect.getsource(vi)
+        blocks = source.split('"--date"')[1:]
+        assert len(blocks) == 3, f"expected the three --date parser sites, found {len(blocks)}"
+        for i, block in enumerate(blocks):
+            head = block[:120]
+            assert "type=iso_date_arg" in head, f"--date site {i + 1} is missing type=iso_date_arg: {head!r}"
+
+    def test_resolver_belt_keeps_stem_for_a_library_caller_with_a_bad_date(self, tmp_path, caplog):
+        channel_dir = tmp_path / "neo4j"
+        channel_dir.mkdir()
+        mp4 = channel_dir / "gc720-hybrid-rag.mp4"
+        mp4.write_bytes(b"x")
+        args = _make_args(title="Hybrid RAG with Neo4j", date="2026/08/31")
+        with caplog.at_level("WARNING"):
+            identity = resolve_local_file_identity(mp4, channel_name="neo4j", channel_dir=channel_dir, args=args)
+        assert identity["prefix"] == "gc720-hybrid-rag"
+        assert "not YYYY-MM-DD" in caplog.text
+
+    def test_resolver_belt_keeps_stem_for_an_empty_slug_title(self, tmp_path, caplog):
+        channel_dir = tmp_path / "neo4j"
+        channel_dir.mkdir()
+        mp4 = channel_dir / "gc720-hybrid-rag.mp4"
+        mp4.write_bytes(b"x")
+        args = _make_args(title="!!!", date="2026-08-31")
+        with caplog.at_level("WARNING"):
+            identity = resolve_local_file_identity(mp4, channel_name="neo4j", channel_dir=channel_dir, args=args)
+        assert identity["prefix"] == "gc720-hybrid-rag"
+        assert "slugifies to nothing" in caplog.text
+
+
+class TestChannelDirStemMetaAdoption:
+    """Issue #186 review P2: a pre-#186 ingest from outside the corpus wrote
+    `<channel>/<stem>.meta.json`; a flags re-run must adopt it instead of
+    deriving a fresh prefix and re-billing Gemini for a duplicate ingest."""
+
+    def test_flags_rerun_adopts_the_existing_channel_dir_stem_meta(self, tmp_path):
+        channel_dir = tmp_path / "video-intel" / "everyinc"
+        channel_dir.mkdir(parents=True)
+        downloads = tmp_path / "Downloads"
+        downloads.mkdir()
+        mp4 = downloads / "session-two.mp4"
+        mp4.write_bytes(b"x")
+        (channel_dir / "session-two.meta.json").write_text(
+            json.dumps({"title": "Session Two", "published": "2026-08-30", "channel": "everyinc"}),
+            encoding="utf-8",
+        )
+
+        args = _make_args(title="Session Two Talk", date="2026-08-31")
+        identity = resolve_local_file_identity(mp4, channel_name="everyinc", channel_dir=channel_dir, args=args)
+
+        assert identity["prefix"] == "session-two"
+        assert identity["meta_path"] == channel_dir / "session-two.meta.json"
+        assert identity["channel_dir"] == channel_dir
+        assert identity["title"] == "Session Two Talk"  # flags still override fields
+
+    def test_true_sibling_still_wins_over_the_channel_dir_copy(self, tmp_path):
+        channel_dir = tmp_path / "video-intel" / "everyinc"
+        channel_dir.mkdir(parents=True)
+        downloads = tmp_path / "Downloads"
+        downloads.mkdir()
+        mp4 = downloads / "session-two.mp4"
+        mp4.write_bytes(b"x")
+        true_sibling = downloads / "session-two.meta.json"
+        true_sibling.write_text(json.dumps({"title": "Beside the file", "published": "2026-08-29"}), encoding="utf-8")
+        (channel_dir / "session-two.meta.json").write_text(
+            json.dumps({"title": "In the channel dir", "published": "2026-08-30"}), encoding="utf-8"
+        )
+
+        identity = resolve_local_file_identity(mp4, channel_name="everyinc", channel_dir=channel_dir, args=_make_args())
+
+        assert identity["meta_path"] == true_sibling
+        assert identity["channel_dir"] == downloads
+        assert identity["title"] == "Beside the file"
+
+    def test_no_meta_anywhere_still_derives_from_the_flags(self, tmp_path):
+        channel_dir = tmp_path / "video-intel" / "everyinc"
+        channel_dir.mkdir(parents=True)
+        downloads = tmp_path / "Downloads"
+        downloads.mkdir()
+        mp4 = downloads / "session-two.mp4"
+        mp4.write_bytes(b"x")
+
+        args = _make_args(title="Session Two Talk", date="2026-08-31")
+        identity = resolve_local_file_identity(mp4, channel_name="everyinc", channel_dir=channel_dir, args=args)
+
+        assert identity["prefix"] == "2026-08-31-session-two-talk"
+
+
+class TestPrefixDerivationRequiresBothFlagsEvenWithVideoId:
+    def test_video_id_plus_title_alone_keeps_the_stem(self, tmp_path):
+        channel_dir = tmp_path / "neo4j"
+        channel_dir.mkdir()
+        mp4 = channel_dir / "gc720-hybrid-rag.mp4"
+        mp4.write_bytes(b"x")
+        args = _make_args(video_id="gc720hybrid", title="Hybrid RAG with Neo4j")
+        identity = resolve_local_file_identity(mp4, channel_name="neo4j", channel_dir=channel_dir, args=args)
+        assert identity["prefix"] == "gc720-hybrid-rag"
+
+    def test_video_id_plus_date_alone_keeps_the_stem(self, tmp_path):
+        channel_dir = tmp_path / "neo4j"
+        channel_dir.mkdir()
+        mp4 = channel_dir / "gc720-hybrid-rag.mp4"
+        mp4.write_bytes(b"x")
+        args = _make_args(video_id="gc720hybrid", date="2026-08-31")
+        identity = resolve_local_file_identity(mp4, channel_name="neo4j", channel_dir=channel_dir, args=args)
+        assert identity["prefix"] == "gc720-hybrid-rag"
+
+
+class TestChannelDirStemMetaAdoptionConflictGuard:
+    """Codex peer-review P1: a same-basename meta in the channel dir can belong
+    to a DIFFERENT video, and adopting it returns at step 1 - before G2's
+    video_id matching can object. A conflicting explicit --video-id, an
+    id-shaped stem, or a conflicting stored channel each REJECT the candidate
+    loudly and let resolution continue."""
+
+    def _layout(self, tmp_path, stem="session-two"):
+        channel_dir = tmp_path / "video-intel" / "everyinc"
+        channel_dir.mkdir(parents=True)
+        downloads = tmp_path / "Downloads"
+        downloads.mkdir()
+        mp4 = downloads / f"{stem}.mp4"
+        mp4.write_bytes(b"x")
+        return channel_dir, mp4
+
+    def test_conflicting_explicit_video_id_rejects_the_candidate(self, tmp_path, caplog):
+        channel_dir, mp4 = self._layout(tmp_path)
+        (channel_dir / "session-two.meta.json").write_text(
+            json.dumps({"video_id": "otherVideo1", "title": "Someone else", "published": "2026-01-01"}),
+            encoding="utf-8",
+        )
+        args = _make_args(video_id="myVideoId12", title="Session Two Talk", date="2026-08-31")
+        with caplog.at_level("WARNING"):
+            identity = resolve_local_file_identity(mp4, channel_name="everyinc", channel_dir=channel_dir, args=args)
+        assert identity["prefix"] == "2026-08-31-session-two-talk"
+        assert identity["video_id"] == "myVideoId12"
+        assert "conflicts with" in caplog.text
+
+    def test_conflicting_stored_channel_rejects_the_candidate(self, tmp_path, caplog):
+        channel_dir, mp4 = self._layout(tmp_path)
+        (channel_dir / "session-two.meta.json").write_text(
+            json.dumps({"title": "Someone else", "published": "2026-01-01", "channel": "lexfridman"}),
+            encoding="utf-8",
+        )
+        args = _make_args(title="Session Two Talk", date="2026-08-31")
+        with caplog.at_level("WARNING"):
+            identity = resolve_local_file_identity(mp4, channel_name="everyinc", channel_dir=channel_dir, args=args)
+        assert identity["prefix"] == "2026-08-31-session-two-talk"
+        assert "conflicts with" in caplog.text
+
+    def test_id_shaped_stem_conflicting_with_stored_id_rejects_and_reaches_g2(self, tmp_path):
+        channel_dir, mp4 = self._layout(tmp_path, stem="abc123XYZ_-")
+        # The would-be adopted meta claims a DIFFERENT id...
+        (channel_dir / "abc123XYZ_-.meta.json").write_text(
+            json.dumps({"video_id": "otherVideo1", "title": "Wrong one", "published": "2026-01-01"}),
+            encoding="utf-8",
+        )
+        # ...while the real canonical scan meta for the stem's id exists under
+        # its own prefix and must win through G2, exactly as pre-adoption.
+        (channel_dir / "2026-04-17-the-real-one.meta.json").write_text(
+            json.dumps({"video_id": "abc123XYZ_-", "title": "The Real One", "published": "2026-04-17"}),
+            encoding="utf-8",
+        )
+        identity = resolve_local_file_identity(mp4, channel_name="everyinc", channel_dir=channel_dir, args=_make_args())
+        assert identity["prefix"] == "2026-04-17-the-real-one"
+        assert identity["video_id"] == "abc123XYZ_-"
+
+    def test_matching_video_id_still_adopts(self, tmp_path):
+        channel_dir, mp4 = self._layout(tmp_path)
+        (channel_dir / "session-two.meta.json").write_text(
+            json.dumps({"video_id": "myVideoId12", "title": "Session Two", "published": "2026-08-30"}),
+            encoding="utf-8",
+        )
+        args = _make_args(video_id="myVideoId12", title="Session Two Talk", date="2026-08-31")
+        identity = resolve_local_file_identity(mp4, channel_name="everyinc", channel_dir=channel_dir, args=args)
+        assert identity["prefix"] == "session-two"
+        assert identity["meta_path"] == channel_dir / "session-two.meta.json"
+
+    def test_unreadable_candidate_is_rejected_not_adopted(self, tmp_path):
+        channel_dir, mp4 = self._layout(tmp_path)
+        (channel_dir / "session-two.meta.json").write_text("{not json", encoding="utf-8")
+        args = _make_args(title="Session Two Talk", date="2026-08-31")
+        identity = resolve_local_file_identity(mp4, channel_name="everyinc", channel_dir=channel_dir, args=args)
+        assert identity["prefix"] == "2026-08-31-session-two-talk"
