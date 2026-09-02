@@ -224,3 +224,66 @@ class TestPartialPathVideoSetFollowsTheNewOrder:
         # longest (most filler) partials are the ones whose videos drop out.
         got_videos = {v["video_id"] for v in res["videos"]}
         assert got_videos == {f"vid{i:08d}xxx" for i in range(5)}
+
+
+class TestLabelPhraseTier:
+    """2026-09-02 taste lab (operator-delegated): a concept whose own
+    PREFERRED LABEL carries the query phrase is the concept NAMED for the
+    query and outranks alias-only matches - measured winner (E) on the
+    19-query adjudicated set (A 4/19 top-1, E 17/19 with both residuals
+    adjudicated as eval artifacts)."""
+
+    def test_the_concept_named_for_the_query_beats_an_alias_holder(self):
+        concepts = {
+            "c.named": {"preferred_label": "Model Benchmarking", "aliases": [], "video_count": 1},
+            "c.hoarder": {
+                "preferred_label": "AI Agent Benchmarking",
+                "aliases": ["model benchmarking"],
+                "video_count": 400,
+            },
+        }
+        res = _search(_tax(concepts), "model benchmarking")
+        assert res["concepts"][0]["concept_id"] == "c.named"
+
+    def test_a_mega_concept_keeps_its_own_name(self):
+        """The control that killed the naive focus-only variant (B): a query
+        matching the mega-concept's OWN label must still return it first,
+        however many aliases it hoards elsewhere."""
+        concepts = {
+            "c.mega": {
+                "preferred_label": "Token Economics",
+                "aliases": [f"alias {i}" for i in range(300)] + ["token economics"],
+                "video_count": 371,
+            },
+            "c.tiny": {"preferred_label": "Inference Pricing", "aliases": ["token economics"], "video_count": 3},
+        }
+        res = _search(_tax(concepts), "token economics")
+        assert res["concepts"][0]["concept_id"] == "c.mega"
+
+
+class TestFocusTieBreak:
+    def test_a_contested_alias_goes_to_the_focused_concept_not_the_junk_drawer(self):
+        """The flagship shape: the exact alias lives on BOTH a 400-alias junk
+        drawer and a focused concept; neither label carries the phrase. The
+        focused concept wins - a concept that claims everything owns nothing
+        in particular."""
+        concepts = {
+            "c.drawer": {
+                "preferred_label": "AI Agent Configuration",
+                "aliases": [f"junk {i}" for i in range(400)] + ["prompt engineering"],
+                "video_count": 448,
+            },
+            "c.focused": {
+                "preferred_label": "Structured Prompting",
+                "aliases": ["advanced prompting", "prompt engineering"],
+                "video_count": 85,
+            },
+        }
+        res = _search(_tax(concepts), "prompt engineering")
+        assert res["concepts"][0]["concept_id"] == "c.focused"
+
+    def test_video_count_still_decides_when_focus_ties(self):
+        a = {"preferred_label": "Prompt Engineering Basics", "aliases": ["x"], "video_count": 3}
+        b = {"preferred_label": "Prompt Engineering Basics", "aliases": ["y"], "video_count": 30}
+        res = _search(_tax({"c.small": a, "c.big": b}), "prompt engineering basics")
+        assert res["concepts"][0]["concept_id"] == "c.big"
