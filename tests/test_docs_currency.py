@@ -61,8 +61,72 @@ def _constant(name: str) -> str:
     return m.group(1).strip()
 
 
+# Global flags that sit BEFORE the subcommand and consume the next token.
+_VALUE_TAKING_GLOBALS = {"--model", "-m", "--log-level"}
+
+
+def _documented_subcommands() -> dict[str, set[str]]:
+    """Every subcommand the living docs actually TELL a reader to run.
+
+    This is the docs -> CLI direction, and it is the whole point of the class
+    below. Deriving the cases from `_registered_subcommands()` instead reads
+    the CLI -> CLI direction: a README that says `video_intel.py scna` fails
+    nothing, because the case list never came from the README. Codex caught
+    exactly that on PR #208 - the test was named for a contract it did not
+    have.
+
+    Returns {subcommand: {docs that mention it}} so a failure names the file.
+    """
+    found: dict[str, set[str]] = {}
+    for doc in LIVING_DOCS:
+        for line in (REPO / doc).read_text(encoding="utf-8").splitlines():
+            if "video_intel.py" not in line:
+                continue
+            tokens = line.split("video_intel.py", 1)[1].split()
+            skip_next = False
+            for tok in tokens:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if tok in _VALUE_TAKING_GLOBALS:
+                    skip_next = True
+                    continue
+                if tok.startswith("-"):
+                    continue
+                if re.fullmatch(r"[a-z][a-z-]*", tok):
+                    found.setdefault(tok, set()).add(doc)
+                break
+    return found
+
+
 class TestEveryDocumentedCommandParses:
-    """The one test a docs change can actually run."""
+    """The one test a docs change can actually run.
+
+    Two directions, and only the first is about the docs:
+
+    * docs -> CLI: every command a living doc tells the reader to run must be
+      a command the CLI has. This is what catches a typo'd or retired
+      invocation in a README.
+    * CLI -> parser: every registered subcommand's `--help` must exit 0. This
+      catches an argparse definition that raises on construction.
+    """
+
+    def test_every_documented_command_is_a_real_subcommand(self):
+        documented = _documented_subcommands()
+        registered = _registered_subcommands()
+        unknown = {c: sorted(d) for c, d in documented.items() if c not in registered}
+        assert not unknown, f"living docs invoke commands the CLI does not have: {unknown}"
+
+    def test_the_doc_extraction_is_not_vacuous(self):
+        """Companion, per the guard-test rule: an extractor that silently
+        stops matching turns the test above into `assert not {}` forever. Pin
+        the hard instances - a bare command, one behind a global `--model`
+        flag, and a two-word `profile show` - not merely a count.
+        """
+        documented = _documented_subcommands()
+        for expected in ("scan", "transcript", "process", "search", "index", "profile"):
+            assert expected in documented, f"the doc walk stopped finding `{expected}`"
+        assert len(documented) >= 8, f"the doc walk found only {sorted(documented)}"
 
     @pytest.mark.parametrize("cmd", sorted(_registered_subcommands()))
     def test_subcommand_help_exits_zero(self, cmd):
@@ -195,11 +259,30 @@ class TestSkillCountCannotDrift:
         return {p.parent.name for p in (REPO / "skills").glob("*/SKILL.md")}
 
     def test_the_manifest_and_the_filesystem_agree(self):
+        """The manifest does not declare skills today - Claude Code discovers
+        them from `skills/*/SKILL.md` - and the first cut of this test hid that
+        behind `manifest.get("skills", []) or self._skill_dirs()`, which
+        compared `_skill_dirs()` with itself and could never fail. Codex caught
+        it on PR #208. So: branch explicitly, and pin the no-declaration state
+        rather than falling back to a self-comparison.
+        """
         import json
 
         manifest = json.loads((REPO / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
-        declared = {s.rstrip("/").split("/")[-1] for s in manifest.get("skills", [])} or self._skill_dirs()
-        assert declared == self._skill_dirs(), "plugin.json and skills/ disagree about which skills exist"
+        on_disk = self._skill_dirs()
+        assert on_disk, "no skills/*/SKILL.md found - the discovery source itself is broken"
+
+        if "skills" not in manifest:
+            # Nothing to cross-check. Assert the premise so a manifest that
+            # STARTS declaring skills reaches the comparison below instead of
+            # silently taking a vacuous path.
+            assert set(manifest) == {"name", "version", "description", "author"}, (
+                "plugin.json grew a key; if it now declares skills, this test must compare them"
+            )
+            return
+
+        declared = {s.rstrip("/").split("/")[-1] for s in manifest["skills"]}
+        assert declared == on_disk, "plugin.json and skills/ disagree about which skills exist"
 
     def test_no_living_doc_claims_the_wrong_number_of_skills(self):
         """The count is spelled out in prose ("two independent skills", "the

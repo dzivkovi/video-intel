@@ -37,8 +37,9 @@ flowchart TD
         direction TB
         T["<b>1. TRANSCRIPT</b> (the catch)<br/><i>only when the channel opted in</i><br/>Gemini watches frames + hears audio<br/>3-task prompt: speech, screen, speakers<br/><i>~$0.33 per video-hour</i>"]
         M["<b>2. MIND MAP</b> (the birds)<br/>text-only Gemini reads the transcript when one exists,<br/>else the old pass over the video itself<br/><i>text is ~10x cheaper</i>"]
-        C["<b>3. CONCEPTS</b> (the index)<br/>text-only Gemini, reads the mind map<br/>normalized against the taxonomy<br/><i>~$0.001 per video</i>"]
-        T --> M --> C
+        C["<b>3. CONCEPTS</b> (the index)<br/>text-only Gemini, reads the mind map<br/><i>only when the channel opted in</i><br/>normalized against the taxonomy<br/><i>~$0.001 per video</i>"]
+        T --> M
+        M -->|"channel sets<br/><code>auto_concepts: true</code>"| C
     end
 
     T --> TR["<code>.transcript.md</code><br/>diarized speech interleaved with<br/>SCREEN sections: slides, code, demos"]
@@ -210,7 +211,7 @@ snippet above, which is trimmed for readability.
 | output_dir | ~/video-intel | Where output files are saved |
 | vector_db_dir | output_dir/.lancedb | LanceDB index location. Set this to a local path if `output_dir` is on a cloud-synced mount (Google Drive File Stream, OneDrive, Dropbox) - those filesystems do not support the atomic rename LanceDB needs. The `index` command runs a pre-flight probe and aborts with an actionable diagnostic before spending Voyage tokens if the path is incompatible. See [ADR-0016](docs/adr/ADR-0016-vector-db-path-config.md). |
 | default_since | 10d | Default lookback window |
-| default_prompt | mindmap-knowledge | Default prompt for mind maps, overridable per channel |
+| default_prompt | the shipped template sets `mindmap-knowledge` | Default prompt for mind maps, overridable per channel. With the key absent the code fallback differs by command - `mindmap-light` on `scan` and `mindmap --url`, `mindmap-knowledge` on `process` - so set it explicitly rather than relying on it; copying `config.yaml.example` does that for you |
 | model | gemini-3.7-flash | Gemini model (overridable via `--model` CLI flag). Chosen by measurement, not spec sheet - see the model-card scorecards in `tests/evals/model-cards/` |
 | models | (unset) | Per-step model overrides, e.g. `models: {mindmap: ..., concepts: ...}`. Falls back to `model` for any step left out |
 | max_parallel | 10 | Concurrent Gemini requests (paid tier can go 50+) |
@@ -240,9 +241,12 @@ snippet above, which is trimmed for readability.
 | min_duration_seconds | No | Drop videos shorter than this |
 | auto_mindmap | No | `none` skips the mind map for notify-only channels |
 
-Every one of these is validated at `scan --dry-run`, which reports a typo'd knob
-with the consequence it would have (whole scan aborted, channel skipped, or just
-that stage failing) before spending any quota.
+Six of these are validated at `scan --dry-run` - `prompt`, `transcript_source`,
+`chunk_minutes`, `transcript_max_duration_seconds`, `transcript_timeout_seconds`
+and `mindmap_source` - which reports a typo'd knob with the consequence it would
+have (whole scan aborted, channel skipped, or just that stage failing) before
+spending any quota. The rest are not preflighted: a bad `skip_shorts`,
+`enabled`, or `min_duration_seconds` surfaces only when the scan reaches it.
 
 ### Selective Mode
 
