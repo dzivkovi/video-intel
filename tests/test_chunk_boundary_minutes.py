@@ -9,8 +9,11 @@ last cue before 100:00, so `search --vector`'s `&t=<seconds>` deep-link pointed
 hours away from the hit.
 
 Measured on the live corpus at the time of the fix: 25 transcripts across 10
-channels, 27,798 cue lines, all `transcript_source: youtube_captions` - the
-longest videos in the corpus, which is where an accurate deep-link matters most.
+channels, 27,798 cue lines - 23 `transcript_source: youtube_captions`, 1
+`gemini`, 1 with no source field. The captions renderer produces the shape
+systematically; `merge_transcript_json` renders model-supplied stamps verbatim,
+so the Gemini path emits it too whenever the model does. These are the longest
+videos in the corpus, which is where an accurate deep-link matters most.
 
 The tests below pin three separate things, because each can regress alone:
 
@@ -32,6 +35,7 @@ from video_intel import (
     CaptionsResult,
     _build_captions_transcript_body,
     chunk_transcript,
+    merge_transcript_json,
 )
 
 HEADER = (
@@ -134,6 +138,7 @@ class TestExistingShapesUnchanged:
             ('[1:15:30] Alice: "h mm ss"', 4530),
             ('[01:15:30] Alice: "hh mm ss"', 4530),
             ('[10:15:30] Alice: "ten hours"', 36930),
+            ('[100:18] ChatGPT (AI assistant): "the live corpus case"', 6018),
         ],
     )
     def test_known_shapes_still_match_and_parse(self, tmp_path, line, expected_seconds):
@@ -199,6 +204,38 @@ class TestParserMatchesTheCaptionsRenderer:
 
 
 # ---------------------------------------------------------------------------
+# Renderer-driven, second writer: the Gemini path renders stamps verbatim
+# ---------------------------------------------------------------------------
+
+
+class TestParserMatchesTheGeminiWriter:
+    """`merge_transcript_json` renders each entry's `start` verbatim, so the
+    Gemini path emits a two-part stamp past 99 minutes whenever the model
+    returns one - the live corpus holds a `transcript_source: gemini` file
+    whose `[100:18]` dialogue stamp proves it. This companion exists so that
+    retiring the captions-renderer class (if `_captions_timestamp` ever moves
+    to `HH:MM:SS`) can never be read as license to narrow the pattern.
+    """
+
+    RAW: ClassVar[dict] = {
+        "transcripts": [
+            {"start": "99:00", "voice": 1, "text": "before the boundary"},
+            {"start": "100:18", "voice": 1, "text": "the live corpus case"},
+        ],
+        "screen_content": [],
+        "speakers": [{"voice": 1, "name": "ChatGPT", "role": "AI assistant", "evidence": "n/a"}],
+    }
+
+    def test_gemini_rendered_stamp_past_the_boundary_is_a_chunk_boundary(self, tmp_path):
+        fused = merge_transcript_json(self.RAW, {})
+        assert "[100:18]" in fused, "the writer no longer renders the model's stamp verbatim"
+        path = _write(tmp_path, fused, name="gemini.transcript.md")
+        chunks = chunk_transcript(path, chunk_size=1)
+        assert [c["timestamp_seconds"] for c in chunks] == [5940, 6018]
+        assert "the live corpus case" in chunks[1]["text"]
+
+
+# ---------------------------------------------------------------------------
 # Corpus-shaped guard: no chunk may swallow an unbounded span
 # ---------------------------------------------------------------------------
 
@@ -261,10 +298,20 @@ class TestOneSharedBoundaryPattern:
         offenders = [line for line in _boundary_match_lines() if "ENTRY_TIMESTAMP_PATTERN" not in line]
         assert offenders == [], f"a boundary regex is hard-coded instead of shared: {offenders}"
 
-    def test_chunk_transcript_hard_codes_no_narrow_minute_field(self):
+    def test_chunk_transcript_hard_codes_no_bounded_minute_field(self):
+        """Any BOUNDED quantifier is the defect - a cap of 3 just moves the cliff."""
         source = _chunk_transcript_source()
-        narrow = re.findall(r"\\d\{1,2\}:", source)
-        assert narrow == [], f"chunk_transcript still hard-codes a narrow minute field: {narrow}"
+        narrow = re.findall(r"\\d\{1,\d+\}:", source)
+        assert narrow == [], f"chunk_transcript still hard-codes a bounded minute field: {narrow}"
+
+    def test_the_shared_pattern_itself_has_no_bounded_minute_field(self):
+        """Catches narrowing the CONSTANT, which the source walk cannot see."""
+        assert ENTRY_TIMESTAMP_PATTERN.startswith(r"\d+"), (
+            f"the minute field must be unbounded: {ENTRY_TIMESTAMP_PATTERN!r}"
+        )
+        assert "{1," not in ENTRY_TIMESTAMP_PATTERN.split(":", 1)[0], (
+            f"ENTRY_TIMESTAMP_PATTERN caps its first field: {ENTRY_TIMESTAMP_PATTERN!r}"
+        )
 
     def test_the_shared_pattern_accepts_wide_and_narrow_minutes(self):
         compiled = re.compile(rf"^\[{ENTRY_TIMESTAMP_PATTERN}\]")

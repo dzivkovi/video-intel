@@ -299,6 +299,23 @@ class TestMindmapTimestampParsing:
         entries = parse_mindmap_timestamps(MINDMAP_A)
         assert find_timestamp(entries, branch="Nope", as_mentioned="also nope") is None
 
+    def test_minutes_past_99_anchor_at_the_real_time_not_a_substring(self):
+        """Issue #195, same class as chunk_transcript's boundary fix.
+
+        The capped `\\d{1,2}` token pattern did not MISS `(100:18)` - findall
+        matched the substring `00:18` and anchored the citation at 18 seconds,
+        100 minutes early. That is a fabricated timestamp, which invariant 4 of
+        this module's contract forbids outright.
+        """
+        text = "## H\n\n* **S**\n  - a bullet from the third hour (100:18)\n"
+        entries = parse_mindmap_timestamps(text)
+        assert entries[0].seconds == 6018
+
+    def test_three_part_timestamps_are_unchanged_by_the_widened_token(self):
+        text = "## H\n\n* **S**\n  - late bullet (1:40:18)\n"
+        entries = parse_mindmap_timestamps(text)
+        assert entries[0].seconds == 6018
+
     def test_mention_link_falls_back_to_plain_url_without_fabricating_a_time(self):
         from wiki_concepts import Mention, VideoRecord
 

@@ -50,7 +50,12 @@ from gemini_common import (
     require_gemini,
     require_youtube,
 )
-from timestamp_utils import normalize_timestamp, parse_time_to_seconds, timestamp_tolerance
+from timestamp_utils import (
+    TIMESTAMP_TOKEN_PATTERN,
+    normalize_timestamp,
+    parse_time_to_seconds,
+    timestamp_tolerance,
+)
 
 log = logging.getLogger("video_intel")
 
@@ -9040,7 +9045,10 @@ def require_voyageai():
 # boundary and folded the whole tail of every multi-hour captions transcript
 # into one chunk carrying the last pre-100:00 timestamp. Both boundary regexes
 # in `chunk_transcript` build on this one pattern so they cannot drift apart.
-ENTRY_TIMESTAMP_PATTERN = r"\d+:\d{2}(?::\d{2})?"
+# The shape itself is defined once in `timestamp_utils` so `wiki_concepts.py`
+# (same defect class in its bullet time-token scan) shares it without importing
+# this module - the issue #152 import-weight firebreak.
+ENTRY_TIMESTAMP_PATTERN = TIMESTAMP_TOKEN_PATTERN
 
 
 def _parse_timestamp_seconds(ts: str) -> int:

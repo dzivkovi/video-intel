@@ -42,7 +42,7 @@ from pathlib import Path
 
 from wiki_atlas import slugify
 
-from timestamp_utils import parse_time_to_seconds, timestamped_url
+from timestamp_utils import TIMESTAMP_TOKEN_PATTERN, parse_time_to_seconds, timestamped_url
 
 log = logging.getLogger(__name__)
 
@@ -365,7 +365,12 @@ def build_co_occurrence(records: list[tuple[VideoRecord, list[dict]]], selected_
 _HEADING_RE = re.compile(r"^##\s+(.+)$")
 _SUBHEADING_RE = re.compile(r"^\*\s+\*\*(.+?)\*\*\s*$")
 _BULLET_TIME_RE = re.compile(r"\(([\d:,\s]+)\)\s*$")
-_TIME_TOKEN_RE = re.compile(r"\d{1,2}(?::\d{2}){1,2}")
+# Issue #195 (same class as chunk_transcript's boundary fix): the minute field
+# is unbounded because rendered timestamps carry minutes past 59. The capped
+# form was WORSE than a miss here - findall("100:18") matched "00:18" and
+# anchored the citation 100 minutes early, violating this module's own
+# never-fabricate-a-timestamp contract (invariant 4).
+_TIME_TOKEN_RE = re.compile(TIMESTAMP_TOKEN_PATTERN)
 
 
 def _whole_token_pattern(term: str) -> re.Pattern[str]:
