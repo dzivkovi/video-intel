@@ -19,7 +19,11 @@
   "transcript_dialogue_entries": 683,
   "transcript_chunk_window_violations": 0,
   "modes_completed": [
-    "transcript"
+    "transcript",
+    "scan"
   ],
-  "last_error": null
+  "last_error": null,
+  "processed": "2026-09-02T22:41:52.125681+00:00",
+  "mindmap_source": "transcript",
+  "prompt": "mindmap-from-transcript"
 }
