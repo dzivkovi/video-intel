@@ -100,10 +100,7 @@ require ADR-grade justification.
 pytest tests/evals/test_search_quality.py -v -s
 ```
 
-Name the module, never the `tests/evals/` directory. The measurability audit in
-`test_instrument.py` fails on purpose when a golden query is unmeasurable, so
-running the directory puts those deliberate failures in the same summary line
-and the N/25 stops being derivable.
+Name the module, never the `tests/evals/` directory. The measurability audit in `test_instrument.py` fails on purpose when a golden query is unmeasurable, so running the directory puts those deliberate failures in the same summary line and the N/25 stops being derivable.
 
 The `-s` flag is important — the harness prints a per-metric report for
 each query. Suppressing stdout (pytest's default) hides the diagnostic
@@ -169,9 +166,7 @@ unnoticed.
 
 **1 of 25 queries pass all gating metrics** (Q11), measured on a
 2,360-video / 85,854-chunk index with the instrument defect above removed.
-The chunk count moved because the #195 boundary-regex fix re-chunked ten
-channels; the N/25 and the passing query did not change across that re-index,
-and the instrument stayed 50/50.
+The chunk count moved because the #195 boundary-regex fix re-chunked ten channels; the N/25 and the passing query did not change across that re-index, and the instrument stayed 50/50.
 
 The number happens to match the 2026-04-19 headline but is not the same
 measurement, and the two are not comparable: the corpus grew roughly 15x, the

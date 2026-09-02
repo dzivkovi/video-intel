@@ -121,15 +121,28 @@ class TestNoStaleDefaultsInLivingDocs:
         as the example value, walks an agent straight back into that shape.
         """
         assert int(_constant("TRANSCRIPT_CHUNK_MINUTES_DEFAULT")) == 30
+        # Scan a WINDOW, not a single line. The first cut required
+        # "chunk-minutes" and "50" on the SAME line, and an accuracy reviewer
+        # found a live stale pair it missed: prose wrapped so that
+        # "then the default (50)." and "(default: 50)." each sat on a line
+        # carrying no "chunk-minutes" text of its own. The suite passed 24/24
+        # over a real defect - the exact false negative a currency guard
+        # cannot afford, and the reason this check is window-based now.
         offenders = []
         for doc in LIVING_DOCS:
-            for lineno, line in enumerate((REPO / doc).read_text(encoding="utf-8").split("\n"), 1):
-                if re.search(r"chunk[- _]minutes[`\s]*[,;]?\s*(?:default\s*)?50\b", line, re.I):
-                    # A historical diagnosis may name the threshold of its day,
-                    # as long as it says so.
-                    if "at the time" in line:
-                        continue
-                    offenders.append(f"{doc}:{lineno}")
+            lines = (REPO / doc).read_text(encoding="utf-8").split("\n")
+            for lineno, line in enumerate(lines, 1):
+                if not re.search(r"\(\s*(?:default:?\s*)?50\s*\)|\bdefault:?\s+50\b", line, re.I):
+                    continue
+                # A historical diagnosis may name the threshold of its day, as
+                # long as it says so.
+                if "at the time" in line:
+                    continue
+                # Only a chunk-minutes context is in scope; an unrelated
+                # "default 50" elsewhere in these docs is not this bug.
+                window = "\n".join(lines[max(0, lineno - 4) : lineno + 3])
+                if re.search(r"chunk[- _]minutes", window, re.I):
+                    offenders.append(f"{doc}:{lineno}: {line.strip()}")
         assert not offenders, f"stale chunk default in living docs: {offenders}"
 
 
@@ -168,6 +181,56 @@ class TestRelativeLinksResolve:
                 if not (p.parent / path_part).resolve().exists():
                     offenders.append(f"{doc} -> {target}")
         assert not offenders, f"broken relative links: {offenders}"
+
+
+class TestSkillCountCannotDrift:
+    """Issue #204's headline finding was a README section claiming TWO skills
+    when the plugin ships three. The first cut of this PR fixed the "Plugin
+    Contents" table and left an identical claim 600 lines later in
+    "Cross-Platform Compatibility" - found by a standards reviewer, not by any
+    test, because nothing asserted skill-count consistency. Now something does.
+    """
+
+    def _skill_dirs(self) -> set[str]:
+        return {p.parent.name for p in (REPO / "skills").glob("*/SKILL.md")}
+
+    def test_the_manifest_and_the_filesystem_agree(self):
+        import json
+
+        manifest = json.loads((REPO / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+        declared = {s.rstrip("/").split("/")[-1] for s in manifest.get("skills", [])} or self._skill_dirs()
+        assert declared == self._skill_dirs(), "plugin.json and skills/ disagree about which skills exist"
+
+    def test_no_living_doc_claims_the_wrong_number_of_skills(self):
+        """The count is spelled out in prose ("two independent skills", "the
+        three SKILL.md files"), so pin the WORD against the real count rather
+        than hoping a grep for a stale table header catches it."""
+        words = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five"}
+        actual = len(self._skill_dirs())
+        wrong = {w for n, w in words.items() if n != actual}
+        alternation = "|".join(sorted(wrong))
+        noun = r"(?:independent skills|skills|`?SKILL\.md`? files)"
+        # Only letters, spaces, hyphens and backticks may sit between the count
+        # word and the noun. A looser gap matched "two-command summary;
+        # [`skills/translate-bcs/SKILL.md`]" - a real false positive this
+        # test produced on its first run.
+        pattern = re.compile(r"\b(?:" + alternation + r")[A-Za-z `-]{0,25}?\b" + noun, re.I)
+        offenders = []
+        for doc in LIVING_DOCS:
+            for lineno, line in enumerate((REPO / doc).read_text(encoding="utf-8").splitlines(), 1):
+                if pattern.search(line):
+                    offenders.append(f"{doc}:{lineno}: {line.strip()[:120]}")
+        assert not offenders, f"a living doc claims the wrong skill count (real count {actual}): {offenders}"
+
+    def test_every_skill_is_named_in_the_entry_point_docs(self):
+        """A count alone is not enough. The omitted skill was
+        `video-intel-search`, and fixing only the NUMBER left INSTALLATION's
+        opening blurb saying "Three skills" while still listing two by name -
+        which is how a count-only check would have let this ship."""
+        for doc in ("README.md", "INSTALLATION.md"):
+            text = (REPO / doc).read_text(encoding="utf-8")
+            missing = [d for d in sorted(self._skill_dirs()) if d not in text]
+            assert not missing, f"skills shipped but never named in {doc}: {missing}"
 
 
 class TestSkillSurfaceMatchesTheCliSurface:

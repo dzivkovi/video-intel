@@ -1,8 +1,9 @@
 # Installation Guide
 
-> Two skills in one install: **video-intel** (English transcripts, mind maps,
-> concept search) and **translate-bcs** (Bosnian/Croatian/Serbian subtitles).
-> Both activate on natural language — no setup beyond installation.
+> Three skills in one install: **video-intel** (curate: scan, transcripts, mind
+> maps, concepts, index), **video-intel-search** (query the corpus read-only;
+> installable globally), and **translate-bcs** (Bosnian/Croatian/Serbian
+> subtitles). All three activate on natural language, with no setup beyond installation.
 
 ## Prerequisites
 
@@ -189,7 +190,7 @@ above - the most common cause is a typo in the marketplace key.
 
 ### Other platforms
 
-The two `SKILL.md` files follow the open [Agent Skills](https://agentskills.io/specification)
+The three `SKILL.md` files follow the open [Agent Skills](https://agentskills.io/specification)
 format. Platforms that support it can consume individual skill folders.
 Copy the specific skill you want into that platform's skills directory:
 

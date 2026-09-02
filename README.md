@@ -30,12 +30,13 @@ birds before you cast a line and read the water before you commit to a spot.
 
 ```mermaid
 flowchart TD
-    Y["YouTube Data API<br/>discover new videos"] --> T
+    Y["YouTube Data API<br/>discover new videos"] -->|"channel sets<br/><code>auto_transcript: all</code>"| T
+    Y -->|"otherwise"| M
 
     subgraph scan["scan - one command, three loops in this order"]
         direction TB
-        T["<b>1. TRANSCRIPT</b> (the catch)<br/>Gemini watches frames + hears audio<br/>3-task prompt: speech, screen, speakers<br/><i>~$0.33 per video-hour</i>"]
-        M["<b>2. MIND MAP</b> (the birds)<br/>text-only Gemini, reads the transcript<br/><i>~10x cheaper than reading the video</i>"]
+        T["<b>1. TRANSCRIPT</b> (the catch)<br/><i>only when the channel opted in</i><br/>Gemini watches frames + hears audio<br/>3-task prompt: speech, screen, speakers<br/><i>~$0.33 per video-hour</i>"]
+        M["<b>2. MIND MAP</b> (the birds)<br/>text-only Gemini reads the transcript when one exists,<br/>else the old pass over the video itself<br/><i>text is ~10x cheaper</i>"]
         C["<b>3. CONCEPTS</b> (the index)<br/>text-only Gemini, reads the mind map<br/>normalized against the taxonomy<br/><i>~$0.001 per video</i>"]
         T --> M --> C
     end
@@ -113,7 +114,7 @@ This repo is also a worked reference for a few patterns that carry to any corpus
 
 If you are scanning to decide whether this repo is worth studying: those three, plus the ADR log in [docs/adr/](docs/adr/), are the transferable core.
 
-## Plugin Contents — Three Skills
+## Plugin Contents: Three Skills
 
 This repo ships as a **plugin** containing three independent skills. They install
 together; Claude picks the right one based on what you ask.
@@ -174,7 +175,7 @@ independently — interoperability with non-Claude-Code tools has not been verif
 by this repo.
 
 **Upgrading from v1.4.x or earlier:** The repo went from "single skill" to "plugin
-with two skills." If you previously installed by copying the repo into
+with three skills." If you previously installed by copying the repo into
 `~/.claude/skills/video-intel/`, remove that directory and re-install via one of
 the plugin paths above. Claude Code manages the actual on-disk plugin cache
 itself (under `~/.claude/plugins/cache/...`); users do not copy files there
@@ -213,7 +214,7 @@ snippet above, which is trimmed for readability.
 | model | gemini-3.7-flash | Gemini model (overridable via `--model` CLI flag). Chosen by measurement, not spec sheet - see the model-card scorecards in `tests/evals/model-cards/` |
 | models | (unset) | Per-step model overrides, e.g. `models: {mindmap: ..., concepts: ...}`. Falls back to `model` for any step left out |
 | max_parallel | 10 | Concurrent Gemini requests (paid tier can go 50+) |
-| auto_concepts | true | Run the concepts step automatically after a scan |
+| auto_concepts | false (the shipped template sets `true`) | Run the concepts step automatically after a scan. The code fallback when the key is absent is `false`, so a hand-written config that omits it gets no concepts; copy `config.yaml.example`, which turns it on |
 | transcript_max_duration_seconds | 7200 | Videos longer than this are dropped from the auto-transcript set with a WARNING naming the manual recipe. Mind maps are unaffected |
 | chunk_minutes | 30 | Split a transcript longer than this into per-window Gemini calls. Lower it on dense material; issue #157 lowered the default from 50 deliberately |
 
@@ -233,7 +234,7 @@ snippet above, which is trimmed for readability.
 | mindmap_source | No | `auto` (default) builds the mind map from the transcript when one is on disk and falls back to video otherwise; `transcript` demands one; `video` forces the old path; `none` skips the mind map |
 | transcript_source | No | `gemini` (multimodal), `yt-captions` (caption track only), or `auto` (Gemini first, captions on failure). Leave it unset unless you mean it - an explicit `gemini` also opts a livestream VOD out of captions-first routing |
 | chunk_minutes | No | Per-channel override of the top-level chunk size |
-| transcript_timeout_seconds | No | Per-transcript wall clock before the call is abandoned and routed to the captions failover (default 600) |
+| transcript_timeout_seconds | No | Per-transcript wall clock before the call is abandoned (default 600). It routes to the captions failover only under `transcript_source: auto`; under the default `gemini` the timeout is recorded as an error and nothing else is tried |
 | skip_shorts | No | `false` opts a substantive-Shorts creator back in. Shorts are dropped before any Gemini call (default: `true`) |
 | skip_video_ids | No | List of video ids to never process. Filtered before the duration lookup, so a blocklisted id costs no API call. Reactive by design: add ids after you see one fail |
 | min_duration_seconds | No | Drop videos shorter than this |
@@ -745,15 +746,15 @@ For the agent-routing side (which phrasing triggers what), see [`skills/translat
 ## Cross-Platform Compatibility
 
 This repo ships as a Claude Code **plugin**: a `.claude-plugin/plugin.json`
-manifest plus a `skills/` directory holding two independent skills, with
+manifest plus a `skills/` directory holding three independent skills, with
 `scripts/` and `prompts/` shared at the plugin root. The `plugin.json` format
 and the plugin auto-discovery flow are Claude Code-specific.
 
-The two `SKILL.md` files themselves follow the open Agent Skills format
-(agentskills.io). Other tools that consume that spec — Gemini CLI, Cursor,
-Copilot, and others — *may* be able to use `skills/video-intel/` or
-`skills/translate-bcs/` as standalone skill folders, but this interoperability
-has not been verified by this repo. If you try a non-Claude-Code setup, results
+The three `SKILL.md` files themselves follow the open Agent Skills format
+(agentskills.io). Other tools that consume that spec (Gemini CLI, Cursor,
+Copilot, and others) *may* be able to use `skills/video-intel/`,
+`skills/video-intel-search/` or `skills/translate-bcs/` as standalone skill
+folders, but this interoperability has not been verified by this repo. If you try a non-Claude-Code setup, results
 welcome as feedback. API keys are read from environment variables in all cases.
 
 ## Packaging
