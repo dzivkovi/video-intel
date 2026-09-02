@@ -1883,9 +1883,13 @@ class TestVideoIdsPredicate:
         assert video_intel.video_ids_predicate({"", None, 123, "realvid1234"}) == "video_id IN ('realvid1234')"
 
     def test_an_empty_usable_set_matches_nothing_never_everything(self):
-        """ "Filter to no videos" must never silently become "no filter"."""
-        assert video_intel.video_ids_predicate(set()) == "video_id IN ('')"
-        assert video_intel.video_ids_predicate({None, 5}) == "video_id IN ('')"
+        """ "Filter to no videos" must never silently become "no filter" - and
+        never "the blank-id rows" either: the live index carries ~750 chunks
+        with a BLANK video_id, so the tempting `video_id IN ('')` matches all
+        of THEM (executed proof, #188 review P2)."""
+        assert video_intel.video_ids_predicate(set()) == "1 = 0"
+        assert video_intel.video_ids_predicate({None, 5}) == "1 = 0"
+        assert "IN ('')" not in video_intel.video_ids_predicate(set())
 
 
 class TestNuggetTopicScoping:
@@ -2044,3 +2048,69 @@ class TestNuggetTopicScoping:
         out = capsys.readouterr().out
         assert "No excerpts in topic 'fde'" in out
         assert "search --topic fde" in out
+
+
+class TestHybridSearchVideoIdsFilterWiring:
+    """Issue #188 review P1: the stubbed nugget tests prove cmd_nugget's
+    kwargs, not that the REAL hybrid_search honors them - both the WHERE
+    wiring and the scoped pool sizing were deletable with every topic test
+    green. These drive the real function through the capturing LanceDB fake."""
+
+    def _run(self, tmp_path, fake_lancedb, monkeypatch, *, ids, limit):
+        monkeypatch.setattr(video_intel, "load_taxonomy", lambda _d: {"concepts": {}})
+        video_intel.hybrid_search(tmp_path, "some query", limit=limit, video_ids_filter=ids)
+        return fake_lancedb
+
+    def test_the_predicate_reaches_the_real_where_clause(self, tmp_path, fake_lancedb, monkeypatch):
+        builder = self._run(tmp_path, fake_lancedb, monkeypatch, ids={"vidA", "vidB"}, limit=5)
+        joined = " AND ".join(builder.where_clauses)
+        assert video_intel.video_ids_predicate({"vidA", "vidB"}) in joined
+
+    def test_no_filter_means_no_video_id_predicate(self, tmp_path, fake_lancedb, monkeypatch):
+        monkeypatch.setattr(video_intel, "load_taxonomy", lambda _d: {"concepts": {}})
+        video_intel.hybrid_search(tmp_path, "some query", limit=5)
+        assert all("video_id IN" not in c for c in fake_lancedb.where_clauses)
+
+    def test_scoped_pool_is_sized_to_the_scope(self, tmp_path, fake_lancedb, monkeypatch):
+        ids = {f"vid{i:08d}" for i in range(19)}
+        builder = self._run(tmp_path, fake_lancedb, monkeypatch, ids=ids, limit=15)
+        # max(max(50, 15*5), min(1000, 19*15)) = max(75, 285) = 285
+        assert builder.limit_calls == [285]
+
+    def test_scoped_pool_is_capped_at_one_thousand(self, tmp_path, fake_lancedb, monkeypatch):
+        ids = {f"vid{i:08d}" for i in range(120)}
+        builder = self._run(tmp_path, fake_lancedb, monkeypatch, ids=ids, limit=10)
+        assert builder.limit_calls == [1000]
+
+    def test_unscoped_pool_is_unchanged(self, tmp_path, fake_lancedb, monkeypatch):
+        monkeypatch.setattr(video_intel, "load_taxonomy", lambda _d: {"concepts": {}})
+        video_intel.hybrid_search(tmp_path, "some query", limit=10)
+        assert fake_lancedb.limit_calls == [50]
+
+
+class TestTopicListingOrderPinsUnresolvedLast:
+    def test_unresolved_and_undated_members_sort_after_every_dated_member(self):
+        topics_data = {
+            "topics": {
+                "fde": {
+                    "video_count": 4,
+                    "channels": ["demo"],
+                    "first_seen": "2026-08-01",
+                    "briefings": [],
+                    "videos": [
+                        {"video_id": "ghost9999999", "unresolved": True},
+                        {"video_id": "old456789012", "channel": "demo", "title": "Old", "published": "2026-01-01"},
+                        {"video_id": "new456789012", "channel": "demo", "title": "New", "published": "2026-08-01"},
+                        {"video_id": "undated12345", "channel": "demo", "title": "Undated", "published": None},
+                    ],
+                }
+            }
+        }
+        lines = video_intel.render_topic_listing(topics_data, "fde")
+        text = "\n".join(lines)
+        # Dated members newest-first; the undated/unresolved tail comes after
+        # EVERY dated member, ordered among itself by video_id (deterministic).
+        assert text.index("New") < text.index("Old")
+        for tail in ("Undated", "ghost9999999"):
+            assert text.index("Old") < text.index(tail)
+        assert text.index("ghost9999999") < text.index("Undated")  # id order within the tail

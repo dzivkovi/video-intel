@@ -9626,7 +9626,12 @@ def video_ids_predicate(video_ids) -> str:
     """
     quoted = sorted(f"'{escape_sql_string_literal(v)}'" for v in video_ids if v and isinstance(v, str))
     if not quoted:
-        return "video_id IN ('')"
+        # NOT "video_id IN ('')": roughly 750 chunks in the live index carry a
+        # BLANK video_id (the selector's known fallback-identity population),
+        # so that predicate matches all of THEM rather than nothing - executed
+        # proof from the #188 review. "1 = 0" counts zero rows on lancedb
+        # 0.30.2.
+        return "1 = 0"
     return f"video_id IN ({', '.join(quoted)})"
 
 
@@ -13010,7 +13015,7 @@ def render_topic_listing(
     undated.sort(key=lambda v: v.get("video_id") or "")
     videos = dated + undated
     total = len(videos)
-    if limit is not None:
+    if limit:  # 0 means no cap, same convention as briefings --limit
         videos = videos[:limit]
 
     lines = [

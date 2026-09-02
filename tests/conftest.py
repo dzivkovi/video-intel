@@ -21,6 +21,7 @@ class _CapturingBuilder:
     def __init__(self) -> None:
         self.where_clauses: list[str] = []
         self.text_calls: list[str] = []
+        self.limit_calls: list[int] = []
 
     def vector(self, _vec):
         return self
@@ -29,7 +30,8 @@ class _CapturingBuilder:
         self.text_calls.append(q)
         return self
 
-    def limit(self, _n):
+    def limit(self, n):
+        self.limit_calls.append(n)
         return self
 
     def where(self, clause):
