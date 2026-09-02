@@ -1198,3 +1198,80 @@ class TestPrefixDerivationRequiresBothFlagsEvenWithVideoId:
         args = _make_args(video_id="gc720hybrid", date="2026-08-31")
         identity = resolve_local_file_identity(mp4, channel_name="neo4j", channel_dir=channel_dir, args=args)
         assert identity["prefix"] == "gc720-hybrid-rag"
+
+
+class TestChannelDirStemMetaAdoptionConflictGuard:
+    """Codex peer-review P1: a same-basename meta in the channel dir can belong
+    to a DIFFERENT video, and adopting it returns at step 1 - before G2's
+    video_id matching can object. A conflicting explicit --video-id, an
+    id-shaped stem, or a conflicting stored channel each REJECT the candidate
+    loudly and let resolution continue."""
+
+    def _layout(self, tmp_path, stem="session-two"):
+        channel_dir = tmp_path / "video-intel" / "everyinc"
+        channel_dir.mkdir(parents=True)
+        downloads = tmp_path / "Downloads"
+        downloads.mkdir()
+        mp4 = downloads / f"{stem}.mp4"
+        mp4.write_bytes(b"x")
+        return channel_dir, mp4
+
+    def test_conflicting_explicit_video_id_rejects_the_candidate(self, tmp_path, caplog):
+        channel_dir, mp4 = self._layout(tmp_path)
+        (channel_dir / "session-two.meta.json").write_text(
+            json.dumps({"video_id": "otherVideo1", "title": "Someone else", "published": "2026-01-01"}),
+            encoding="utf-8",
+        )
+        args = _make_args(video_id="myVideoId12", title="Session Two Talk", date="2026-08-31")
+        with caplog.at_level("WARNING"):
+            identity = resolve_local_file_identity(mp4, channel_name="everyinc", channel_dir=channel_dir, args=args)
+        assert identity["prefix"] == "2026-08-31-session-two-talk"
+        assert identity["video_id"] == "myVideoId12"
+        assert "conflicts with" in caplog.text
+
+    def test_conflicting_stored_channel_rejects_the_candidate(self, tmp_path, caplog):
+        channel_dir, mp4 = self._layout(tmp_path)
+        (channel_dir / "session-two.meta.json").write_text(
+            json.dumps({"title": "Someone else", "published": "2026-01-01", "channel": "lexfridman"}),
+            encoding="utf-8",
+        )
+        args = _make_args(title="Session Two Talk", date="2026-08-31")
+        with caplog.at_level("WARNING"):
+            identity = resolve_local_file_identity(mp4, channel_name="everyinc", channel_dir=channel_dir, args=args)
+        assert identity["prefix"] == "2026-08-31-session-two-talk"
+        assert "conflicts with" in caplog.text
+
+    def test_id_shaped_stem_conflicting_with_stored_id_rejects_and_reaches_g2(self, tmp_path):
+        channel_dir, mp4 = self._layout(tmp_path, stem="abc123XYZ_-")
+        # The would-be adopted meta claims a DIFFERENT id...
+        (channel_dir / "abc123XYZ_-.meta.json").write_text(
+            json.dumps({"video_id": "otherVideo1", "title": "Wrong one", "published": "2026-01-01"}),
+            encoding="utf-8",
+        )
+        # ...while the real canonical scan meta for the stem's id exists under
+        # its own prefix and must win through G2, exactly as pre-adoption.
+        (channel_dir / "2026-04-17-the-real-one.meta.json").write_text(
+            json.dumps({"video_id": "abc123XYZ_-", "title": "The Real One", "published": "2026-04-17"}),
+            encoding="utf-8",
+        )
+        identity = resolve_local_file_identity(mp4, channel_name="everyinc", channel_dir=channel_dir, args=_make_args())
+        assert identity["prefix"] == "2026-04-17-the-real-one"
+        assert identity["video_id"] == "abc123XYZ_-"
+
+    def test_matching_video_id_still_adopts(self, tmp_path):
+        channel_dir, mp4 = self._layout(tmp_path)
+        (channel_dir / "session-two.meta.json").write_text(
+            json.dumps({"video_id": "myVideoId12", "title": "Session Two", "published": "2026-08-30"}),
+            encoding="utf-8",
+        )
+        args = _make_args(video_id="myVideoId12", title="Session Two Talk", date="2026-08-31")
+        identity = resolve_local_file_identity(mp4, channel_name="everyinc", channel_dir=channel_dir, args=args)
+        assert identity["prefix"] == "session-two"
+        assert identity["meta_path"] == channel_dir / "session-two.meta.json"
+
+    def test_unreadable_candidate_is_rejected_not_adopted(self, tmp_path):
+        channel_dir, mp4 = self._layout(tmp_path)
+        (channel_dir / "session-two.meta.json").write_text("{not json", encoding="utf-8")
+        args = _make_args(title="Session Two Talk", date="2026-08-31")
+        identity = resolve_local_file_identity(mp4, channel_name="everyinc", channel_dir=channel_dir, args=args)
+        assert identity["prefix"] == "2026-08-31-session-two-talk"

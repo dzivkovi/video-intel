@@ -1814,6 +1814,47 @@ def _find_canonical_meta_by_video_id(channel_dir: Path, video_id: str) -> Path |
     return matches[0] if matches else None
 
 
+def _adoptable_channel_stem_meta(meta_path: Path, *, stem: str, args, channel_name: str | None) -> bool:
+    """Whether a stem-named meta in the TARGET channel dir may claim this file.
+
+    Codex peer-review P1 on the adoption: a same-basename meta can belong to a
+    DIFFERENT video, and adopting it returns at step 1 - before G2's video_id
+    matching can ever object - so an explicit conflicting ``--video-id`` (or an
+    id-shaped stem) and a conflicting stored ``channel`` must each REJECT the
+    candidate, loudly, and let resolution continue to G2/fallback. An
+    unreadable candidate is rejected the same way: adoption is an optimization,
+    and refusing costs one derived prefix, while adopting the wrong video's
+    meta corrupts identity. The true sibling next to the file keeps its
+    pre-existing adopt-with-flag-overrides contract - this guard is only for
+    the channel-dir candidate the #186 review round introduced.
+    """
+    meta = _read_meta_best_effort(meta_path, raise_on_os_error=False)
+    if not meta:
+        return False
+    candidate_id = getattr(args, "video_id", None) or (stem if _VIDEO_ID_RE.match(stem) else None)
+    stored_id = meta.get("video_id")
+    if candidate_id and stored_id and stored_id != candidate_id:
+        log.warning(
+            "%s: not adopting %s - its video_id %r conflicts with %r",
+            stem,
+            meta_path.name,
+            stored_id,
+            candidate_id,
+        )
+        return False
+    stored_channel = meta.get("channel")
+    if channel_name and stored_channel and stored_channel != channel_name:
+        log.warning(
+            "%s: not adopting %s - its channel %r conflicts with %r",
+            stem,
+            meta_path.name,
+            stored_channel,
+            channel_name,
+        )
+        return False
+    return True
+
+
 def resolve_local_file_identity(
     input_path: Path,
     *,
@@ -1861,7 +1902,9 @@ def resolve_local_file_identity(
     # semantics as the true sibling; the true sibling wins when both exist.
     if not sibling_meta.exists() and channel_dir is not None and channel_dir != input_path.parent:
         channel_stem_meta = channel_dir / f"{stem}.meta.json"
-        if channel_stem_meta.exists():
+        if channel_stem_meta.exists() and _adoptable_channel_stem_meta(
+            channel_stem_meta, stem=stem, args=args, channel_name=channel_name
+        ):
             sibling_meta = channel_stem_meta
     if sibling_meta.exists():
         try:
