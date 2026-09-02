@@ -9847,6 +9847,13 @@ def cmd_index(args, config):
         print("  Run 'search --vector \"query\"' to search.")
 
 
+# Boundary punctuation stripped from field tokens in the issue #189 specificity
+# tie-break. Deliberately conservative: no `+`, `#` or `.` in the set, so
+# "c++", "c#" and ".net" survive as their own tokens and can equal the user's
+# query term.
+_FIELD_TOKEN_STRIP = ",;:!?()[]{}\"'"
+
+
 def search_corpus(
     output_dir: Path,
     query: str,
@@ -9866,8 +9873,12 @@ def search_corpus(
     query_terms = query_lower.split()
     # Issue #189: phrase detection reuses the SAME punctuation-aware boundary
     # the Stage-1 expander uses for taxonomy terms - one definition of "the
-    # query appears as a phrase", never two.
-    phrase_re = _alias_boundary_pattern(query_lower.strip()) if query_lower.strip() else None
+    # query appears as a phrase", never two. The regex gets the WHITESPACE-
+    # NORMALIZED query (Codex peer-pass P3): `.split()` already normalizes it
+    # for term scoring, so a double space or a pasted tab must not silently
+    # disable the phrase bonus while every other score stays identical.
+    phrase_query = " ".join(query_terms)
+    phrase_re = _alias_boundary_pattern(phrase_query) if phrase_query else None
 
     # Search concepts by preferred_label and aliases
     matching_concepts = []
@@ -9894,13 +9905,22 @@ def search_corpus(
             best_field_score = 0.0
             tightness = 0.0
             for f in fields:
-                hit = sum(1 for term in query_terms if term in f)
+                # Codex peer-pass P2: the tie-break counts TOKEN EQUALITY, not
+                # substrings - a substring numerator over a token denominator
+                # made "prompting, engineering" a perfect, maximally tight
+                # match for "prompt engineering". Boundary punctuation is
+                # stripped so "prompt," matches "prompt" while "prompting"
+                # does not; interior punctuation stays so "c++" still equals
+                # "c++". The SELECTION bag above keeps substring semantics on
+                # purpose - recall is its job, precision is this one's.
+                tokens = [t.strip(_FIELD_TOKEN_STRIP) for t in f.split()]
+                hit = sum(1 for term in query_terms if term in tokens)
                 score = hit / len(query_terms)
                 if score > best_field_score:
                     best_field_score = score
                     tightness = 0.0
-                if score == best_field_score and f.split():
-                    tightness = max(tightness, len(query_terms) / len(f.split()))
+                if score == best_field_score and tokens:
+                    tightness = max(tightness, len(query_terms) / len(tokens))
             matching_concepts.append(
                 {
                     "concept_id": cid,
