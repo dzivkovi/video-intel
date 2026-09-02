@@ -362,3 +362,54 @@ class TestEscapeSqlStringLiteral:
             "a channel predicate interpolates a raw value; route it through "
             f"escape_sql_string_literal: {raw_interpolations}"
         )
+
+
+class TestVideoIdsFilterIsAPrefilter:
+    """Issue #188: pins the scoped-nugget premise on a REAL LanceDB table -
+    the `video_id IN (...)` predicate applies BEFORE each leg's top-k, so a
+    member whose chunks rank outside the UNSCOPED candidate pool is still
+    returned when the scope names it. Verified twice on the live index during
+    review (query-plan inspection; a 67-id topic returning 20 members absent
+    from the unscoped top-1000); this keeps the property from silently
+    flipping on a lancedb upgrade. The cmd_nugget belt catches LEAKS - nothing
+    but this would catch STARVATION.
+    """
+
+    def _pad_to_mod7(self, base: str, target: int) -> str:
+        return base + "x" * ((target - len(base)) % 7)
+
+    def test_a_member_outside_the_unscoped_pool_is_still_returned_when_scoped(self, corpus) -> None:
+        # The stub Voyage embedding's first component is len(text) % 7, so
+        # vector distance is |lenA%7 - lenB%7|. The query's length mod 7 is
+        # pinned below; decoys are padded to the SAME class (distance 0) and
+        # the member to the farthest (distance 3), and the member shares no
+        # FTS term with the query - so its single chunk ranks behind all 60
+        # decoy chunks on both legs and cannot enter the 50-chunk unscoped
+        # pool.
+        query = self._pad_to_mod7("decoy topic words", 3)
+        for i in range(60):
+            body = self._pad_to_mod7(f"decoy topic words number {i}", 3)
+            _write_video(corpus.output_dir / "alpha", vid=f"d{i:09d}xx", slug=f"decoy-{i}", body=body)
+        member_body = self._pad_to_mod7("entirely unrelated quiet prose", 6)
+        _write_video(corpus.output_dir / "beta", vid="membervid01", slug="member-video", body=member_body)
+
+        vi.build_search_index(corpus.output_dir, config=corpus.config)
+
+        unscoped = vi.hybrid_search(corpus.output_dir, query, limit=5, config=corpus.config, expand=False)
+        assert unscoped, "fixture sanity: the unscoped search must return decoys"
+        assert all(h["video_id"] != "membervid01" for h in unscoped), (
+            "fixture must place the member outside the unscoped pool for the pin to mean anything"
+        )
+
+        scoped = vi.hybrid_search(
+            corpus.output_dir,
+            query,
+            limit=5,
+            config=corpus.config,
+            expand=False,
+            video_ids_filter={"membervid01"},
+        )
+        assert [h["video_id"] for h in scoped] == ["membervid01"], (
+            "the scope names the member, so a genuine PREfilter must return it; "
+            "an empty result here means lancedb applied the predicate after top-k"
+        )

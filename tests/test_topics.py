@@ -1753,3 +1753,364 @@ class TestYamlScalarVideoIdsAreNotVideoIds:
             collect_briefing_topic_assertions(tmp_path / "_briefings")
 
         assert caplog.text == ""
+
+
+# ---------------------------------------------------------------------------
+# Issue #188: query-less `search --topic` listing + `nugget --topic` scoping
+# ---------------------------------------------------------------------------
+
+
+class TestQueryLessTopicListing:
+    """`search --topic <slug>` with no query lists the topic's members from
+    topics.json alone - a pure read + render, no retrieval, no index needed."""
+
+    def _corpus(self, tmp_path):
+        write_meta(tmp_path, "demo", "p1", video_id="insidevid12", title="Newer member", published="2026-08-01")
+        write_meta(tmp_path, "demo", "p2", video_id="insidevid34", title="Older member", published="2026-05-01")
+        write_meta(tmp_path, "other", "p3", video_id="outsidevid1", title="Not in topic", published="2026-07-01")
+        write_briefing(
+            tmp_path,
+            "fde/2026-08-22-a.md",
+            front_matter="video_ids:\n  - insidevid12\n  - insidevid34\n  - ghostvid9999\n",
+        )
+        write_topics(tmp_path, build_topics(tmp_path))
+
+    def _args(self, **over):
+        base = dict(query=None, channel=None, limit=None, vector=False, since=None, topic="fde", preview=False)
+        base.update(over)
+        return argparse.Namespace(**base)
+
+    def test_lists_every_member_newest_first_and_nothing_else(self, tmp_path, capsys, monkeypatch):
+        self._corpus(tmp_path)
+        monkeypatch.setattr("video_intel.resolve_output_dir", lambda _c, **_kw: tmp_path)
+        cmd_search(self._args(), {})
+        out = capsys.readouterr().out
+        assert "Newer member" in out
+        assert "Older member" in out
+        assert "Not in topic" not in out
+        assert out.index("Newer member") < out.index("Older member")
+        assert "https://www.youtube.com/watch?v=insidevid12" in out
+
+    def test_unresolved_member_is_shown_as_unresolved(self, tmp_path, capsys, monkeypatch):
+        self._corpus(tmp_path)
+        monkeypatch.setattr("video_intel.resolve_output_dir", lambda _c, **_kw: tmp_path)
+        cmd_search(self._args(), {})
+        out = capsys.readouterr().out
+        assert "[unresolved] ghostvid9999" in out
+
+    def test_listing_makes_no_retrieval_call(self, tmp_path, capsys, monkeypatch):
+        """The listing is a read + render; a Voyage/LanceDB call would regress
+        exactly the no-index reachability the issue asks for."""
+        self._corpus(tmp_path)
+        monkeypatch.setattr("video_intel.resolve_output_dir", lambda _c, **_kw: tmp_path)
+
+        def _boom(*_a, **_kw):
+            raise AssertionError("retrieval must not run for a query-less listing")
+
+        monkeypatch.setattr("video_intel.hybrid_search", _boom)
+        monkeypatch.setattr("video_intel.search_corpus", _boom)
+        cmd_search(self._args(), {})
+        assert "Newer member" in capsys.readouterr().out
+
+    def test_no_query_and_no_topic_exits_2(self, tmp_path, capsys, monkeypatch):
+        """The pre-#188 missing-positional exit code was 2; assert the CODE,
+        not just SystemExit, per the issue #185 lesson."""
+        monkeypatch.setattr("video_intel.resolve_output_dir", lambda _c, **_kw: tmp_path)
+        with pytest.raises(SystemExit) as exc:
+            cmd_search(self._args(topic=None), {})
+        assert exc.value.code == 2
+        assert "--topic" in capsys.readouterr().out
+
+    def test_vector_without_query_exits_2_before_any_retrieval(self, tmp_path, capsys, monkeypatch):
+        self._corpus(tmp_path)
+        monkeypatch.setattr("video_intel.resolve_output_dir", lambda _c, **_kw: tmp_path)
+
+        def _boom(*_a, **_kw):
+            raise AssertionError("hybrid_search must not run without a query")
+
+        monkeypatch.setattr("video_intel.hybrid_search", _boom)
+        with pytest.raises(SystemExit) as exc:
+            cmd_search(self._args(vector=True), {})
+        assert exc.value.code == 2
+
+    def test_channel_since_and_limit_compose_as_filters(self, tmp_path, capsys, monkeypatch):
+        self._corpus(tmp_path)
+        monkeypatch.setattr("video_intel.resolve_output_dir", lambda _c, **_kw: tmp_path)
+        cmd_search(self._args(channel="demo", since="2026-06-01", limit=5), {})
+        out = capsys.readouterr().out
+        assert "Newer member" in out
+        assert "Older member" not in out  # published before --since
+        assert "[unresolved]" not in out  # unresolved has no channel; --channel filters it
+
+    def test_limit_caps_and_names_the_remainder(self, tmp_path, capsys, monkeypatch):
+        self._corpus(tmp_path)
+        monkeypatch.setattr("video_intel.resolve_output_dir", lambda _c, **_kw: tmp_path)
+        cmd_search(self._args(limit=1), {})
+        out = capsys.readouterr().out
+        assert "Newer member" in out
+        assert "Older member" not in out
+        assert "more; raise --limit" in out
+
+    def test_unknown_topic_fails_soft_with_the_known_slugs(self, tmp_path, capsys, monkeypatch):
+        self._corpus(tmp_path)
+        monkeypatch.setattr("video_intel.resolve_output_dir", lambda _c, **_kw: tmp_path)
+        cmd_search(self._args(topic="nope"), {})
+        out = capsys.readouterr().out
+        assert "No topic 'nope'" in out
+        assert "known: fde" in out
+        assert "Traceback" not in out
+
+    def test_missing_topics_json_fails_soft_with_one_actionable_message(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.setattr("video_intel.resolve_output_dir", lambda _c, **_kw: tmp_path)
+        cmd_search(self._args(), {})
+        out = capsys.readouterr().out
+        assert out.count("topics-build") == 1
+        assert "Traceback" not in out
+
+
+class TestVideoIdsPredicate:
+    """The SQL fragment scoping retrieval to a video-id set (issue #188).
+    Same escaping rule as the channel predicate (issue #183 invariant 6)."""
+
+    def test_ids_are_sorted_and_quoted(self):
+        assert video_intel.video_ids_predicate({"b2", "a1"}) == "video_id IN ('a1', 'b2')"
+
+    def test_a_quote_in_an_id_is_escaped_not_a_breakout(self):
+        pred = video_intel.video_ids_predicate({"o'brien"})
+        assert pred == "video_id IN ('o''brien')"
+
+    def test_empty_and_non_string_ids_are_dropped(self):
+        assert video_intel.video_ids_predicate({"", None, 123, "realvid1234"}) == "video_id IN ('realvid1234')"
+
+    def test_an_empty_usable_set_matches_nothing_never_everything(self):
+        """ "Filter to no videos" must never silently become "no filter" - and
+        never "the blank-id rows" either: the live index carries ~750 chunks
+        with a BLANK video_id, so the tempting `video_id IN ('')` matches all
+        of THEM (executed proof, #188 review P2)."""
+        assert video_intel.video_ids_predicate(set()) == "1 = 0"
+        assert video_intel.video_ids_predicate({None, 5}) == "1 = 0"
+        assert "IN ('')" not in video_intel.video_ids_predicate(set())
+
+
+class TestNuggetTopicScoping:
+    """`nugget --topic <slug>` narrows retrieval to the topic's members with
+    the SAME resolver, over-fetch multiplier and emptied-message shape as
+    search --topic (issue #146: a topic surface filters, never reorders)."""
+
+    def _corpus(self, tmp_path):
+        write_meta(tmp_path, "demo", "p1", video_id="insidevid12", title="Anchor talk", published="2026-08-01")
+        write_meta(tmp_path, "other", "p2", video_id="outsidevid1", title="Louder talk", published="2026-07-01")
+        write_briefing(tmp_path, "fde/2026-08-22-a.md", front_matter="video_ids:\n  - insidevid12\n")
+        write_topics(tmp_path, build_topics(tmp_path))
+
+    def _hit(self, vid, channel, text, relevance):
+        return {
+            "video_id": vid,
+            "channel": channel,
+            "title": f"title {vid}",
+            "published": "2026-08-01",
+            "timestamp": "01:00",
+            "timestamp_seconds": 60,
+            "relevance": relevance,
+            "text": text,
+            "source_file": f"{channel}/x.transcript.md",
+        }
+
+    def _args(self, **over):
+        base = dict(
+            query="thinking partner",
+            channel=None,
+            limit=4,
+            since=None,
+            min_relevance=0.0,
+            no_expand=False,
+            output=None,
+            no_save=False,
+            topic="fde",
+            model=None,
+        )
+        base.update(over)
+        return argparse.Namespace(**base)
+
+    def _run(self, tmp_path, monkeypatch, hits, args):
+        monkeypatch.setattr("video_intel.resolve_output_dir", lambda _c, **_kw: tmp_path)
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        captured = {}
+
+        def fake_hybrid(_out, _query, **kw):
+            captured["limit"] = kw.get("limit")
+            captured["video_ids_filter"] = kw.get("video_ids_filter")
+            ids = kw.get("video_ids_filter")
+            # Faithful to the real index-level predicate: only members return.
+            return hits if ids is None else [h for h in hits if h["video_id"] in ids]
+
+        monkeypatch.setattr("video_intel.hybrid_search", fake_hybrid)
+
+        response = MagicMock()
+        response.text = "synthesized brief body"
+        client = MagicMock()
+        client.models.generate_content.return_value = response
+        monkeypatch.setattr("video_intel.create_client", lambda _key: client)
+
+        video_intel.cmd_nugget(args, {})
+        if client.models.generate_content.called:
+            captured["prompt"] = client.models.generate_content.call_args.kwargs["contents"].parts[0].text
+        return captured
+
+    def test_scopes_retrieval_at_the_index_query_with_the_users_own_limit(self, tmp_path, capsys, monkeypatch):
+        """The filter is an index-level predicate, not a post-filter over the
+        global pool - Gate 1 measured the post-filter shape starving a
+        19-video topic down to 2 surviving excerpts. The limit passed through
+        is the USER's, untouched: no over-fetch multiplier on this surface."""
+        self._corpus(tmp_path)
+        hits = [
+            self._hit("outsidevid1", "other", "louder chunk", 0.9),
+            self._hit("insidevid12", "demo", "anchor chunk", 0.5),
+        ]
+        captured = self._run(tmp_path, monkeypatch, hits, self._args())
+        assert captured["limit"] == 4
+        assert captured["video_ids_filter"] == {"insidevid12"}
+        assert "anchor chunk" in captured["prompt"]
+        assert "louder chunk" not in captured["prompt"]
+
+    def test_a_leak_past_the_index_filter_is_dropped_with_a_warning(self, tmp_path, capsys, monkeypatch, caplog):
+        """Belt: the predicate owns membership, but if it ever silently stops
+        filtering, the leak must not reach the synthesis unnoticed."""
+        self._corpus(tmp_path)
+
+        def leaky_hybrid(_out, _query, **kw):
+            return [
+                self._hit("insidevid12", "demo", "anchor chunk", 0.5),
+                self._hit("outsidevid1", "other", "leaked chunk", 0.9),
+            ]
+
+        monkeypatch.setattr("video_intel.resolve_output_dir", lambda _c, **_kw: tmp_path)
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        monkeypatch.setattr("video_intel.hybrid_search", leaky_hybrid)
+        response = MagicMock()
+        response.text = "brief"
+        client = MagicMock()
+        client.models.generate_content.return_value = response
+        monkeypatch.setattr("video_intel.create_client", lambda _key: client)
+        with caplog.at_level("WARNING"):
+            video_intel.cmd_nugget(self._args(no_save=True), {})
+        prompt = client.models.generate_content.call_args.kwargs["contents"].parts[0].text
+        assert "anchor chunk" in prompt
+        assert "leaked chunk" not in prompt
+        assert "outside the topic despite the index-level filter" in caplog.text
+
+    def test_without_the_flag_retrieval_is_byte_identical_to_pre_188(self, tmp_path, capsys, monkeypatch):
+        self._corpus(tmp_path)
+        hits = [
+            self._hit("outsidevid1", "other", "louder chunk", 0.9),
+            self._hit("insidevid12", "demo", "anchor chunk", 0.5),
+        ]
+        captured = self._run(tmp_path, monkeypatch, hits, self._args(topic=None))
+        assert captured["limit"] == 4  # no over-fetch without a topic
+        assert "louder chunk" in captured["prompt"]
+        assert "anchor chunk" in captured["prompt"]
+
+    def test_scoped_brief_front_matter_records_the_topic(self, tmp_path, capsys, monkeypatch):
+        self._corpus(tmp_path)
+        hits = [self._hit("insidevid12", "demo", "anchor chunk", 0.5)]
+        self._run(tmp_path, monkeypatch, hits, self._args())
+        briefs = list((tmp_path / "_briefings" / "nuggets").glob("*.md"))
+        assert len(briefs) == 1
+        front = briefs[0].read_text(encoding="utf-8").split("---")[1]
+        assert "topic: fde" in front
+
+    def test_unscoped_brief_front_matter_has_no_topic_key(self, tmp_path, capsys, monkeypatch):
+        self._corpus(tmp_path)
+        hits = [self._hit("insidevid12", "demo", "anchor chunk", 0.5)]
+        self._run(tmp_path, monkeypatch, hits, self._args(topic=None))
+        briefs = list((tmp_path / "_briefings" / "nuggets").glob("*.md"))
+        assert len(briefs) == 1
+        assert "topic:" not in briefs[0].read_text(encoding="utf-8").split("---")[1]
+
+    def test_unknown_topic_is_refused_before_any_retrieval(self, tmp_path, capsys, monkeypatch):
+        """Probe before you pay: an unknown slug must not cost a Voyage call."""
+        self._corpus(tmp_path)
+        monkeypatch.setattr("video_intel.resolve_output_dir", lambda _c, **_kw: tmp_path)
+
+        def _boom(*_a, **_kw):
+            raise AssertionError("hybrid_search must not run for an unknown topic")
+
+        monkeypatch.setattr("video_intel.hybrid_search", _boom)
+        video_intel.cmd_nugget(self._args(topic="nope"), {})
+        out = capsys.readouterr().out
+        assert "No topic 'nope'" in out
+        assert "known: fde" in out
+
+    def test_no_matching_excerpts_prints_a_topic_aware_message(self, tmp_path, capsys, monkeypatch):
+        self._corpus(tmp_path)
+        hits = [self._hit("outsidevid1", "other", "louder chunk", 0.9)]
+        self._run(tmp_path, monkeypatch, hits, self._args())
+        out = capsys.readouterr().out
+        assert "No excerpts in topic 'fde'" in out
+        assert "search --topic fde" in out
+
+
+class TestHybridSearchVideoIdsFilterWiring:
+    """Issue #188 review P1: the stubbed nugget tests prove cmd_nugget's
+    kwargs, not that the REAL hybrid_search honors them - both the WHERE
+    wiring and the scoped pool sizing were deletable with every topic test
+    green. These drive the real function through the capturing LanceDB fake."""
+
+    def _run(self, tmp_path, fake_lancedb, monkeypatch, *, ids, limit):
+        monkeypatch.setattr(video_intel, "load_taxonomy", lambda _d: {"concepts": {}})
+        video_intel.hybrid_search(tmp_path, "some query", limit=limit, video_ids_filter=ids)
+        return fake_lancedb
+
+    def test_the_predicate_reaches_the_real_where_clause(self, tmp_path, fake_lancedb, monkeypatch):
+        builder = self._run(tmp_path, fake_lancedb, monkeypatch, ids={"vidA", "vidB"}, limit=5)
+        joined = " AND ".join(builder.where_clauses)
+        assert video_intel.video_ids_predicate({"vidA", "vidB"}) in joined
+
+    def test_no_filter_means_no_video_id_predicate(self, tmp_path, fake_lancedb, monkeypatch):
+        monkeypatch.setattr(video_intel, "load_taxonomy", lambda _d: {"concepts": {}})
+        video_intel.hybrid_search(tmp_path, "some query", limit=5)
+        assert all("video_id IN" not in c for c in fake_lancedb.where_clauses)
+
+    def test_scoped_pool_is_sized_to_the_scope(self, tmp_path, fake_lancedb, monkeypatch):
+        ids = {f"vid{i:08d}" for i in range(19)}
+        builder = self._run(tmp_path, fake_lancedb, monkeypatch, ids=ids, limit=15)
+        # max(max(50, 15*5), min(1000, 19*15)) = max(75, 285) = 285
+        assert builder.limit_calls == [285]
+
+    def test_scoped_pool_is_capped_at_one_thousand(self, tmp_path, fake_lancedb, monkeypatch):
+        ids = {f"vid{i:08d}" for i in range(120)}
+        builder = self._run(tmp_path, fake_lancedb, monkeypatch, ids=ids, limit=10)
+        assert builder.limit_calls == [1000]
+
+    def test_unscoped_pool_is_unchanged(self, tmp_path, fake_lancedb, monkeypatch):
+        monkeypatch.setattr(video_intel, "load_taxonomy", lambda _d: {"concepts": {}})
+        video_intel.hybrid_search(tmp_path, "some query", limit=10)
+        assert fake_lancedb.limit_calls == [50]
+
+
+class TestTopicListingOrderPinsUnresolvedLast:
+    def test_unresolved_and_undated_members_sort_after_every_dated_member(self):
+        topics_data = {
+            "topics": {
+                "fde": {
+                    "video_count": 4,
+                    "channels": ["demo"],
+                    "first_seen": "2026-08-01",
+                    "briefings": [],
+                    "videos": [
+                        {"video_id": "ghost9999999", "unresolved": True},
+                        {"video_id": "old456789012", "channel": "demo", "title": "Old", "published": "2026-01-01"},
+                        {"video_id": "new456789012", "channel": "demo", "title": "New", "published": "2026-08-01"},
+                        {"video_id": "undated12345", "channel": "demo", "title": "Undated", "published": None},
+                    ],
+                }
+            }
+        }
+        lines = video_intel.render_topic_listing(topics_data, "fde")
+        text = "\n".join(lines)
+        # Dated members newest-first; the undated/unresolved tail comes after
+        # EVERY dated member, ordered among itself by video_id (deterministic).
+        assert text.index("New") < text.index("Old")
+        for tail in ("Undated", "ghost9999999"):
+            assert text.index("Old") < text.index(tail)
+        assert text.index("ghost9999999") < text.index("Undated")  # id order within the tail

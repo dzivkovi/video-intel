@@ -9614,6 +9614,27 @@ def build_search_index(
     return len(all_records)
 
 
+def video_ids_predicate(video_ids) -> str:
+    """SQL predicate restricting rows to a set of video ids (issue #188).
+
+    Every id goes through `escape_sql_string_literal`, the same rule as the
+    channel predicate (issue #183 invariant 6): LanceDB predicates are SQL
+    text and a quote in an id must not break or widen the filter. Empty and
+    non-string ids are dropped; an empty usable set returns a predicate that
+    matches nothing, because "filter to no videos" must never silently mean
+    "no filter".
+    """
+    quoted = sorted(f"'{escape_sql_string_literal(v)}'" for v in video_ids if v and isinstance(v, str))
+    if not quoted:
+        # NOT "video_id IN ('')": roughly 750 chunks in the live index carry a
+        # BLANK video_id (the selector's known fallback-identity population),
+        # so that predicate matches all of THEM rather than nothing - executed
+        # proof from the #188 review. "1 = 0" counts zero rows on lancedb
+        # 0.30.2.
+        return "1 = 0"
+    return f"video_id IN ({', '.join(quoted)})"
+
+
 def hybrid_search(
     output_dir: Path,
     query: str,
@@ -9625,6 +9646,7 @@ def hybrid_search(
     expand: bool = True,
     return_diagnostics: bool = False,
     dedup_by_video: bool = True,
+    video_ids_filter=None,
 ) -> list[dict] | tuple[list[dict], dict]:
     """Search the LanceDB index with hybrid BM25 + vector + RRF fusion.
 
@@ -9706,6 +9728,17 @@ def hybrid_search(
 
     # Hybrid search: BM25 (FTS on title+text) + vector, merged by RRF (K=60 default)
     fetch_count = max(50, limit * 5)
+    if video_ids_filter is not None:
+        # Scoped retrieval sizes its pool to the SCOPE, not the product default
+        # (issue #188). Measured on the live index: a 19-video topic's pool of
+        # 95 chunks was consumed 23-deep by single chunk-dense members, so a
+        # member whose best chunk ranked 131st among the topic's own chunks
+        # could never surface no matter the --limit. Fifteen slots per member
+        # clears that shape with margin; the 1,000 cap bounds the pandas
+        # materialization for very large topics. This is deliberately NOT the
+        # unscoped pool (issue #190 invariant 4 pins that one): a scope is a
+        # different surface with its own documented depth.
+        fetch_count = max(fetch_count, min(1000, len(video_ids_filter) * 15))
     search_builder = (
         table.search(query_type="hybrid", fts_columns=["title", "text"])
         .vector(query_embedding)
@@ -9717,6 +9750,12 @@ def hybrid_search(
         where_clauses.append(f"channel = '{escape_sql_string_literal(channel_filter)}'")
     if since_iso:
         where_clauses.append(f"published >= '{since_iso}'")
+    if video_ids_filter is not None:
+        # Issue #188: scope retrieval AT the index query, not by post-filtering
+        # the global top pool - Gate 1 measured the post-filter shape starving
+        # a 19-video topic down to 2 surviving excerpts, because membership had
+        # to fight 2,300+ other videos for pool slots first.
+        where_clauses.append(video_ids_predicate(video_ids_filter))
     if where_clauses:
         search_builder = search_builder.where(" AND ".join(where_clauses))
 
@@ -9941,24 +9980,41 @@ def cmd_search(args, config):
     topic_slug = getattr(args, "topic", None)
     topic_ids: set[str] | None = None
     fetch_limit = args.limit
+
+    # Issue #188: `query` became optional so a topic can be LISTED without one.
+    # Neither query nor topic is an unusable invocation and keeps the old
+    # missing-positional exit code (2); --vector without a query has nothing to
+    # embed and is refused the same way.
+    if args.query is None and not topic_slug:
+        print("search needs a query, a --topic to list, or both. Try: search --topic <slug>")
+        sys.exit(2)
+    if args.query is None and getattr(args, "vector", False):
+        print("--vector needs a query to search for. Drop --vector to list the topic's members.")
+        sys.exit(2)
+
+    topics_data = None
     if topic_slug:
-        topics_data, topics_problem = load_topics_artifact(output_dir)
-        if topics_problem:
-            print(topics_problem)
-            return
-        topic_ids = topic_video_ids(topics_data, topic_slug)
-        if topic_ids is None:
-            known = ", ".join(sorted(topics_data.get("topics", {}))) or "(none)"
-            print(
-                f"No topic '{topic_slug}' in {output_dir / TOPICS_FILENAME} "
-                f"(known: {known}). Re-run 'topics-build' after adding a briefing folder."
-            )
+        topic_ids, topics_data, topic_problem = resolve_topic_filter(output_dir, topic_slug)
+        if topic_problem:
+            print(topic_problem)
             return
         # Over-fetch before post-filtering, so a topic whose videos rank below
         # the requested limit is not reported as empty. Both modes rank first
         # and filter after (same shape as concept mode's --since filter), so
         # without this the filter would silently truncate the topic.
         fetch_limit = args.limit * TOPIC_FILTER_OVERFETCH
+
+    if args.query is None and topic_slug:
+        # Query-less listing: pure read + render from topics.json, no retrieval.
+        for line in render_topic_listing(
+            topics_data,
+            topic_slug,
+            channel_filter=args.channel,
+            since_iso=since_iso,
+            limit=args.limit,
+        ):
+            print(line)
+        return
 
     # Hybrid search mode (BM25 + vector + RRF)
     if getattr(args, "vector", False):
@@ -10720,7 +10776,9 @@ def _render_nugget_sources(hits: list[dict]) -> list[str]:
     return lines
 
 
-def render_nugget_brief_markdown(query: str, response_text: str, hits: list[dict], *, today: date | None = None) -> str:
+def render_nugget_brief_markdown(
+    query: str, response_text: str, hits: list[dict], *, today: date | None = None, topic: str | None = None
+) -> str:
     """Render a nugget brief as a persistable corpus artifact.
 
     Front matter uses `cited_video_ids` (NOT `video_ids`): `load_seen_video_ids`
@@ -10752,6 +10810,13 @@ def render_nugget_brief_markdown(query: str, response_text: str, hits: list[dict
         "generator": {"name": "nugget", "version": 1},
         "cited_video_ids": cited_video_ids,
     }
+    # Issue #188: a topic-scoped brief says so - a reader (or a later session)
+    # must be able to tell "the corpus only had these voices" from "retrieval
+    # was deliberately narrowed to a curated thread". Additive optional key;
+    # the nuggets folder is in RESERVED_BRIEFING_DIRS, so this can never be
+    # read back as a topic ASSERTION by topics-build.
+    if topic:
+        front_matter["topic"] = topic
     lines = [
         "---",
         yaml.safe_dump(front_matter, sort_keys=False, allow_unicode=True).rstrip(),
@@ -10777,7 +10842,13 @@ def nugget_brief_slug(query: str) -> str:
 
 
 def write_nugget_brief(
-    output_dir: Path, query: str, response_text: str, hits: list[dict], *, today: date | None = None
+    output_dir: Path,
+    query: str,
+    response_text: str,
+    hits: list[dict],
+    *,
+    today: date | None = None,
+    topic: str | None = None,
 ) -> Path:
     """Persist a nugget brief under `_briefings/nuggets/`, never clobbering same-day re-runs.
 
@@ -10800,7 +10871,7 @@ def write_nugget_brief(
     while out_path.exists():
         out_path = nuggets_dir / f"{base_name}-{counter}.md"
         counter += 1
-    content = render_nugget_brief_markdown(query, response_text, hits, today=today)
+    content = render_nugget_brief_markdown(query, response_text, hits, today=today, topic=topic)
     out_path.write_text(content, encoding="utf-8")
     return out_path
 
@@ -10811,6 +10882,23 @@ def cmd_nugget(args, config):
     since_raw = getattr(args, "since", None)
     since_iso = parse_since(since_raw).date().isoformat() if since_raw else None
 
+    # Issue #188: --topic scopes retrieval AT the index query (a `video_id IN`
+    # predicate through the shared resolver), never by post-filtering the
+    # global pool - Gate 1 measured the post-filter shape starving a 19-video
+    # topic down to 2 surviving excerpts, because membership had to fight the
+    # whole corpus for pool slots first. The semantic contract matches
+    # search --topic (issue #146: filters, never reorders or boosts); only the
+    # mechanism differs, because nugget's output is a synthesis whose quality
+    # IS its evidence base. The unknown-slug check runs BEFORE retrieval so a
+    # typo costs no Voyage query.
+    topic_slug = getattr(args, "topic", None)
+    topic_ids: set[str] | None = None
+    if topic_slug:
+        topic_ids, _topics_data, topic_problem = resolve_topic_filter(output_dir, topic_slug)
+        if topic_problem:
+            print(topic_problem)
+            return
+
     log.info("Retrieving top-%d excerpts for: %s", args.limit, args.query)
     hits = hybrid_search(
         output_dir,
@@ -10820,9 +10908,28 @@ def cmd_nugget(args, config):
         limit=args.limit,
         config=config,
         expand=not getattr(args, "no_expand", False),
+        video_ids_filter=topic_ids,
     )
+    if topic_ids is not None:
+        # Belt: the index-level predicate owns membership; a leak here means
+        # that predicate silently stopped filtering, which must never pass
+        # through to the synthesis unnoticed.
+        leaked = [h for h in hits if h.get("video_id") not in topic_ids]
+        if leaked:
+            log.warning(
+                "topic '%s': %d retrieved chunks were outside the topic despite the index-level filter; dropping them",
+                topic_slug,
+                len(leaked),
+            )
+            hits = [h for h in hits if h.get("video_id") in topic_ids]
     if not hits:
-        print(f'No results for "{args.query}". Is the index built? Run: video_intel.py index')
+        if topic_slug:
+            print(
+                f"No excerpts in topic '{topic_slug}' matched \"{args.query}\". "
+                f"Try a broader query, or list the members: search --topic {topic_slug}"
+            )
+        else:
+            print(f'No results for "{args.query}". Is the index built? Run: video_intel.py index')
         return
 
     min_rel = getattr(args, "min_relevance", 0.0)
@@ -10895,7 +11002,7 @@ def cmd_nugget(args, config):
     # write fails (permissions, unmounted cloud drive, disk full).
     if not getattr(args, "no_save", False):
         try:
-            saved_path = write_nugget_brief(output_dir, args.query, response_text, strong)
+            saved_path = write_nugget_brief(output_dir, args.query, response_text, strong, topic=topic_slug)
             log.info(
                 "Nugget brief persisted: %s (cited_video_ids: %d)",
                 saved_path,
@@ -12849,6 +12956,92 @@ def topic_video_ids(topics_data: dict, slug: str) -> set[str] | None:
     return {v.get("video_id") for v in topic.get("videos", []) if v.get("video_id")}
 
 
+def resolve_topic_filter(output_dir: Path, topic_slug: str):
+    """Resolve one topic slug into its video-id set, failing soft.
+
+    Returns ``(topic_ids, topics_data, problem)``. ``problem`` is a printable,
+    actionable message (missing/unparseable topics.json, or an unknown slug
+    with the known slugs listed) and the ids are None when it is set. ONE
+    resolver shared by every read surface that accepts ``--topic``
+    (issue #146: `search`; issue #188: the query-less listing and `nugget`),
+    so the fail-soft contract and the unknown-slug message cannot drift apart
+    between consumers.
+    """
+    topics_data, topics_problem = load_topics_artifact(output_dir)
+    if topics_problem:
+        return None, None, topics_problem
+    topic_ids = topic_video_ids(topics_data, topic_slug)
+    if topic_ids is None:
+        known = ", ".join(sorted(topics_data.get("topics", {}))) or "(none)"
+        return (
+            None,
+            topics_data,
+            f"No topic '{topic_slug}' in {output_dir / TOPICS_FILENAME} "
+            f"(known: {known}). Re-run 'topics-build' after adding a briefing folder.",
+        )
+    return topic_ids, topics_data, None
+
+
+def render_topic_listing(
+    topics_data: dict,
+    topic_slug: str,
+    *,
+    channel_filter: str | None = None,
+    since_iso: str | None = None,
+    limit: int | None = None,
+) -> list[str]:
+    """Render one topic's membership as printable lines, from topics.json alone.
+
+    Issue #188: "show me everything I tagged <topic>" needs no query and no
+    retrieval - topics.json already carries each member's channel, title and
+    published date, so this is a pure read + render. Sorted newest-first by
+    published (unknown dates and unresolved ids last, by video_id for
+    determinism). ``--channel`` and ``--since`` compose as filters, ``--limit``
+    caps AFTER filtering; none of them reorder (the #146 contract: a topic
+    surface narrows, it never reorders).
+    """
+    entry = topics_data["topics"][topic_slug]
+    videos = list(entry.get("videos", []))
+    if channel_filter:
+        videos = [v for v in videos if v.get("channel") == channel_filter]
+    if since_iso:
+        videos = [v for v in videos if (v.get("published") or "") >= since_iso]
+    # Newest-first for dated members; unknown dates and unresolved ids LAST
+    # (sorted by id for determinism) - a reverse() over one combined key would
+    # instead float the unknowns to the top.
+    dated = [v for v in videos if v.get("published")]
+    undated = [v for v in videos if not v.get("published")]
+    dated.sort(key=lambda v: (v["published"], v.get("video_id") or ""), reverse=True)
+    undated.sort(key=lambda v: v.get("video_id") or "")
+    videos = dated + undated
+    total = len(videos)
+    if limit:  # 0 means no cap, same convention as briefings --limit
+        videos = videos[:limit]
+
+    lines = [
+        f"Topic '{topic_slug}': {entry['video_count']} videos, "
+        f"{len(entry.get('channels', []))} channels, first seen {entry.get('first_seen') or 'unknown'}",
+    ]
+    for b in entry.get("briefings", []):
+        lines.append(f"  briefing: {b}")
+    lines.append("")
+    if not videos:
+        lines.append("  (no members match the given filters)")
+        return lines
+    for v in videos:
+        if v.get("unresolved"):
+            lines.append(f"  [unresolved] {v['video_id']} - no artifact in the corpus for this id")
+            continue
+        url = f"https://www.youtube.com/watch?v={v['video_id']}" if v.get("video_id") else ""
+        lines.append(f"  [{v.get('channel', '?')}] {v.get('published') or '????-??-??'}  {v.get('title', '')}")
+        if url:
+            lines.append(f"      Video: {url}")
+    if limit is not None and total > len(videos):
+        lines.append("")
+        lines.append(f"  ({total - len(videos)} more; raise --limit to see them)")
+    return lines
+
+
 def cmd_topics_build(args, config):
     """Rebuild `topics.json` from briefing front matter + meta.json topics."""
     output_dir = resolve_output_dir(config)
@@ -13210,7 +13403,16 @@ Examples:
 
     # search command
     search_parser = subparsers.add_parser("search", help="Search corpus by concept or vector similarity")
-    search_parser.add_argument("query", help="Search terms (matched against concept labels and aliases)")
+    search_parser.add_argument(
+        "query",
+        nargs="?",
+        default=None,
+        help=(
+            "Search terms (matched against concept labels and aliases). "
+            "Optional when --topic is given: with a topic and no query, the "
+            "topic's members are listed from topics.json with no retrieval."
+        ),
+    )
     search_parser.add_argument("--channel", help="Filter results to this channel")
     search_parser.add_argument(
         "--limit", type=int, default=None, help="Max results (default: 10 for --vector, 20 for concept)"
@@ -13292,6 +13494,15 @@ Examples:
         default=0.0,
         dest="min_relevance",
         help="Minimum relevance score (RRF scale) for inclusion (default: 0.0)",
+    )
+    nugget_parser.add_argument(
+        "--topic",
+        type=topic_slug_arg,
+        help=(
+            "Restrict retrieval to one curation topic's video set (see "
+            "'topics-build'), so curated threads feed the synthesis. Same "
+            "narrowing contract as search --topic: it filters, never reorders."
+        ),
     )
     nugget_parser.add_argument(
         "--no-expand",
