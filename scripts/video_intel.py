@@ -954,7 +954,19 @@ def channel_config_by_name(config: dict, channel_name: str | None) -> dict:
     """
     if not channel_name or channel_name == STANDALONE_CHANNEL:
         return {}
-    return next((c for c in (config.get("channels") or []) if c.get("name") == channel_name), {})
+    # `isinstance(c, dict)` is not defensive padding: three ordinary YAML
+    # mistakes reach here as a non-dict - `channels:` written as a mapping
+    # (dashes omitted), `channels:` given a bare string, and a scalar list
+    # entry (`- natebjones` instead of `- name: natebjones`). Each raised
+    # AttributeError on `c.get`, killing every manual --url command. The
+    # `or []` beside it covers the fourth: `channels:` with nothing under it
+    # parses as None. Resolving the channel is a CONVENIENCE - `_standalone`
+    # is always an available answer - so a malformed watchlist must degrade
+    # to "no configured channel", never abort the run.
+    return next(
+        (c for c in (config.get("channels") or []) if isinstance(c, dict) and c.get("name") == channel_name),
+        {},
+    )
 
 
 def resolve_mindmap_source(channel_config: dict, *, transcript_available: bool, transcript_severe: bool = False) -> str:
@@ -7354,10 +7366,7 @@ def _cmd_mindmap_impl(args, config):
         if transcript_available
         else False
     )
-    channel_cfg: dict = next(
-        (c for c in config.get("channels", []) if c.get("name") == channel_name),
-        {},
-    )
+    channel_cfg: dict = channel_config_by_name(config, channel_name)
     try:
         resolved_source = resolve_mindmap_source(
             channel_cfg, transcript_available=transcript_available, transcript_severe=transcript_severe
@@ -8509,10 +8518,7 @@ def _cmd_process_impl(args, config):
     # (ValueError, TypeError): belt-and-braces for consistency with the eight
     # sibling config-knob guards - resolve_chunk_minutes maps TypeError onto
     # ValueError internally.
-    channel_cfg: dict = next(
-        (c for c in config.get("channels", []) if c.get("name") == channel_name),
-        {},
-    )
+    channel_cfg: dict = channel_config_by_name(config, channel_name)
     try:
         chunk_minutes = resolve_chunk_minutes(channel_cfg, config, getattr(args, "chunk_minutes", None))
     except (ValueError, TypeError) as e:
@@ -11825,8 +11831,13 @@ def match_configured_channel(youtube, config: dict, yt_channel_id: str | None) -
             name = ch.get("name")
             if isinstance(name, str) and name:
                 return name
+            # `continue`, not `return None` - the same rule as the url-less
+            # skip above, and for the same reason. A nameless entry sitting
+            # ABOVE a real one would otherwise hide it, which is the quieter
+            # half of the bug this whole helper exists to fix. Reviewed and
+            # reproduced: nameless-first, real-second returned None.
             log.warning("Configured channel matched %s but has no usable name; ignoring", yt_channel_id)
-            return None
+            continue
     return None
 
 

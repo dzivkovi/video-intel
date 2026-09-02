@@ -16,6 +16,7 @@ so the fix is one shared helper rather than three patched copies.
 
 from __future__ import annotations
 
+import contextlib
 import sys
 from pathlib import Path
 
@@ -173,3 +174,249 @@ class TestOneMatcherNotThree:
         drop to 0 and the test would pass by finding nothing."""
         assert callable(vi.match_configured_channel)
         assert callable(vi._configured_channel_id)
+
+
+# ---------------------------------------------------------------------------
+# Caller-level coverage.
+#
+# Everything above drives `match_configured_channel` directly. That is not
+# enough, and the review pass proved it the only way that counts: it reverted
+# `_cmd_process_url` to the verbatim pre-#205 inline loop - using a different
+# loop variable (`entry["url"]`) plus one decoy mention to keep the name count
+# at four - and all 21 tests stayed green while the real CLI raised
+# `KeyError: 'url'`. The exact bug this ticket is about was live under a green
+# suite.
+#
+# Both source-walk guards are structurally blind to that: one greps the literal
+# substring `ch["url"]`, which a loop named `entry` evades, and the other is a
+# raw `source.count("match_configured_channel(")`, which any other textual
+# occurrence - a future code comment with parentheses - restores.
+#
+# So these tests drive the three real commands. Only the YouTube client is
+# stubbed; the channel resolution under test is production code.
+# ---------------------------------------------------------------------------
+
+
+class _FakeYouTube:
+    """Minimal stand-in for the Data API client, snippet lookup only."""
+
+    def __init__(self, channel_id: str, channel_title: str = "Some Creator"):
+        self._channel_id = channel_id
+        self._channel_title = channel_title
+
+    def videos(self):
+        return self
+
+    def list(self, **_kw):
+        return self
+
+    def execute(self):
+        return {
+            "items": [
+                {
+                    "snippet": {
+                        "title": "A Talk",
+                        "publishedAt": "2026-08-12T00:00:00Z",
+                        "channelId": self._channel_id,
+                        "channelTitle": self._channel_title,
+                    }
+                }
+            ]
+        }
+
+
+@pytest.fixture
+def wire_commands(monkeypatch, tmp_path):
+    """Neutralize everything the three commands touch EXCEPT channel resolution."""
+
+    def _wire(config, yt_channel_id, *, lookup=None):
+        seen: dict = {}
+
+        def fake_get_channel_id(youtube, url):
+            return (f"UC-for-{url.rsplit('@', 1)[-1]}", url)
+
+        monkeypatch.setattr(vi, "get_channel_id", lookup or fake_get_channel_id)
+        monkeypatch.setattr(vi, "require_youtube", lambda: lambda *a, **kw: _FakeYouTube(yt_channel_id))
+        monkeypatch.setattr(vi, "require_gemini", lambda: (None, None))
+        monkeypatch.setattr(vi, "create_client", lambda *_a, **_kw: object())
+        monkeypatch.setattr(vi, "load_prompt", lambda _n: "PROMPT")
+        monkeypatch.setattr(vi, "resolve_output_dir", lambda _c, **_kw: tmp_path)
+        monkeypatch.setattr(vi, "resolve_model", lambda *_a, **_kw: "stub-model")
+        monkeypatch.setattr(vi, "_lookup_was_livestream", lambda _v: False)
+        monkeypatch.setattr(vi, "_lookup_video_duration_seconds", lambda _v: 600)
+        monkeypatch.setattr(vi, "require_channels_config", lambda _c: None)
+        monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+        monkeypatch.setenv("YOUTUBE_API_KEY", "fake-yt-key")
+
+        def record(*a, **kw):
+            # Record EVERYTHING. These helpers take the channel positionally on
+            # some paths and by keyword on others, and a capture that guesses
+            # the wrong one silently records None - which reads as "the match
+            # failed" and would make this test lie in the safe direction.
+            seen.setdefault("seen_values", []).extend(str(x) for x in a)
+            seen["seen_values"].extend(str(v) for v in kw.values())
+            seen.setdefault("called", 0)
+            seen["called"] += 1
+            return ("2026-08-12-a-talk", "done")
+
+        for name in ("process_transcript", "process_mindmap", "process_concepts"):
+            monkeypatch.setattr(vi, name, record)
+        return seen
+
+    return _wire
+
+
+def _args(**overrides):
+    from types import SimpleNamespace
+
+    base = {
+        "url": "https://www.youtube.com/watch?v=abcdefghijk",
+        "file": None,
+        "channel": None,
+        "title": None,
+        "date": None,
+        "start": None,
+        "end": None,
+        "force": False,
+        "prompt": None,
+        "model": None,
+        "video_id": None,
+        "media_resolution": "low",
+        "chunk_minutes": None,
+        "transcript_source": None,
+        "topic": None,
+    }
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+class TestEveryManualUrlCommandSurvivesTheReportedConfig:
+    """LIVE_SHAPE has two url-less `enabled: false` placeholders ABOVE a real
+    channel - the config that produced the reported `KeyError: 'url'`."""
+
+    @pytest.mark.parametrize("command", ["transcript", "mindmap", "process"])
+    def test_an_unconfigured_video_does_not_crash(self, command, wire_commands, monkeypatch):
+        wire_commands(LIVE_SHAPE, "UC-for-nobody")
+        fn = {
+            "transcript": vi.cmd_transcript,
+            "mindmap": vi.cmd_mindmap,
+            "process": vi.cmd_process,
+        }[command]
+        # Any exception is the defect; a clean return or SystemExit is not.
+        try:
+            fn(_args(), dict(LIVE_SHAPE))
+        except SystemExit:
+            pass
+        except KeyError as e:  # the reported crash
+            pytest.fail(f"{command} still raises the #205 crash: KeyError({e})")
+
+    @pytest.mark.parametrize("command", ["transcript", "mindmap", "process"])
+    def test_a_configured_video_below_the_placeholders_still_resolves(self, command, wire_commands, monkeypatch):
+        """`everyinc` sits AFTER both url-less entries. A fix that stopped at
+        the first bad entry would silently stop matching everything below it."""
+        seen = wire_commands(LIVE_SHAPE, "UC-for-everyinc")
+        fn = {
+            "transcript": vi.cmd_transcript,
+            "mindmap": vi.cmd_mindmap,
+            "process": vi.cmd_process,
+        }[command]
+        with contextlib.suppress(SystemExit):
+            fn(_args(), dict(LIVE_SHAPE))
+        assert seen.get("called"), f"{command} never reached a processing step"
+        values = seen.get("seen_values", [])
+        assert any("everyinc" in v for v in values), f"{command} did not resolve the configured channel; saw: {values}"
+        assert not any("some-creator" in v.lower() for v in values), (
+            f"{command} fell back to the slugified title instead of matching: {values}"
+        )
+
+
+class TestDegenerateConfigsDoNotCrashTheCommands:
+    """The helper-level suite proves the MATCHER survives these. The commands
+    did not: `channel_config_by_name` read `c.get("name")` with no dict check,
+    so three ordinary YAML mistakes raised AttributeError one function past the
+    hardened matcher, and `mindmap` had its own inline copy that broke on
+    `channels: None` too.
+    """
+
+    @pytest.mark.parametrize(
+        ("label", "config"),
+        [
+            ("channels is None", {"channels": None}),
+            ("channels is a mapping (dashes omitted)", {"channels": {"name": "alpha"}}),
+            ("channels is a bare string", {"channels": "alpha"}),
+            ("a scalar list entry", {"channels": ["alpha", {"name": "beta", "url": "https://youtube.com/@beta"}]}),
+        ],
+    )
+    @pytest.mark.parametrize("command", ["transcript", "mindmap", "process"])
+    def test_no_traceback(self, label, config, command, wire_commands):
+        wire_commands(config, "UC-for-nobody")
+        fn = {
+            "transcript": vi.cmd_transcript,
+            "mindmap": vi.cmd_mindmap,
+            "process": vi.cmd_process,
+        }[command]
+        try:
+            fn(_args(), dict(config))
+        except SystemExit:
+            pass
+        except (AttributeError, TypeError, KeyError) as e:
+            pytest.fail(f"{command} crashed on {label}: {type(e).__name__}: {e}")
+
+
+class TestSkippingIsAlwaysContinueNeverBreak:
+    """Invariant 2, applied to every skip reason - not just the url-less one.
+    The review found the non-dict skip and the nameless-match skip both
+    unpinned; the latter was a `return None`, i.e. a `break` in disguise."""
+
+    def test_a_non_dict_entry_does_not_hide_a_later_real_match(self, counted_lookup):
+        cfg = {"channels": ["oops", {"name": "real", "url": "https://youtube.com/@real"}]}
+        assert vi.match_configured_channel(object(), cfg, "UC-for-real") == "real"
+
+    def test_a_nameless_entry_does_not_hide_a_later_real_match(self, counted_lookup):
+        """Both entries resolve to the SAME channel id. The nameless one is
+        found first and has no usable name; returning None there would report
+        "unconfigured" for a video whose channel IS configured, one line down."""
+        url = "https://youtube.com/@twin"
+        cfg = {"channels": [{"url": url}, {"name": "twin", "url": url}]}
+        assert vi.match_configured_channel(object(), cfg, "UC-for-twin") == "twin"
+
+
+class TestBothChannelsNoneGuardsAreLoadBearing:
+    """`config.get("channels") or []` and the `isinstance(c, dict)` check guard
+    DIFFERENT shapes. The review found that removing either one alone left all
+    21 tests green - only removing both failed anything, which means neither
+    was actually pinned."""
+
+    def test_the_or_empty_list_guard_is_pinned(self):
+        """Falsified by reverting to `config.get("channels", [])`."""
+        assert vi.match_configured_channel(object(), {"channels": None}, "UC-x") is None
+        assert vi.channel_config_by_name({"channels": None}, "alpha") == {}
+
+    def test_the_isinstance_dict_guard_is_pinned(self):
+        """Falsified by dropping `isinstance(c, dict)`. A bare string entry is
+        an ordinary YAML mistake (`- alpha` for `- name: alpha`)."""
+        cfg = {"channels": ["alpha"]}
+        assert vi.match_configured_channel(object(), cfg, "UC-x") is None
+        assert vi.channel_config_by_name(cfg, "alpha") == {}
+
+
+class TestTheLookupIsSharedNotCopied:
+    """The #205 finding was that ONE loop existed as three copies. The review
+    then found a FOURTH copy of the adjacent channel-config lookup in
+    `_cmd_mindmap_impl` and a fifth in `_cmd_process_impl`, both using
+    `config.get("channels", [])` - verbatim the shape the matcher's own comment
+    calls out as the `channels: None` crash. Both now route through
+    `channel_config_by_name`."""
+
+    def test_only_the_shared_helper_looks_a_channel_up_by_name(self):
+        source = (Path(__file__).resolve().parent.parent / "scripts" / "video_intel.py").read_text(encoding="utf-8")
+        hits = [
+            f"{n}: {line.strip()}"
+            for n, line in enumerate(source.split("\n"), 1)
+            if 'c.get("name") == channel_name' in line
+        ]
+        assert len(hits) == 1, f"expected only channel_config_by_name's own lookup, found: {hits}"
+
+    def test_the_walk_is_not_vacuous(self):
+        assert callable(vi.channel_config_by_name)
+        assert vi.channel_config_by_name({"channels": [{"name": "a", "x": 1}]}, "a") == {"name": "a", "x": 1}
