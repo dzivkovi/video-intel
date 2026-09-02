@@ -99,9 +99,13 @@ Both skills route the natural phrasing. Say it the way you think it:
 
 **1. A filtered search can return videos the unfiltered search did not show.**
 
-`search "X" --topic fde` is not "filter the top 20 results down to FDE". It means "the top N *within* FDE". The command over-fetches before filtering, so a genuine FDE video ranked 34th still surfaces. Without that, every topic member below the display cap would be invisible.
+`search "X" --topic fde` is not "filter the top 20 results down to FDE". It means "the top N *within* FDE". The scope reaches retrieval itself rather than the ranked output, so a member never has to beat the rest of the corpus for a result slot: a genuine FDE video that would have ranked 340th corpus-wide still surfaces. The two modes get there differently. `--vector` scopes at the search index, before anything is ranked. Concept search ranks its corpus-wide concept matches first and then applies the scope before the result cap, which is equally exact because it has the whole matching set in hand at that point. Without that, every topic member below the display cap would be invisible.
 
-The limitation to know: over-fetch is `limit * 5`, which is a large improvement, not a guarantee. A member ranked below that is still missed. Raise `--limit` on a big topic.
+A member's corpus-wide *video* rank is irrelevant at any depth, in both modes. `--limit` still caps how many results you see, as it does for any search; raise it on a big topic to see more of them.
+
+One cliff remains, and only in concept search. When your query has no exact concept match, concept search picks the five best partial-matching concepts and looks up videos for those alone. That cut happens before the topic scope, so a member whose only relevant concept ranked sixth stays invisible however high you set `--limit`. If a member you expected is missing from a concept search, that is the reason: use `--vector` (no such cut), or query the concept's own label. `search --topic <slug>` with no query always lists every member regardless.
+
+This replaced an earlier `limit * 5` over-fetch (retired in issue #203), which was a probability improvement rather than a guarantee and starved in practice: a 19-member topic had to out-rank 2,300+ other videos for 25 pool slots, and the scoped search returned nothing at all for a question the unscoped search answered well.
 
 **2. Renaming a topic folder renames the topic.**
 

@@ -74,7 +74,13 @@ Five commands against the pre-built corpus:
    with `--channel`, `--since` and `--vector`. Answers "which videos belong
    to my FDE thread". Reads only the derived `topics.json`; when that file
    is absent or unreadable it says so and names `topics-build`, rather than
-   returning a misleading empty result. The query is OPTIONAL with `--topic`:
+   returning a misleading empty result. With a query, the scope is applied
+   to retrieval itself in both modes - at the search index for `--vector`,
+   before the result cap for concept search - so a member competes only
+   against the topic's other members, never against the whole corpus, and
+   its corpus-wide rank is irrelevant. `--limit` caps how many results you
+   see, exactly as it does for an unscoped search. The query is OPTIONAL
+   with `--topic`:
    `search --topic fde` alone lists the topic's members (newest first, with
    channel, date and video link) straight from `topics.json` - no retrieval,
    no index needed. That is the command for "show me everything I tagged
