@@ -76,6 +76,24 @@ SKILL_DIR = Path(__file__).resolve().parent.parent
 # A/B did show is that "minimal" degrades timestamp granularity badly, collapsing
 # minutes of video into one stamped block and wrecking &t= deep-link precision.
 DEFAULT_MODEL = "gemini-3.7-flash"
+# The mind-map prompt used when neither the channel nor the top-level config
+# names one (issue #210). ONE definition, six readers.
+#
+# Before this it was an inline default at each of those six sites, and they
+# DISAGREED: `mindmap-light` in `cmd_scan`'s mindmap step, `mindmap --url`, and
+# the `scan --dry-run` preflight; `mindmap-knowledge` in `process --url`,
+# `process --file`, and `cmd_scan`'s concepts step. So the same config produced
+# a different prompt depending on which command read it, and - worse - the
+# PREFLIGHT disagreed with three of the writers it exists to predict, which is
+# the standing checker-must-use-the-writer's-own-rule class (PR #136).
+#
+# `mindmap-knowledge` is the value, chosen by the owner: it is what
+# `config.yaml.example` ships, so anyone who copied the template already gets
+# it, and it is the richer output. That makes `scan` and `mindmap --url` on a
+# config with NO `default_prompt` key produce knowledge mind maps where they
+# previously produced light ones - a deliberate, user-visible change, and the
+# only behavioral half of this fix.
+DEFAULT_PROMPT_NAME = "mindmap-knowledge"
 MAX_OUTPUT_TOKENS = 65536
 TRANSCRIPT_PARSE_RETRY_LIMIT = 1
 SALVAGE_MIN_SPEECH_ENTRIES = 5
@@ -1257,7 +1275,7 @@ def validate_channel_knobs(
     #    unresolvable name with sys.exit(1). The WORST of these knobs: it does
     #    not skip a channel, it kills the run mid-scan after every earlier
     #    channel's Gemini spend, and it is the one an operator least suspects.
-    prompt_name = channel_config.get("prompt") or config.get("default_prompt", "mindmap-light")
+    prompt_name = channel_config.get("prompt") or config.get("default_prompt", DEFAULT_PROMPT_NAME)
     try:
         prompt_resolves = resolve_prompt_path(prompt_name).exists()
     except TypeError as e:
@@ -6888,7 +6906,7 @@ def cmd_scan(args, config):
                 log.info("    %s - %s", v["published"], v["title"])
             continue
 
-        prompt_name = ch.get("prompt") or config.get("default_prompt", "mindmap-light")
+        prompt_name = ch.get("prompt") or config.get("default_prompt", DEFAULT_PROMPT_NAME)
         prompt_text = load_prompt(prompt_name)
 
         # ----------------------------------------------------------------------
@@ -7196,7 +7214,7 @@ def cmd_scan(args, config):
             if scan_taxonomy is None:
                 scan_taxonomy = load_taxonomy(output_dir)
             taxonomy = scan_taxonomy
-            prompt_name = ch.get("prompt") or config.get("default_prompt", "mindmap-knowledge")
+            prompt_name = ch.get("prompt") or config.get("default_prompt", DEFAULT_PROMPT_NAME)
             channel_dir_for_concepts = output_dir / ch_name
             # Issue #173 (scan half): this pre-filter and the process_concepts
             # call below must both honor args.force, mirroring cmd_concepts's
@@ -7344,7 +7362,9 @@ def _cmd_mindmap_impl(args, config):
     )
 
     # Resolve prompt
-    prompt_name = normalize_prompt_name(getattr(args, "prompt", None) or config.get("default_prompt", "mindmap-light"))
+    prompt_name = normalize_prompt_name(
+        getattr(args, "prompt", None) or config.get("default_prompt", DEFAULT_PROMPT_NAME)
+    )
     prompt_text = load_prompt(prompt_name)
 
     # --- Local-file path (plan rev 4) ---
@@ -8174,7 +8194,7 @@ def _cmd_process_url(args, config):
     register_topic_stamp_target(args, video, channel_dir, prefix, channel_name)
 
     prompt_name = normalize_prompt_name(
-        getattr(args, "prompt", None) or config.get("default_prompt", "mindmap-knowledge")
+        getattr(args, "prompt", None) or config.get("default_prompt", DEFAULT_PROMPT_NAME)
     )
     mindmap_prompt = load_prompt(prompt_name)
     transcript_prompt = load_prompt("transcript")
@@ -8592,7 +8612,7 @@ def _cmd_process_impl(args, config):
             log.error("Channel '%s' not found in config.yaml", args.channel)
             sys.exit(1)
 
-    prompt_name = args.prompt or config.get("default_prompt", "mindmap-knowledge")
+    prompt_name = args.prompt or config.get("default_prompt", DEFAULT_PROMPT_NAME)
     prompt_name = normalize_prompt_name(prompt_name)
     mindmap_prompt = load_prompt(prompt_name)
     transcript_prompt = load_prompt("transcript")
