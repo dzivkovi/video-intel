@@ -89,10 +89,19 @@ DEFAULT_MODEL = "gemini-3.7-flash"
 #
 # `mindmap-knowledge` is the value, chosen by the owner: it is what
 # `config.yaml.example` ships, so anyone who copied the template already gets
-# it, and it is the richer output. That makes `scan` and `mindmap --url` on a
-# config with NO `default_prompt` key produce knowledge mind maps where they
-# previously produced light ones - a deliberate, user-visible change, and the
-# only behavioral half of this fix.
+# it, and it is the richer output.
+#
+# The behavioral half, stated exactly: on a config with NO `default_prompt`
+# key, the three sites that used to fall back to `mindmap-light` now use this
+# constant. Those are `cmd_scan`'s mindmap step, `mindmap --url`, and
+# `mindmap --file` - the LAST of which is the one where it always bites,
+# because that path stays on mindmap-from-video unconditionally. `scan` and
+# `mindmap --url` consume it only on the video BRANCH: with a transcript on
+# disk they send `mindmap-from-transcript` and this constant never reaches
+# Gemini at all. Measured on the corpus: 1,665 of 2,420 metas are
+# `mindmap_source: transcript` and only 63 (2.6%) are `video`, so the blast
+# radius is small - and zero corpus artifacts were built with
+# `mindmap-light`, because the shipped template has always set this key.
 DEFAULT_PROMPT_NAME = "mindmap-knowledge"
 MAX_OUTPUT_TOKENS = 65536
 TRANSCRIPT_PARSE_RETRY_LIMIT = 1
@@ -7214,7 +7223,6 @@ def cmd_scan(args, config):
             if scan_taxonomy is None:
                 scan_taxonomy = load_taxonomy(output_dir)
             taxonomy = scan_taxonomy
-            prompt_name = ch.get("prompt") or config.get("default_prompt", DEFAULT_PROMPT_NAME)
             channel_dir_for_concepts = output_dir / ch_name
             # Issue #173 (scan half): this pre-filter and the process_concepts
             # call below must both honor args.force, mirroring cmd_concepts's
@@ -7284,7 +7292,17 @@ def cmd_scan(args, config):
                         output_dir,
                         ch_name,
                         source_file=mindmap_path.name,
-                        source_prompt=prompt_name,
+                        # The WRITER's own record, never a re-derivation:
+                        # `process_mindmap` stamps `prompt` into meta.json,
+                        # and this loop already parsed that meta a few lines
+                        # above. Re-deriving it from config disagreed with
+                        # the artifact on 1,004 of 2,383 corpus files (42%),
+                        # because a mindmap built from a transcript records
+                        # `mindmap-from-transcript` while config says
+                        # `mindmap-knowledge`. The sibling `cmd_concepts`
+                        # always did this correctly. Measured by the issue
+                        # #210 review pass; PR #136's checker/writer rule.
+                        source_prompt=meta.get("prompt"),
                         force=args.force,
                         prefix=prefix,
                     )
