@@ -55,10 +55,10 @@ claude
 That's it. The repo ships with `.claude/settings.json` which auto-registers
 the plugin as a local marketplace. On first launch, Claude Code shows a
 trust prompt for the `video-intel` plugin — click **"Install for this project"**
-to enable both skills for this repo. No manual config, no path editing.
+to enable all three skills for this repo. No manual config, no path editing.
 
-After the one-time trust prompt, both `video-intel` and `translate-bcs` skills
-appear automatically in every session opened in this directory.
+After the one-time trust prompt, `video-intel`, `video-intel-search` and
+`translate-bcs` appear automatically in every session opened in this directory.
 
 **Tip:** You can also set API keys in `~/.claude/settings.local.json`
 instead of system environment variables (this file is never committed):
@@ -231,12 +231,16 @@ translate this YouTube video to Bosnian: https://www.youtube.com/watch?v=VIDEO_I
 ```
 
 If the translate-bcs skill activates, you'll see it preparing to call
-`translate_video.py`. Both skills should be listed when you ask Claude
+`translate_video.py`. All three skills should be listed when you ask Claude
 "what skills do you have?"
 
 ## Configure
 
-Edit `config.yaml` at the repo root to add your YouTube channels:
+Copy the template, then edit `config.yaml` at the repo root to add your YouTube channels:
+
+```bash
+cp config.yaml.example config.yaml     # Windows: copy config.yaml.example config.yaml
+```
 
 ```yaml
 output_dir: ~/video-intel        # Where output files are saved
@@ -271,7 +275,7 @@ Your `config.yaml` is preserved — git pull won't overwrite local changes.
 
 | Platform | Notes |
 |----------|-------|
-| **Claude Code** (CLI, Desktop, VS Code) | Full plugin support. Both skills auto-discovered. |
+| **Claude Code** (CLI, Desktop, VS Code) | Full plugin support. All three skills auto-discovered. |
 | **Gemini CLI** | Single-skill install via `skills/video-intel/`. |
 | **Cursor, Copilot, Codex** | Single-skill install. Not verified by this project. |
 
@@ -302,7 +306,7 @@ Two structural changes you should know about:
    `video-intel` (ingest / curate — scan, transcribe, index, dedupe) and
    `video-intel-search` (read-only query — search, nugget, status, profile show).
    `translate-bcs` is unchanged. After `git pull`, close and reopen Claude
-   Code to pick up the new skill registration; both skills auto-discover
+   Code to pick up the new skill registration; all three auto-discover
    from `.claude/settings.json` as before.
 
 3. **User-level install now supported.** The `video-intel-search` skill can

@@ -1,31 +1,142 @@
 # Video Intel
 
 > **30 seconds to read a mind map vs. 30 minutes to watch the video.**
-> Scanned 15 videos from a single channel in under 2 minutes, ~$0.15-0.25 each.
-> Free tier covers 8 hours of YouTube video per day.
+> A channel's new uploads scanned in minutes, ~$0.15-0.25 per 15-minute video, and the Gemini free tier covers 8 hours of video a day.
 
-Multimodal video intelligence powered by Gemini. Scan YouTube channels,
-generate thematic mind maps, and produce enriched transcripts that capture
-what was said AND what was shown on screen.
+Point it at the YouTube channels you follow. It watches the videos for you - frames, on-screen text and audio together - and writes back a mind map, a transcript that records what was *shown* as well as what was said, and, if you want it, a search index that answers a question with timestamped links to the moments that match. You read the mind maps, decide what deserves 30 minutes, and ask questions across everything you have indexed.
 
-Then, optionally, it turns that whole corpus into a small analytics store and asks it questions a search box cannot - who reached an idea first, which creators genuinely cluster, what is suddenly spiking - with the statistics done honestly: real null models, significance testing, and a plain caveat on every number. See [The intelligence layer](#the-intelligence-layer-optional).
+It is a Claude Code plugin: you say "scan my channels" or "what did anyone say about prompt caching", and Claude runs the tool. In daily use since March 2026 on a corpus of 2,400+ videos across 75 channels.
 
-## Key Principles
+## What a Fused Transcript Looks Like
 
-- **Multimodal, not transcript-based.** Gemini sees video frames at 1 FPS,
-  reads all on-screen text, and hears audio simultaneously. When a presenter
-  says "as you can see here," the output tells you what was actually shown.
-- **Decoupled task prompting.** Transcription (audio) and speaker identification
-  (vision) run as separate tasks within a single prompt to preserve attention
-  quality, borrowed from Laurent Picard's research.
-- **Scan-then-triage funnel.** Mind maps are cheap and fast. Read 30-second
-  summaries, then spend transcript budget only on videos worth deep engagement.
-- **Idempotent processing.** Re-running a scan skips already-processed videos.
-  Safe to interrupt, safe to re-run.
+Traditional transcripts lose everything visual. When a presenter says "as you
+can see here," you see nothing. The fused transcript captures both channels:
+
+```text
+[01:09] Ray (Developer and Instructor): "But then this introduced
+a brand new problem whereby in session one you would have a pretty
+fresh, clean, and relevant memory. And then as you go on, you would
+notice that Claude Code decides to add more and more stuff to its
+memory and you get noise and contradictions and stuff like that."
+
+  SCREEN [01:09-01:31] [diagram]: Excalidraw diagram titled
+  'THE PROBLEM WITH AI MEMORY', illustrating how memory accumulates
+  noise and contradictions over multiple sessions (Session 1 to
+  Session 20).
+
+[01:32] Ray (Developer and Instructor): "And Claude did have some
+instructions in the system prompt telling it to verify that the
+memory is still correct and up-to-date, but that didn't really
+do a good job."
+```
+
+This is real output from scanning [Ray Amjad's](https://youtube.com/@ramjad)
+channel. Speaker names are identified from visual cues (Zoom labels, name
+cards, badges, slide footers) with evidence provided for each identification.
+
+## Pick your depth
+
+Not everyone wants everything. Start with mind maps. Add transcripts, then search, when you want deeper evidence. Synthesis and analysis are two separate branches off the searchable corpus; neither needs the other. Every level is a fine place to stop.
+
+| Level | You want to... | What runs | What it costs |
+| --- | --- | --- | --- |
+| **0 - Skim** | know which new videos deserve your time | `scan`, mind maps only | ~$0.15-0.25 per 15-minute video; the free tier covers a weekly scan |
+| **1 - Read** | a transcript that includes what was on screen, with speakers named | `scan` with `auto_transcript: all` | ~$0.33 per video-hour |
+| **2 - Search** | "what did anyone say about X", with a link to the exact second | `index` once (needs a free Voyage AI key), then `search --vector` | the one-time index is a few cents per channel; then ~$0.02 per query |
+| **3 - Synthesize** | a brief that compares creators, a personalized catch-up guide, topic threads | `nugget`, `briefings --unseen`, `topics-build` | one text-only Gemini call per brief; briefings and topics are free |
+| **4 - Analyze** | who reached an idea first, what is spiking, which creators cluster | the intelligence layer (DuckDB) | free, no API calls |
+| **Side path** | Bosnian/Croatian/Serbian subtitles for one video | `translate_video.py` | cents per video |
+
+```mermaid
+flowchart LR
+    L0["<b>0 Skim</b><br/>mind maps"] --> L1["<b>1 Read</b><br/>fused transcripts"]
+    L1 --> L2["<b>2 Search</b><br/>timestamped hits"]
+    L2 --> L3["<b>3 Synthesize</b><br/>briefs, briefings, topics"]
+    L2 --> L4["<b>4 Analyze</b><br/>who led, what is spiking"]
+    L0 -.-> S0["stop here:<br/>a weekly triage habit"]
+    L2 -.-> S2["stop here:<br/>a searchable library"]
+    L3 -.-> S3["stop here:<br/>a research assistant"]
+    L4 -.-> S4["stop here:<br/>a research instrument"]
+    style S0 fill:#dcfce7,stroke:#15803d
+    style S2 fill:#dcfce7,stroke:#15803d
+    style S3 fill:#dcfce7,stroke:#15803d
+    style S4 fill:#dcfce7,stroke:#15803d
+```
+
+Each level is one section further down this page. Level 4 has its own guide, [docs/intelligence-layer.md](docs/intelligence-layer.md), written for developers without a statistics background.
+
+## Quick Start
+
+```bash
+# 1. API keys (both free)
+export GEMINI_API_KEY=your_key    # https://aistudio.google.com/apikey
+export YOUTUBE_API_KEY=your_key   # https://console.cloud.google.com/apis/credentials
+
+# 2. Dependencies
+pip install google-genai google-api-python-client pyyaml youtube-transcript-api
+
+# 3. Clone the repo, cd into it, and open Claude Code:
+git clone https://github.com/dzivkovi/video-intel.git
+cd video-intel
+claude
+#    On first launch, Claude Code shows a trust prompt for the video-intel
+#    plugin. Click "Install for this project". All three skills become available.
+#    No manual config needed — the project settings auto-register the plugin.
+#
+# 4. Create your config from the template, add your channels, then scan:
+cp config.yaml.example config.yaml      # Windows: copy config.yaml.example config.yaml
+python scripts/video_intel.py scan
+```
+
+Or in Claude Code, just say:
+
+- **"scan my channels"** → video-intel skill
+- **"find videos about MCP"** → video-intel-search skill
+- **"translate this YouTube video to Bosnian"** → translate-bcs skill
+
+For detailed installation guidance across platforms, see
+[INSTALLATION.md](INSTALLATION.md). The plugin format is Claude Code-specific; on
+other tools that consume the open Agent Skills format, the individual skill
+folders (`skills/video-intel/` or `skills/translate-bcs/`) may be usable
+independently — interoperability with non-Claude-Code tools has not been verified
+by this repo.
+
+**Upgrading from v1.4.x or earlier:** The repo went from "single skill" to "plugin
+with three skills." If you previously installed by copying the repo into
+`~/.claude/skills/video-intel/`, remove that directory and re-install via one of
+the plugin paths above. Claude Code manages the actual on-disk plugin cache
+itself (under `~/.claude/plugins/cache/...`); users do not copy files there
+directly.
 
 ## How It Works
 
-The architecture is a narrowing funnel - like fishing, where you look for
+Three services, one script, plain files on your disk. Nothing runs in the background and every derived store can be deleted and rebuilt.
+
+```mermaid
+flowchart LR
+    subgraph you["Your machine"]
+        CC["Claude Code<br/>you talk, it runs the CLI"]
+        CLI["video_intel.py<br/>one script, subcommands"]
+        CORPUS[("output_dir/<br/>per video: mind map, transcript, concepts, meta.json<br/>per corpus: taxonomy.json, _briefings/, _wiki/<br/>all plain Markdown and JSON")]
+        LDB[("LanceDB<br/>search index, rebuildable")]
+        DDB[("DuckDB<br/>receipts book, optional, rebuildable")]
+    end
+    subgraph apis["APIs, each with a free tier"]
+        YT["YouTube Data API<br/>which videos are new"]
+        GEM["Gemini<br/>watches the video"]
+        VOY["Voyage AI<br/>embeds transcript chunks"]
+    end
+    CC --> CLI
+    YT --> CLI
+    GEM --> CLI
+    CLI --> CORPUS
+    CORPUS -->|"index"| LDB
+    VOY -->|"embeddings"| LDB
+    CORPUS -->|"intel_graph.py load"| DDB
+    style CORPUS fill:#fef3c7,stroke:#b45309
+```
+
+Inside `scan`, the work is a narrowing funnel - like fishing, where you look for
 birds before you cast a line and read the water before you commit to a spot.
 
 ```mermaid
@@ -59,61 +170,26 @@ flowchart TD
     style S fill:#e9d5ff,stroke:#7e22ce
 ```
 
-**Read the order carefully - it inverted in issue #54 and the cost argument is why.** For any channel with `auto_transcript: all` (what the example config ships), `scan` transcribes first and then builds the mind map *from the transcript text*, not from the video. A text-only call against a 50 KB transcript costs roughly a tenth of a second pass over an hour of frames, and it has no frame cap. Only a channel with no transcript on disk falls back to the old mindmap-from-video path.
+**Transcript first, mind map second - the cost argument.** For any channel with `auto_transcript: all` (what the example config ships), `scan` transcribes first and then builds the mind map *from the transcript text*, not from the video. A text-only call against a 50 KB transcript costs roughly a tenth of a second pass over an hour of frames, and it has no frame cap. Only a channel with no transcript on disk falls back to the old mindmap-from-video path.
 
-Three consequences worth knowing before you configure a channel: the expensive step now runs first, so a transcript bug surfaces before you have paid for anything downstream; the mind map inherits the transcript's quality, and a transcript flagged severe is treated as unavailable so the mind map falls back to video rather than propagating the damage; and `concepts` reads the mind map, never the video, so it is always the cheap step.
+Three consequences worth knowing before you configure a channel: the expensive step runs first, so a transcript bug surfaces before you have paid for anything downstream; the mind map inherits the transcript's quality, and a transcript flagged severe is treated as unavailable so the mind map falls back to video rather than propagating the damage; and `concepts` reads the mind map, never the video, so it is always the cheap step.
 
 **triage** - After scanning, ask Claude (no Gemini cost):
 
 > "Read the mind maps in ~/video-intel/natebjones/ from this week and tell me
 > which videos are worth watching for agentic AI patterns."
 
-## What a Fused Transcript Looks Like
+## Design principles
 
-Traditional transcripts lose everything visual. When a presenter says "as you
-can see here," you see nothing. The fused transcript captures both channels:
-
-```text
-[01:09] Ray (Developer and Instructor): "But then this introduced
-a brand new problem whereby in session one you would have a pretty
-fresh, clean, and relevant memory. And then as you go on, you would
-notice that Claude Code decides to add more and more stuff to its
-memory and you get noise and contradictions and stuff like that."
-
-  SCREEN [01:09-01:31] [diagram]: Excalidraw diagram titled
-  'THE PROBLEM WITH AI MEMORY', illustrating how memory accumulates
-  noise and contradictions over multiple sessions (Session 1 to
-  Session 20).
-
-[01:32] Ray (Developer and Instructor): "And Claude did have some
-instructions in the system prompt telling it to verify that the
-memory is still correct and up-to-date, but that didn't really
-do a good job."
-```
-
-This is real output from scanning [Ray Amjad's](https://youtube.com/@ramjad)
-channel. Speaker names are identified from visual cues (Zoom labels, name
-cards, badges, slide footers) with evidence provided for each identification.
-
-## Why This Architecture
-
-- **Gemini watches, Claude thinks.** Best tool for each job, not competing models.
-- **Mind maps first, transcripts second.** 30-second scan before 15-minute commitment.
-- **Three decoupled tasks, not one prompt.** Tokens compete for attention - split audio, vision, and speaker ID for better quality.
-- **One model replaces four.** Gemini Flash 3.x does what Whisper + pyannote + Claude + Gemini did separately - and captures visual content they never could.
-- **Prompts are fuel, the skill is the engine.** External, self-contained, swappable. No hidden prefix assembly.
-- **Per-channel config.** Daily creators get `since: 10d`. Monthly creators get `since: 120d`. Each channel captures your relationship with that creator.
-- **The skill only does Gemini work.** Triage and deep-dive are conversations with Claude, not API calls. They were in the design, then deliberately cut.
-
-## Reusable beyond video-intel
-
-This repo is also a worked reference for a few patterns that carry to any corpus-intelligence project, stated with honest maturity so you know what is proven vs still a hypothesis:
-
-- **Hybrid search on LanceDB (BM25 + vector + RRF) - proven, portable.** The retrieval layer ([ADR-0013](docs/adr/ADR-0013-hybrid-search-rrf-fusion.md), [search internals](docs/search-internals.md)) is the piece most worth lifting into another project: local, embedded, no server, and it composes keyword + semantic ranking cleanly. Already reused elsewhere as a default.
-- **A derived analytics layer beside retrieval (DuckDB) - documented decision, not yet a framework.** The vector layer answers "find me the passage"; a derived, rebuildable DuckDB store of extracted, provenance-linked observations answers "who / when / how-often / who-with" (lead-lag, validated creator ties, bursts). When it is worth adding, when to refuse it, and the terminology discipline ("extracted observation store," never "truth store") are captured as a constrained decision record in [ADR-0019](docs/adr/ADR-0019-derived-analytical-layer-beside-retrieval.md). It stays a per-project decision until a second consumer of the analytical half validates it.
-- **Honest statistics as a discipline.** Every analytical claim rides a null model, a pre-registered kill criterion, and a caveat on every number - and one method was retired precisely because it failed its own kill test. The plain-English lecture is [docs/intelligence-layer.md](docs/intelligence-layer.md); the foundations for developers without a stats background are [docs/intelligence-layer-math.md](docs/intelligence-layer-math.md).
-
-If you are scanning to decide whether this repo is worth studying: those three, plus the ADR log in [docs/adr/](docs/adr/), are the transferable core.
+- **Gemini watches, Claude thinks.** Gemini sees frames at 1 FPS, reads on-screen text and hears audio in one pass. Claude never calls Gemini during triage: it reads the files Gemini produced. Best tool for each job, not competing models.
+- **Multimodal, not transcript-based.** When a presenter says "as you can see here," the output records what was actually shown.
+- **Three decoupled tasks, not one prompt.** Transcription, screen content and speaker identification run as separate tasks inside one prompt, so they do not compete for the model's attention (borrowed from Laurent Picard's research).
+- **Read the mind map before the transcript.** A 30-second read before a 30-minute commitment. When transcripts are on, the pipeline runs the other way - it transcribes first and derives the mind map from the text, because that is cheaper - but your reading order is still mind map first.
+- **One model replaces the four-tool transcription stack.** For getting words, speakers and slides out of a video, Gemini Flash does what Whisper + pyannote + Claude + Gemini did separately, and captures the visual channel they never could. (Discovery, embeddings and triage still use their own tools.)
+- **Idempotent.** Re-running a scan skips what is done. Safe to interrupt, safe to re-run.
+- **Prompts are files.** Every prompt lives in `prompts/`, self-contained and swappable. No hidden prefix assembly.
+- **Per-channel config.** A daily creator gets `since: 10d`, a monthly one `since: 120d`. Each entry captures your relationship with that creator.
+- **The tool only does the Gemini work.** Triage and deep-dives are conversations with Claude over the files, not API calls. They were in the design, then deliberately cut.
 
 ## Plugin Contents: Three Skills
 
@@ -128,6 +204,16 @@ together; Claude picks the right one based on what you ask.
 
 The split between the first two is by **write scope**, not by topic: `video-intel-search` never mutates the corpus, which is what makes it safe to install once and query from anywhere. `translate-bcs` stays operationally independent of both - it does not read video-intel's channel config, taxonomy, or meta files. The integration point is a file handoff: for context-heavy videos, `translate-bcs` reads a rich transcript that `video-intel` produced, and Claude orchestrates both CLI steps in one conversation.
 
+## Reusable beyond video-intel
+
+This repo is also a worked reference for a few patterns that carry to any corpus-intelligence project, stated with honest maturity so you know what is proven vs still a hypothesis:
+
+- **Hybrid search on LanceDB (BM25 + vector + RRF) - proven, portable.** The retrieval layer ([ADR-0013](docs/adr/ADR-0013-hybrid-search-rrf-fusion.md), [search internals](docs/search-internals.md)) is the piece most worth lifting into another project: local, embedded, no server, and it composes keyword + semantic ranking cleanly. Already reused elsewhere as a default.
+- **A derived analytics layer beside retrieval (DuckDB) - documented decision, not yet a framework.** The vector layer answers "find me the passage"; a derived, rebuildable DuckDB store of extracted, provenance-linked observations answers "who / when / how-often / who-with" (lead-lag, validated creator ties, bursts). When it is worth adding, when to refuse it, and the terminology discipline ("extracted observation store," never "truth store") are captured as a constrained decision record in [ADR-0019](docs/adr/ADR-0019-derived-analytical-layer-beside-retrieval.md). It stays a per-project decision until a second consumer of the analytical half validates it.
+- **Honest statistics as a discipline.** Every analytical claim rides a null model, a pre-registered kill criterion, and a caveat on every number - and one method was retired precisely because it failed its own kill test. The plain-English lecture is [docs/intelligence-layer.md](docs/intelligence-layer.md); the foundations for developers without a stats background are [docs/intelligence-layer-math.md](docs/intelligence-layer-math.md).
+
+If you are scanning to decide whether this repo is worth studying: those three, plus the ADR log in [docs/adr/](docs/adr/), are the transferable core.
+
 ## A worked learning path: from watchlist to a talk
 
 A real example of the full loop, exactly as it ran on 2026-09-01, preparing a 1-hour internal talk ("AI as a Thinking Partner") for a mixed developer + PM audience. Useful as a template for turning a corpus into teaching material - and honest about which surface did which job.
@@ -141,46 +227,20 @@ A real example of the full loop, exactly as it ran on 2026-09-01, preparing a 1-
 
 The pattern generalizes: curate topics as you go (they are cheap), let `nugget` argue both sides, use vector search for named people and full questions, and read the mindmaps - they are the corpus's own notes to you.
 
-## Quick Start
+## Where to go next
 
-```bash
-# 1. API keys (both free)
-export GEMINI_API_KEY=your_key    # https://aistudio.google.com/apikey
-export YOUTUBE_API_KEY=your_key   # https://console.cloud.google.com/apis/credentials
-
-# 2. Dependencies
-pip install google-genai google-api-python-client pyyaml youtube-transcript-api
-
-# 3. Clone the repo, cd into it, and open Claude Code:
-git clone https://github.com/dzivkovi/video-intel.git
-cd video-intel
-claude
-#    On first launch, Claude Code shows a trust prompt for the video-intel
-#    plugin. Click "Install for this project". Both skills become available.
-#    No manual config needed — the project settings auto-register the plugin.
-#
-# 4. Configure channels in config.yaml, then:
-python scripts/video_intel.py scan
-```
-
-Or in Claude Code, just say:
-
-- **"scan my channels"** → video-intel skill
-- **"translate this YouTube video to Bosnian"** → translate-bcs skill
-
-For detailed installation guidance across platforms, see
-[INSTALLATION.md](INSTALLATION.md). The plugin format is Claude Code-specific; on
-other tools that consume the open Agent Skills format, the individual skill
-folders (`skills/video-intel/` or `skills/translate-bcs/`) may be usable
-independently — interoperability with non-Claude-Code tools has not been verified
-by this repo.
-
-**Upgrading from v1.4.x or earlier:** The repo went from "single skill" to "plugin
-with three skills." If you previously installed by copying the repo into
-`~/.claude/skills/video-intel/`, remove that directory and re-install via one of
-the plugin paths above. Claude Code manages the actual on-disk plugin cache
-itself (under `~/.claude/plugins/cache/...`); users do not copy files there
-directly.
+| If you want to... | Read |
+| --- | --- |
+| install it, or use it from another agent platform | [INSTALLATION.md](INSTALLATION.md) |
+| understand how a search hit is ranked | [docs/search-internals.md](docs/search-internals.md) |
+| organize the corpus into the threads you are following | [docs/topics-layer.md](docs/topics-layer.md) |
+| make what you learn compound instead of re-paying for it | [docs/wiki-layer.md](docs/wiki-layer.md) |
+| ask who led, what is spiking, which creators cluster | [docs/intelligence-layer.md](docs/intelligence-layer.md), then [the math](docs/intelligence-layer-math.md) if you want the why |
+| recover a video that would not process | [docs/troubleshooting.md](docs/troubleshooting.md) |
+| know what every `meta.json` field means | [docs/meta-json-schema.md](docs/meta-json-schema.md) |
+| translate a video into BCS | [docs/translate-bcs.md](docs/translate-bcs.md) |
+| see how it is tested, and the retrieval eval | [docs/testing.md](docs/testing.md) |
+| see why a decision was made | [docs/adr/](docs/adr/) |
 
 ## Configuration
 
@@ -211,13 +271,13 @@ snippet above, which is trimmed for readability.
 | output_dir | ~/video-intel | Where output files are saved |
 | vector_db_dir | output_dir/.lancedb | LanceDB index location. Set this to a local path if `output_dir` is on a cloud-synced mount (Google Drive File Stream, OneDrive, Dropbox) - those filesystems do not support the atomic rename LanceDB needs. The `index` command runs a pre-flight probe and aborts with an actionable diagnostic before spending Voyage tokens if the path is incompatible. See [ADR-0016](docs/adr/ADR-0016-vector-db-path-config.md). |
 | default_since | 10d | Default lookback window |
-| default_prompt | mindmap-knowledge | Default prompt for mind maps, overridable per channel. One `DEFAULT_PROMPT_NAME` constant backs every command; before issue #210 the code fallback differed by command, so a config omitting this key got different prompts from `scan` and `process` |
+| default_prompt | mindmap-knowledge | Default prompt for mind maps, overridable per channel. Every command uses the same fallback |
 | model | gemini-3.7-flash | Gemini model (overridable via `--model` CLI flag). Chosen by measurement, not spec sheet - see the model-card scorecards in `tests/evals/model-cards/` |
 | models | (unset) | Per-step model overrides, e.g. `models: {mindmap: ..., concepts: ...}`. Falls back to `model` for any step left out |
 | max_parallel | 10 | Concurrent Gemini requests (paid tier can go 50+) |
-| auto_concepts | false (the shipped template sets `true`) | Run the concepts step automatically after a scan. The code fallback when the key is absent is `false`, so a hand-written config that omits it gets no concepts; copy `config.yaml.example`, which turns it on |
+| auto_concepts | false (the template sets `true`) | Run the concepts step automatically after a scan. Absent means off, so copy `config.yaml.example` rather than writing a config from scratch |
 | transcript_max_duration_seconds | 7200 | Videos longer than this are dropped from the auto-transcript set with a WARNING naming the manual recipe. Mind maps are unaffected |
-| chunk_minutes | 30 | Split a transcript longer than this into per-window Gemini calls. Lower it on dense material; issue #157 lowered the default from 50 deliberately |
+| chunk_minutes | 30 | Split a transcript longer than this into per-window Gemini calls. Lower it on dense material such as keynotes |
 
 ### Channel Settings
 
@@ -593,7 +653,7 @@ See **[docs/wiki-layer.md](docs/wiki-layer.md)** for full usage, the safety rule
 
 ## The intelligence layer (optional)
 
-Beyond search, the repo can build a small **DuckDB analytics store** from your corpus and ask it harder questions: who covered an idea first, what is suddenly spiking, and how ideas connect. It is entirely optional - the scan/transcript/search pipeline above never touches it.
+Beyond search, the repo can build a small **DuckDB analytics store** from your corpus and ask it questions a search box cannot: who covered an idea first, what is suddenly spiking, which creators genuinely cluster. The statistics are done carefully - real null models, significance testing, and a plain caveat on every number - and the guide below explains all of it without assuming a stats background. It is entirely optional; the scan/transcript/search pipeline above never touches it.
 
 ```bash
 pip install -e ".[intelligence]"                            # one-time setup
@@ -610,15 +670,17 @@ Want the science behind the tools? **[docs/intelligence-layer-math.md](docs/inte
 
 ## Cost
 
-Using Gemini 3 Flash ($0.50/M input tokens, $1.00/M audio, $3.00/M output):
+The one number to anchor on: a full transcript costs **~$0.33 per video-hour** on the default `gemini-3.7-flash`, measured on real scans (the model cards in `tests/evals/model-cards/` carry the method). The per-operation figures below are typical ranges at Flash-tier rates ($0.50/M input tokens, $1.00/M audio, $3.00/M output):
 
 | Operation | Typical Cost |
 | --------- | ----------- |
 | Mind map for a 15-min video | ~$0.15-0.25 |
 | Mind map for a 45-min video | ~$0.40-0.60 |
-| Full transcript for a 30-min video | ~$0.30-0.50 |
+| Full transcript for a 30-min video | ~$0.15-0.20 (measured: $0.33 per video-hour) |
 | Weekly scan of 5 channels (30 videos) | ~$5-10 |
 | Batch API (async, 50% discount) | Half the above |
+
+The two mind-map rows are for a mind map built from the video itself, which only happens on a channel with no transcript. With `auto_transcript: all` the mind map is a text-only call over the transcript and costs a small fraction of the transcript row.
 
 **Free tier** covers 8 hours of input video per day. When active, input tokens
 cost nothing and output tokens ($3/M) become nearly the entire bill — about
