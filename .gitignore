@@ -82,3 +82,7 @@ tests/evals/model_fixtures.yaml
 
 # Gate 1 harness scratch output (can contain corpus copies)
 gate1_*_out/
+
+# Reader-facing renders of examples stay on disk, never in git (2026-09-02)
+examples/*.docx
+examples/*.pdf
