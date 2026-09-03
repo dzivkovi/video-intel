@@ -85,3 +85,5 @@ gate1_*_out/
 
 # Reader-facing renders of examples stay on disk, never in git (2026-09-02)
 examples/*.docx
+# Timestamped backups of the private config, made before a config edit
+config.yaml.backup-*
