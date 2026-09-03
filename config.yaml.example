@@ -30,6 +30,7 @@ model: gemini-3.7-flash
 # An explicit --model suppresses this whole block, so the "force Pro when Flash
 # struggles" recovery still applies to the entire run. Empty by default.
 # models:
+#   transcript: <model>
 #   mindmap: <model>
 #   concepts: <model>
 
@@ -41,6 +42,27 @@ auto_concepts: true
 # unaffected. Default 7200 = 2 hours leaves headroom for typical technical
 # talks; raise to 10800 for podcast creators who routinely go to 3h.
 transcript_max_duration_seconds: 7200
+
+# How long a video may be before the transcript step splits it into separate
+# Gemini calls, in minutes. Density, not duration, predicts an output-cap
+# truncation, so a dense 42-minute keynote can truncate where a rambling
+# 90-minute interview does not (issue #128). Lower this for conference and
+# keynote channels; raise it for conversational ones.
+# Default 30. It was 50 until issue #157 measured multi-minute blind gaps at
+# that size, so do not raise it back toward 50 without re-checking transcript
+# quality flags on the result.
+chunk_minutes: 30
+
+# Wall-clock ceiling on a single transcript Gemini call, in seconds (issue #74).
+# On expiry the video routes to the captions failover instead of hanging the
+# whole scan. Must stay BELOW the HTTP read timeout (1200s) so this fires first.
+transcript_timeout_seconds: 600
+
+# Per-channel overrides: every knob in this block can also be set on an
+# individual channel below, and the channel value wins. Precedence throughout is
+#   CLI flag > per-channel > top-level > built-in default
+# That applies to chunk_minutes, transcript_timeout_seconds,
+# transcript_max_duration_seconds, skip_shorts, auto_concepts, prompt and since.
 
 # Issue #54: per-channel `mindmap_source: auto|transcript|video|none` controls
 # what the mindmap step reads. Default `auto` (no opt-in needed):
@@ -63,6 +85,37 @@ channels:
     url: https://youtube.com/@example
     auto_transcript: all
     since: 90d
+    # transcript_source controls how the transcript step gets its text.
+    # Default "gemini" when the key is absent. Set it deliberately:
+    #   gemini       Gemini multimodal: speech + on-screen text + diarization.
+    #                Richest output, and the only mode that reads slides.
+    #   yt-captions  Build from YouTube's public English caption track. Cheap
+    #                and fast, but SPEECH ONLY (no screen content, no speaker
+    #                labels), and it fails outright when a video has no captions.
+    #   auto         Try Gemini; on failure (exception, 403, token cap, or the
+    #                confabulation guard tripping) fall back to captions. Never
+    #                worse than "gemini", so this is the safe choice for most
+    #                channels.
+    # One subtlety worth knowing: for a completed-livestream VOD, an ABSENT key
+    # and an explicit "auto" both route captions-FIRST, because livestream URIs
+    # fail Gemini ingestion at a much higher rate. Writing "gemini" explicitly
+    # opts out of that and keeps Gemini first, which is what you want when the
+    # captions are known-bad or the on-screen content is the point.
+    # transcript_source: auto
+    #
+    # prompt: override the mind map prompt for this channel only (a name from
+    # prompts/, without the .md). Falls back to the top-level default_prompt.
+    # Read by `scan` and by the `scan --dry-run` preflight; the manual
+    # `mindmap --url` / `process` commands do NOT consult it (issue #216), so
+    # pass --prompt on those.
+    # prompt: mindmap-heavy
+    #
+    # Any top-level knob can be overridden here, and the channel value wins:
+    # chunk_minutes: 20                  # a dense keynote channel
+    # transcript_timeout_seconds: 900    # a slow-to-transcribe channel
+    # transcript_max_duration_seconds: 10800
+    # auto_concepts: false
+    #
     # mindmap_source defaults to "auto" -- transcript-first when available,
     # video fallback when not. Override only when needed:
     # mindmap_source: video       # force legacy mindmap-from-video path

@@ -327,3 +327,141 @@ class TestSkillSurfaceMatchesTheCliSurface:
             cmd for cmd in registered if re.search(rf"video_intel\.py\s+(?:--\S+\s+\S+\s+)*{re.escape(cmd)}\b", text)
         }
         assert not (registered - named), f"subcommands documented nowhere: {sorted(registered - named)}"
+
+
+# ---------------------------------------------------------------------------
+# config.yaml.example must document every knob the code reads
+# ---------------------------------------------------------------------------
+
+TEMPLATE = REPO / "config.yaml.example"
+
+# Receivers that are unambiguously a config dict. Kept PRECISE rather than wide
+# on purpose: the wide variant (every `.get("...")` in the module) drags in
+# meta.json fields, taxonomy entries and YouTube API resources, and a guard
+# that false-alarms gets its exclusions widened until it guards nothing.
+_CONFIG_RECEIVERS = {"config", "channel_config", "channel_cfg", "ch", "channel"}
+
+
+def _config_keys_the_code_reads(source: str | None = None) -> dict[str, set[str]]:
+    """Every string key read off a config dict, mapped to the receivers that read it.
+
+    Two shapes count: `<recv>.get("key" ...)` and `"key" in <recv>`. Takes its
+    source as a parameter so the non-vacuity companion below is a real positive
+    control rather than a re-implementation (the #213 lesson).
+    """
+    import ast
+
+    tree = ast.parse(source if source is not None else _source())
+
+    def receiver_name(expr: ast.expr) -> str | None:
+        # A bare name, or the `(config or {})` defensive shape that issue #213's
+        # own drift guard had to learn to see - `configured_channels` reads
+        # `channels` through exactly that, and a walk that only accepts a bare
+        # Name reports the template's `channels:` as a key nobody reads.
+        if isinstance(expr, ast.Name):
+            return expr.id
+        if isinstance(expr, ast.BoolOp) and isinstance(expr.op, ast.Or):
+            for value in expr.values:
+                if isinstance(value, ast.Name):
+                    return value.id
+        return None
+
+    found: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        key = recv = None
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            key, recv = node.args[0].value, receiver_name(node.func.value)
+        elif (
+            isinstance(node, ast.Compare)
+            and len(node.ops) == 1
+            and isinstance(node.ops[0], ast.In)
+            and isinstance(node.left, ast.Constant)
+            and isinstance(node.left.value, str)
+        ):
+            key, recv = node.left.value, receiver_name(node.comparators[0])
+        if key is not None and recv in _CONFIG_RECEIVERS:
+            found.setdefault(key, set()).add(recv)
+    return found
+
+
+def _template_keys() -> set[str]:
+    """Every key the template shows - live, commented-out, or as a list item.
+
+    A commented `# transcript_source: auto` IS documentation: the template's
+    convention is to show optional knobs commented out with prose above them.
+    """
+    text = TEMPLATE.read_text(encoding="utf-8")
+    return set(re.findall(r"^\s*(?:-\s*)?#?\s*([a-z_]+)\s*:", text, re.M))
+
+
+class TestConfigTemplateDocumentsEveryKnob:
+    """`config.yaml.example` was written before most of the knobs existed.
+
+    On 2026-09-03 an audit found four real knobs the code reads that the
+    template never mentioned - `transcript_source` (the whole captions failover,
+    issues #60/#120), `chunk_minutes` (the size #157 lowered on purpose),
+    `transcript_timeout_seconds` (#74) and the per-channel `prompt:` - plus
+    three knobs documented at one level when the code honors both. A user
+    copying the template had no way to discover any of them.
+
+    Direction: CODE -> TEMPLATE. The case list comes from the source, so a
+    knob added to the code without a template line fails here by name.
+    """
+
+    @pytest.mark.parametrize("key", sorted(_config_keys_the_code_reads()))
+    def test_every_knob_the_code_reads_is_in_the_template(self, key):
+        assert key in _template_keys(), (
+            f"the code reads config key {key!r} but config.yaml.example never shows it. "
+            "Add it (commented out is fine) with a line of prose saying what it does."
+        )
+
+    def test_the_walk_finds_the_hard_instances_by_name(self):
+        """Non-vacuity, pinned to the four shapes a narrowing would drop first:
+        a `channel_config` receiver, the nested `ch.get(.., config.get(..))`
+        override idiom, the `channel` receiver used only by the headline path,
+        and a bare `ch.get` with no top-level twin."""
+        found = _config_keys_the_code_reads()
+        assert "channel_config" in found.get("transcript_source", set())
+        assert {"ch", "config"} <= found.get("transcript_timeout_seconds", set())
+        assert "channel" in found.get("headline_digest", set())
+        assert "ch" in found.get("prompt", set())
+        # The `(config or {}).get("channels")` shape from `configured_channels`.
+        assert "config" in found.get("channels", set())
+        assert len(found) >= 20, f"the walk found only {len(found)} keys - it has stopped seeing the config reads"
+
+    def test_the_walk_is_a_real_positive_control(self):
+        """Feed the extractor a synthetic module and require it to find a read
+        there - proving the matcher matches, independent of the real source."""
+        synthetic = 'def f(config, ch):\n    return ch.get("brand_new_knob", config.get("brand_new_knob"))\n'
+        assert _config_keys_the_code_reads(synthetic) == {"brand_new_knob": {"ch", "config"}}
+
+    def test_the_template_shows_no_knob_the_code_does_not_read(self):
+        """The other direction, so a knob RENAMED in the code cannot leave a
+        stale name in the template teaching users a key that does nothing."""
+        read = set(_config_keys_the_code_reads())
+        # The per-step model names live UNDER `models:` and are read by
+        # iterating STEP_MODEL_KEYS, never as a top-level `.get("transcript")`.
+        step_keys = set(re.findall(r'"([a-z]+)"', _constant_block("STEP_MODEL_KEYS")))
+        assert step_keys, "STEP_MODEL_KEYS not found - the models-block allowlist is empty"
+        stale = _template_keys() - read - step_keys
+        assert not stale, f"config.yaml.example shows keys the code never reads: {sorted(stale)}"
+
+    def test_the_template_parses_as_yaml(self):
+        import yaml
+
+        data = yaml.safe_load(TEMPLATE.read_text(encoding="utf-8"))
+        assert isinstance(data, dict) and isinstance(data.get("channels"), list)
+
+
+def _constant_block(name: str) -> str:
+    """The full text of a module-level assignment, including a multi-line tuple."""
+    m = re.search(rf"^{name}\s*=\s*(\(.*?\)|\[.*?\]|.+)$", _source(), re.M | re.S)
+    assert m, f"{name} not found in {SCRIPT.name}"
+    return m.group(1)

@@ -8,6 +8,16 @@ Everything here is experimental and deliberately small. The trust story is not t
 
 Your corpus is a pile of transcripts. This layer turns that pile into a **receipts book**: a small database that knows *who said what, when, and where the exact quote is*. That is the whole mental model.
 
+```mermaid
+flowchart LR
+    C[("your corpus<br/>transcripts, concepts, dates")] -->|"intel_graph.py load"| B[("the receipts book<br/>one DuckDB file")]
+    B --> Q1["who got there first?<br/>lead_lag_report.py"]
+    B --> Q2["what is heating up?<br/>burst_report.py"]
+    B --> Q3["who clusters together?<br/>sdsm_network.py"]
+    B --> Q4["let me wander<br/>wiki_atlas.py"]
+    style B fill:#fef3c7,stroke:#b45309
+```
+
 Once you have that book, every analysis below is just **one honest question asked of it**. You do not need graph theory or statistics to use them. You need to know which question each one answers, and the handful of ways each one could fool you (that part matters, and it has its own section).
 
 The book lives in a single DuckDB file (`~/.cache/video-intel/intel.duckdb`). DuckDB is "SQLite for analytics": no server, no Docker, nothing running in the background. The file is derived from your corpus, so you can delete it and rebuild it any time.
