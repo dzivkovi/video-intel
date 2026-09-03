@@ -190,6 +190,112 @@ def load_config() -> dict[str, Any]:
     sys.exit(1)
 
 
+def configured_channels(config: dict, *, strict: bool = False) -> list[dict]:
+    """Every USABLE channel entry from `config["channels"]` (issue #213).
+
+    The ONE reader of that key. Before this, thirteen sites read it directly
+    and each assumed a list of dicts carrying a `name`, so four ordinary YAML
+    mistakes raised a raw traceback across eight commands:
+
+    * ``channels:`` with nothing under it parses as ``None`` -> ``TypeError``
+    * ``channels: {name: alpha}`` (the dashes omitted) -> ``AttributeError``
+    * ``channels: alpha`` (a bare string, iterated character by character)
+    * ``- alpha`` instead of ``- name: alpha`` -> ``AttributeError``/``KeyError``
+
+    Issue #205 hardened two of the thirteen; the Codex peer pass on it
+    confirmed by execution that the other eleven still crashed. Scattering the
+    guard is how those paths drifted apart in the first place, so this is the
+    same one-definition-N-consumers shape as ``ENTRY_TIMESTAMP_PATTERN``
+    (#195), ``TS_MINUTES`` (#197) and ``match_configured_channel`` (#205).
+
+    **`strict` is the whole design question, not a convenience flag.** A
+    malformed entry must NOT be silently dropped on a curate path: skipping a
+    channel the operator believes they configured is how a creator goes
+    unscanned for weeks, and `scan` / `concepts` / `dedupe` / `prune-shorts`
+    all spend money or mutate the corpus on the strength of this list. Those
+    pass ``strict=True`` and the run aborts with the offending entry printed.
+
+    Read-only and convenience consumers (`status`, the `--channel` validators,
+    the headline digest, `channel_config_by_name`, `match_configured_channel`)
+    pass the default ``strict=False``: they degrade to "that channel is not
+    configured", which is already an answer they know how to give, and
+    `_standalone` is always available. Aborting `status` over one bad row
+    would be worse than the row.
+
+    "Usable" means a dict with a non-empty string ``name``. Requiring the name
+    is not extra strictness - every consumer keys on it, several by direct
+    ``c["name"]`` indexing, so a nameless entry is unusable to all of them and
+    dropping it here beats each of them re-deciding.
+    """
+    raw = (config or {}).get("channels")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        hint = " A mapping usually means the leading '- ' dashes were omitted." if isinstance(raw, dict) else ""
+        _reject_channels(
+            f"config 'channels:' must be a list of channel entries, got {type(raw).__name__}.{hint}",
+            strict=strict,
+            lenient_tail="Treating the watchlist as empty.",
+        )
+        return []
+
+    # Every rejection is collected and reported before any exit, so an
+    # operator with three bad rows fixes them in one pass rather than
+    # discovering them across three runs (review P3).
+    usable: list[dict] = []
+    rejections: list[str] = []
+    for i, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            _note_channel_rejection(
+                rejections,
+                f"config 'channels:' entry {i} is a {type(entry).__name__}, not a channel entry "
+                f"({entry!r}). Write '- name: {entry}' rather than '- {entry}'."
+                if isinstance(entry, str)
+                else f"config 'channels:' entry {i} is a {type(entry).__name__}, not a channel entry.",
+            )
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str) or not name.strip():
+            _note_channel_rejection(
+                rejections,
+                f"config 'channels:' entry {i} has no usable 'name' ({name!r}).",
+            )
+            continue
+        usable.append(entry)
+    for message in rejections:
+        _reject_channels(message, strict=strict, exit_now=False)
+    if rejections and strict:
+        sys.exit(1)
+    return usable
+
+
+def _note_channel_rejection(sink: list[str], message: str) -> None:
+    """Collect a per-entry rejection for reporting after the whole list."""
+    sink.append(message)
+
+
+def _reject_channels(
+    message: str,
+    *,
+    strict: bool,
+    lenient_tail: str = "Skipping it.",
+    exit_now: bool = True,
+) -> None:
+    """Abort on a curate path, warn on a read-only one (issue #213).
+
+    Exits rather than raising, matching `require_channels_config` and
+    `load_prompt`: every strict caller is a command whose next act would spend
+    Gemini money or mutate the corpus, and there is nothing useful to continue
+    to. Tests assert the CODE, not merely that SystemExit was raised (#185).
+    """
+    if strict:
+        log.error("%s Fix config.yaml before re-running.", message)
+        if exit_now:
+            sys.exit(1)
+        return
+    log.warning("%s %s", message, lenient_tail)
+
+
 def require_channels_config(config: dict[str, Any]) -> None:
     """Fail fast when a curate command runs without ``channels:`` configured.
 
@@ -208,7 +314,22 @@ def require_channels_config(config: dict[str, Any]) -> None:
     from the plugin repo (step 1 of the precedence), or point the env var at
     a checkout that has ``channels:`` populated.
     """
-    if not config.get("channels"):
+    # LENIENT, deliberately. This guard answers one question - is there a
+    # watchlist at all - and it runs at the top of every curate command,
+    # including `dedupe --channel X` and `prune-shorts --channel X`, which
+    # never read the list when a channel is named. Making it strict (the
+    # first cut of issue #213) meant one malformed row aborted those two
+    # even when the named channel was perfectly healthy - measured against
+    # origin/main, both went from running normally to SystemExit(1). That
+    # removed the operator's escape hatch of working on one good channel
+    # while the watchlist is broken, and `prune-shorts --channel` is
+    # precisely the recovery this repo's own docs recommend.
+    #
+    # Lenient still fixes the original hole: `channels: alpha` (truthy but
+    # unusable) yields no usable entries, so the guard fires here with its
+    # own actionable message instead of crashing further in - and the
+    # accessor has already logged WHY.
+    if not configured_channels(config):
         log.error(
             "This command requires 'channels:' in config.yaml. Run from the "
             "plugin repo, or set VIDEO_INTEL_OUTPUT_DIR to point at a checkout "
@@ -954,16 +1075,13 @@ def channel_config_by_name(config: dict, channel_name: str | None) -> dict:
     """
     if not channel_name or channel_name == STANDALONE_CHANNEL:
         return {}
-    # `isinstance(c, dict)` is not defensive padding: three ordinary YAML
-    # mistakes reach here as a non-dict - `channels:` written as a mapping
-    # (dashes omitted), `channels:` given a bare string, and a scalar list
-    # entry (`- natebjones` instead of `- name: natebjones`). Each raised
-    # AttributeError on `c.get`, killing every manual --url command. The
-    # `or []` beside it covers the fourth: `channels:` with nothing under it
-    # parses as None. Resolving the channel is a CONVENIENCE - `_standalone`
-    # is always an available answer - so a malformed watchlist must degrade
-    # to "no configured channel", never abort the run.
-    matches = [c for c in (config.get("channels") or []) if isinstance(c, dict) and c.get("name") == channel_name]
+    # `configured_channels` (issue #213) owns every malformed-`channels:`
+    # shape; the inline `or []` and `isinstance(c, dict)` guards this
+    # function used to carry are its job now. LENIENT here on purpose:
+    # resolving the channel is a CONVENIENCE - `_standalone` is always an
+    # available answer - so a malformed watchlist must degrade to "no
+    # configured channel", never abort a run started for one video.
+    matches = [c for c in configured_channels(config) if c.get("name") == channel_name]
     if len(matches) > 1:
         # Two rows sharing a name is a config error with a QUIET failure
         # mode, which is why it warns rather than being left to the
@@ -1807,7 +1925,7 @@ def infer_channel_from_file_path(input_path: Path, output_dir: Path, config: dic
         return None
 
     candidate = rel.parts[0]
-    configured = {c["name"] for c in config.get("channels", [])}
+    configured = {c["name"] for c in configured_channels(config)}
     return candidate if candidate in configured else None
 
 
@@ -6467,8 +6585,15 @@ def cmd_scan(args, config):
     model = resolve_model(args, config)
     max_parallel = config.get("max_parallel", 10)
 
-    # Filter channels if --channel specified
-    channels = config.get("channels", [])
+    # Filter channels if --channel specified.
+    # strict only when this run iterates the WHOLE watchlist. With
+    # `--channel X` the operator named one channel, so a malformed OTHER
+    # row must not abort them - and if X IS the malformed row, the lenient
+    # drop surfaces as the existing "not found in config.yaml" error,
+    # which is actionable. Aborting protects the case where a dropped row
+    # means a creator silently goes unscanned; a named-channel run has no
+    # such exposure.
+    channels = configured_channels(config, strict=not args.channel)
     if args.channel:
         channels = [c for c in channels if c["name"] == args.channel]
         if not channels:
@@ -7233,7 +7358,7 @@ def _cmd_mindmap_impl(args, config):
 
         if args.channel:
             require_channels_config(config)
-            configured = {c["name"] for c in config.get("channels", [])}
+            configured = {c["name"] for c in configured_channels(config)}
             if args.channel not in configured:
                 log.error("Channel '%s' not found in config.yaml", args.channel)
                 sys.exit(1)
@@ -7535,7 +7660,7 @@ def _cmd_transcript_impl(args, config):
 
         if args.channel:
             require_channels_config(config)
-            configured = {c["name"] for c in config.get("channels", [])}
+            configured = {c["name"] for c in configured_channels(config)}
             if args.channel not in configured:
                 log.error("Channel '%s' not found in config.yaml", args.channel)
                 sys.exit(1)
@@ -8462,7 +8587,7 @@ def _cmd_process_impl(args, config):
     channel_name = args.channel or infer_channel_from_file_path(input_path, output_dir, config)
     if args.channel:
         require_channels_config(config)
-        configured = {c["name"] for c in config.get("channels", [])}
+        configured = {c["name"] for c in configured_channels(config)}
         if args.channel not in configured:
             log.error("Channel '%s' not found in config.yaml", args.channel)
             sys.exit(1)
@@ -8905,7 +9030,8 @@ def cmd_concepts(args, config):
 
     # Collect all videos that have mindmaps but no concepts.json
     to_process = []
-    channels = config.get("channels", [])
+    # strict only for a whole-watchlist run - see cmd_scan for the rule.
+    channels = configured_channels(config, strict=not getattr(args, "channel", None))
     if args.channel:
         channels = [c for c in channels if c["name"] == args.channel]
 
@@ -9085,7 +9211,7 @@ def cmd_status(args, config):
 
     print("\nChannels:")
     configured_names: set[str] = set()
-    for ch in config.get("channels", []):
+    for ch in configured_channels(config):
         ch_name = ch["name"]
         configured_names.add(ch_name)
         ch_dir = output_dir / ch_name
@@ -10603,7 +10729,9 @@ def cmd_dedupe(args, config):
     channel_filter = getattr(args, "channel", None)
     apply = bool(getattr(args, "apply", False))
 
-    channel_names = [channel_filter] if channel_filter else [c["name"] for c in config.get("channels", [])]
+    channel_names = (
+        [channel_filter] if channel_filter else [c["name"] for c in configured_channels(config, strict=True)]
+    )
 
     total_groups = 0
     total_excess = 0
@@ -10779,7 +10907,9 @@ def cmd_prune_shorts(args, config):
     yt_build = require_youtube()
     youtube = yt_build("youtube", "v3", developerKey=yt_key)
 
-    channel_names = [channel_filter] if channel_filter else [c["name"] for c in config.get("channels", [])]
+    channel_names = (
+        [channel_filter] if channel_filter else [c["name"] for c in configured_channels(config, strict=True)]
+    )
 
     total_shorts = 0
     total_artifacts = 0
@@ -11478,7 +11608,11 @@ def _infer_profile(output_dir: Path, config: dict | None = None, *, today=None) 
     """
     if today is None:
         today = datetime.now(UTC).date()
-    channels = [c.get("name") for c in (config or {}).get("channels", []) if c.get("name")]
+    # Lenient: profile inference is read-only and a malformed watchlist must
+    # not abort it. Found by the AST walk in tests/test_configured_channels.py,
+    # NOT by the grep that seeded this fix - the receiver here is `(config or
+    # {})`, so a `config.get("channels"` text search misses it entirely.
+    channels = [c["name"] for c in configured_channels(config or {})]
     interest_concepts: dict[str, int] = {}
     domains: dict[str, int] = {}
     tax_path = output_dir / "taxonomy.json"
@@ -11843,27 +11977,20 @@ def match_configured_channel(youtube, config: dict, yt_channel_id: str | None) -
     if not yt_channel_id:
         return None
     cache: dict = {}
-    # `channels:` with nothing under it parses as None, not [], and
-    # `config.get("channels", [])` hands that None straight to `for` - caught by
-    # Gate 1 on this very fix, not by reading it.
-    channels = config.get("channels") or []
-    if not isinstance(channels, list):
-        log.warning("config 'channels' is %s, not a list; cannot match by channel id", type(channels).__name__)
-        return None
-    for ch in channels:
-        if not isinstance(ch, dict):
-            continue
+    # `configured_channels` (issue #213) owns every malformed-`channels:` shape
+    # and guarantees a list of dicts each carrying a usable string `name`, so
+    # the three guards that used to live inline here - the `or []`, the
+    # list-shape check, and the per-entry `isinstance(ch, dict)` skip - are its
+    # job now. It is LENIENT here on purpose: resolving a channel is a
+    # convenience with `_standalone` always available, so one bad row must not
+    # abort a run started to transcribe one video.
+    for ch in configured_channels(config):
         if _configured_channel_id(youtube, ch, cache) == yt_channel_id:
-            name = ch.get("name")
-            if isinstance(name, str) and name:
-                return name
-            # `continue`, not `return None` - the same rule as the url-less
-            # skip above, and for the same reason. A nameless entry sitting
-            # ABOVE a real one would otherwise hide it, which is the quieter
-            # half of the bug this whole helper exists to fix. Reviewed and
-            # reproduced: nameless-first, real-second returned None.
-            log.warning("Configured channel matched %s but has no usable name; ignoring", yt_channel_id)
-            continue
+            # The name is guaranteed usable by the accessor, so the old
+            # nameless-match branch (a `return None` that hid a real match one
+            # row below it) is gone rather than left unreachable: a nameless
+            # entry never reaches this loop at all now.
+            return ch["name"]
     if cache.get("__failed__"):
         # No match, but at least one lookup RAISED - so this is not evidence
         # the channel is unconfigured, and the caller is about to act as if
@@ -11928,7 +12055,7 @@ def collect_headline_channels(config: dict) -> list[dict]:
     is ignored.
     """
     eligible: list[dict] = []
-    for channel in config.get("channels", []):
+    for channel in configured_channels(config):
         if channel.get("enabled", True) is not False:
             continue
         if channel.get("headline_digest") is not True:
