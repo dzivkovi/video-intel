@@ -946,7 +946,7 @@ Prompt templates live at the plugin root, `${CLAUDE_SKILL_DIR}/../../prompts/`:
 - `mindmap-heavy.md` - Comprehensive conceptual extraction
 - `transcript.md` - Full diarized transcript with screen content
 - `concepts.md` - Concept extraction + normalization against taxonomy
-- `nugget-brief.md` - Consultant-grade cross-creator synthesis with attributed nuggets
+- `nugget-brief.md` - Evidence-cited cross-creator synthesis with attributed nuggets
 
 Each prompt is self-contained. Users can modify or add their own.
 

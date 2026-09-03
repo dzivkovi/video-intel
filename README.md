@@ -400,7 +400,7 @@ python scripts/video_intel.py index                          # build index (one-
 python scripts/video_intel.py search "helium supply chain" --vector
 python scripts/video_intel.py search "code beats markdown" --vector --preview
 
-# Cross-creator nugget brief — consultant-grade synthesis across multiple creators
+# Cross-creator nugget brief — evidence-cited synthesis across multiple creators
 # Retrieves top-K hybrid-search excerpts, then feeds them through a cross-creator
 # prompt that produces: consensus, divergence (with underlying frame-of-reference
 # differences), attributed nuggets (mental models, metaphors, warnings,
@@ -559,7 +559,7 @@ Prompts live in `prompts/`. Each file is self-contained.
 | mindmap-heavy.md | Comprehensive extraction (6-10 branches, resources, perspectives) |
 | transcript.md | Three-task diarized transcript with screen content |
 | concepts.md | Concept extraction + normalization against taxonomy |
-| nugget-brief.md | Cross-creator consultant-grade synthesis (consensus / divergence / attributed nuggets / 1+1=3 emergent insights) |
+| nugget-brief.md | Evidence-cited cross-creator synthesis (consensus / divergence / attributed nuggets / 1+1=3 emergent insights) |
 | translate-bcs.md | BCS subtitle translation, video-understanding fallback path (`translate_video.py`) |
 | translate-bcs-from-srt.md | BCS subtitle translation, captions-first path (`translate_video.py`) |
 | translate-bcs-from-transcript.md | BCS subtitle translation from a rich transcript (`translate_video.py --from-transcript`) |

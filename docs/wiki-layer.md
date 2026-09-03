@@ -11,7 +11,7 @@ Both are **derived, additive, rebuildable artifacts**. Nothing downstream of the
 
 ## Nugget persistence
 
-`nugget "query"` already retrieves top-K evidence via hybrid search and synthesizes a consultant-grade cross-creator brief. As of this feature, it also writes that brief to disk:
+`nugget "query"` already retrieves top-K evidence via hybrid search and synthesizes an evidence-cited cross-creator brief. As of this feature, it also writes that brief to disk:
 
 ```bash
 python scripts/video_intel.py nugget "forward deployed engineering"

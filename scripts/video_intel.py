@@ -11166,7 +11166,7 @@ def write_nugget_brief(
 
 
 def cmd_nugget(args, config):
-    """Synthesize a consultant-grade multi-creator nugget brief for a query."""
+    """Synthesize an evidence-cited multi-creator nugget brief for a query."""
     output_dir = resolve_output_dir(config)
     since_raw = getattr(args, "since", None)
     since_iso = parse_since(since_raw).date().isoformat() if since_raw else None
@@ -13905,7 +13905,7 @@ Examples:
     # nugget command
     nugget_parser = subparsers.add_parser(
         "nugget",
-        help="Synthesize a consultant-grade nugget brief across creators for a query",
+        help="Synthesize an evidence-cited nugget brief across creators for a query",
     )
     nugget_parser.add_argument("query", help="Research question to probe across creators")
     nugget_parser.add_argument("--channel", help="Restrict to this channel (default: all)")

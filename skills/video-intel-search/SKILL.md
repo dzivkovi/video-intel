@@ -60,7 +60,7 @@ Five commands against the pre-built corpus:
    matches) and `--vector` (hybrid BM25 + vector + RRF, returns transcript
    passages with timestamps). Read-only.
 
-2. **`nugget`** - synthesize a consultant-grade cross-creator brief on a topic.
+2. **`nugget`** - synthesize an evidence-cited cross-creator brief on a topic.
    Retrieves top-K evidence via hybrid search, feeds it through a Gemini-backed
    synthesis prompt, returns attributed insights with timestamps. By default
    also persists the brief as a corpus artifact under
