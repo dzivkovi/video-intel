@@ -211,7 +211,7 @@ snippet above, which is trimmed for readability.
 | output_dir | ~/video-intel | Where output files are saved |
 | vector_db_dir | output_dir/.lancedb | LanceDB index location. Set this to a local path if `output_dir` is on a cloud-synced mount (Google Drive File Stream, OneDrive, Dropbox) - those filesystems do not support the atomic rename LanceDB needs. The `index` command runs a pre-flight probe and aborts with an actionable diagnostic before spending Voyage tokens if the path is incompatible. See [ADR-0016](docs/adr/ADR-0016-vector-db-path-config.md). |
 | default_since | 10d | Default lookback window |
-| default_prompt | the shipped template sets `mindmap-knowledge` | Default prompt for mind maps, overridable per channel. With the key absent the code fallback differs by command - `mindmap-light` on `scan` and `mindmap --url`, `mindmap-knowledge` on `process` - so set it explicitly rather than relying on it; copying `config.yaml.example` does that for you |
+| default_prompt | mindmap-knowledge | Default prompt for mind maps, overridable per channel. One `DEFAULT_PROMPT_NAME` constant backs every command; before issue #210 the code fallback differed by command, so a config omitting this key got different prompts from `scan` and `process` |
 | model | gemini-3.7-flash | Gemini model (overridable via `--model` CLI flag). Chosen by measurement, not spec sheet - see the model-card scorecards in `tests/evals/model-cards/` |
 | models | (unset) | Per-step model overrides, e.g. `models: {mindmap: ..., concepts: ...}`. Falls back to `model` for any step left out |
 | max_parallel | 10 | Concurrent Gemini requests (paid tier can go 50+) |
