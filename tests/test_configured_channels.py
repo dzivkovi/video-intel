@@ -149,13 +149,13 @@ class TestTheAccessorIsTheOnlyReader:
         name = getattr(target, "id", None)
         return isinstance(name, str) and ("config" in name.lower() or name.lower() in {"cfg", "conf"})
 
-    def _direct_reads(self) -> list[str]:
+    def _direct_reads(self, source: str = SOURCE) -> list[str]:
         """Every `config["channels"]` / `.get("channels")` read OUTSIDE the
         accessor. An AST walk rather than a grep, because a comment mentioning
         the key must not count as a read - and this file's guardrails
         deliberately quote the old expression in prose.
         """
-        tree = ast.parse(SOURCE)
+        tree = ast.parse(source)
         accessor_lines: set[int] = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef) and node.name == "configured_channels":
@@ -197,22 +197,19 @@ class TestTheAccessorIsTheOnlyReader:
         )
 
     def test_the_walk_is_not_vacuous(self):
-        """Companion, per the standing rule: an AST walk that stops matching
-        turns the check above into `assert [] == []` forever. Prove it finds a
-        read when one exists, using the accessor's OWN read - which the check
-        excludes by line range, so this is a real positive control."""
-        tree = ast.parse(SOURCE)
-        accessor_reads = [
-            n
-            for n in ast.walk(tree)
-            if isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Attribute)
-            and n.func.attr == "get"
-            and n.args
-            and isinstance(n.args[0], ast.Constant)
-            and n.args[0].value == "channels"
-        ]
-        assert accessor_reads, "the walk finds no read at all - it has stopped matching"
+        """A REAL positive control: feed `_direct_reads` a synthetic module that
+        contains a genuine bypassing read and require it to be found.
+
+        The first version re-implemented the matcher inline, WITHOUT the
+        receiver filter and WITHOUT the accessor line-exclusion - so it was a
+        control for a different function. A reviewer proved it: inserting
+        `return []` at the top of `_direct_reads` left all 29 tests green.
+        Same tautology class as the issue #182 field-inventory walk.
+        """
+        synthetic = "def somewhere(config):\n    return config.get('channels', [])\n"
+        assert self._direct_reads(synthetic), "the walk cannot see a plain bypassing read - it has stopped matching"
+        subscript = "def somewhere(cfg):\n    return cfg['channels']\n"
+        assert self._direct_reads(subscript), "the walk misses subscript reads"
 
     def test_the_receiver_filter_accepts_config_and_rejects_topics_data(self):
         """The filter is where a false alarm would come from, so pin both
@@ -236,13 +233,41 @@ class TestTheAccessorIsTheOnlyReader:
         assert not cls._receiver_is_config(reject), "a topics.json read would be a false alarm"
         assert not cls._receiver_is_config(reject_sub)
 
-    def test_both_modes_are_actually_used_in_production(self):
-        """A `strict` parameter nothing passes is a parameter that will drift.
-        Curate paths must pass True; the default covers the read-only ones."""
-        assert SOURCE.count("configured_channels(config, strict=True)") >= 4, (
-            "the curate paths stopped opting into strict"
+    def test_every_call_site_is_classified_by_NAME_not_by_a_slack_count(self):
+        """The first version was `SOURCE.count(...) >= 4` / `>= 5`, which
+        tolerated one strict flip and three lenient flips and never said which
+        site should be which. A reviewer flipped `cmd_scan` to lenient and
+        `cmd_status` to strict; the suite stayed green both times.
+
+        So the classification is a TABLE, keyed by the enclosing function, and
+        every call site in the module must appear in it. A new caller has to be
+        classified deliberately, exactly like `CONFIG_BACKUP_COMMANDS`.
+        """
+        tree = ast.parse(SOURCE)
+        found: dict[str, bool] = {}
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in ast.walk(fn):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "configured_channels"
+                ):
+                    strict_kw = next((k for k in node.keywords if k.arg == "strict"), None)
+                    # `strict=True` -> always strict. `strict=not args.channel`
+                    # -> strict for a whole-list run, which is what the rule is
+                    # about, so it counts as strict here. No keyword -> lenient.
+                    is_strict = strict_kw is not None
+                    found[fn.name] = found.get(fn.name, False) or is_strict
+
+        # The one place that is neither: the accessor's own recursion-free body.
+        found.pop("configured_channels", None)
+        assert found == EXPECTED_STRICTNESS, (
+            "a configured_channels call site is unclassified or changed mode.\n"
+            f"  found:    {dict(sorted(found.items()))}\n"
+            f"  expected: {dict(sorted(EXPECTED_STRICTNESS.items()))}"
         )
-        assert SOURCE.count("configured_channels(config)") >= 5, "the read-only paths stopped using the accessor"
 
 
 class TestRequireChannelsConfigNoLongerAcceptsTruthyGarbage:
@@ -265,3 +290,129 @@ class TestRequireChannelsConfigNoLongerAcceptsTruthyGarbage:
 
     def test_a_healthy_watchlist_passes(self):
         vi.require_channels_config({"channels": [GOOD]})
+
+
+# Every function that reads the watchlist, and whether it aborts on a bad row.
+#
+# STRICT means "this run iterates the WHOLE watchlist, so a dropped row is a
+# creator silently going unscanned". LENIENT means the command is read-only, is
+# a convenience lookup, or the operator named one channel.
+#
+# `cmd_scan` and `cmd_concepts` pass `strict=not args.channel`: they are strict
+# for a whole-list run and lenient when a channel is named, which is why they
+# read as strict here.
+EXPECTED_STRICTNESS = {
+    "require_channels_config": False,
+    "cmd_scan": True,
+    "cmd_concepts": True,
+    "cmd_dedupe": True,
+    "cmd_prune_shorts": True,
+    "cmd_status": False,
+    "channel_config_by_name": False,
+    "match_configured_channel": False,
+    "infer_channel_from_file_path": False,
+    "collect_headline_channels": False,
+    "_infer_profile": False,
+    "_cmd_mindmap_impl": False,
+    "_cmd_transcript_impl": False,
+    "_cmd_process_impl": False,
+}
+
+
+class TestTheClassificationHoldsAtTheCaller:
+    """Source-level classification is not enough: a reviewer replaced
+    `cmd_status`'s accessor call with `settings = config` /
+    `settings.get("channels", [])` - reintroducing the ticket's exact crash -
+    and all 29 tests stayed green, because every one called the accessor
+    directly or walked source with a receiver filter blind to `settings`.
+
+    This is verbatim what issue #205 invariant 6 calls "the sharpest lesson of
+    the ticket". These drive the real commands.
+    """
+
+    @pytest.fixture
+    def wired(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(vi, "resolve_output_dir", lambda *a, **k: tmp_path)
+        monkeypatch.setattr(vi, "load_taxonomy", lambda *a, **k: {"concepts": {}})
+        monkeypatch.setenv("GEMINI_API_KEY", "fake")
+        return tmp_path
+
+    @pytest.mark.parametrize(("label", "raw"), sorted(MALFORMED_ENTRIES.items()))
+    def test_status_degrades_rather_than_aborting(self, label, raw, wired):
+        """Read-only. One bad row must never cost the operator their status."""
+        from types import SimpleNamespace
+
+        try:
+            vi.cmd_status(SimpleNamespace(channel=None), {"channels": raw})
+        except SystemExit as e:
+            pytest.fail(f"status aborted (exit {e.code}) on {label}")
+
+    @pytest.mark.parametrize(("label", "raw"), sorted(MALFORMED_ENTRIES.items()))
+    def test_a_named_channel_run_is_not_blocked_by_an_unrelated_bad_row(self, label, raw, wired):
+        """CONFIRMED REGRESSION in the first cut, A/B'd against origin/main:
+        `dedupe --channel beta` and `prune-shorts --channel beta` went from
+        running normally to SystemExit(1) when an UNRELATED row was malformed.
+
+        Neither command even reads the list when a channel is named - the abort
+        came from `require_channels_config` having been made strict. That
+        removed the operator's escape hatch of working on one healthy channel
+        while the watchlist is broken, and `prune-shorts --channel` is exactly
+        the recovery this repo's docs recommend elsewhere.
+        """
+        from types import SimpleNamespace
+
+        for name, fn in (("dedupe", vi.cmd_dedupe), ("prune-shorts", vi.cmd_prune_shorts)):
+            args = SimpleNamespace(channel="beta", apply=False, dry_run=True)
+            try:
+                fn(args, {"channels": raw})
+            except SystemExit as e:
+                if e.code:
+                    pytest.fail(f"{name} --channel beta aborted (exit {e.code}) on an unrelated {label}")
+            except Exception:
+                # Anything else (no corpus on disk, etc.) is not this test's
+                # business - only a config-driven ABORT is.
+                pass
+
+    def test_require_channels_config_still_refuses_a_watchlist_with_nothing_usable(self):
+        """The lenient change must not weaken the guard's actual job."""
+        with pytest.raises(SystemExit) as exc:
+            vi.require_channels_config({"channels": "alpha"})
+        assert exc.value.code == 1
+
+    def test_require_channels_config_passes_a_list_with_one_bad_row_and_one_good(self):
+        """The regression above, at the guard itself."""
+        vi.require_channels_config({"channels": [{"url": "u"}, GOOD]})
+
+
+class TestEveryRejectionIsReportedBeforeExiting:
+    """An operator with three bad rows should fix them in one pass, not
+    discover them across three runs (review P3)."""
+
+    def test_strict_reports_all_three_then_exits_once(self, caplog):
+        cfg = {"channels": ["a", {"url": "u"}, {"name": 42}, GOOD]}
+        with caplog.at_level("ERROR"), pytest.raises(SystemExit) as exc:
+            vi.configured_channels(cfg, strict=True)
+        assert exc.value.code == 1
+        reported = [r.getMessage() for r in caplog.records]
+        for entry in ("entry 0", "entry 1", "entry 2"):
+            assert any(entry in m for m in reported), f"{entry} was never reported: {reported}"
+
+    def test_the_mapping_hint_only_appears_for_a_mapping(self, caplog):
+        """It used to be appended for every non-list type, so a bare string got
+        'got str. A mapping usually means the dashes were omitted' - a hint
+        contradicting the type it had just printed."""
+        with caplog.at_level("WARNING"):
+            vi.configured_channels({"channels": "alpha"})
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "got str" in joined and "dashes were omitted" not in joined, joined
+
+        caplog.clear()
+        with caplog.at_level("WARNING"):
+            vi.configured_channels({"channels": {"name": "a"}})
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "dashes were omitted" in joined, joined
+
+    def test_a_none_config_does_not_raise(self):
+        """Only `_infer_profile` defended with `config or {}`; the accessor
+        owns it now."""
+        assert vi.configured_channels(None) == []
