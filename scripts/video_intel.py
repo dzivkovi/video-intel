@@ -103,6 +103,40 @@ DEFAULT_MODEL = "gemini-3.7-flash"
 # radius is small - and zero corpus artifacts were built with
 # `mindmap-light`, because the shipped template has always set this key.
 DEFAULT_PROMPT_NAME = "mindmap-knowledge"
+#: Env var naming extra prompt directories: one path, or several joined by
+#: `os.pathsep` (`;` on Windows, `:` elsewhere).
+PROMPT_DIR_ENV_VAR = "VIDEO_INTEL_PROMPT_DIR"
+#: Extra directories searched for prompt templates AHEAD of the bundled
+#: `prompts/`, populated by `load_config` from the optional `prompt_dirs:`
+#: config key.
+#:
+#: The repo ships plain, general-purpose templates. An operator who has
+#: sharpened one of them can keep the opinionated version outside this public
+#: repo and name its folder here: the private file wins locally, a fork with no
+#: `prompt_dirs:` keeps working on the shipped defaults, and nothing in the code
+#: depends on a file that is not in the repo.
+#:
+#: Module-level because `resolve_prompt_path` takes only a NAME - it is the one
+#: place a prompt name becomes a path (issue #169 item 8), and threading a
+#: config dict through its callers would give the preflight and the loader two
+#: chances to disagree about where a prompt lives.
+PROMPT_DIRS: list[Path] = []
+#: `(prompt name, directory)` pairs already logged as overridden. The INFO line
+#: is once per process per pair, so a scan over 40 videos does not repeat it 40
+#: times - and keying on the DIRECTORY too means a second overridden name, or
+#: the same name later winning from a different folder, still gets its own line.
+_LOGGED_PROMPT_OVERRIDES: set[tuple[str, str]] = set()
+#: Prompt names already warned about falling back to the bundled template while
+#: override directories were configured. Once per name per process.
+_LOGGED_PROMPT_FALLBACKS: set[str] = set()
+#: Override directories already warned about as unreadable. Once per directory
+#: per process - the resolver runs on every prompt lookup.
+_LOGGED_UNREADABLE_PROMPT_DIRS: set[str] = set()
+#: Parsed `$VIDEO_INTEL_PROMPT_DIR` values, keyed on the raw env string. The
+#: resolver runs on every prompt lookup, so re-parsing would re-warn about a
+#: malformed entry once per lookup (measured: 150+ identical lines in one
+#: scan). Keying on the raw string keeps a changed variable honest.
+_ENV_PROMPT_DIRS_CACHE: dict[str, list[Path]] = {}
 MAX_OUTPUT_TOKENS = 65536
 TRANSCRIPT_PARSE_RETRY_LIMIT = 1
 SALVAGE_MIN_SPEECH_ENTRIES = 5
@@ -126,7 +160,97 @@ def _user_config_path() -> Path:
     return Path.home() / ".video-intel" / "config.yaml"
 
 
-_USER_CONFIG_SUPPORTED_KEYS = frozenset({"output_dir", "vector_db_dir"})
+_USER_CONFIG_SUPPORTED_KEYS = frozenset({"output_dir", "vector_db_dir", "prompt_dirs"})
+
+
+def _strip_matched_quotes(value: str) -> str:
+    """`"C:\\prompts"` -> `C:\\prompts`, leaving an unquoted value alone.
+
+    `set VIDEO_INTEL_PROMPT_DIR="C:\\prompts"` on cmd.exe keeps the quotes in
+    the variable, and `Path('"C:\\prompts"')` is not absolute - so the entry was
+    dropped with a "relative entry" warning that named a path the operator can
+    see is absolute. Only a MATCHED leading/trailing quote pair is removed; a
+    quote character elsewhere is part of the path.
+    """
+    trimmed = value.strip()
+    if len(trimmed) >= 2 and trimmed[0] == trimmed[-1] and trimmed[0] in "\"'":
+        return trimmed[1:-1]
+    return trimmed
+
+
+def _coerce_prompt_dirs(raw: Any, *, source: str) -> list[Path]:
+    """Usable absolute directories from a `prompt_dirs`-shaped config value.
+
+    Degrades, never aborts (the issue #213 convention): a non-string, relative,
+    or non-directory entry is dropped with one WARNING naming it and the rest
+    of the list still applies. A relative entry is NOT resolved against the CWD
+    - a prompt directory whose meaning depends on which folder the shell
+    happens to be in is worse than no override at all, because the same command
+    would quietly send a different prompt to Gemini from a different directory.
+    A leading `~` IS expanded, because that names one fixed directory.
+
+    A directory that does not exist is KEPT: it is skipped at resolve time, so
+    one shared config can name a folder only some machines have. An entry that
+    exists but is a FILE is dropped - it can never hold a prompt, and silently
+    keeping it would leave the operator believing an override is in place.
+    """
+    if raw is None:
+        return []
+    entries = [raw] if isinstance(raw, str) else raw
+    if not isinstance(entries, list):
+        log.warning("Ignoring 'prompt_dirs' in %s: expected a list of absolute paths, got %r", source, raw)
+        return []
+
+    dirs: list[Path] = []
+    for entry in entries:
+        if not isinstance(entry, str):
+            log.warning("Ignoring non-string 'prompt_dirs' entry in %s: %r", source, entry)
+            continue
+        candidate = Path(_strip_matched_quotes(entry)).expanduser()
+        if not candidate.is_absolute():
+            log.warning(
+                "Ignoring relative 'prompt_dirs' entry in %s: %r (absolute paths only)",
+                source,
+                entry,
+            )
+            continue
+        if candidate.exists() and not candidate.is_dir():
+            log.warning("Ignoring 'prompt_dirs' entry in %s that is not a directory: %s", source, candidate)
+            continue
+        dirs.append(candidate)
+    return dirs
+
+
+def _env_prompt_dirs() -> list[Path]:
+    """Absolute directories named by `$VIDEO_INTEL_PROMPT_DIR`, in order.
+
+    Memoized on the RAW variable value: `resolve_prompt_path` runs on every
+    prompt lookup, so an uncached parse re-warned about a malformed entry once
+    per lookup. A changed variable is a different key and is parsed again, so a
+    test that sets it still sees the new value.
+    """
+    raw = (os.environ.get(PROMPT_DIR_ENV_VAR) or "").strip()
+    if not raw:
+        return []
+    cached = _ENV_PROMPT_DIRS_CACHE.get(raw)
+    if cached is None:
+        cached = _coerce_prompt_dirs(
+            [part for part in raw.split(os.pathsep) if part.strip()], source=f"${PROMPT_DIR_ENV_VAR}"
+        )
+        _ENV_PROMPT_DIRS_CACHE[raw] = cached
+    return list(cached)
+
+
+def prompt_search_dirs() -> list[Path]:
+    """Every directory `resolve_prompt_path` searches, in precedence order.
+
+    Config `prompt_dirs:` first, then `$VIDEO_INTEL_PROMPT_DIR`, then the
+    bundled `prompts/` LAST - so a fork with neither configured behaves exactly
+    as it did before, and the shipped template is always the final fallback.
+    """
+    return [*PROMPT_DIRS, *_env_prompt_dirs(), SKILL_DIR / "prompts"]
+
+
 _LAST_RESOLVED_SOURCE: str | None = None
 # The actual Path of the config file that won resolution, or None when the
 # winning source was the env var (which names a directory, not a config file).
@@ -143,9 +267,15 @@ def load_config() -> dict[str, Any]:
     2. ``$VIDEO_INTEL_OUTPUT_DIR`` - env-var override for installed users
        pointing a cached plugin at a non-default corpus. Must be absolute.
     3. ``~/.video-intel/config.yaml`` - user-level minimal config accepting
-       ``output_dir`` (required) and ``vector_db_dir`` (optional). Extra
-       keys are ignored with one INFO log.
+       ``output_dir`` (required), ``vector_db_dir`` and ``prompt_dirs``
+       (optional). Extra keys are ignored with one INFO log.
     4. Hard error with an actionable message naming both overrides.
+
+    Also the one place module-level :data:`PROMPT_DIRS` is populated, from the
+    optional ``prompt_dirs:`` key. It lives here rather than at the prompt
+    resolver because ``resolve_prompt_path`` takes only a name, and it is set
+    on every path that returns a config so a stale value from a previous load
+    can never leak into the next one.
 
     KD1: plugin-local config wins over env var to prevent a stale shell
     variable from silently redirecting a curate scan away from the author's
@@ -156,14 +286,18 @@ def load_config() -> dict[str, Any]:
     stored in module-level :data:`_LAST_RESOLVED_SOURCE` for downstream
     helpers (e.g. ``require_channels_config``) that surface diagnostics.
     """
-    global _LAST_RESOLVED_SOURCE, _LAST_RESOLVED_PATH
+    global _LAST_RESOLVED_SOURCE, _LAST_RESOLVED_PATH, PROMPT_DIRS
     _LAST_RESOLVED_PATH = None
+    # Reset first, then let each returning path set it: an absent `prompt_dirs`
+    # key must clear a previous load's value, never inherit it.
+    PROMPT_DIRS = []
 
     # Step 1: plugin-local config
     skill_config = SKILL_DIR / "config.yaml"
     if skill_config.exists():
         with open(skill_config) as f:
             config = yaml.safe_load(f) or {}
+        PROMPT_DIRS = _coerce_prompt_dirs(config.get("prompt_dirs"), source=str(skill_config))
         _LAST_RESOLVED_SOURCE = f"SKILL_DIR/config.yaml ({skill_config})"
         _LAST_RESOLVED_PATH = skill_config
         log.info("Config resolved from %s", _LAST_RESOLVED_SOURCE)
@@ -197,6 +331,7 @@ def load_config() -> dict[str, Any]:
             )
             sys.exit(1)
         supported = {k: v for k, v in raw.items() if k in _USER_CONFIG_SUPPORTED_KEYS}
+        PROMPT_DIRS = _coerce_prompt_dirs(supported.get("prompt_dirs"), source=str(user_config))
         extras = sorted(k for k in raw if k not in _USER_CONFIG_SUPPORTED_KEYS)
         if extras:
             log.info(
@@ -1400,23 +1535,100 @@ def find_mindmap_source(channel_dir: Path, prefix: str) -> Path | None:
 
 
 def resolve_prompt_path(prompt_name: str) -> Path:
-    """The file `load_prompt` would read for this name. Existence NOT checked.
+    """The file `load_prompt` would read for this name.
+
+    Searches `prompt_search_dirs()` in order and returns the FIRST candidate
+    that exists, so an operator's private copy of a shipped template wins over
+    the bundled one. When nothing exists anywhere, returns the bundled path
+    unchanged - existence is consulted only to pick a winner, so callers and
+    error messages keep naming the file they have always named.
 
     Split out for issue #169's preflight, which needs to ask "would this name
     resolve?" WITHOUT the answer being `sys.exit(1)`. The preflight must not
-    re-derive `SKILL_DIR / "prompts" / f"{name}.md"` itself - that is the PR
-    #136 checker/writer-path-drift class, and a preflight that looks in a
-    different directory than the loader is worse than no preflight.
+    re-derive the path itself - that is the PR #136 checker/writer-path-drift
+    class, and a preflight that looks in a different directory than the loader
+    is worse than no preflight.
     """
-    return SKILL_DIR / "prompts" / f"{normalize_prompt_name(prompt_name)}.md"
+    name = normalize_prompt_name(prompt_name)
+    filename = f"{name}.md"
+    search_dirs = prompt_search_dirs()
+    bundled_dir = SKILL_DIR / "prompts"
+    override_dirs = [d for d in search_dirs if d != bundled_dir]
+    for directory in search_dirs:
+        candidate = directory / filename
+        try:
+            # `is_file()`, never `exists()`: a DIRECTORY named `<name>.md`
+            # inside an override folder satisfies an existence check, so the
+            # preflight would report the name as resolving and `load_prompt`
+            # would then die on the read - the checker and the writer
+            # disagreeing about one path (the PR #136 class).
+            if not candidate.is_file():
+                continue
+        except OSError as exc:
+            # An unreadable override folder must not raise out of here: this
+            # resolver runs inside issue #169's report-only `--dry-run`
+            # preflight, which is documented as never exiting.
+            _warn_unreadable_prompt_dir(directory, exc)
+            continue
+        if directory != bundled_dir:
+            memo = (name, str(directory))
+            if memo not in _LOGGED_PROMPT_OVERRIDES:
+                _LOGGED_PROMPT_OVERRIDES.add(memo)
+                log.info("Prompt %r resolved from %s (overrides bundled prompts/)", name, directory)
+        elif override_dirs:
+            _warn_bundled_prompt_fallback(name, override_dirs)
+        return candidate
+    return bundled_dir / filename
+
+
+def _warn_unreadable_prompt_dir(directory: Path, exc: OSError) -> None:
+    """One WARNING per unreadable prompt directory per process."""
+    key = str(directory)
+    if key in _LOGGED_UNREADABLE_PROMPT_DIRS:
+        return
+    _LOGGED_UNREADABLE_PROMPT_DIRS.add(key)
+    log.warning("Prompt directory %s is unreadable (%s); skipping it", directory, exc)
+
+
+def _warn_bundled_prompt_fallback(name: str, override_dirs: list[Path]) -> None:
+    """One WARNING per prompt name per process when an override was expected.
+
+    Falling back must never be silent. An operator who configured
+    `prompt_dirs:` believes their own template is in play; a typo in the
+    filename, or a file deleted mid-run, otherwise sends the shipped default to
+    Gemini with nothing said.
+    """
+    if name in _LOGGED_PROMPT_FALLBACKS:
+        return
+    _LOGGED_PROMPT_FALLBACKS.add(name)
+    log.warning(
+        "Prompt %r not found in any override dir (%s); using bundled prompts/",
+        name,
+        ", ".join(str(d) for d in override_dirs),
+    )
 
 
 def load_prompt(prompt_name: str) -> str:
     prompt_path = resolve_prompt_path(prompt_name)
     if not prompt_path.exists():
-        log.error("Prompt file not found: %s", prompt_path)
+        # Name every directory searched: with overrides configured, "not found"
+        # at the bundled path alone would send the operator hunting in the one
+        # folder they did not intend the prompt to come from.
+        log.error(
+            "Prompt file not found: %s (searched: %s)",
+            prompt_path,
+            ", ".join(str(d) for d in prompt_search_dirs()),
+        )
         sys.exit(1)
-    return prompt_path.read_text(encoding="utf-8")
+    try:
+        return prompt_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        # Same exit as "not found": a prompt we cannot read is a prompt we
+        # cannot send, and continuing would mean calling Gemini with whatever a
+        # caller does next. `UnicodeDecodeError` subclasses `ValueError`, not
+        # `OSError`, so both are named (the issue #124 rule).
+        log.error("Prompt file could not be read: %s (%s)", prompt_path, exc)
+        sys.exit(1)
 
 
 def parse_since(since_str):
