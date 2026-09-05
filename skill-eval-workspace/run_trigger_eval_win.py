@@ -16,6 +16,7 @@ Usage:
   python run_trigger_eval_win.py --eval-set <eval.json> --skill-id video-intel:video-intel \
       --model claude-opus-4-8 --runs 3 --timeout 60 > results.json
 """
+
 import argparse
 import json
 import os
@@ -124,10 +125,17 @@ def main():
         rate = hits / args.runs
         got = rate >= args.threshold
         ok = got == want
-        results.append({
-            "query": q, "tag": e.get("tag", ""), "should_trigger": want,
-            "trigger_rate": rate, "triggers": hits, "runs": args.runs, "pass": ok,
-        })
+        results.append(
+            {
+                "query": q,
+                "tag": e.get("tag", ""),
+                "should_trigger": want,
+                "trigger_rate": rate,
+                "triggers": hits,
+                "runs": args.runs,
+                "pass": ok,
+            }
+        )
         flag = "PASS" if ok else "FAIL"
         print(f"  [{flag}] rate={hits}/{args.runs} want={want} | {q[:65]}", file=sys.stderr)
 

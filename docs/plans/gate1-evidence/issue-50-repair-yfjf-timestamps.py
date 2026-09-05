@@ -22,7 +22,9 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-FILE = Path("G:/My Drive/video-intel/lexfridman/2026-02-12-openclaw-the-viral-ai-agent-that-broke-the-internet-peter-steinberger-lex-fridma.transcript.md")
+FILE = Path(
+    "G:/My Drive/video-intel/lexfridman/2026-02-12-openclaw-the-viral-ai-agent-that-broke-the-internet-peter-steinberger-lex-fridma.transcript.md"
+)
 BACKUP = Path(str(FILE) + ".broken-stitching.bak")
 
 # Final coverage table at top of file references chunk ranges in MM:SS - HH:MM:SS
