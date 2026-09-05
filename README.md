@@ -187,7 +187,7 @@ Three consequences worth knowing before you configure a channel: the expensive s
 - **Read the mind map before the transcript.** A 30-second read before a 30-minute commitment. When transcripts are on, the pipeline runs the other way - it transcribes first and derives the mind map from the text, because that is cheaper - but your reading order is still mind map first.
 - **One model replaces the four-tool transcription stack.** For getting words, speakers and slides out of a video, Gemini Flash does what Whisper + pyannote + Claude + Gemini did separately, and captures the visual channel they never could. (Discovery, embeddings and triage still use their own tools.)
 - **Idempotent.** Re-running a scan skips what is done. Safe to interrupt, safe to re-run.
-- **Prompts are files.** Every prompt lives in `prompts/`, self-contained and swappable. No hidden prefix assembly.
+- **Prompts are files.** Every prompt lives in `prompts/`, self-contained and swappable. No hidden prefix assembly. The shipped templates are plain defaults: list your own folders in `prompt_dirs:` (or `$VIDEO_INTEL_PROMPT_DIR`) and a private file of the same name wins over the bundled one, so an opinionated version can live outside this repo while a fork keeps working on the defaults.
 - **Per-channel config.** A daily creator gets `since: 10d`, a monthly one `since: 120d`. Each entry captures your relationship with that creator.
 - **The tool only does the Gemini work.** Triage and deep-dives are conversations with Claude over the files, not API calls. They were in the design, then deliberately cut.
 
@@ -227,6 +227,10 @@ A real example of the full loop, exactly as it ran on 2026-09-01, preparing a 1-
 
 The pattern generalizes: curate topics as you go (they are cheap), let `nugget` argue both sides, use vector search for named people and full questions, and read the mindmaps - they are the corpus's own notes to you.
 
+## Beyond video: newsletters and communities
+
+The corpus has grown past YouTube. The reading layer that turns transcripts into mind maps, briefings and topic digests is source-agnostic: the same templates, the same "fixed template, ranking, so what" rules, and the same `prompt_dirs:` precedence apply to any set of short items about one topic, not only to video. The 2026 AI Tinkerers pass documented in [docs/reading-layer.md](docs/reading-layer.md) is the reference run: a community's newsletter issues and the talk pages behind them were reduced to the same topic-digest shape this repo already produces for video. What stays video-specific is the ingest pipeline itself - the Gemini transcripts, mind maps, concept extraction and the LanceDB index all assume a video source. Fetching a community's own newsletter or talk pages (mail access, sign-in, site harvest) is operator-specific and deliberately not part of this repo; bring your own fetching routine and feed its output into the same templates.
+
 ## Where to go next
 
 | If you want to... | Read |
@@ -234,6 +238,7 @@ The pattern generalizes: curate topics as you go (they are cheap), let `nugget` 
 | install it, or use it from another agent platform | [INSTALLATION.md](INSTALLATION.md) |
 | understand how a search hit is ranked | [docs/search-internals.md](docs/search-internals.md) |
 | organize the corpus into the threads you are following | [docs/topics-layer.md](docs/topics-layer.md) |
+| understand why every briefing, digest and distillation has the same shape, and bring your own templates | [docs/reading-layer.md](docs/reading-layer.md) |
 | make what you learn compound instead of re-paying for it | [docs/wiki-layer.md](docs/wiki-layer.md) |
 | ask who led, what is spiking, which creators cluster | [docs/intelligence-layer.md](docs/intelligence-layer.md), then [the math](docs/intelligence-layer-math.md) if you want the why |
 | recover a video that would not process | [docs/troubleshooting.md](docs/troubleshooting.md) |
@@ -272,6 +277,7 @@ snippet above, which is trimmed for readability.
 | vector_db_dir | output_dir/.lancedb | LanceDB index location. Set this to a local path if `output_dir` is on a cloud-synced mount (Google Drive File Stream, OneDrive, Dropbox) - those filesystems do not support the atomic rename LanceDB needs. The `index` command runs a pre-flight probe and aborts with an actionable diagnostic before spending Voyage tokens if the path is incompatible. See [ADR-0016](docs/adr/ADR-0016-vector-db-path-config.md). |
 | default_since | 10d | Default lookback window |
 | default_prompt | mindmap-knowledge | Default prompt for mind maps, overridable per channel. Every command uses the same fallback |
+| prompt_dirs | (unset) | Folders searched for prompt templates before the bundled `prompts/`, in order. Lets a private, sharpened copy of a shipped template win locally. Absolute paths; a leading `~` is expanded. A folder that does not exist is allowed and skipped; a prompt name that falls back to the bundled template logs INFO once if never overridden, or WARNING once if it previously won from an override and now doesn't. `$VIDEO_INTEL_PROMPT_DIR` does the same and is searched after these |
 | model | gemini-3.7-flash | Gemini model (overridable via `--model` CLI flag). Chosen by measurement, not spec sheet - see the model-card scorecards in `tests/evals/model-cards/` |
 | models | (unset) | Per-step model overrides, e.g. `models: {mindmap: ..., concepts: ...}`. Falls back to `model` for any step left out |
 | max_parallel | 10 | Concurrent Gemini requests (paid tier can go 50+) |
@@ -560,12 +566,36 @@ Prompts live in `prompts/`. Each file is self-contained.
 | transcript.md | Three-task diarized transcript with screen content |
 | concepts.md | Concept extraction + normalization against taxonomy |
 | nugget-brief.md | Evidence-cited cross-creator synthesis (consensus / divergence / attributed nuggets / 1+1=3 emergent insights) |
+| topic-digest.md | Cross-source digest of many short sources about one topic, ranked, fixed sections |
+| cliffnotes-distiller.md | One long transcript to a deep-linked reference |
 | translate-bcs.md | BCS subtitle translation, video-understanding fallback path (`translate_video.py`) |
 | translate-bcs-from-srt.md | BCS subtitle translation, captions-first path (`translate_video.py`) |
 | translate-bcs-from-transcript.md | BCS subtitle translation from a rich transcript (`translate_video.py --from-transcript`) |
 
+`topic-digest` and `cliffnotes-distiller` are plain defaults meant to be
+overridden through `prompt_dirs` - see [docs/reading-layer.md](docs/reading-layer.md).
+
 Add a `.md` file to `prompts/` and reference it in config.yaml by filename
 (without extension).
+
+A prompt name is resolved against each `prompt_dirs:` entry first, then each
+path in `$VIDEO_INTEL_PROMPT_DIR` (one path, or several joined by `;` on
+Windows and `:` elsewhere), then the bundled `prompts/` - first file found
+wins. So a private folder holding your own `mindmap-knowledge.md` overrides
+the shipped one without editing the repo, and a checkout with neither set
+resolves exactly as it always has.
+
+Entries must be absolute paths; a leading `~` is expanded. A relative entry, an
+entry that names a file rather than a folder, and a non-string entry are each
+ignored with a warning while the rest of the list still applies. A folder that
+does not exist is allowed and skipped, so one config can name a path only some
+machines have - but a prompt name that ends up falling back to the bundled
+template while override folders are configured is logged about once, so a
+typo in a filename never silently sends the shipped default to Gemini: a name
+never resolved from an override in this run logs INFO (routine - overriding a
+couple of templates should not warn about every other one), while a name that
+previously resolved from an override and now falls back logs a WARNING
+instead (a real regression, such as the override file being deleted mid-run).
 
 ## Output
 

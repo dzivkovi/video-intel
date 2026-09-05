@@ -142,11 +142,33 @@ def score(raw: str, usage: dict, model: str, seg_secs: int, wall: float | None) 
     }
 
 
+def prompt_override(prompt_name: str) -> str | None:
+    """The resolved prompt path when it is NOT the bundled template.
+
+    A scorecard is a claim about a MODEL, but `prompt_dirs:` and
+    `$VIDEO_INTEL_PROMPT_DIR` can redirect the transcript prompt - and this
+    harness never calls `load_config`, so a config it never read still moves
+    its input through the module-level resolver. A card produced against a
+    private prompt is not comparable to one produced against the shipped
+    template, so the run says so and the card records it.
+    """
+    path = v.resolve_prompt_path(prompt_name)
+    try:
+        path.relative_to(v.SKILL_DIR / "prompts")
+    except ValueError:
+        return str(path)
+    return None
+
+
 def run_one(client, types, fx: dict, model: str, thinking: str | None, seg: int, scratch: Path) -> dict:
     """One (fixture, model) call. Cached on disk so a re-run costs nothing."""
     tag = f"{fx['id']}__{model}"
     raw_p, use_p = scratch / f"{tag}.json", scratch / f"{tag}.usage.json"
     wall = None
+    # Resolved BEFORE the cache check: a card re-rendered from a warm cache must
+    # still say which prompt is active, or a cached rerun under an override
+    # would be labelled as measuring the bundled template.
+    override = prompt_override("transcript")
     if raw_p.exists() and use_p.exists():
         raw = raw_p.read_text(encoding="utf-8")
         usage = json.loads(use_p.read_text(encoding="utf-8"))
@@ -159,6 +181,13 @@ def run_one(client, types, fx: dict, model: str, thinking: str | None, seg: int,
             else v._make_thinking_config_for_transcript(types, model)
         )
         usage: dict = {}
+        if override:
+            v.log.warning(
+                "A private prompt override is active: the transcript prompt comes from %s, not the bundled "
+                "prompts/. This scorecard measures that prompt, so it is not comparable to a card run against "
+                "the shipped template.",
+                override,
+            )
         t0 = time.time()
         try:
             raw = v.call_gemini(
@@ -183,6 +212,7 @@ def run_one(client, types, fx: dict, model: str, thinking: str | None, seg: int,
         print(f"  [live]   {tag}  {wall:.1f}s")
     row = score(raw, usage, model, seg, wall)
     row["fixture"] = fx["id"]
+    row["prompt_override"] = override
     return row
 
 
@@ -196,6 +226,15 @@ def render(rows: list[dict], models: list[str], manifest: dict, incumbent: str |
         "counts while differing several-fold on this number.",
         "",
     ]
+    overrides = sorted({r["prompt_override"] for r in rows if r.get("prompt_override")})
+    if overrides:
+        out += [
+            "**Prompt override active.** The transcript prompt came from "
+            + ", ".join(f"`{p}`" for p in overrides)
+            + ", not the bundled `prompts/`. This card measures that prompt; it is not comparable to a card run "
+            "against the shipped template.",
+            "",
+        ]
     cols = [
         ("fixture", "fixture", 22),
         ("model", "model", 22),

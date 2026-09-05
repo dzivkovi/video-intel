@@ -17,6 +17,20 @@ output_dir: ~/video-intel
 
 default_since: 10d
 default_prompt: mindmap-knowledge
+# prompt_dirs: extra folders searched for prompt templates BEFORE the bundled
+# prompts/, in the order listed. The repo ships plain, general-purpose
+# templates; keep your sharpened versions of the same-named prompts in a
+# private folder and they win locally, while a fork with no prompt_dirs keeps
+# working on the shipped defaults. Absolute paths; a leading ~ is expanded (a
+# relative entry, or one naming a file, is ignored with a warning). A folder
+# that does not exist is allowed and skipped, so one config can name a path
+# only some machines have - but a prompt name that falls back to the bundled
+# template anyway is warned about once, so a typo never silently sends the
+# shipped default to Gemini. $VIDEO_INTEL_PROMPT_DIR (one
+# path, or several joined by ; on Windows and : elsewhere) does the same thing
+# and is searched after these. See docs/reading-layer.md.
+# prompt_dirs:
+#   - /absolute/path/to/my-private-prompts
 # Gemini model for every step. Chosen by measurement, not spec sheet: run
 # `python scripts/model_eval.py --candidate <new> --incumbent <current>` and read
 # the scorecard in tests/evals/model-cards/ before changing this. The dimension
