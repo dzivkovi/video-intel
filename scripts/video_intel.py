@@ -126,9 +126,13 @@ PROMPT_DIRS: list[Path] = []
 #: times - and keying on the DIRECTORY too means a second overridden name, or
 #: the same name later winning from a different folder, still gets its own line.
 _LOGGED_PROMPT_OVERRIDES: set[tuple[str, str]] = set()
-#: Prompt names already warned about falling back to the bundled template while
-#: override directories were configured. Once per name per process.
-_LOGGED_PROMPT_FALLBACKS: set[str] = set()
+#: `(prompt name, severity)` pairs already logged as falling back to the
+#: bundled template while override directories were configured. Keyed on
+#: severity as well as name: an INFO fallback (never overridden) memoizing
+#: the name alone would silently suppress a LATER WARNING fallback for that
+#: same name once it has overridden and then regressed - each severity still
+#: logs at most once per name per process.
+_LOGGED_PROMPT_FALLBACKS: set[tuple[str, str]] = set()
 #: Override directories already warned about as unreadable. Once per directory
 #: per process - the resolver runs on every prompt lookup.
 _LOGGED_UNREADABLE_PROMPT_DIRS: set[str] = set()
@@ -1576,7 +1580,7 @@ def resolve_prompt_path(prompt_name: str) -> Path:
                 _LOGGED_PROMPT_OVERRIDES.add(memo)
                 log.info("Prompt %r resolved from %s (overrides bundled prompts/)", name, directory)
         elif override_dirs:
-            _warn_bundled_prompt_fallback(name, override_dirs)
+            _log_bundled_prompt_fallback(name, override_dirs)
         return candidate
     return bundled_dir / filename
 
@@ -1590,19 +1594,42 @@ def _warn_unreadable_prompt_dir(directory: Path, exc: OSError) -> None:
     log.warning("Prompt directory %s is unreadable (%s); skipping it", directory, exc)
 
 
-def _warn_bundled_prompt_fallback(name: str, override_dirs: list[Path]) -> None:
-    """One WARNING per prompt name per process when an override was expected.
+def _log_bundled_prompt_fallback(name: str, override_dirs: list[Path]) -> None:
+    """One log line per (prompt name, severity) pair per process when the
+    bundled file wins despite override dirs being configured.
 
-    Falling back must never be silent. An operator who configured
-    `prompt_dirs:` believes their own template is in play; a typo in the
-    filename, or a file deleted mid-run, otherwise sends the shipped default to
-    Gemini with nothing said.
+    Falling back must never be silent, but the severity depends on whether
+    this name has ever won from an override in this process. A name that
+    NEVER has is the routine case - an operator who overrode two of a dozen
+    templates should not see a WARNING for the other ten on every run - so it
+    logs INFO once. A name that WAS resolved from an override earlier in this
+    same run and now falls back (the private file deleted, or its directory
+    unmounted, mid-run) is a real regression the operator needs to see, so it
+    logs WARNING instead.
+
+    The severity is decided BEFORE the once-per-name memo is consulted, and
+    the memo is keyed on `(name, level)`, not on the name alone: an INFO
+    fallback logged for a name that has never overridden anything must not
+    suppress a LATER WARNING for that same name once it later does override
+    and then regresses (override resolved, then the private file vanishes).
+    Each severity still fires at most once per name per process.
     """
-    if name in _LOGGED_PROMPT_FALLBACKS:
+    prior_dirs = sorted({directory for logged_name, directory in _LOGGED_PROMPT_OVERRIDES if logged_name == name})
+    level = "warning" if prior_dirs else "info"
+    memo = (name, level)
+    if memo in _LOGGED_PROMPT_FALLBACKS:
         return
-    _LOGGED_PROMPT_FALLBACKS.add(name)
-    log.warning(
-        "Prompt %r not found in any override dir (%s); using bundled prompts/",
+    _LOGGED_PROMPT_FALLBACKS.add(memo)
+    if prior_dirs:
+        log.warning(
+            "Prompt %r was resolved from %s earlier in this run and now falls back to bundled prompts/ - "
+            "check the override directory",
+            name,
+            ", ".join(prior_dirs),
+        )
+        return
+    log.info(
+        "Prompt %r not in any override dir (%s); using bundled prompts/",
         name,
         ", ".join(str(d) for d in override_dirs),
     )

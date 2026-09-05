@@ -227,6 +227,10 @@ A real example of the full loop, exactly as it ran on 2026-09-01, preparing a 1-
 
 The pattern generalizes: curate topics as you go (they are cheap), let `nugget` argue both sides, use vector search for named people and full questions, and read the mindmaps - they are the corpus's own notes to you.
 
+## Beyond video: newsletters and communities
+
+The corpus has grown past YouTube. The reading layer that turns transcripts into mind maps, briefings and topic digests is source-agnostic: the same templates, the same "fixed template, ranking, so what" rules, and the same `prompt_dirs:` precedence apply to any set of short items about one topic, not only to video. The 2026 AI Tinkerers pass documented in [docs/reading-layer.md](docs/reading-layer.md) is the reference run: a community's newsletter issues and the talk pages behind them were reduced to the same topic-digest shape this repo already produces for video. What stays video-specific is the ingest pipeline itself - the Gemini transcripts, mind maps, concept extraction and the LanceDB index all assume a video source. Fetching a community's own newsletter or talk pages (mail access, sign-in, site harvest) is operator-specific and deliberately not part of this repo; bring your own fetching routine and feed its output into the same templates.
+
 ## Where to go next
 
 | If you want to... | Read |
@@ -273,7 +277,7 @@ snippet above, which is trimmed for readability.
 | vector_db_dir | output_dir/.lancedb | LanceDB index location. Set this to a local path if `output_dir` is on a cloud-synced mount (Google Drive File Stream, OneDrive, Dropbox) - those filesystems do not support the atomic rename LanceDB needs. The `index` command runs a pre-flight probe and aborts with an actionable diagnostic before spending Voyage tokens if the path is incompatible. See [ADR-0016](docs/adr/ADR-0016-vector-db-path-config.md). |
 | default_since | 10d | Default lookback window |
 | default_prompt | mindmap-knowledge | Default prompt for mind maps, overridable per channel. Every command uses the same fallback |
-| prompt_dirs | (unset) | Folders searched for prompt templates before the bundled `prompts/`, in order. Lets a private, sharpened copy of a shipped template win locally. Absolute paths; a leading `~` is expanded. A folder that does not exist is allowed and skipped, but a prompt name that falls back to the bundled template is warned about once. `$VIDEO_INTEL_PROMPT_DIR` does the same and is searched after these |
+| prompt_dirs | (unset) | Folders searched for prompt templates before the bundled `prompts/`, in order. Lets a private, sharpened copy of a shipped template win locally. Absolute paths; a leading `~` is expanded. A folder that does not exist is allowed and skipped; a prompt name that falls back to the bundled template logs INFO once if never overridden, or WARNING once if it previously won from an override and now doesn't. `$VIDEO_INTEL_PROMPT_DIR` does the same and is searched after these |
 | model | gemini-3.7-flash | Gemini model (overridable via `--model` CLI flag). Chosen by measurement, not spec sheet - see the model-card scorecards in `tests/evals/model-cards/` |
 | models | (unset) | Per-step model overrides, e.g. `models: {mindmap: ..., concepts: ...}`. Falls back to `model` for any step left out |
 | max_parallel | 10 | Concurrent Gemini requests (paid tier can go 50+) |
@@ -586,8 +590,12 @@ entry that names a file rather than a folder, and a non-string entry are each
 ignored with a warning while the rest of the list still applies. A folder that
 does not exist is allowed and skipped, so one config can name a path only some
 machines have - but a prompt name that ends up falling back to the bundled
-template while override folders are configured is warned about once, so a typo
-in a filename never silently sends the shipped default to Gemini.
+template while override folders are configured is logged about once, so a
+typo in a filename never silently sends the shipped default to Gemini: a name
+never resolved from an override in this run logs INFO (routine - overriding a
+couple of templates should not warn about every other one), while a name that
+previously resolved from an override and now falls back logs a WARNING
+instead (a real regression, such as the override file being deleted mid-run).
 
 ## Output
 

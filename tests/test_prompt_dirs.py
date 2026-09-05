@@ -373,26 +373,31 @@ class TestAnUnreadableOverrideDirDegrades:
 
 
 class TestFallingBackToBundledIsNeverSilent:
-    def test_configured_overrides_that_lack_the_name_warn_once_per_name(self, tmp_path, monkeypatch, caplog):
+    def test_configured_overrides_that_lack_the_name_log_info_once_per_name(self, tmp_path, monkeypatch, caplog):
+        # A name never overridden in this process is the routine case: it
+        # must not read as a WARNING just because some OTHER name is overridden.
         monkeypatch.setattr(vi, "PROMPT_DIRS", [tmp_path / "private"])
 
-        with caplog.at_level(logging.WARNING, logger="video_intel"):
+        with caplog.at_level(logging.INFO, logger="video_intel"):
             for _ in range(3):
                 vi.resolve_prompt_path(SHIPPED_NAME)
 
-        assert caplog.text.count("not found in any override dir") == 1
+        assert caplog.text.count("not in any override dir") == 1
         assert SHIPPED_NAME in caplog.text
         assert str(tmp_path / "private") in caplog.text
+        assert not any(r.levelno >= logging.WARNING for r in caplog.records)
 
-    def test_no_fallback_warning_when_no_override_dir_is_configured(self, caplog):
-        with caplog.at_level(logging.WARNING, logger="video_intel"):
+    def test_no_fallback_log_when_no_override_dir_is_configured(self, caplog):
+        with caplog.at_level(logging.INFO, logger="video_intel"):
             vi.resolve_prompt_path(SHIPPED_NAME)
 
-        assert "not found in any override dir" not in caplog.text
+        assert "not in any override dir" not in caplog.text
 
     def test_deleting_the_override_file_mid_run_switches_to_bundled_with_a_warning(self, tmp_path, monkeypatch, caplog):
         # The memo must not swallow this: an operator who deletes the private
         # file mid-scan silently starts sending Gemini a different prompt.
+        # This name previously resolved from an override, so falling back now
+        # is a real regression and must escalate to WARNING, not INFO.
         private = write_prompt(tmp_path / "private", SHIPPED_NAME, "PRIVATE VERSION")
         monkeypatch.setattr(vi, "PROMPT_DIRS", [tmp_path / "private"])
 
@@ -401,7 +406,44 @@ class TestFallingBackToBundledIsNeverSilent:
             private.unlink()
             assert vi.resolve_prompt_path(SHIPPED_NAME) == BUNDLED / f"{SHIPPED_NAME}.md"
 
-        assert "not found in any override dir" in caplog.text
+        assert any(
+            r.levelno == logging.WARNING and "falls back to bundled prompts/" in r.getMessage() for r in caplog.records
+        )
+
+    def test_fallback_then_override_then_fallback_logs_the_warning(self, tmp_path, monkeypatch, caplog):
+        # Reported bug: the once-per-name fallback memo used to be a single
+        # set keyed on name alone. Sequence: (1) no override file yet -> INFO
+        # fallback, name memoized; (2) the file appears -> INFO override line;
+        # (3) the file is deleted again -> this SHOULD escalate to WARNING
+        # (the name previously won from an override), but the old code's
+        # early return on step 1's memo fired first and nothing was logged
+        # at all. A third fallback must not repeat the WARNING.
+        private_dir = tmp_path / "private"
+        monkeypatch.setattr(vi, "PROMPT_DIRS", [private_dir])
+
+        with caplog.at_level(logging.INFO, logger="video_intel"):
+            # Step 1: no override file present yet -> INFO fallback.
+            assert vi.resolve_prompt_path(SHIPPED_NAME) == BUNDLED / f"{SHIPPED_NAME}.md"
+
+            # Step 2: the override file appears -> INFO override line.
+            private = write_prompt(private_dir, SHIPPED_NAME, "PRIVATE VERSION")
+            assert vi.resolve_prompt_path(SHIPPED_NAME) == private
+
+            # Step 3: the override file is deleted again -> WARNING fallback.
+            private.unlink()
+            assert vi.resolve_prompt_path(SHIPPED_NAME) == BUNDLED / f"{SHIPPED_NAME}.md"
+
+            # Step 4: still gone -> no duplicate WARNING.
+            assert vi.resolve_prompt_path(SHIPPED_NAME) == BUNDLED / f"{SHIPPED_NAME}.md"
+
+        assert caplog.text.count("not in any override dir") == 1
+        assert caplog.text.count("overrides bundled prompts/") == 1
+        warning_lines = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and "falls back to bundled prompts/" in r.getMessage()
+        ]
+        assert len(warning_lines) == 1
 
     def test_a_second_overridden_name_logs_its_own_info_line(self, tmp_path, monkeypatch, caplog):
         write_prompt(tmp_path / "private", SHIPPED_NAME, "ONE")
@@ -413,6 +455,26 @@ class TestFallingBackToBundledIsNeverSilent:
             vi.resolve_prompt_path("transcript")
 
         assert caplog.text.count("overrides bundled prompts/") == 2
+
+    def test_two_overridden_names_and_five_bundled_names_log_five_info_and_no_warnings(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        # Two names genuinely override; five others only ever exist bundled.
+        # None of the five untouched names may escalate to WARNING just
+        # because other names in the same config are overridden.
+        write_prompt(tmp_path / "private", SHIPPED_NAME, "ONE")
+        write_prompt(tmp_path / "private", "cliffnotes-distiller", "TWO")
+        monkeypatch.setattr(vi, "PROMPT_DIRS", [tmp_path / "private"])
+        bundled_only_names = ["mindmap-light", "mindmap-heavy", "concepts", "transcript", "topic-digest"]
+
+        with caplog.at_level(logging.INFO, logger="video_intel"):
+            vi.resolve_prompt_path(SHIPPED_NAME)
+            vi.resolve_prompt_path("cliffnotes-distiller")
+            for name in bundled_only_names:
+                vi.resolve_prompt_path(name)
+
+        assert caplog.text.count("not in any override dir") == 5
+        assert not any(r.levelno >= logging.WARNING for r in caplog.records)
 
 
 class TestEntryNormalization:
