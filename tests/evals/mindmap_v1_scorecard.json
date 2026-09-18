@@ -1,0 +1,51 @@
+{
+ "label": "v1-shipped",
+ "rolls": 3,
+ "control_mean_recall": 0.2743,
+ "control_rolls": [
+  0.2653,
+  0.2833
+ ],
+ "variant_rolls": [
+  0.2928144078144078,
+  0.3305433455433455,
+  0.36259462759462757
+ ],
+ "variant_mean_recall": 0.32865079365079364,
+ "variant_worst_roll": 0.2928144078144078,
+ "guards_hold": true,
+ "guard_totals_per_roll": [
+  {
+   "quantitative_details": 57,
+   "timestamped_bullets": 424,
+   "bullets": 463,
+   "themes": 66,
+   "subthemes": 158
+  },
+  {
+   "quantitative_details": 61,
+   "timestamped_bullets": 434,
+   "bullets": 493,
+   "themes": 66,
+   "subthemes": 147
+  },
+  {
+   "quantitative_details": 53,
+   "timestamped_bullets": 400,
+   "bullets": 445,
+   "themes": 70,
+   "subthemes": 155
+  }
+ ],
+ "historical_on_disk_recall": 0.4151,
+ "tokens": {
+  "prompt": 487161,
+  "out": 104083
+ },
+ "statistics": {
+  "one_sided_exact_permutation_p": 0.1,
+  "note": "5 rolls total (2 control, 3 variant). Enumerating all 10 assignments gives p=0.10 one-sided. Directionally suggestive, NOT established. Also unadjusted for having chosen among several prompt variants, and repeated generations over the same 15 videos do not establish generalization to unseen videos.",
+  "control_sd": 0.0127,
+  "variant_sd": 0.0349
+ }
+}

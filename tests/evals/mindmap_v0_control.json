@@ -1,0 +1,32 @@
+{
+ "label": "v0-incumbent",
+ "prompt": "prompts/mindmap-from-transcript.md",
+ "rolls": 1,
+ "baseline_recall": 0.4151221001221001,
+ "mean_recall_over_rolls": 0.26533577533577535,
+ "worst_roll_recall": 0.26533577533577535,
+ "best_roll_recall": 0.26533577533577535,
+ "guards_hold": false,
+ "guards_broken": [
+  "timestamped_bullets: 536 -> 421",
+  "bullets: 538 -> 458"
+ ],
+ "per_roll": [
+  {
+   "videos": 15,
+   "videos_with_ground_truth": 15,
+   "mean_recall": 0.26533577533577535,
+   "names_found": 24,
+   "names_expected": 84,
+   "quantitative_details": 60,
+   "timestamped_bullets": 421,
+   "bullets": 458,
+   "themes": 70,
+   "subthemes": 152
+  }
+ ],
+ "tokens": {
+  "prompt": 161232,
+  "out": 36676
+ }
+}
