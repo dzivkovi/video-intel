@@ -87,8 +87,14 @@ class TestTheScorecardIsRecordedAndHonest:
         assert card["guards_hold"] is True
 
     def test_the_worst_variant_roll_beats_the_best_control_roll(self):
-        """The claim that makes this an improvement rather than a lucky draw.
-        Roll-to-roll noise on the identical prompt was measured at ~0.02."""
+        """A robustness property, NOT a significance claim.
+
+        With 2 control and 3 variant rolls, the exact permutation test gives
+        p = 0.10 one-sided (verified independently of the reviewer who raised
+        it). The honest wording is "directionally suggestive, not
+        established", and `statistics` in the scorecard says so. What this
+        test pins is the weaker, checkable thing: the separation is not an
+        artifact of picking the best roll on each side."""
         card = json.loads(SCORECARD.read_text(encoding="utf-8"))
         assert card["variant_worst_roll"] > max(card["control_rolls"])
 
@@ -107,3 +113,21 @@ class TestTheScorecardIsRecordedAndHonest:
         prompt_gain = card["variant_mean_recall"] - card["control_mean_recall"]
         era_gap = card["historical_on_disk_recall"] - card["control_mean_recall"]
         assert era_gap > prompt_gain, "the recorded numbers no longer support the model-era claim"
+
+    def test_the_scorecard_refuses_to_overstate_the_statistics(self):
+        """The claim is the deliverable here, so an over-claim is the defect.
+        A future edit that drops the caveat should fail."""
+        card = json.loads(SCORECARD.read_text(encoding="utf-8"))
+        stats = card.get("statistics") or {}
+        assert stats.get("one_sided_exact_permutation_p") is not None, "the p-value was removed"
+        assert stats["one_sided_exact_permutation_p"] >= 0.05, (
+            "if this became significant, the wording below should be upgraded deliberately"
+        )
+        assert "not established" in stats.get("note", "").lower()
+
+    def test_the_control_mean_matches_its_own_rolls(self):
+        """It did not: 0.2653 and 0.2833 average to 0.2743, and 0.2745 was
+        recorded. Small, but nothing was recomputing it."""
+        card = json.loads(SCORECARD.read_text(encoding="utf-8"))
+        rolls = card["control_rolls"]
+        assert abs(card["control_mean_recall"] - sum(rolls) / len(rolls)) < 1e-6

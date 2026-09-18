@@ -14,6 +14,7 @@ WRITES NOTHING INTO THE CORPUS. Every generated mindmap lands under --out.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -71,11 +72,23 @@ def main() -> int:
             tokens["prompt"] += u.get("prompt") or 0
             tokens["out"] += (u.get("candidates") or 0) + (u.get("thoughts") or 0)
 
+    if args.rolls < 1:
+        print("--rolls must be at least 1")
+        return 1
+    failures: list[str] = []
     per_roll: list[dict] = []
     for roll in range(args.rolls):
         rows = []
         for gt, transcript, _ in loaded:
-            dest = out / f"{gt.channel}__{gt.prefix}__r{roll}.md"
+            # The cache key MUST include WHAT WAS SENT, not just which video
+            # and which roll (Codex peer pass). Keyed on channel+prefix+roll
+            # alone, pointing a second variant at an existing output directory
+            # silently rescored the FIRST variant's text and wrote a summary
+            # naming the second - a fabricated result with no error. Proven
+            # reachable by execution; not proven to have affected the recorded
+            # run, because the old summaries carried no provenance to check.
+            fingerprint = hashlib.sha256("␟".join((prompt_text, model, transcript)).encode()).hexdigest()[:12]
+            dest = out / f"{gt.channel}__{gt.prefix}__r{roll}__{fingerprint}.md"
             if dest.exists():
                 text = dest.read_text(encoding="utf-8")
             else:
@@ -88,12 +101,21 @@ def main() -> int:
                         response_mime_type="text/plain",
                         on_response=note,
                     )
-                except Exception as e:  # a single video must not kill the sweep
+                except Exception as e:
+                    # Do NOT silently drop it. Excluding a failed video from
+                    # recall AND from the guards changes the population the
+                    # score describes: a probe with one failure out of two
+                    # videos reported recall 1.0 over the survivor and exited 0
+                    # (Codex peer pass).
                     print(f"  !! {gt.channel}/{gt.prefix} roll{roll}: {type(e).__name__}: {e}")
+                    failures.append(f"{gt.channel}/{gt.prefix} roll{roll}: {type(e).__name__}")
                     continue
                 dest.write_text(text, encoding="utf-8")
             rows.append(score_mindmap(text, gt))
+        if len(rows) != len(loaded):
+            print(f"  !! roll {roll} scored {len(rows)} of {len(loaded)} videos - the population changed")
         agg = aggregate(rows)
+        agg["videos_attempted"] = len(loaded)
         per_roll.append(agg)
         mr = agg["mean_recall"]
         print(f"[{label}] roll {roll}: mean_recall={mr:.3f}  names={agg['names_found']}/{agg['names_expected']}")
@@ -102,7 +124,17 @@ def main() -> int:
     best = max(per_roll, key=lambda a: a["mean_recall"] or 0)
     worst = min(per_roll, key=lambda a: a["mean_recall"] or 0)
     mean_of_rolls = sum(a["mean_recall"] or 0 for a in per_roll) / len(per_roll)
-    ok, broken = holds_guards(baseline, best)
+    # EVERY roll must hold the guards, not the highest-recall one (Codex peer
+    # pass). Checking only the best roll reported guards_hold=True for a probe
+    # whose two rolls had quantitative counts of 10 and 0, because the
+    # ten-detail roll happened to score higher on recall. A guard satisfiable
+    # by a lucky roll is not a guard.
+    ok, broken = True, []
+    for i, roll_agg in enumerate(per_roll):
+        roll_ok, roll_broken = holds_guards(baseline, roll_agg)
+        if not roll_ok:
+            ok = False
+            broken.extend(f"roll {i}: {b}" for b in roll_broken)
 
     summary = {
         "label": label,
@@ -114,6 +146,13 @@ def main() -> int:
         "best_roll_recall": best["mean_recall"],
         "guards_hold": ok,
         "guards_broken": broken,
+        "failures": failures,
+        "sample_size": len(loaded),
+        # Provenance, so a future reader can tell whether two summaries are
+        # comparable. Its ABSENCE on the pre-review summaries is why the
+        # cache-collision hazard could not be ruled out retroactively.
+        "model": model,
+        "prompt_sha256_12": hashlib.sha256(prompt_text.encode()).hexdigest()[:12],
         "per_roll": per_roll,
         "tokens": tokens,
     }

@@ -1,7 +1,7 @@
 {
  "label": "v1-shipped",
  "rolls": 3,
- "control_mean_recall": 0.2745,
+ "control_mean_recall": 0.2743,
  "control_rolls": [
   0.2653,
   0.2833
@@ -41,5 +41,11 @@
  "tokens": {
   "prompt": 487161,
   "out": 104083
+ },
+ "statistics": {
+  "one_sided_exact_permutation_p": 0.1,
+  "note": "5 rolls total (2 control, 3 variant). Enumerating all 10 assignments gives p=0.10 one-sided. Directionally suggestive, NOT established. Also unadjusted for having chosen among several prompt variants, and repeated generations over the same 15 videos do not establish generalization to unseen videos.",
+  "control_sd": 0.0127,
+  "variant_sd": 0.0349
  }
 }
