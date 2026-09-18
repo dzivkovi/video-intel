@@ -90,7 +90,7 @@ class TestIdentityStamping:
 
         monkeypatch.setattr(vi, "call_gemini", boom)
         monkeypatch.setattr(vi, "_make_thinking_config_for_transcript", lambda t, m: None)
-        monkeypatch.setattr(vi, "fetch_english_captions", lambda vid: CaptionsResult([(0.0, "hi")], True, "en"))
+        monkeypatch.setattr(vi, "fetch_english_captions", lambda vid, **_kw: CaptionsResult([(0.0, "hi")], True, "en"))
         (_, status), mpath = _run(tmp_path, source="auto")
         assert "captions" in status
         meta = json.loads(mpath.read_text())

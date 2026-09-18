@@ -64,7 +64,7 @@ def count_gemini_calls(monkeypatch, tmp_path):
         monkeypatch.setattr(
             vi,
             "fetch_english_captions",
-            lambda vid: __import__("youtube_captions").CaptionsResult(cues, True, "en"),
+            lambda vid, **_kw: __import__("youtube_captions").CaptionsResult(cues, True, "en"),
         )
         monkeypatch.setattr(vi, "resolve_output_dir", lambda _c, **_k: tmp_path)
         monkeypatch.setattr(vi, "require_youtube", lambda: lambda *a, **k: object())

@@ -23,6 +23,70 @@ from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Why a caption fetch failed (issue #231)
+# ---------------------------------------------------------------------------
+#
+# `youtube-transcript-api` ALREADY distinguishes these cases - `RequestBlocked`
+# and `IpBlocked` are distinct classes from `NoTranscriptFound` and
+# `TranscriptsDisabled`. The pre-#231 code caught their shared base class
+# `CouldNotRetrieveTranscript` and reported every one as "No English captions
+# available", discarding a distinction the library had already made.
+#
+# That is not cosmetic. Under `transcript_source: yt-captions` a block fails
+# EVERY video in the scan, and the operator reads it as "this creator has no
+# captions" - false, and it trains them to disbelieve the message.
+
+CAPTIONS_FAILURE_ABSENT = "absent"
+CAPTIONS_FAILURE_BLOCKED = "blocked"
+CAPTIONS_FAILURE_VIDEO = "video_unavailable"
+CAPTIONS_FAILURE_EMPTY = "empty"
+CAPTIONS_FAILURE_NO_LIBRARY = "no_library"
+CAPTIONS_FAILURE_OTHER = "other"
+
+#: Stated in the log and in the meta error so the operator is never told to run
+#: a recovery that cannot work. MEASURED 2026-09-18: a block observed at 01:38
+#: was still refusing the same three video ids at 19:30 - eighteen hours, not
+#: the "wait a bit" this was first assumed to be. So the message names waiting
+#: as uncertain and names the switch to Gemini as the certain route.
+CAPTIONS_BLOCK_RECOVERY = (
+    "YouTube is refusing caption requests from this IP (not a video without captions). "
+    "A block observed on 2026-09-18 persisted at least 18 hours, so re-running shortly "
+    "may not help; the certain route is transcript_source: gemini (or auto) for this run."
+)
+
+#: Exception class NAMES, resolved defensively at call time. A name is used
+#: rather than a direct import because `RequestBlocked`/`IpBlocked` do not
+#: exist in older `youtube-transcript-api` releases, and importing a missing
+#: name would break the whole captions path rather than degrade one branch.
+_BLOCKED_EXC_NAMES = ("RequestBlocked", "IpBlocked", "PoTokenRequired", "YouTubeRequestFailed")
+_ABSENT_EXC_NAMES = ("NoTranscriptFound", "TranscriptsDisabled", "NotTranslatable")
+_VIDEO_EXC_NAMES = ("VideoUnavailable", "VideoUnplayable", "AgeRestricted", "InvalidVideoId")
+
+
+def _exception_kind(exc: BaseException) -> str:
+    """Classify a youtube-transcript-api exception by its own class name.
+
+    Walks the real MRO rather than matching one name, so `IpBlocked` is
+    recognised through its `RequestBlocked` base without listing every
+    subclass a future release might add.
+    """
+    names = {klass.__name__ for klass in type(exc).__mro__}
+    if names & set(_BLOCKED_EXC_NAMES):
+        return CAPTIONS_FAILURE_BLOCKED
+    if names & set(_ABSENT_EXC_NAMES):
+        return CAPTIONS_FAILURE_ABSENT
+    if names & set(_VIDEO_EXC_NAMES):
+        return CAPTIONS_FAILURE_VIDEO
+    return CAPTIONS_FAILURE_OTHER
+
+
+def captions_failure_is_refusal(kind: str | None) -> bool:
+    """True when the fetch failed because we were refused, not because the
+    video has no English track. Callers use this to decide whether their
+    error message should claim anything about the video at all."""
+    return kind == CAPTIONS_FAILURE_BLOCKED
+
 
 @dataclass(frozen=True)
 class CaptionsResult:
@@ -46,7 +110,7 @@ class CaptionsResult:
     durations: tuple[float, ...] = ()
 
 
-def fetch_english_captions(video_id: str) -> CaptionsResult | None:
+def fetch_english_captions(video_id: str, *, reason_sink: dict | None = None) -> CaptionsResult | None:
     """Fetch the English caption track from YouTube, preferring manual over auto-generated.
 
     Returns a CaptionsResult on success, or None when no captions are
@@ -58,7 +122,27 @@ def fetch_english_captions(video_id: str) -> CaptionsResult | None:
     return a manually authored track when one exists, falling back to
     the auto-generated track only if no manual track is present. We
     rely on that default instead of re-implementing preference logic.
+
+    ``reason_sink`` (issue #231): pass a FRESH dict per call to learn WHY a
+    ``None`` came back - it is filled with ``{"kind", "exception", "message"}``
+    where ``kind`` is one of the ``CAPTIONS_FAILURE_*`` constants. Omit it and
+    behaviour is byte-identical to pre-#231, which is what keeps
+    ``translate_video.py`` (operationally separate, same shared module)
+    untouched by this change.
+
+    The dict must be per-call, never one shared across a scan: the captions
+    path runs under ``max_parallel`` threads, and a shared sink would let one
+    video inherit another's failure reason - the same mistake the per-chunk
+    ``usage_capture`` guardrail in CLAUDE.md exists to prevent.
     """
+
+    def _note(kind: str, exc: BaseException | None = None) -> None:
+        if reason_sink is None:
+            return
+        reason_sink["kind"] = kind
+        reason_sink["exception"] = type(exc).__name__ if exc is not None else None
+        reason_sink["message"] = str(exc) if exc is not None else ""
+
     try:
         from youtube_transcript_api import (
             CouldNotRetrieveTranscript,
@@ -69,6 +153,7 @@ def fetch_english_captions(video_id: str) -> CaptionsResult | None:
         )
     except ImportError:
         log.debug("youtube-transcript-api not installed, skipping captions fetch")
+        _note(CAPTIONS_FAILURE_NO_LIBRARY)
         return None
 
     try:
@@ -77,13 +162,35 @@ def fetch_english_captions(video_id: str) -> CaptionsResult | None:
         transcript = transcript_list.find_transcript(["en"])
         fetched = transcript.fetch()
     except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable, CouldNotRetrieveTranscript) as e:
-        log.info("No English captions available (%s) - falling back to video path", type(e).__name__)
+        # The CATCH is deliberately unchanged from pre-#231, including the three
+        # names that are redundant with the base class in the real library
+        # (`TranscriptsDisabled` and friends all derive from
+        # `CouldNotRetrieveTranscript`). Narrowing it to the base alone would be
+        # a real behaviour change against any version - or any test fixture -
+        # where they are siblings rather than subclasses, and an escaping
+        # exception is a far worse regression than the message this fixes.
+        #
+        # What changed is that the branch now CLASSIFIES before it speaks.
+        kind = _exception_kind(e)
+        _note(kind, e)
+        if kind == CAPTIONS_FAILURE_BLOCKED:
+            # WARNING, not info: under transcript_source: yt-captions this fails
+            # every video in the scan, and it says nothing about the video.
+            log.warning(
+                "Caption request REFUSED for %s (%s). %s",
+                video_id,
+                type(e).__name__,
+                CAPTIONS_BLOCK_RECOVERY,
+            )
+        else:
+            log.info("No English captions available (%s) - falling back to video path", type(e).__name__)
         return None
 
     snippets = [(float(s.start), s.text) for s in fetched]
     durations = tuple(float(getattr(s, "duration", 0.0) or 0.0) for s in fetched)
     if not snippets:
         log.info("Captions list returned empty - falling back to video path")
+        _note(CAPTIONS_FAILURE_EMPTY)
         return None
 
     return CaptionsResult(

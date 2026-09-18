@@ -38,7 +38,12 @@ from typing import Any
 import httpx
 import yaml
 from googleapiclient.errors import HttpError
-from youtube_captions import CaptionsResult, fetch_english_captions
+from youtube_captions import (
+    CAPTIONS_BLOCK_RECOVERY,
+    CaptionsResult,
+    captions_failure_is_refusal,
+    fetch_english_captions,
+)
 
 from gemini_common import (
     MAX_RETRIES_TRANSPORT,
@@ -6233,6 +6238,7 @@ def _try_captions_transcript(
     end_offset: int | None = None,
     force: bool = False,
     duration_seconds: int | None = None,
+    reason_sink: dict | None = None,
 ) -> tuple[str, str] | None:
     """Build a transcript from the YouTube English caption track (issue #60).
 
@@ -6263,7 +6269,22 @@ def _try_captions_transcript(
     if transcript_path.exists() and not force:
         log.info("  %s: transcript already on disk; leaving it alone (pass --force to replace)", prefix)
         return None
-    captions = fetch_english_captions(video_id)
+    # Issue #231: a refused request and a video with no English track both
+    # arrive here as None. The sink is how the caller tells them apart; it is
+    # threaded from the caller so the dict is fresh PER CALL (the captions path
+    # runs under max_parallel threads, and one shared sink would let a video
+    # inherit another's failure reason).
+    # The kwarg is passed ONLY when a caller actually wants the reason. That
+    # keeps the opt-in promise at the CALL site and not just in the signature:
+    # every pre-#231 stub of this function (six test files monkeypatch it to
+    # study livestream routing, timeouts and idempotency, none of which care
+    # about #231) keeps working untouched. Churning 42 unrelated tests to
+    # thread a keyword they ignore would add risk and buy nothing.
+    captions = (
+        fetch_english_captions(video_id, reason_sink=reason_sink)
+        if reason_sink is not None
+        else fetch_english_captions(video_id)
+    )
     if captions is None:
         return None
     snippets = captions.snippets
@@ -6413,6 +6434,8 @@ def process_transcript(
     # Issue #60: explicit captions-only source skips Gemini entirely (cheap,
     # speech-only). Fails when no captions exist - the caller chose this source.
     if transcript_source == "yt-captions":
+        # Fresh sink per video - never hoisted out of this branch (threads).
+        captions_reason: dict = {}
         captioned = _try_captions_transcript(
             video,
             transcript_path,
@@ -6422,9 +6445,20 @@ def process_transcript(
             end_offset=end_offset,
             force=force,
             duration_seconds=duration_seconds,
+            reason_sink=captions_reason,
         )
         if captioned is not None:
             return captioned
+        # Issue #231: do not claim the video has no captions when we were simply
+        # refused. Under this source a block fails EVERY video in the scan, and
+        # the pre-#231 message read as a fact about the creator.
+        if captions_failure_is_refusal(captions_reason.get("kind")):
+            detail = f"caption request refused ({captions_reason.get('exception') or 'blocked'})"
+            _record_transcript_error(
+                meta_path,
+                f"{detail} (transcript_source=yt-captions). {CAPTIONS_BLOCK_RECOVERY}",
+            )
+            return prefix, "error: captions request refused (yt-captions, rate limited or blocked)"
         _record_transcript_error(meta_path, "no English captions available (transcript_source=yt-captions)")
         return prefix, "error: no captions available (yt-captions)"
 
