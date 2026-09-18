@@ -67,6 +67,19 @@ transcript_max_duration_seconds: 7200
 # quality flags on the result.
 chunk_minutes: 30
 
+# Seconds above which a video's transcript comes from the FREE YouTube caption
+# track instead of Gemini (issue #227). Unset (the default) preserves today's
+# routing exactly - a long video either chunks into several Gemini calls or,
+# past transcript_max_duration_seconds, is dropped from the loop with no
+# artifact at all. There was no way to say "get it cheaply rather than not at
+# all", which is what this adds - the caption track is whole and free, and
+# mindmap_source: auto then routes off it, so the mindmap and concepts still
+# happen. Deliberately beats transcript_max_duration_seconds when both apply:
+# that guard exists because a long GEMINI transcript is expensive and
+# truncates, and neither is true of captions. Trade-off: speech-only, so no
+# on-screen content and no diarization - wrong for a screen-heavy creator.
+# captions_over_duration_seconds: 3600
+
 # Wall-clock ceiling on a single transcript Gemini call, in seconds (issue #74).
 # On expiry the video routes to the captions failover instead of hanging the
 # whole scan. Must stay BELOW the HTTP read timeout (1200s) so this fires first.
@@ -76,7 +89,8 @@ transcript_timeout_seconds: 600
 # individual channel below, and the channel value wins. Precedence throughout is
 #   CLI flag > per-channel > top-level > built-in default
 # That applies to chunk_minutes, transcript_timeout_seconds,
-# transcript_max_duration_seconds, skip_shorts, auto_concepts, prompt and since.
+# transcript_max_duration_seconds, captions_over_duration_seconds, skip_shorts,
+# auto_concepts, prompt and since.
 
 # Issue #54: per-channel `mindmap_source: auto|transcript|video|none` controls
 # what the mindmap step reads. Default `auto` (no opt-in needed):
@@ -128,6 +142,7 @@ channels:
     # chunk_minutes: 20                  # a dense keynote channel
     # transcript_timeout_seconds: 900    # a slow-to-transcribe channel
     # transcript_max_duration_seconds: 10800
+    # captions_over_duration_seconds: 3600   # long ones cheap, not dropped
     # auto_concepts: false
     #
     # mindmap_source defaults to "auto" -- transcript-first when available,
