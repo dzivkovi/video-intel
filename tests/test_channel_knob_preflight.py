@@ -464,6 +464,7 @@ class TestValidateChannelKnobsCheckOrderIsTheContract:
             "auto_transcript": "all",
             "transcript_source": "bogus",
             "chunk_minutes": 0,
+            "captions_over_duration_seconds": "one hour",
             "transcript_max_duration_seconds": "bad",
             "transcript_timeout_seconds": "bad",
             "auto_mindmap": "all",
@@ -476,6 +477,7 @@ class TestValidateChannelKnobsCheckOrderIsTheContract:
             "prompt",
             "transcript_source",
             "chunk_minutes",
+            "captions_over_duration_seconds",
             "transcript_max_duration_seconds",
             "transcript_timeout_seconds",
             "mindmap_source",
@@ -899,3 +901,36 @@ class TestScanNonDryRunRoutingUnchanged:
             f"expected the typo channel in the end-of-scan failure summary, got: {summary_lines}"
         )
         assert any("typo" in line for line in summary_lines)
+
+
+class TestCaptionsOverDurationIsPreflighted:
+    """Issue #227's knob is SKIPS_CHANNEL-shaped, which is exactly the class
+    #169's preflight exists to surface before any YouTube quota is spent.
+
+    Without this, `scan --dry-run` printed a clean preview and the real run
+    then dropped the channel AFTER paying for its fetch - the self-contradicting
+    preview #169 item 6 was written about. It also made README's "six of these
+    are validated at scan --dry-run" list wrong.
+    """
+
+    def test_a_typoed_value_is_reported_by_the_preflight(self):
+        problems = validate_channel_knobs({"auto_transcript": "all", "captions_over_duration_seconds": "one hour"}, {})
+        names = [p[0] for p in problems]
+        assert "captions_over_duration_seconds" in names, f"preflight missed the knob: {names}"
+
+    def test_it_reports_the_channel_will_be_skipped(self):
+        problems = validate_channel_knobs({"auto_transcript": "all", "captions_over_duration_seconds": 0}, {})
+        entry = next(p for p in problems if p[0] == "captions_over_duration_seconds")
+        assert entry[2] == vi.KNOB_CONSEQUENCE_SKIPS_CHANNEL
+
+    def test_a_top_level_typo_is_caught_too(self):
+        problems = validate_channel_knobs({"auto_transcript": "all"}, {"captions_over_duration_seconds": "nope"})
+        assert any(p[0] == "captions_over_duration_seconds" for p in problems)
+
+    def test_a_healthy_value_is_silent(self):
+        problems = validate_channel_knobs({"auto_transcript": "all", "captions_over_duration_seconds": 3600}, {})
+        assert not any(p[0] == "captions_over_duration_seconds" for p in problems)
+
+    def test_the_cli_override_is_preflighted(self):
+        problems = validate_channel_knobs({"auto_transcript": "all"}, {}, None, 0)
+        assert any(p[0] == "captions_over_duration_seconds" for p in problems)

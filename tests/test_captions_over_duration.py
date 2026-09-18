@@ -217,14 +217,48 @@ class TestCallerLevel:
 
     def test_a_typoed_value_skips_the_channel_and_lands_in_the_failure_summary(self, scan, caplog):
         """Issue #135/#169: a config typo must not abort the whole scan, and
-        must not leave it reporting Done. with a channel silently dropped."""
+        must not leave it reporting Done. with a channel silently dropped.
+
+        The FAILURE SUMMARY half is the load-bearing one and it is separate
+        from the log line: the `log.error` and the `errors.append` are
+        independent statements. An earlier version of this test asserted only
+        `caplog` text, and deleting the `errors.append` left the whole file
+        green - exactly the blind spot CLAUDE.md #168 names.
+        """
         import logging
 
-        with caplog.at_level(logging.ERROR):
+        with caplog.at_level(logging.WARNING):
             seen = scan({"captions_over_duration_seconds": "sixty"}, durations=["PT20M"])
         assert seen == {}
         assert "invalid captions_over_duration_seconds" in caplog.text
         assert "skipping entire channel" in caplog.text
+        assert "--- 1 FAILED ---" in caplog.text, (
+            "the channel was skipped but never reached the end-of-scan failure summary"
+        )
+
+    def test_an_explicit_gemini_channel_is_not_overridden_by_a_top_level_threshold(self, scan):
+        """Issue #120 invariant 2: an explicit `transcript_source: gemini` is
+        the documented escape hatch for a channel whose captions are known
+        garbage, the wrong language, or whose on-screen content IS the content.
+        A top-level threshold the channel never set must not silently undo it."""
+        # 1h30m: over the captions threshold, UNDER the 2h default
+        # transcript_max_duration_seconds, so it still reaches the transcript
+        # step and the source it reaches with is the assertion. (A 3h video
+        # would be dropped by that guard instead, which is correct pre-#227
+        # behavior but would not test this.)
+        seen = scan(
+            {"transcript_source": "gemini"},
+            durations=["PT1H30M"],
+            top_level={"captions_over_duration_seconds": 3600},
+        )
+        assert seen.get("Video 0") == "gemini", "a top-level knob overrode the #120 escape hatch"
+
+    def test_a_channel_that_did_not_ask_for_gemini_still_gets_the_top_level_threshold(self, scan):
+        """The other half: an ABSENT transcript_source must stay
+        distinguishable from an explicit "gemini", or the exclusion above
+        disables the top-level knob for every channel."""
+        seen = scan({}, durations=["PT1H30M"], top_level={"captions_over_duration_seconds": 3600})
+        assert seen.get("Video 0") == "yt-captions"
 
     def test_the_cli_flag_reaches_the_routing(self, scan):
         seen = scan({}, durations=["PT1H37M"], cli=3600)

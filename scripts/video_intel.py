@@ -1375,6 +1375,7 @@ def validate_channel_knobs(
     channel_config: dict,
     config: dict,
     cli_chunk_minutes: int | None = None,
+    cli_captions_over_duration: int | None = None,
 ) -> list[tuple[str, str, str]]:
     """Preflight-validate a channel's per-video config knobs (issue #169).
 
@@ -1471,6 +1472,16 @@ def validate_channel_knobs(
         resolve_chunk_minutes(channel_config, config, cli_chunk_minutes)
     except (ValueError, TypeError) as e:
         problems.append(("chunk_minutes", str(e), _reached(KNOB_CONSEQUENCE_SKIPS_CHANNEL)))
+    # Issue #227, position 4: the runtime firing order inside cmd_scan's channel
+    # body is transcript_source -> chunk_minutes -> captions_over_duration, and
+    # this list must mirror it (issue #169 item 10 - the check ORDER is the
+    # contract, because _downgrade_unreached_knobs rewrites everything after the
+    # first STOPPING problem). Its runtime guard is SKIPS_CHANNEL-shaped, which
+    # is exactly the class the preflight exists to surface before quota is spent.
+    try:
+        resolve_captions_over_duration(channel_config, config, cli_captions_over_duration)
+    except ValueError as e:
+        problems.append(("captions_over_duration_seconds", str(e), _reached(KNOB_CONSEQUENCE_SKIPS_CHANNEL)))
 
     # 4/5. Two knobs with no resolver: scan reads them straight off the dict.
     #      See the docstring for why their consequences differ despite looking
@@ -7083,7 +7094,12 @@ def cmd_scan(args, config):
         # (non-dry-run) run will log a problem twice - once here, once at the
         # skip site - and that is intended: the first says the config is
         # invalid, the second says what is being done about it.
-        knob_problems = validate_channel_knobs(ch, config, getattr(args, "chunk_minutes", None))
+        knob_problems = validate_channel_knobs(
+            ch,
+            config,
+            getattr(args, "chunk_minutes", None),
+            getattr(args, "captions_over_duration", None),
+        )
         for knob_name, error_message, consequence in knob_problems:
             log_fn = log.warning if consequence.startswith(KNOB_CONSEQUENCE_NOT_REACHED) else log.error
             log_fn(
@@ -7490,6 +7506,17 @@ def cmd_scan(args, config):
                     and duration_s is not None
                     and duration_s > captions_over
                     and transcript_source != TRANSCRIPT_SOURCE_YT_CAPTIONS
+                    # An EXPLICIT `transcript_source: gemini` on the channel is
+                    # issue #120's documented escape hatch - the operator chose
+                    # multimodal on purpose because the captions are known
+                    # garbage, the wrong language, or the on-screen content IS
+                    # the content. A top-level captions threshold is a knob that
+                    # channel never set, and letting it win would silently undo
+                    # that choice. Tested with `in`, never `.get(..., "gemini")`,
+                    # for the same reason livestream_captions_first_applies does:
+                    # an ABSENT key and an explicit "gemini" must stay
+                    # distinguishable.
+                    and not (ch.get("transcript_source") == "gemini" and "transcript_source" in ch)
                 ):
                     log.info(
                         '[%s] "%s" is %s (> %s): transcript from captions instead of Gemini.',
