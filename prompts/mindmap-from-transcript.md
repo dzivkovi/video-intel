@@ -25,6 +25,7 @@ Group by concept (not chronologically). Use 4-6 main branches as noun-phrase hea
 - Tight concept phrases (5-10 words), not full sentences
 - Include timestamp at end of each bullet, derived from the transcript line where the concept appears (e.g., "concept phrase (3:45)" — drop the leading hour for sub-1h videos, keep `H:MM:SS` for longer)
 - Keep key statistics, numbers, benchmarks, and named examples — including those that appear only in SCREEN blocks
+- If a bullet is ABOUT a named thing — a repo, tool, product, company, model, protocol, person or paper — the bullet MUST carry that name verbatim. A description of the thing is not a substitute for its name. Prefer the exact on-screen spelling (`owner/repo`) when the transcript shows one, otherwise the spoken name.
 - Each concept appears in exactly one place — merge duplicates across themes
 - If a bullet wouldn't be worth highlighting, cut it
 
@@ -40,14 +41,14 @@ Group by concept (not chronologically). Use 4-6 main branches as noun-phrase hea
 ## Retrieval-Augmented Generation
 
 * **Architecture Components**
-  - Vector store with embedding-based similarity search (2:15)
+  - LanceDB vector store with embedding-based similarity search (2:15)
   - Chunking strategy directly affects retrieval precision (4:30)
-  - Reranking layer between retrieval and generation (7:12)
+  - Cohere Rerank layer between retrieval and generation (7:12)
 
 * **Production Tradeoffs**
   - Latency-accuracy tradeoff in chunk size selection (9:45)
   - Hallucination rate drops 40% with source grounding (11:20)
-  - Cold-start indexing cost for large document corpora (14:03)
+  - voyage-3 embeddings cut cold-start indexing cost (14:03)
 ```
 
 Output the mind map in Markdown. Do not wrap the output in ```markdown fences. Do not preface with explanation. The mind map IS the response.
