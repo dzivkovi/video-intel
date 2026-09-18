@@ -205,15 +205,15 @@ class TestBackfill:
         monkeypatch.setattr(vi, "require_youtube", lambda: lambda *a, **k: yt)
 
     def test_it_fills_a_meta_that_has_none(self, tmp_path, monkeypatch):
-        self._corpus(tmp_path, {"a.meta.json": {"video_id": "vid123", "title": "T"}})
-        yt = FakeYouTube(videos={"items": [{"id": "vid123", "snippet": {"description": DESC}}]})
+        self._corpus(tmp_path, {"a.meta.json": {"video_id": "aX8Y183qDpY", "title": "T"}})
+        yt = FakeYouTube(videos={"items": [{"id": "aX8Y183qDpY", "snippet": {"description": DESC}}]})
         self._patch(monkeypatch, tmp_path, yt)
         assert vi.cmd_backfill_descriptions(self._args(apply=True), {}) == 1
         assert json.loads((tmp_path / "chan" / "a.meta.json").read_text(encoding="utf-8"))["description"] == DESC
 
     def test_it_never_overwrites_an_existing_description(self, tmp_path, monkeypatch):
-        self._corpus(tmp_path, {"a.meta.json": {"video_id": "vid123", "description": "mine, hand-edited"}})
-        yt = FakeYouTube(videos={"items": [{"id": "vid123", "snippet": {"description": DESC}}]})
+        self._corpus(tmp_path, {"a.meta.json": {"video_id": "aX8Y183qDpY", "description": "mine, hand-edited"}})
+        yt = FakeYouTube(videos={"items": [{"id": "aX8Y183qDpY", "snippet": {"description": DESC}}]})
         self._patch(monkeypatch, tmp_path, yt)
         vi.cmd_backfill_descriptions(self._args(apply=True), {})
         stored = json.loads((tmp_path / "chan" / "a.meta.json").read_text(encoding="utf-8"))["description"]
@@ -221,11 +221,30 @@ class TestBackfill:
         assert yt.calls == [], "a meta that already had one must not even be fetched"
 
     def test_dry_run_writes_nothing(self, tmp_path, monkeypatch):
-        self._corpus(tmp_path, {"a.meta.json": {"video_id": "vid123"}})
-        yt = FakeYouTube(videos={"items": [{"id": "vid123", "snippet": {"description": DESC}}]})
+        self._corpus(tmp_path, {"a.meta.json": {"video_id": "aX8Y183qDpY"}})
+        yt = FakeYouTube(videos={"items": [{"id": "aX8Y183qDpY", "snippet": {"description": DESC}}]})
         self._patch(monkeypatch, tmp_path, yt)
         vi.cmd_backfill_descriptions(self._args(apply=False), {})
         assert "description" not in json.loads((tmp_path / "chan" / "a.meta.json").read_text(encoding="utf-8"))
+
+    def test_a_non_youtube_video_id_is_refused_not_reported_as_deleted(self, tmp_path, monkeypatch):
+        """A Fathom/Goldcast/local-file id would return nothing from the API
+        and then be counted as "deleted, private, or empty", misattributing
+        the cause. repair-metas refuses non-YouTube sources; so does this."""
+        self._corpus(tmp_path, {"a.meta.json": {"video_id": "fathom-804160513"}})
+        yt = FakeYouTube(videos={"items": []})
+        self._patch(monkeypatch, tmp_path, yt)
+        assert vi.cmd_backfill_descriptions(self._args(apply=True), {}) == 0
+        assert yt.calls == [], "a non-YouTube id reached the YouTube API"
+
+    def test_a_typoed_channel_does_not_read_as_success(self, tmp_path, monkeypatch):
+        """Issue #183 invariant 5c: folder existence separates a typo from a
+        channel that is genuinely already complete."""
+        self._corpus(tmp_path, {"a.meta.json": {"video_id": "aX8Y183qDpY"}})
+        yt = FakeYouTube(videos={"items": []})
+        self._patch(monkeypatch, tmp_path, yt)
+        assert vi.cmd_backfill_descriptions(self._args(apply=True, channel="typoo"), {}) == 0
+        assert yt.calls == []
 
     def test_a_meta_without_a_usable_video_id_is_skipped_not_coerced(self, tmp_path, monkeypatch):
         self._corpus(tmp_path, {"a.meta.json": {"video_id": 123}, "b.meta.json": {"title": "no id"}})
@@ -235,24 +254,24 @@ class TestBackfill:
         assert yt.calls == []
 
     def test_an_unreadable_meta_does_not_abort_the_walk(self, tmp_path, monkeypatch):
-        chan = self._corpus(tmp_path, {"good.meta.json": {"video_id": "vid123"}})
+        chan = self._corpus(tmp_path, {"good.meta.json": {"video_id": "aX8Y183qDpY"}})
         (chan / "bad.meta.json").write_bytes(b'{"video_id": "v\xff\xfe')
-        yt = FakeYouTube(videos={"items": [{"id": "vid123", "snippet": {"description": DESC}}]})
+        yt = FakeYouTube(videos={"items": [{"id": "aX8Y183qDpY", "snippet": {"description": DESC}}]})
         self._patch(monkeypatch, tmp_path, yt)
         assert vi.cmd_backfill_descriptions(self._args(apply=True), {}) == 1
 
     def test_a_video_gone_upstream_is_not_an_error(self, tmp_path, monkeypatch):
-        self._corpus(tmp_path, {"a.meta.json": {"video_id": "deleted1234"}})
+        self._corpus(tmp_path, {"a.meta.json": {"video_id": "dEl3t3dV1d0"}})
         yt = FakeYouTube(videos={"items": []})
         self._patch(monkeypatch, tmp_path, yt)
         assert vi.cmd_backfill_descriptions(self._args(apply=True), {}) == 0
 
     def test_channel_filter_restricts_the_walk(self, tmp_path, monkeypatch):
-        self._corpus(tmp_path, {"a.meta.json": {"video_id": "vid123"}})
+        self._corpus(tmp_path, {"a.meta.json": {"video_id": "aX8Y183qDpY"}})
         other = tmp_path / "other"
         other.mkdir()
-        (other / "b.meta.json").write_text(json.dumps({"video_id": "vid999"}), encoding="utf-8")
-        yt = FakeYouTube(videos={"items": [{"id": "vid123", "snippet": {"description": DESC}}]})
+        (other / "b.meta.json").write_text(json.dumps({"video_id": "NuMmY3bX6NI"}), encoding="utf-8")
+        yt = FakeYouTube(videos={"items": [{"id": "aX8Y183qDpY", "snippet": {"description": DESC}}]})
         self._patch(monkeypatch, tmp_path, yt)
         vi.cmd_backfill_descriptions(self._args(apply=True, channel="chan"), {})
         assert "description" not in json.loads((other / "b.meta.json").read_text(encoding="utf-8"))
@@ -365,8 +384,8 @@ class TestEveryManualUrlCommandCapturesIt:
     @pytest.mark.parametrize("command", sorted(_COMMANDS))
     def test_the_description_reaches_the_processing_helpers(self, command, drive_command):
         captured, _ = drive_command()
-        with contextlib_suppress():
-            getattr(vi, _COMMANDS[command])(_cmd_args(), {"channels": []})
+        code = _run_command(command, _cmd_args(), {"channels": []})
+        assert code in (0, vi.EXIT_PARTIAL), f"{command}: unexpected exit {code}"
         assert captured, f"{command}: no video dict reached the processing helpers"
         assert any(v.get("description") == DESC for v in captured), (
             f"{command}: built its video dict without the description the API returned"
@@ -377,14 +396,26 @@ class TestEveryManualUrlCommandCapturesIt:
         """With --channel/--title/--date supplied the API is never called, so
         there is nothing to carry - and nothing may blow up."""
         captured, yt = drive_command()
-        with contextlib_suppress():
-            getattr(vi, _COMMANDS[command])(_cmd_args(channel="mychan", title="T", date="2026-08-12"), {"channels": []})
+        code = _run_command(command, _cmd_args(channel="mychan", title="T", date="2026-08-12"), {"channels": []})
+        assert code in (0, vi.EXIT_PARTIAL), f"{command}: unexpected exit {code}"
         assert yt.calls == 0, f"{command}: made an API call it did not need"
         assert captured, f"{command}: no video dict reached the processing helpers"
         assert all(v.get("description") is None for v in captured)
 
 
-def contextlib_suppress():
-    import contextlib
+def _run_command(command, args, config):
+    """Run a real command and return its exit code (0 when it did not exit).
 
-    return contextlib.suppress(SystemExit, Exception)
+    NOT `contextlib.suppress(SystemExit, Exception)`. Two things went wrong
+    with that (in-family review of PR #229): a post-capture crash injected
+    into the command left every case green, so a test named
+    `..._and_no_crash` could not detect a crash; and the `[process]` cases
+    were already passing over a real `SystemExit(3)` (EXIT_PARTIAL). Per the
+    issue #185 rule, a test that asserts on an exit code asserts the CODE.
+    Anything that is not a SystemExit propagates and fails the test.
+    """
+    try:
+        getattr(vi, _COMMANDS[command])(args, config)
+    except SystemExit as exc:
+        return exc.code if exc.code is not None else 0
+    return 0

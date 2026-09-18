@@ -1155,6 +1155,11 @@ _VALID_TRANSCRIPT_SOURCE_VALUES = {"gemini", "yt-captions", "auto"}
 # meta.json transcript_source value written when a transcript is built from the
 # YouTube caption track (mirrors the existing "local_file" value for uploads).
 TRANSCRIPT_SOURCE_CAPTIONS = "youtube_captions"
+
+#: A YouTube video id: exactly 11 characters of the URL-safe base64 alphabet.
+#: Used to keep non-YouTube ids (local files, Fathom/Goldcast shares) out of
+#: calls to the YouTube API, where they would look like a deleted video.
+_YOUTUBE_VIDEO_ID_RE = re.compile(r"[A-Za-z0-9_-]{11}")
 TRANSCRIPT_SOURCE_GEMINI = "gemini"
 
 
@@ -3655,11 +3660,15 @@ def _run_chunked_transcript_url(
     # failover (which key on that prefix) stay untouched.
     is_partial = bool(failed_chunks) or thin_chunk_count > 0 or transcript_quality_flags_are_severe(quality_flags)
     meta_fields = {
-        "video_url": video["url"],
-        "video_id": video["video_id"],
-        "channel": channel_dir.name,
-        "title": video["title"],
-        "published": video["published"],
+        # Issue #224: route through the shared seam instead of hand-rolling the
+        # identity block. This writer serves every video over `chunk_minutes`
+        # (278 of 2,785 metas in the live corpus), so a hand-rolled copy meant
+        # the description silently never reached 10% of the corpus - the exact
+        # drift the "one seam" claim is supposed to prevent. Behavior delta
+        # worth stating: identity fields now go through the falsy-drop instead
+        # of being written unconditionally, which is strictly better per #66
+        # (a re-stamp can only ADD identity, never downgrade a good field).
+        **_transcript_identity_fields(video, channel_dir),
         "model": model,
         "transcript_status": "partial" if is_partial else "ok",
         "transcript_chunks": len(chunks),
@@ -4931,6 +4940,14 @@ def process_mindmap(
             "model": model,
             "mindmap_source": source,
         }
+        # Issue #224. GUARDED, not unconditional: this writer's meta_fields has
+        # no falsy-drop, so `video.get("description")` would write None on the
+        # --file path and clobber a description already on disk. `mindmap --url`
+        # fetches the description and is the only writer on that path, which is
+        # the documented cherry-pick recipe for notify-only channels and the
+        # members-only 403 recovery flow.
+        if video.get("description"):
+            meta_fields["description"] = video["description"]
         if source == "transcript" and transcript_status not in _HEALTHY_TRANSCRIPT_STATUSES:
             meta_fields["mindmap_source_status"] = "partial"
         if prompt_name:
@@ -4963,6 +4980,11 @@ def process_mindmap(
                 "last_error": str(e),
             }
         )
+        # Issue #224, same guard as the success path above: this dict has no
+        # falsy-drop either, and an error path must never be the thing that
+        # erases metadata it did not produce.
+        if video.get("description"):
+            meta["description"] = video["description"]
         meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
         return resolved_prefix, f"error: {e}"
 
@@ -8069,7 +8091,13 @@ def _cmd_transcript_impl(args, config):
                     snippet = resp["items"][0]["snippet"]
                     title = title or unescape(snippet["title"])
                     date = date or snippet["publishedAt"][:10]
-                    # Issue #224: same snippet, no extra call. Stays None when the
+                    # Issue #224: same snippet, no extra call. NOT run through
+                    # unescape() like the adjacent title read: a description
+                    # arrives already decoded (checked over 50 real corpus
+                    # videos - zero HTML entities, and raw &, apostrophes and
+                    # quotes all come through literal), so unescaping one that
+                    # legitimately contains the text "&amp;" would corrupt it.
+                    # Stays None when the
                     # operator passed --channel/--title/--date and this lookup never
                     # ran; the falsy-drop in _transcript_identity_fields then leaves
                     # any description already on disk untouched.
@@ -11030,9 +11058,15 @@ def _apply_dedupe_group(
     # ignored rather than inherited, because hand-editing a meta is this
     # project's documented recovery flow and a scalar there is a real typo.
     if not canonical_data.get("description"):
-        for loser_path, loser_data in metas:
-            if loser_path == canonical_path:
-                continue
+        # Most recently processed loser first, not `metas` order: a creator can
+        # edit a description, so the freshest capture is the best one. `metas`
+        # order is filesystem order and would pick arbitrarily.
+        losers = sorted(
+            (m for m in metas if m[0] != canonical_path),
+            key=lambda m: str(m[1].get("processed") or ""),
+            reverse=True,
+        )
+        for loser_path, loser_data in losers:
             inherited = loser_data.get("description")
             if isinstance(inherited, str) and inherited:
                 canonical_data["description"] = inherited
@@ -11644,9 +11678,16 @@ def cmd_backfill_descriptions(args, config):
     """
     output_dir = resolve_output_dir(config)
     only = getattr(args, "channel", None)
+    # Issue #183 invariant 5c, same trick: a mistyped --channel otherwise logs
+    # "0 to backfill" and returns, which reads exactly like a channel that is
+    # already complete. Folder existence separates the two.
+    if only and not (output_dir / only).is_dir():
+        log.warning("No channel folder named %r under %s; nothing to back-fill.", only, output_dir)
+        return 0
 
     pending: list[tuple[Path, str]] = []
     skipped_no_id = 0
+    skipped_non_youtube = 0
     already = 0
     for meta_path in sorted(output_dir.glob("*/*.meta.json")):
         if only and meta_path.parent.name != only:
@@ -11673,12 +11714,22 @@ def cmd_backfill_descriptions(args, config):
         if not usable_video_id(video_id):
             skipped_no_id += 1
             continue
+        # `repair-metas` refuses local/non-YouTube sources and so must this
+        # (Codex peer pass): a Fathom/Goldcast/local-file id submitted to
+        # videos.list returns nothing and would then be reported as "deleted,
+        # private, or empty", which misattributes the cause. A YouTube id is
+        # exactly 11 chars of the URL-safe alphabet.
+        if not _YOUTUBE_VIDEO_ID_RE.fullmatch(video_id):
+            skipped_non_youtube += 1
+            continue
         pending.append((meta_path, video_id))
 
     log.info(
-        "Descriptions: %d meta(s) already have one, %d missing a usable video_id, %d to backfill.",
+        "Descriptions: %d meta(s) already have one, %d missing a usable video_id, "
+        "%d non-YouTube source(s) skipped, %d to backfill.",
         already,
         skipped_no_id,
+        skipped_non_youtube,
         len(pending),
     )
     if not pending:
@@ -11699,7 +11750,15 @@ def cmd_backfill_descriptions(args, config):
     fetched: dict[str, str] = {}
     for i in range(0, len(ids), 50):
         batch = ids[i : i + 50]
-        resp = youtube.videos().list(id=",".join(batch), part="snippet").execute()
+        try:
+            resp = youtube.videos().list(id=",".join(batch), part="snippet").execute()
+        except Exception as e:
+            # Every sibling command surfaces a quota or transport failure as a
+            # message, not a traceback. All fetching precedes any write, so
+            # stopping here leaves the corpus untouched and the run rerunnable.
+            log.error("Stopped after %d of %d video(s): %s", i, len(ids), e)
+            log.error("  Nothing was written. Re-run to continue (quota resets daily).")
+            break
         for item in resp.get("items", []):
             desc = item.get("snippet", {}).get("description")
             if desc:
@@ -11739,9 +11798,17 @@ def cmd_backfill_descriptions(args, config):
             # only sweep that rewrites thousands of metas in one run, on a
             # cloud-synced mount. Repo-wide adoption is tracked separately
             # rather than smuggled into this diff.
+            # Named `<prefix>.meta.json.tmp`... which `*.meta.json` does NOT
+            # match, so a failed os.replace would leave an orphan no glob and
+            # no cleanup pattern can ever see (Codex peer pass). Remove it on
+            # failure instead of relying on a sweep to find it later.
             tmp = meta_path.with_suffix(meta_path.suffix + ".tmp")
-            tmp.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-            os.replace(tmp, meta_path)
+            try:
+                tmp.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+                os.replace(tmp, meta_path)
+            except OSError:
+                tmp.unlink(missing_ok=True)
+                raise
             applied += 1
 
     if missing_upstream:
