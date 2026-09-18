@@ -106,13 +106,42 @@ class TestTheScorecardIsRecordedAndHonest:
         card = json.loads(SCORECARD.read_text(encoding="utf-8"))
         assert card["variant_mean_recall"] < 0.9
 
-    def test_the_model_era_effect_is_recorded_as_larger_than_the_prompt_fix(self):
-        """The biggest finding of the sweep: the mindmaps already on disk score
-        higher than today's model produces from the same prompt and sample."""
+    def test_the_model_era_claim_is_recorded_as_RETRACTED(self):
+        """This test used to assert the opposite, and that is the point of it.
+
+        It originally pinned "the mindmaps already on disk score higher than
+        today's model produces" as the sweep's biggest finding. A free
+        corpus-wide rescore refuted it: 0.393 (n=941) preview vs 0.359 (n=930)
+        for 3.7, paired within channel +0.017 with preview ahead in only 21 of
+        34. The 0.415-vs-0.274 gap was a sampling artifact - the 15-video
+        sample was preview-dominated, and the re-run arm fed preview-era
+        TRANSCRIPTS into 3.7, a pairing production never runs.
+
+        `historical_on_disk_recall` stays in the scorecard because it is what
+        was measured on that sample; what must never come back is the reading
+        of it. A future edit that deletes the retraction should fail here.
+        """
         card = json.loads(SCORECARD.read_text(encoding="utf-8"))
-        prompt_gain = card["variant_mean_recall"] - card["control_mean_recall"]
-        era_gap = card["historical_on_disk_recall"] - card["control_mean_recall"]
-        assert era_gap > prompt_gain, "the recorded numbers no longer support the model-era claim"
+        retraction = card.get("historical_on_disk_retraction") or {}
+        assert retraction.get("retracted") is True, (
+            "the model-era retraction was removed; the raw number is a sampling "
+            "artifact and must not be republished as a finding"
+        )
+        rescore = retraction.get("corpus_wide_rescore") or {}
+        assert rescore.get("paired_within_channel_gap") is not None, (
+            "the corpus-wide rescore that refuted the claim was removed"
+        )
+
+    def test_the_sample_gap_is_not_presented_as_bigger_than_the_prompt_fix(self):
+        """The raw sample numbers still show a large gap - that is exactly why
+        the retraction has to travel with them. Anyone reading the scorecard
+        arithmetic alone reaches the wrong conclusion, so this test asserts the
+        pairing rather than the arithmetic."""
+        card = json.loads(SCORECARD.read_text(encoding="utf-8"))
+        if "historical_on_disk_recall" in card:
+            assert "historical_on_disk_retraction" in card, (
+                "historical_on_disk_recall must never appear without its retraction"
+            )
 
     def test_the_scorecard_refuses_to_overstate_the_statistics(self):
         """The claim is the deliverable here, so an over-claim is the defect.

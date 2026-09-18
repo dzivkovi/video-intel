@@ -47,5 +47,28 @@
   "note": "5 rolls total (2 control, 3 variant). Enumerating all 10 assignments gives p=0.10 one-sided. Directionally suggestive, NOT established. Also unadjusted for having chosen among several prompt variants, and repeated generations over the same 15 videos do not establish generalization to unseen videos.",
   "control_sd": 0.0127,
   "variant_sd": 0.0349
+ },
+ "historical_on_disk_retraction": {
+  "retracted": true,
+  "original_claim": "historical_on_disk_recall 0.4151 vs control 0.2743 was read as a model-era regression",
+  "verdict": "sampling artifact, not a model-era effect. Do not repeat the original claim.",
+  "corpus_wide_rescore": {
+   "gemini-3-flash-preview": {
+    "mean_recall": 0.393,
+    "n": 941
+   },
+   "gemini-3.7-flash": {
+    "mean_recall": 0.359,
+    "n": 930
+   },
+   "paired_within_channel_gap": 0.017,
+   "channels_where_preview_leads": "21 of 34"
+  },
+  "confounds": [
+   "the 15-video sample was 9 preview-era and 6 3.7-era artifacts, so the on-disk figure was dominated by preview-era work",
+   "the re-run arm fed preview-era TRANSCRIPTS into 3.7, a pairing production never runs",
+   "ground truth was 100% the repeated-proper-noun heuristic (zero metas carried a description at the time); its denominator grows with transcript richness, mechanically depressing 3.7"
+  ],
+  "what_survives": "3.7 fed OLD transcripts measured 0.22-0.30, which is exactly the pairing a bulk re-derivation would run - so issue #235 must measure before spending."
  }
 }
