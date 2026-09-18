@@ -57,6 +57,8 @@ class TestFetchPreflightStatus:
             "live_broadcast_content": "none",
             "privacy_status": "public",
             "was_livestream": False,
+            # Issue #224: same call, one more free field.
+            "description": None,
         }
         assert result["b"]["live_broadcast_content"] == "upcoming"
 

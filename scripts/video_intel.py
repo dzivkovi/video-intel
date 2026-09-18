@@ -550,6 +550,7 @@ CONFIG_BACKUP_COMMANDS = frozenset(
         "topics-build",
         "index",
         "repair-metas",
+        "backfill-descriptions",
         "dedupe",
         "prune-shorts",
         "mark-skip",
@@ -1154,6 +1155,11 @@ _VALID_TRANSCRIPT_SOURCE_VALUES = {"gemini", "yt-captions", "auto"}
 # meta.json transcript_source value written when a transcript is built from the
 # YouTube caption track (mirrors the existing "local_file" value for uploads).
 TRANSCRIPT_SOURCE_CAPTIONS = "youtube_captions"
+
+#: A YouTube video id: exactly 11 characters of the URL-safe base64 alphabet.
+#: Used to keep non-YouTube ids (local files, Fathom/Goldcast shares) out of
+#: calls to the YouTube API, where they would look like a deleted video.
+_YOUTUBE_VIDEO_ID_RE = re.compile(r"[A-Za-z0-9_-]{11}")
 TRANSCRIPT_SOURCE_GEMINI = "gemini"
 
 
@@ -1730,6 +1736,13 @@ def fetch_channel_videos(youtube, channel_id, since_dt):
                     "title": unescape(item["snippet"]["title"]),
                     "published": published_str[:10],
                     "url": f"https://www.youtube.com/watch?v={video_id}",
+                    # Issue #224: the description is already inside this
+                    # snippet - it is where a creator puts the shownotes PDF
+                    # link and the repo/tool URLs, and keeping it costs no
+                    # extra quota. None rather than "" so the falsy-drop in
+                    # _transcript_identity_fields treats an empty description
+                    # and an absent one identically.
+                    "description": item["snippet"].get("description") or None,
                 }
             )
 
@@ -1826,6 +1839,11 @@ def fetch_preflight_status(youtube, video_ids: list[str]) -> dict[str, dict]:
                 "live_broadcast_content": item.get("snippet", {}).get("liveBroadcastContent"),
                 "privacy_status": item.get("status", {}).get("privacyStatus"),
                 "was_livestream": _is_completed_livestream(item),
+                # Issue #224: `snippet` is already requested by this call, so
+                # the full (untruncated) description is free here. This is the
+                # authoritative copy - the uploads-playlist snippet also has
+                # one, and the keyword-search snippet has a truncated one.
+                "description": item.get("snippet", {}).get("description") or None,
             }
     return result
 
@@ -2020,6 +2038,13 @@ def fetch_playlist_videos(youtube, playlist_id: str) -> list[dict]:
                     "title": unescape(item["snippet"]["title"]),
                     "published": published_str[:10],
                     "url": f"https://www.youtube.com/watch?v={video_id}",
+                    # Issue #224: the description is already inside this
+                    # snippet - it is where a creator puts the shownotes PDF
+                    # link and the repo/tool URLs, and keeping it costs no
+                    # extra quota. None rather than "" so the falsy-drop in
+                    # _transcript_identity_fields treats an empty description
+                    # and an absent one identically.
+                    "description": item["snippet"].get("description") or None,
                 }
             )
 
@@ -2063,6 +2088,10 @@ def fetch_keyword_videos(youtube, channel_id: str, keyword: str, *, max_pages: i
                     "title": unescape(item["snippet"]["title"]),
                     "published": published_str[:10],
                     "url": f"https://www.youtube.com/watch?v={video_id}",
+                    # Issue #224: search().list() returns a TRUNCATED
+                    # description by API design, so it is deliberately NOT
+                    # taken here. The pre-flight videos.list call in cmd_scan
+                    # supplies the full text for these videos instead.
                 }
             )
 
@@ -3631,11 +3660,15 @@ def _run_chunked_transcript_url(
     # failover (which key on that prefix) stay untouched.
     is_partial = bool(failed_chunks) or thin_chunk_count > 0 or transcript_quality_flags_are_severe(quality_flags)
     meta_fields = {
-        "video_url": video["url"],
-        "video_id": video["video_id"],
-        "channel": channel_dir.name,
-        "title": video["title"],
-        "published": video["published"],
+        # Issue #224: route through the shared seam instead of hand-rolling the
+        # identity block. This writer serves every video over `chunk_minutes`
+        # (278 of 2,785 metas in the live corpus), so a hand-rolled copy meant
+        # the description silently never reached 10% of the corpus - the exact
+        # drift the "one seam" claim is supposed to prevent. Behavior delta
+        # worth stating: identity fields now go through the falsy-drop instead
+        # of being written unconditionally, which is strictly better per #66
+        # (a re-stamp can only ADD identity, never downgrade a good field).
+        **_transcript_identity_fields(video, channel_dir),
         "model": model,
         "transcript_status": "partial" if is_partial else "ok",
         "transcript_chunks": len(chunks),
@@ -4907,6 +4940,14 @@ def process_mindmap(
             "model": model,
             "mindmap_source": source,
         }
+        # Issue #224. GUARDED, not unconditional: this writer's meta_fields has
+        # no falsy-drop, so `video.get("description")` would write None on the
+        # --file path and clobber a description already on disk. `mindmap --url`
+        # fetches the description and is the only writer on that path, which is
+        # the documented cherry-pick recipe for notify-only channels and the
+        # members-only 403 recovery flow.
+        if video.get("description"):
+            meta_fields["description"] = video["description"]
         if source == "transcript" and transcript_status not in _HEALTHY_TRANSCRIPT_STATUSES:
             meta_fields["mindmap_source_status"] = "partial"
         if prompt_name:
@@ -4939,6 +4980,11 @@ def process_mindmap(
                 "last_error": str(e),
             }
         )
+        # Issue #224, same guard as the success path above: this dict has no
+        # falsy-drop either, and an error path must never be the thing that
+        # erases metadata it did not produce.
+        if video.get("description"):
+            meta["description"] = video["description"]
         meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
         return resolved_prefix, f"error: {e}"
 
@@ -5815,6 +5861,14 @@ def _transcript_identity_fields(video: dict, channel_dir: Path | None, *, channe
         "channel": channel_name if channel_name else (channel_dir.name if channel_dir is not None else None),
         "title": video.get("title"),
         "published": video.get("published"),
+        # Issue #224: the raw YouTube description. Not identity, but it travels
+        # on the same video dict and belongs to the same "YouTube-side facts
+        # this meta carries" set, so it rides the one seam every writer already
+        # merges instead of needing a sixth call site to keep in sync. The
+        # falsy-drop below is exactly the semantics it needs: a video with no
+        # description, or a manual run that never called the API, must never
+        # clobber a description already on disk.
+        "description": video.get("description"),
     }
     # Drop falsy values so a re-stamp can only ADD identity, never downgrade a
     # previously-good field to None/"" - e.g. local-file flows where video["url"]
@@ -7053,6 +7107,12 @@ def cmd_scan(args, config):
                 # dict so the transcript and mindmap loops below can route on it
                 # without a second API call.
                 v["was_livestream"] = bool(status.get("was_livestream"))
+                # Issue #224: prefer the pre-flight copy. A video absent from
+                # the pre-flight response yields {}, and a keyword-search video
+                # carries only a truncated description, so only a non-empty
+                # value may overwrite what the producer already put here.
+                if status.get("description"):
+                    v["description"] = status["description"]
                 if v["was_livestream"]:
                     # One line PER VIDEO, not an aggregate count. YouTube attaches
                     # liveStreamingDetails to aired PREMIERES of ordinary uploads
@@ -7728,6 +7788,7 @@ def _cmd_mindmap_impl(args, config):
     title = args.title
     date = args.date
 
+    description = None
     # Fetch video metadata from YouTube API
     if not channel_name or not title or not date:
         yt_key = os.environ.get("YOUTUBE_API_KEY")
@@ -7739,6 +7800,11 @@ def _cmd_mindmap_impl(args, config):
                 snippet = resp["items"][0]["snippet"]
                 title = title or unescape(snippet["title"])
                 date = date or snippet["publishedAt"][:10]
+                # Issue #224: same snippet, no extra call. Stays None when the
+                # operator passed --channel/--title/--date and this lookup never
+                # ran; the falsy-drop in _transcript_identity_fields then leaves
+                # any description already on disk untouched.
+                description = snippet.get("description") or None
                 if not channel_name:
                     channel_name = match_configured_channel(youtube, config, snippet.get("channelId"))
                     if not channel_name:
@@ -7751,6 +7817,7 @@ def _cmd_mindmap_impl(args, config):
         "url": f"https://www.youtube.com/watch?v={video_id}",
         "title": title or video_id,
         "published": date or datetime.now().strftime("%Y-%m-%d"),
+        "description": description,
     }
 
     # Issue #54: route through resolver. When a transcript is already on disk
@@ -8012,6 +8079,7 @@ def _cmd_transcript_impl(args, config):
         title = args.title
         date = args.date
 
+        description = None
         # Fetch video metadata from YouTube API
         if not channel_name or not title or not date:
             yt_key = os.environ.get("YOUTUBE_API_KEY")
@@ -8023,6 +8091,17 @@ def _cmd_transcript_impl(args, config):
                     snippet = resp["items"][0]["snippet"]
                     title = title or unescape(snippet["title"])
                     date = date or snippet["publishedAt"][:10]
+                    # Issue #224: same snippet, no extra call. NOT run through
+                    # unescape() like the adjacent title read: a description
+                    # arrives already decoded (checked over 50 real corpus
+                    # videos - zero HTML entities, and raw &, apostrophes and
+                    # quotes all come through literal), so unescaping one that
+                    # legitimately contains the text "&amp;" would corrupt it.
+                    # Stays None when the
+                    # operator passed --channel/--title/--date and this lookup never
+                    # ran; the falsy-drop in _transcript_identity_fields then leaves
+                    # any description already on disk untouched.
+                    description = snippet.get("description") or None
                     if not channel_name:
                         # Match against configured channels by channel ID.
                         # Issue #205: one shared, guarded, cached matcher.
@@ -8080,6 +8159,7 @@ def _cmd_transcript_impl(args, config):
             "url": f"https://www.youtube.com/watch?v={video_id}",
             "title": title or video_id,
             "published": date or datetime.now().strftime("%Y-%m-%d"),
+            "description": description,
         }
         channel_dir = output_dir / channel_name
         prefix = video_file_prefix(video)
@@ -8409,6 +8489,7 @@ def _cmd_process_url(args, config):
     channel_name = args.channel
     title = args.title
     date = args.date
+    description = None
     if not channel_name or not title or not date:
         yt_key = os.environ.get("YOUTUBE_API_KEY")
         if yt_key:
@@ -8419,6 +8500,11 @@ def _cmd_process_url(args, config):
                 snippet = resp["items"][0]["snippet"]
                 title = title or unescape(snippet["title"])
                 date = date or snippet["publishedAt"][:10]
+                # Issue #224: same snippet, no extra call. Stays None when the
+                # operator passed --channel/--title/--date and this lookup never
+                # ran; the falsy-drop in _transcript_identity_fields then leaves
+                # any description already on disk untouched.
+                description = snippet.get("description") or None
                 if not channel_name:
                     channel_name = match_configured_channel(yt, config, snippet.get("channelId"))
                     if not channel_name:
@@ -8429,6 +8515,7 @@ def _cmd_process_url(args, config):
         "url": f"https://www.youtube.com/watch?v={video_id}",
         "title": title or video_id,
         "published": date or datetime.now().strftime("%Y-%m-%d"),
+        "description": description,
     }
     channel_dir = output_dir / channel_name
     computed_prefix = video_file_prefix(video)
@@ -10958,6 +11045,34 @@ def _apply_dedupe_group(
     if merged_topics:
         canonical_data["topics"] = sorted(merged_topics)
 
+    # Inherit the description from a loser when the canonical has none (issue
+    # #224, found by the Codex peer pass on PR #229). The canonical is picked
+    # on transcript quality and recency, never on metadata completeness, so the
+    # group's only captured description can easily sit on the meta that loses
+    # the tie-break - and the sweep below deletes every loser. That text is not
+    # always re-fetchable: a video that goes private or is deleted upstream
+    # takes its description with it, and `backfill-descriptions` then has
+    # nothing to read. Same hazard as the `topics` union directly above.
+    # FILL-ONLY: a description already on the canonical belongs to the
+    # surviving identity and may have been hand-edited. A non-string value is
+    # ignored rather than inherited, because hand-editing a meta is this
+    # project's documented recovery flow and a scalar there is a real typo.
+    if not canonical_data.get("description"):
+        # Most recently processed loser first, not `metas` order: a creator can
+        # edit a description, so the freshest capture is the best one. `metas`
+        # order is filesystem order and would pick arbitrarily.
+        losers = sorted(
+            (m for m in metas if m[0] != canonical_path),
+            key=lambda m: str(m[1].get("processed") or ""),
+            reverse=True,
+        )
+        for loser_path, loser_data in losers:
+            inherited = loser_data.get("description")
+            if isinstance(inherited, str) and inherited:
+                canonical_data["description"] = inherited
+                log.info("    inherited description from %s (%d chars)", loser_path.name, len(inherited))
+                break
+
     canonical_path.write_text(json.dumps(canonical_data, indent=2), encoding="utf-8")
 
     # Sweep every loser prefix's remaining siblings - except any file that
@@ -11541,6 +11656,168 @@ def cmd_nugget(args, config):
         print(f"Nugget brief saved: {out_path}")
     else:
         print(response_text)
+
+
+def cmd_backfill_descriptions(args, config):
+    """Backfill the YouTube description into metas written before issue #224.
+
+    Walks existing ``.meta.json`` files, collects the ones with a usable
+    ``video_id`` and no ``description``, and fills them from
+    ``videos.list(part="snippet")`` - 1 quota unit per 50 videos. Dry-run by
+    default; ``--apply`` writes.
+
+    Deliberately NOT routed through ``update_meta``: that is the shared
+    SUCCESS-path writer and it sets ``last_error = None`` unconditionally, so
+    backfilling a cosmetic field would erase the record of a real processing
+    failure. This is provenance, not stage completion - the same reasoning that
+    gives ``stamp_video_topics`` its own writer (issue #146).
+
+    Only FILLS an absent or empty description; an existing one is never
+    replaced, so re-running is safe and a creator's later edit is not clobbered
+    by an older cached copy.
+    """
+    output_dir = resolve_output_dir(config)
+    only = getattr(args, "channel", None)
+    # Issue #183 invariant 5c, same trick: a mistyped --channel otherwise logs
+    # "0 to backfill" and returns, which reads exactly like a channel that is
+    # already complete. Folder existence separates the two.
+    if only and not (output_dir / only).is_dir():
+        log.warning("No channel folder named %r under %s; nothing to back-fill.", only, output_dir)
+        return 0
+
+    pending: list[tuple[Path, str]] = []
+    skipped_no_id = 0
+    skipped_non_youtube = 0
+    already = 0
+    for meta_path in sorted(output_dir.glob("*/*.meta.json")):
+        if only and meta_path.parent.name != only:
+            continue
+        # A read failure here must not abort the walk over a whole corpus.
+        # UnicodeDecodeError subclasses ValueError, not OSError (issue #124),
+        # so both are caught - a meta with Cyrillic/BCS content torn mid-write
+        # is the normal shape of this failure.
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            log.warning("  [%s] %s: unreadable, skipped", meta_path.parent.name, meta_path.name)
+            continue
+        if not isinstance(meta, dict):
+            log.warning("  [%s] %s: not a JSON object, skipped", meta_path.parent.name, meta_path.name)
+            continue
+        if meta.get("description"):
+            already += 1
+            continue
+        video_id = meta.get("video_id")
+        # usable_video_id is the shared join-key predicate: a non-string or
+        # id-shaped-but-empty value cannot be submitted to the API and must not
+        # be coerced (issue #146 - str() would merge a malformed 123 into "123").
+        if not usable_video_id(video_id):
+            skipped_no_id += 1
+            continue
+        # `repair-metas` refuses local/non-YouTube sources and so must this
+        # (Codex peer pass): a Fathom/Goldcast/local-file id submitted to
+        # videos.list returns nothing and would then be reported as "deleted,
+        # private, or empty", which misattributes the cause. A YouTube id is
+        # exactly 11 chars of the URL-safe alphabet.
+        if not _YOUTUBE_VIDEO_ID_RE.fullmatch(video_id):
+            skipped_non_youtube += 1
+            continue
+        pending.append((meta_path, video_id))
+
+    log.info(
+        "Descriptions: %d meta(s) already have one, %d missing a usable video_id, "
+        "%d non-YouTube source(s) skipped, %d to backfill.",
+        already,
+        skipped_no_id,
+        skipped_non_youtube,
+        len(pending),
+    )
+    if not pending:
+        return 0
+
+    yt_key = os.environ.get("YOUTUBE_API_KEY")
+    if not yt_key:
+        log.error("YOUTUBE_API_KEY is not set; cannot fetch descriptions.")
+        sys.exit(1)
+    yt_build = require_youtube()
+    youtube = yt_build("youtube", "v3", developerKey=yt_key)
+
+    by_id: dict[str, list[Path]] = {}
+    for meta_path, vid in pending:
+        by_id.setdefault(vid, []).append(meta_path)
+    ids = sorted(by_id)
+
+    fetched: dict[str, str] = {}
+    for i in range(0, len(ids), 50):
+        batch = ids[i : i + 50]
+        try:
+            resp = youtube.videos().list(id=",".join(batch), part="snippet").execute()
+        except Exception as e:
+            # Every sibling command surfaces a quota or transport failure as a
+            # message, not a traceback. All fetching precedes any write, so
+            # stopping here leaves the corpus untouched and the run rerunnable.
+            log.error("Stopped after %d of %d video(s): %s", i, len(ids), e)
+            log.error("  Nothing was written. Re-run to continue (quota resets daily).")
+            break
+        for item in resp.get("items", []):
+            desc = item.get("snippet", {}).get("description")
+            if desc:
+                fetched[item["id"]] = desc
+
+    applied = 0
+    missing_upstream = 0
+    for vid in ids:
+        desc = fetched.get(vid)
+        if not desc:
+            # Deleted, private, or region-blocked upstream. Not an error worth
+            # failing the run over; the meta simply keeps no description.
+            missing_upstream += 1
+            continue
+        for meta_path in by_id[vid]:
+            log.info("  [%s] %s: +%d chars", meta_path.parent.name, meta_path.name, len(desc))
+            if not args.apply:
+                continue
+            # Re-read at write time: the walk above may be minutes old on a
+            # large corpus, and a concurrent writer must not be clobbered.
+            meta = _read_meta_best_effort(meta_path, raise_on_os_error=True)
+            if not meta.get("video_id"):
+                # A quarantined read returns {}; writing only a description
+                # would leave an identity-less meta that _load_video_id_index
+                # skips, re-queueing a full re-transcribe as the price of a
+                # cosmetic field (issue #66).
+                log.warning("  [%s] %s: lost identity on re-read, not writing", meta_path.parent.name, meta_path.name)
+                continue
+            if meta.get("description"):
+                continue
+            meta["description"] = desc
+            # Atomic replace rather than write_text (Codex peer pass, PR #229).
+            # write_text opens with mode "w", so a failure after truncation
+            # leaves partial JSON - losing identity, operator annotations and
+            # processing state. Every writer in this file shares that window;
+            # what makes it worth closing HERE is blast radius: this is the
+            # only sweep that rewrites thousands of metas in one run, on a
+            # cloud-synced mount. Repo-wide adoption is tracked separately
+            # rather than smuggled into this diff.
+            # Named `<prefix>.meta.json.tmp`... which `*.meta.json` does NOT
+            # match, so a failed os.replace would leave an orphan no glob and
+            # no cleanup pattern can ever see (Codex peer pass). Remove it on
+            # failure instead of relying on a sweep to find it later.
+            tmp = meta_path.with_suffix(meta_path.suffix + ".tmp")
+            try:
+                tmp.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+                os.replace(tmp, meta_path)
+            except OSError:
+                tmp.unlink(missing_ok=True)
+                raise
+            applied += 1
+
+    if missing_upstream:
+        log.warning("  %d video(s) returned no description upstream (deleted, private, or empty).", missing_upstream)
+    if args.apply:
+        log.info("Backfilled %d meta(s).", applied)
+    else:
+        log.info("Dry run - pass --apply to write.")
+    return applied
 
 
 def cmd_repair_metas(args, config):
@@ -14218,6 +14495,18 @@ Examples:
         help="Write the backfilled fields. Default is dry-run (report only).",
     )
 
+    # backfill-descriptions command (issue #224)
+    backfill_parser = subparsers.add_parser(
+        "backfill-descriptions",
+        help="Fill the YouTube description into metas written before it was captured (issue #224).",
+    )
+    backfill_parser.add_argument("--channel", help="Restrict to this channel (default: all channels).")
+    backfill_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write the descriptions. Default is dry-run (report only).",
+    )
+
     # prune-shorts command
     prune_parser = subparsers.add_parser(
         "prune-shorts",
@@ -14380,6 +14669,8 @@ Examples:
             cmd_nugget(args, config)
         elif args.command == "status":
             cmd_status(args, config)
+        elif args.command == "backfill-descriptions":
+            cmd_backfill_descriptions(args, config)
         elif args.command == "repair-metas":
             cmd_repair_metas(args, config)
         elif args.command == "dedupe":

@@ -1070,3 +1070,75 @@ def test_scan_without_dry_run_calls_alt_title_recorder_on_rotation(tmp_path, mon
     assert call_count["n"] == 1, "recorder must fire in a non-dry-run scan"
     meta = json.loads((ch / "2026-04-15-original.meta.json").read_text())
     assert meta["alt_titles"] == ["Rotated"]
+
+
+# --- description inheritance (issue #224, Codex peer pass on PR #229) -------
+#
+# `_pick_canonical` selects on transcript quality and recency, never on
+# metadata completeness, so the group's only captured description can easily
+# sit on the meta that loses the tie-break - and the sweep deletes every
+# loser. The text is not always re-fetchable: a video that goes private or is
+# deleted upstream takes its description with it, and `backfill-descriptions`
+# then has nothing to read. Same hazard the `topics` union already covers.
+
+
+def _dupe_group_with_description(ch: Path, *, on_loser: str | None, on_canonical: str | None) -> None:
+    """Earlier prefix loses the recency tie-break; later prefix is canonical."""
+    _make_dupe_group(ch, "2026-04-15-earlier", "2026-04-15-later")
+    for prefix, desc in (("2026-04-15-earlier", on_loser), ("2026-04-15-later", on_canonical)):
+        path = ch / f"{prefix}.meta.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if desc is not None:
+            data["description"] = desc
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def test_dedupe_inherits_a_description_the_canonical_lacks(tmp_path):
+    """The reported data-loss path."""
+    ch = tmp_path / "ch"
+    _dupe_group_with_description(ch, on_loser="Links featured:\n- https://github.com/a/b", on_canonical=None)
+
+    vi.cmd_dedupe(Namespace(channel=None, apply=True), _make_config(tmp_path, ["ch"]))
+
+    survivor = json.loads((ch / "2026-04-15-later.meta.json").read_text(encoding="utf-8"))
+    assert survivor["description"] == "Links featured:\n- https://github.com/a/b"
+
+
+def test_dedupe_never_replaces_a_description_the_canonical_already_has(tmp_path):
+    """Fill-only. The canonical's copy belongs to the surviving identity and
+    may have been hand-edited, so a loser must never overwrite it."""
+    ch = tmp_path / "ch"
+    _dupe_group_with_description(ch, on_loser="from the loser", on_canonical="mine, hand-edited")
+
+    vi.cmd_dedupe(Namespace(channel=None, apply=True), _make_config(tmp_path, ["ch"]))
+
+    survivor = json.loads((ch / "2026-04-15-later.meta.json").read_text(encoding="utf-8"))
+    assert survivor["description"] == "mine, hand-edited"
+
+
+def test_dedupe_with_no_description_anywhere_adds_no_key(tmp_path):
+    """The ordinary group must stay byte-identical in this respect: an empty
+    string or a None must not be written where the field was simply absent."""
+    ch = tmp_path / "ch"
+    _dupe_group_with_description(ch, on_loser=None, on_canonical=None)
+
+    vi.cmd_dedupe(Namespace(channel=None, apply=True), _make_config(tmp_path, ["ch"]))
+
+    survivor = json.loads((ch / "2026-04-15-later.meta.json").read_text(encoding="utf-8"))
+    assert "description" not in survivor
+
+
+def test_dedupe_ignores_a_non_string_description_on_a_loser(tmp_path):
+    """A hand-edited meta is this project's documented recovery flow, so a
+    scalar or list here is a realistic typo. It must not be inherited."""
+    ch = tmp_path / "ch"
+    _dupe_group_with_description(ch, on_loser=None, on_canonical=None)
+    path = ch / "2026-04-15-earlier.meta.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["description"] = ["not", "a", "string"]
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    vi.cmd_dedupe(Namespace(channel=None, apply=True), _make_config(tmp_path, ["ch"]))
+
+    survivor = json.loads((ch / "2026-04-15-later.meta.json").read_text(encoding="utf-8"))
+    assert "description" not in survivor

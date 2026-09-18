@@ -435,6 +435,9 @@ class TestFetchChannelVideos:
             "title": "Test & Video",
             "published": "2026-03-15",
             "url": "https://www.youtube.com/watch?v=vid123",
+            # Issue #224: the uploads-playlist snippet already carries the
+            # description, so the producer keeps it. None when absent/empty.
+            "description": None,
         }
 
 

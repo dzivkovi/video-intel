@@ -441,6 +441,13 @@ python scripts/video_intel.py prune-shorts --apply
 python scripts/video_intel.py repair-metas
 python scripts/video_intel.py repair-metas --apply
 
+# Fill the YouTube description into metas written before it was captured.
+# The description is where creators put shownotes PDFs and owner/repo URLs -
+# frequently on-screen only, so no transcript has them. Costs 1 quota unit per
+# 50 videos, never replaces a description already stored, never indexed.
+python scripts/video_intel.py backfill-descriptions
+python scripts/video_intel.py backfill-descriptions --apply --channel thenextnewthingai
+
 # Stop re-attempting one stage on one video, without blocking the others.
 # --mode is repeatable; --reason is recorded in the meta for your future self.
 python scripts/video_intel.py mark-skip --url "URL" --mode transcript --reason "2h+, truncates"
