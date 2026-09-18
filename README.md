@@ -301,14 +301,16 @@ snippet above, which is trimmed for readability.
 | mindmap_source | No | `auto` (default) builds the mind map from the transcript when one is on disk and falls back to video otherwise; `transcript` demands one; `video` forces the old path; `none` skips the mind map |
 | transcript_source | No | `gemini` (multimodal), `yt-captions` (caption track only), or `auto` (Gemini first, captions on failure). Leave it unset unless you mean it - an explicit `gemini` also opts a livestream VOD out of captions-first routing |
 | chunk_minutes | No | Per-channel override of the top-level chunk size |
+| captions_over_duration_seconds | No | Seconds above which a video's transcript comes from the free caption track instead of Gemini (issue #227). Unset preserves current routing. **Beats `transcript_max_duration_seconds`** when both apply, so a long video is fetched cheaply rather than dropped with no artifact. Speech-only, so no on-screen content. An explicit `transcript_source: gemini` on the channel is NOT overridden; set `captions_over_duration_seconds:` (null) on a channel to opt it out of a top-level value |
 | transcript_timeout_seconds | No | Per-transcript wall clock before the call is abandoned (default 600). It routes to the captions failover only under `transcript_source: auto`; under the default `gemini` the timeout is recorded as an error and nothing else is tried |
 | skip_shorts | No | `false` opts a substantive-Shorts creator back in. Shorts are dropped before any Gemini call (default: `true`) |
 | skip_video_ids | No | List of video ids to never process. Filtered before the duration lookup, so a blocklisted id costs no API call. Reactive by design: add ids after you see one fail |
 | min_duration_seconds | No | Drop videos shorter than this |
 | auto_mindmap | No | `none` skips the mind map for notify-only channels |
 
-Six of these are validated at `scan --dry-run` - `prompt`, `transcript_source`,
-`chunk_minutes`, `transcript_max_duration_seconds`, `transcript_timeout_seconds`
+Seven of these are validated at `scan --dry-run` - `prompt`, `transcript_source`,
+`chunk_minutes`, `captions_over_duration_seconds`,
+`transcript_max_duration_seconds`, `transcript_timeout_seconds`
 and `mindmap_source` - which reports a typo'd knob with the consequence it would
 have (whole scan aborted, channel skipped, or just that stage failing) before
 spending any quota. The rest are not preflighted: a bad `skip_shorts`,

@@ -1152,6 +1152,12 @@ _HEALTHY_TRANSCRIPT_STATUSES = {"ok", "complete"}
 
 # Issue #60: how the transcript step sources its text.
 _VALID_TRANSCRIPT_SOURCE_VALUES = {"gemini", "yt-captions", "auto"}
+#: The CONFIG value that selects the caption track. Deliberately distinct from
+#: TRANSCRIPT_SOURCE_CAPTIONS below, which is the PROVENANCE value written into
+#: meta.json once a transcript has been built that way. Same idea, two
+#: vocabularies, and conflating them would make a meta unreadable as config or
+#: a config unwritable as provenance.
+TRANSCRIPT_SOURCE_YT_CAPTIONS = "yt-captions"
 # meta.json transcript_source value written when a transcript is built from the
 # YouTube caption track (mirrors the existing "local_file" value for uploads).
 TRANSCRIPT_SOURCE_CAPTIONS = "youtube_captions"
@@ -1369,6 +1375,7 @@ def validate_channel_knobs(
     channel_config: dict,
     config: dict,
     cli_chunk_minutes: int | None = None,
+    cli_captions_over_duration: int | None = None,
 ) -> list[tuple[str, str, str]]:
     """Preflight-validate a channel's per-video config knobs (issue #169).
 
@@ -1465,6 +1472,16 @@ def validate_channel_knobs(
         resolve_chunk_minutes(channel_config, config, cli_chunk_minutes)
     except (ValueError, TypeError) as e:
         problems.append(("chunk_minutes", str(e), _reached(KNOB_CONSEQUENCE_SKIPS_CHANNEL)))
+    # Issue #227, position 4: the runtime firing order inside cmd_scan's channel
+    # body is transcript_source -> chunk_minutes -> captions_over_duration, and
+    # this list must mirror it (issue #169 item 10 - the check ORDER is the
+    # contract, because _downgrade_unreached_knobs rewrites everything after the
+    # first STOPPING problem). Its runtime guard is SKIPS_CHANNEL-shaped, which
+    # is exactly the class the preflight exists to surface before quota is spent.
+    try:
+        resolve_captions_over_duration(channel_config, config, cli_captions_over_duration)
+    except ValueError as e:
+        problems.append(("captions_over_duration_seconds", str(e), _reached(KNOB_CONSEQUENCE_SKIPS_CHANNEL)))
 
     # 4/5. Two knobs with no resolver: scan reads them straight off the dict.
     #      See the docstring for why their consequences differ despite looking
@@ -2625,6 +2642,11 @@ def _fmt_hms(seconds: int) -> str:
 #: inside a single chunk without tripping the per-chunk quality assessor.
 TRANSCRIPT_CHUNK_MINUTES_DEFAULT = 30
 
+#: Issue #227. Unset means today's behavior exactly: a long video either
+#: chunks into N Gemini calls or is dropped by `transcript_max_duration_seconds`.
+#: There was no way to say "get it cheaply instead of not at all".
+CAPTIONS_OVER_DURATION_DEFAULT = None
+
 #: Fraction of MAX_OUTPUT_TOKENS at or above which a response is treated as
 #: having hit the OUTPUT cap. Empirically the confirmed truncation reported
 #: candidates=65522 against a 65536 cap (99.98%), while healthy per-chunk
@@ -2691,6 +2713,62 @@ def hit_output_cap(candidates: int | None, finish_reason: str | None, *, max_out
 # Default 600s (10 min): comfortably above a legitimate hour-long transcript's
 # wall-clock, well below the 1200s httpx read timeout so this fires first.
 TRANSCRIPT_TIMEOUT_DEFAULT = 600
+
+
+def resolve_captions_over_duration(
+    channel_config: dict,
+    config: dict | None = None,
+    cli_override: int | None = None,
+) -> int | None:
+    """Duration in seconds above which a video's transcript comes from captions.
+
+    Issue #227. Before this, a long video on a scanned channel had three
+    outcomes and none of them was "cheap but present": it chunked into N
+    Gemini calls, it exceeded ``transcript_max_duration_seconds`` and was
+    dropped from the transcript loop entirely, or the operator blocklisted it
+    by hand. This knob adds the fourth: build the transcript from the free
+    YouTube caption track, which is whole and costs nothing, and let the rest
+    of the chain continue normally (``mindmap_source: auto`` routes off
+    whatever transcript is on disk, so the mindmap and concepts still happen).
+
+    ``None`` (the default, and the value for any channel that does not set it)
+    means the pre-#227 behavior, byte for byte.
+
+    Precedence matches every other knob here: CLI > per-channel > top-level >
+    default. A non-numeric or non-positive value raises ``ValueError`` so a
+    config typo surfaces at the call site like its siblings; booleans are
+    rejected before the int() coercion because PyYAML types an unquoted
+    ``yes`` as ``True`` and ``int(True) == 1`` would silently mean "every
+    video longer than one second", i.e. the whole channel.
+    """
+    if cli_override is not None:
+        candidate = cli_override
+    elif "captions_over_duration_seconds" in channel_config:
+        candidate = channel_config["captions_over_duration_seconds"]
+    elif config is not None and "captions_over_duration_seconds" in config:
+        candidate = config["captions_over_duration_seconds"]
+    else:
+        return CAPTIONS_OVER_DURATION_DEFAULT
+    if candidate is None:
+        return None
+    # isinstance(True, int) is True, so this MUST precede the int() coercion.
+    if isinstance(candidate, bool):
+        raise ValueError(
+            f"Invalid captions_over_duration_seconds={candidate!r}: expected a positive number of seconds, not a boolean."
+        )
+    try:
+        seconds = int(candidate)
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError, not just ValueError: a YAML float that overflows
+        # (1e400 parses as inf) reaches int() and raises OverflowError, which
+        # is NOT a ValueError subclass. Caught here so every malformed value
+        # surfaces through the one ValueError the call sites guard.
+        raise ValueError(
+            f"Invalid captions_over_duration_seconds={candidate!r}: expected a positive number of seconds."
+        ) from None
+    if seconds <= 0:
+        raise ValueError(f"Invalid captions_over_duration_seconds={seconds!r}: expected a positive number of seconds.")
+    return seconds
 
 
 def resolve_chunk_minutes(channel_config: dict, config: dict, cli_override: int | None = None) -> int:
@@ -7016,7 +7094,12 @@ def cmd_scan(args, config):
         # (non-dry-run) run will log a problem twice - once here, once at the
         # skip site - and that is intended: the first says the config is
         # invalid, the second says what is being done about it.
-        knob_problems = validate_channel_knobs(ch, config, getattr(args, "chunk_minutes", None))
+        knob_problems = validate_channel_knobs(
+            ch,
+            config,
+            getattr(args, "chunk_minutes", None),
+            getattr(args, "captions_over_duration", None),
+        )
         for knob_name, error_message, consequence in knob_problems:
             log_fn = log.warning if consequence.startswith(KNOB_CONSEQUENCE_NOT_REACHED) else log.error
             log_fn(
@@ -7385,6 +7468,26 @@ def cmd_scan(args, config):
                 )
                 errors.append((ch_name, ch_name, f"error: {e}"))
                 continue
+            # Issue #227: duration above which a video's transcript comes from
+            # the free caption track instead of Gemini. Same guard shape as its
+            # siblings above - one channel's typo must not abort the whole scan
+            # after quota is already sunk, and --dry-run returns before here.
+            try:
+                captions_over = resolve_captions_over_duration(
+                    ch, config, getattr(args, "captions_over_duration", None)
+                )
+            except ValueError as e:
+                log.error(
+                    "[%s] invalid captions_over_duration_seconds (%s); skipping entire channel (mindmap and concepts too)",
+                    ch_name,
+                    e,
+                )
+                errors.append((ch_name, ch_name, f"error: {e}"))
+                continue
+            # Per-video source, because the decision depends on this video's
+            # duration. Keyed by prefix so the submit block below can look it
+            # up without recomputing.
+            per_video_source: dict[str, str] = {}
             transcript_videos: list[dict] = []
             for v in videos:
                 if is_processed(output_dir, ch_name, v, "transcript"):
@@ -7392,6 +7495,39 @@ def cmd_scan(args, config):
                 if is_skipped(output_dir, ch_name, v, mode="transcript"):
                     continue
                 duration_s = _parse_iso8601_duration(v.get("duration_iso"))
+                # Issue #227. This branch runs BEFORE the max-duration drop on
+                # purpose. That guard exists because a long GEMINI transcript
+                # is expensive and truncates; neither is true of a caption
+                # track, which is free and arrives whole. Dropping a video the
+                # operator explicitly asked to fetch cheaply would defeat the
+                # knob entirely, so a configured captions threshold wins.
+                if (
+                    captions_over is not None
+                    and duration_s is not None
+                    and duration_s > captions_over
+                    and transcript_source != TRANSCRIPT_SOURCE_YT_CAPTIONS
+                    # An EXPLICIT `transcript_source: gemini` on the channel is
+                    # issue #120's documented escape hatch - the operator chose
+                    # multimodal on purpose because the captions are known
+                    # garbage, the wrong language, or the on-screen content IS
+                    # the content. A top-level captions threshold is a knob that
+                    # channel never set, and letting it win would silently undo
+                    # that choice. Tested with `in`, never `.get(..., "gemini")`,
+                    # for the same reason livestream_captions_first_applies does:
+                    # an ABSENT key and an explicit "gemini" must stay
+                    # distinguishable.
+                    and not (ch.get("transcript_source") == "gemini" and "transcript_source" in ch)
+                ):
+                    log.info(
+                        '[%s] "%s" is %s (> %s): transcript from captions instead of Gemini.',
+                        ch_name,
+                        v["title"],
+                        _fmt_hms(duration_s),
+                        _fmt_hms(captions_over),
+                    )
+                    per_video_source[video_file_prefix(v)] = TRANSCRIPT_SOURCE_YT_CAPTIONS
+                    transcript_videos.append(v)
+                    continue
                 if duration_s is not None and duration_s > threshold:
                     log.warning(
                         '[%s] Skipping transcript for "%s" (%s > %dm).',
@@ -7424,7 +7560,7 @@ def cmd_scan(args, config):
                             model=model,
                             channel_dir=output_dir / ch_name,
                             prefix=video_file_prefix(v),
-                            transcript_source=transcript_source,
+                            transcript_source=per_video_source.get(video_file_prefix(v), transcript_source),
                             transcript_timeout_seconds=transcript_timeout_seconds,
                             livestream_captions_first=(vod_captions_first and bool(v.get("was_livestream"))),
                             duration_seconds=_parse_iso8601_duration(v.get("duration_iso")),
@@ -14154,6 +14290,19 @@ Examples:
     scan_parser.add_argument("--since", help="Override lookback window (e.g. 14d, 2026-01-01)")
     scan_parser.add_argument("--dry-run", action="store_true", help="Preview without processing")
     scan_parser.add_argument("--force", action="store_true", help="Regenerate mindmaps even if they exist")
+    scan_parser.add_argument(
+        "--captions-over-duration",
+        type=int,
+        default=None,
+        dest="captions_over_duration",
+        help=(
+            "Seconds above which a video's transcript comes from the free YouTube caption "
+            "track instead of Gemini (issue #227). Overrides per-channel and top-level "
+            "captions_over_duration_seconds. Unset means today's behavior: a long video "
+            "either chunks into several Gemini calls or is dropped by "
+            "transcript_max_duration_seconds. Speech-only, so no on-screen content."
+        ),
+    )
     scan_parser.add_argument(
         "--chunk-minutes",
         type=int,
