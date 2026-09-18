@@ -3884,6 +3884,12 @@ def is_processed(
     return _mode_artifact_present(channel_dir, prefix, mode, any_variant=any_variant)
 
 
+#: Modes `_mode_artifact_present` knows how to resolve to a file. "scan" and
+#: "mindmap" both mean the mindmap artifact (scan writes no artifact of its
+#: own); "concepts" is included because callers pass it to `is_processed`.
+_MODE_ARTIFACT_MODES = frozenset({"scan", "mindmap", "transcript", "concepts"})
+
+
 def _mode_artifact_present(
     channel_dir: Path,
     prefix: str,
@@ -3891,7 +3897,16 @@ def _mode_artifact_present(
     *,
     any_variant: bool,
 ) -> bool:
-    """True when the given mode's artifact exists and is non-empty under prefix."""
+    """True when the given mode's artifact exists and is non-empty under prefix.
+
+    Any mode other than "transcript" resolves to the MINDMAP artifact, which is
+    correct for "scan"/"mindmap" and was silently correct-by-accident for
+    anything else. `scan_completion_mode` now chooses between two of these
+    values, so an unrecognized third would silently reproduce issue #226
+    instead of failing - hence the explicit membership check.
+    """
+    if mode not in _MODE_ARTIFACT_MODES:
+        raise ValueError(f"Unknown artifact mode {mode!r}. Expected one of: {sorted(_MODE_ARTIFACT_MODES)}")
     if mode == "transcript":
         target = channel_dir / f"{prefix}.transcript.md"
         return target.exists() and target.stat().st_size > 0
@@ -3905,6 +3920,42 @@ def _mode_artifact_present(
 
     target = channel_dir / f"{prefix}.mindmap.md"
     return target.exists() and target.stat().st_size > 0
+
+
+def scan_completion_mode(channel_config: dict) -> str:
+    """Which artifact proves `scan` already did its work for a video (#226).
+
+    `scan` writes no artifact of its own: its completion marker is the
+    MINDMAP, which is why `is_processed(..., "scan", any_variant=True)`
+    resolves to a `{prefix}.mindmap*.md` check. A channel that disables the
+    mindmap step therefore never writes the thing the count is looking for,
+    so every video inside the window is reported as new on every scan - the
+    log cannot distinguish a real upload from the standing set, `--dry-run`
+    previews work that will not happen, and the mindmap executor is handed
+    closures that only return a skip string.
+
+    Returns `"transcript"` when the mindmap step is off but the transcript
+    step is on, and `"scan"` (unchanged behavior) otherwise.
+
+    Deliberately total: a channel with BOTH steps off produces no artifact at
+    all, so there is nothing that could mark a video done and "new" keeps its
+    original meaning. And a malformed `mindmap_source` returns `"scan"`
+    rather than raising - reporting a bad knob is `validate_channel_knobs`'s
+    job (issue #169), and a counting helper must not become a new place for a
+    config typo to abort a scan (issue #135).
+    """
+    if channel_config.get("auto_mindmap", "all") == "none":
+        mindmap_off = True
+    else:
+        try:
+            mindmap_off = resolve_mindmap_source(channel_config, transcript_available=True) == "skip"
+        except (ValueError, TypeError):
+            return "scan"
+    if not mindmap_off:
+        return "scan"
+    if channel_config.get("auto_transcript", "none") != "all":
+        return "scan"
+    return "transcript"
 
 
 def record_alt_title_if_rotated(
@@ -7169,17 +7220,38 @@ def cmd_scan(args, config):
                 )
             videos = kept
 
-        # Filter already processed or skipped (any_variant=True prevents backfill).
-        # mode="mindmap" so per-mode skip_modes=["transcript"] does NOT block the
-        # mindmap loop. See is_skipped_meta() and issue #42.
+        # Filter already processed or skipped.
+        #
+        # The skip predicate has to ask about the SAME mode as the completion
+        # marker (issue #226). Historically both were the mindmap: mode=
+        # "mindmap" is what stops a per-mode `skip_modes: ["transcript"]` from
+        # blocking the mindmap loop (issue #42). Once the marker can be the
+        # transcript, a fixed "mindmap" here asks about a different step than
+        # the count does - and an operator who suppressed the transcript on a
+        # mindmap-less channel would see that video reported new forever,
+        # because they suppressed the only step that could write the marker.
+        #
+        # `any_variant=True` is inert for the transcript branch of
+        # `_mode_artifact_present` (it returns before reading the flag) and
+        # only prevents mindmap backfill on the "scan" branch. Passed
+        # unconditionally so the two branches stay one expression.
+        #
+        # Known residual, pre-existing and unchanged: `skip_modes: ["mindmap"]`
+        # on a normal channel under-reports, because the suppressed step is the
+        # marker. Not introduced here; recorded so it is not mistaken for new.
+        # Issue #226: on a channel whose mindmap step is off, the mindmap
+        # artifact this count looks for is never written, so ask for the
+        # artifact that channel actually produces instead.
+        completion_mode = scan_completion_mode(ch)
+        skip_mode = "transcript" if completion_mode == "transcript" else "mindmap"
         if args.force:
-            new_videos = [v for v in videos if not is_skipped(output_dir, ch_name, v, mode="mindmap")]
+            new_videos = [v for v in videos if not is_skipped(output_dir, ch_name, v, mode=skip_mode)]
         else:
             new_videos = [
                 v
                 for v in videos
-                if not is_processed(output_dir, ch_name, v, "scan", any_variant=True)
-                and not is_skipped(output_dir, ch_name, v, mode="mindmap")
+                if not is_processed(output_dir, ch_name, v, completion_mode, any_variant=True)
+                and not is_skipped(output_dir, ch_name, v, mode=skip_mode)
             ]
         label = "to regenerate" if args.force else "new"
         log.info("  Found %d videos, %d %s.", len(videos), len(new_videos), label)
@@ -7390,6 +7462,22 @@ def cmd_scan(args, config):
                     log.info("    %s - %s", v["published"], v["title"])
             else:
                 log.info("  auto_mindmap=none: no new videos.")
+        elif completion_mode == "transcript":
+            # Issue #226: mindmap_source=none. Submitting the per-video
+            # closures here costs nothing but returns one skip string per
+            # video, which reads in the log like work that happened.
+            log.info("  mindmap_source=none: mindmap step skipped for this channel.")
+            # `touched_prefixes` bounds the auto_concepts loop under --force
+            # (issue #173 round 3). Leaving it empty here would make
+            # `scan --force` on such a channel re-extract ZERO concepts, and
+            # SILENTLY - not even the "Extracting concepts" line would appear.
+            # That is a behavior change issue #226 never asked for, and a
+            # silently-ignored flag is the same sin as a flag doing something
+            # other than its name (issue #183 invariant 5c). Populated with the
+            # same set the mindmap loop would have used, so --force keeps its
+            # pre-#226 concepts behavior on a channel that still has mindmaps
+            # on disk from before it was flipped to `none`.
+            touched_prefixes = {video_file_prefix(v) for v in new_videos}
         elif not new_videos:
             log.info("  All mind maps up to date.")
         else:
