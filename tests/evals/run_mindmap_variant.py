@@ -53,7 +53,7 @@ def main() -> int:
         print("no sample videos resolved; nothing to do")
         return 1
 
-    genai, types = vi.require_gemini()
+    _genai, types = vi.require_gemini()
     import os
 
     api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
