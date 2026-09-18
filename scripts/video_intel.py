@@ -11017,6 +11017,28 @@ def _apply_dedupe_group(
     if merged_topics:
         canonical_data["topics"] = sorted(merged_topics)
 
+    # Inherit the description from a loser when the canonical has none (issue
+    # #224, found by the Codex peer pass on PR #229). The canonical is picked
+    # on transcript quality and recency, never on metadata completeness, so the
+    # group's only captured description can easily sit on the meta that loses
+    # the tie-break - and the sweep below deletes every loser. That text is not
+    # always re-fetchable: a video that goes private or is deleted upstream
+    # takes its description with it, and `backfill-descriptions` then has
+    # nothing to read. Same hazard as the `topics` union directly above.
+    # FILL-ONLY: a description already on the canonical belongs to the
+    # surviving identity and may have been hand-edited. A non-string value is
+    # ignored rather than inherited, because hand-editing a meta is this
+    # project's documented recovery flow and a scalar there is a real typo.
+    if not canonical_data.get("description"):
+        for loser_path, loser_data in metas:
+            if loser_path == canonical_path:
+                continue
+            inherited = loser_data.get("description")
+            if isinstance(inherited, str) and inherited:
+                canonical_data["description"] = inherited
+                log.info("    inherited description from %s (%d chars)", loser_path.name, len(inherited))
+                break
+
     canonical_path.write_text(json.dumps(canonical_data, indent=2), encoding="utf-8")
 
     # Sweep every loser prefix's remaining siblings - except any file that
@@ -11709,7 +11731,17 @@ def cmd_backfill_descriptions(args, config):
             if meta.get("description"):
                 continue
             meta["description"] = desc
-            meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            # Atomic replace rather than write_text (Codex peer pass, PR #229).
+            # write_text opens with mode "w", so a failure after truncation
+            # leaves partial JSON - losing identity, operator annotations and
+            # processing state. Every writer in this file shares that window;
+            # what makes it worth closing HERE is blast radius: this is the
+            # only sweep that rewrites thousands of metas in one run, on a
+            # cloud-synced mount. Repo-wide adoption is tracked separately
+            # rather than smuggled into this diff.
+            tmp = meta_path.with_suffix(meta_path.suffix + ".tmp")
+            tmp.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            os.replace(tmp, meta_path)
             applied += 1
 
     if missing_upstream:
