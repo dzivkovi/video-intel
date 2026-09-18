@@ -79,6 +79,22 @@ chunk_minutes: 30
 # truncates, and neither is true of captions. Trade-off: speech-only, so no
 # on-screen content and no diarization - wrong for a screen-heavy creator.
 # captions_over_duration_seconds: 3600
+# FREE CAPTIONS: the cost tiers (issue #225).
+# `transcript_source: yt-captions` skips the call that WATCHES the video, which
+# is the expensive one. It does NOT make the channel Gemini-free on its own:
+# with the default mindmap_source: auto the caption-built transcript still
+# feeds a text-only mindmap call, and auto_concepts still runs. Those two are
+# cents, and turning them off costs the mindmap triage surface and
+# concepts.json - so the channel disappears from concept-mode search and the
+# taxonomy. Start at tier 1 and subtract only if you mean it:
+#   1. transcript_source: yt-captions            <- free captions, everything else intact
+#   2. + mindmap_source: none                    <- no mindmap, and concepts has nothing to read
+#   3. + auto_concepts: false                    <- out of the taxonomy
+#   2+3 together                                 <- zero Gemini calls; search --vector only
+# The trade is the same at every tier: speech-only, no on-screen content, no
+# speaker names. Wrong for a screen-heavy creator, fine for a talking head.
+# GEMINI_API_KEY must still be set even at the zero tier (scan exits without
+# it before making any call), and `index` still costs Voyage tokens.
 
 # Wall-clock ceiling on a single transcript Gemini call, in seconds (issue #74).
 # On expiry the video routes to the captions failover instead of hanging the

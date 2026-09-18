@@ -299,7 +299,7 @@ snippet above, which is trimmed for readability.
 | enabled | No | `false` drops the channel from `scan` entirely, including an explicit `scan --channel <name>`, while keeping it addressable for `transcript --url --channel`, the `--file` paths and `concepts --channel`. Use it for Skool, Vimeo, members-only YouTube, and one-off creators (default: `true`) |
 | headline_digest | No | `true` on an `enabled: false` channel includes it in the metadata-only "Other headlines" digest at the end of a full scan. No Gemini calls, no corpus artifacts (default: `false`) |
 | mindmap_source | No | `auto` (default) builds the mind map from the transcript when one is on disk and falls back to video otherwise; `transcript` demands one; `video` forces the old path; `none` skips the mind map |
-| transcript_source | No | `gemini` (multimodal), `yt-captions` (caption track only), or `auto` (Gemini first, captions on failure). Leave it unset unless you mean it - an explicit `gemini` also opts a livestream VOD out of captions-first routing |
+| transcript_source | No | `gemini` (multimodal), `yt-captions` (caption track only), or `auto` (Gemini first, captions on failure). Leave it unset unless you mean it - an explicit `gemini` also opts a livestream VOD out of captions-first routing. **`yt-captions` skips the TRANSCRIPT call only, not Gemini entirely** - see the cost tiers below |
 | chunk_minutes | No | Per-channel override of the top-level chunk size |
 | captions_over_duration_seconds | No | Seconds above which a video's transcript comes from the free caption track instead of Gemini (issue #227). Unset preserves current routing. **Beats `transcript_max_duration_seconds`** when both apply, so a long video is fetched cheaply rather than dropped with no artifact. Speech-only, so no on-screen content. An explicit `transcript_source: gemini` on the channel is NOT overridden; set `captions_over_duration_seconds:` (null) on a channel to opt it out of a top-level value |
 | transcript_timeout_seconds | No | Per-transcript wall clock before the call is abandoned (default 600). It routes to the captions failover only under `transcript_source: auto`; under the default `gemini` the timeout is recorded as an error and nothing else is tried |
@@ -307,6 +307,23 @@ snippet above, which is trimmed for readability.
 | skip_video_ids | No | List of video ids to never process. Filtered before the duration lookup, so a blocklisted id costs no API call. Reactive by design: add ids after you see one fail |
 | min_duration_seconds | No | Drop videos shorter than this |
 | auto_mindmap | No | `none` skips the mind map for notify-only channels |
+
+#### Running a channel on free captions: the cost tiers
+
+The expensive call is the one that watches the video. The two text calls after it are cents, and turning them off costs real capability, so `transcript_source: yt-captions` on its own is the right setting for most "follow this cheaply" channels - **not** the zero-Gemini extreme.
+
+| What you want | Config | What you get |
+| --- | --- | --- |
+| **Free captions (start here)** | `transcript_source: yt-captions` | Caption-built transcript, mindmap generated from it, concepts, full concept search. Skips only the video call. |
+| Free captions, no mindmap | add `mindmap_source: none` | Transcript only. No triage surface, and concepts has no mindmap to read. |
+| Free captions, no concepts | add `auto_concepts: false` | Mindmap still built; the channel stays out of `taxonomy.json`. |
+| Zero Gemini calls | both of the above | Transcript only. `search --vector` is the only way back in. |
+
+`mindmap_source: auto` (the default) routes off whatever transcript is on disk and does not care how it was produced, so the mindmap and concepts steps work from a caption-built transcript with no extra configuration.
+
+The trade-off is the same at every tier and it is the thing to decide on: **speech-only text, so no on-screen content and no speaker names.** For a screen-heavy creator that is disqualifying; for a talking-head or a pointer feed it is not.
+
+Two things that surprise people: `GEMINI_API_KEY` must still be set even at the zero tier, because `scan` exits without it before making any call; and `index` still costs Voyage tokens (roughly $0.03 for 33 short videos).
 
 Seven of these are validated at `scan --dry-run` - `prompt`, `transcript_source`,
 `chunk_minutes`, `captions_over_duration_seconds`,
