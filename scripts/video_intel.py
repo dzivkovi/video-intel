@@ -4226,7 +4226,7 @@ _GEMINI_3_FLASH_RE = re.compile(r"gemini-3(?:\.\d+)?-flash")
 # so a future Flash that DOES support minimal needs no edit here - and so a
 # model that does not is a loud 400 at call time rather than a silent
 # fall-through to a costlier level.
-_NO_MINIMAL_THINKING_LEVEL = ("gemini-3.7-flash",)
+_NO_MINIMAL_THINKING_LEVEL = ("gemini-3.7-flash", "gemini-3.8-flash")
 
 
 def _make_thinking_config_for_transcript(types, model: str):
@@ -4248,6 +4248,7 @@ def _make_thinking_config_for_transcript(types, model: str):
             # 2026-08-17: MINIMAL returns 400 INVALID_ARGUMENT, and
             # thinking_budget=0 is accepted but IGNORED (911 thinking tokens
             # still billed), so there is no way to reach zero thinking here.
+            # gemini-3.8-flash verified the same way 2026-09-19.
             return types.ThinkingConfig(thinking_level="low")
         # Flash-exclusive level: lower than LOW. Confirmed in official docs at
         # ai.google.dev/gemini-api/docs/thinking and Firebase AI Logic guide.

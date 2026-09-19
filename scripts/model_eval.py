@@ -73,13 +73,15 @@ PRICING = {
     "gemini-3.5-flash": (1.50, 9.00, None),
     "gemini-3.6-flash": (0.75, 3.75, "2026-12-31"),
     "gemini-3.7-flash": (0.75, 3.75, "2026-12-31"),
+    # Same introductory rate and expiry as 3.7 (blog.google, 2026-09): $1.50/$7.50 from 2027-01-01.
+    "gemini-3.8-flash": (0.75, 3.75, "2026-12-31"),
     "gemini-2.5-flash": (0.30, 2.50, None),
     "gemini-2.5-pro": (1.25, 10.00, None),
 }
 
 # Thinking levels a model accepts. `minimal` is Flash-exclusive and 3.7 dropped
 # it; sending it there is a hard 400. None means "let the helper decide".
-DEFAULT_THINKING = {"gemini-3.7-flash": "low"}
+DEFAULT_THINKING = {"gemini-3.7-flash": "low", "gemini-3.8-flash": "low"}
 
 
 def _secs(stamp: str) -> int | None:

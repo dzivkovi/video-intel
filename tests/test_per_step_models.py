@@ -109,11 +109,12 @@ class TestFlashVersionDetection:
             "64k output cap the transcript competes for."
         )
 
-    def test_gemini_3_7_flash_gets_low_not_minimal(self, fake_types):
-        """3.7 rejects MINIMAL with a 400; LOW is its floor."""
-        cfg = _make_thinking_config_for_transcript(fake_types, "gemini-3.7-flash")
+    @pytest.mark.parametrize("model", ["gemini-3.7-flash", "gemini-3.8-flash"])
+    def test_flash_models_that_reject_minimal_get_low(self, model, fake_types):
+        """3.7 rejects MINIMAL with a 400; LOW is its floor. 3.8 verified 2026-09-19."""
+        cfg = _make_thinking_config_for_transcript(fake_types, model)
         assert getattr(cfg, "thinking_level", None) == "low", (
-            "gemini-3.7-flash must route to 'low'. Sending 'minimal' returns "
+            f"{model} must route to 'low'. Sending 'minimal' returns "
             "400 INVALID_ARGUMENT and would hard-fail every chunked transcript."
         )
 

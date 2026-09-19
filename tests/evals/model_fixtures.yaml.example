@@ -56,3 +56,22 @@ fixtures:
     url: https://www.youtube.com/watch?v=REPLACE_ME
     channel: your_channel
     start: 3000
+
+  - id: four-presenter-panel
+    facet: >-
+      Four presenters in a 36-minute session, little on screen. Probes attribution
+      at scale: whether four voices stay four speakers across handoffs, or collapse
+      into two, and whether segment density holds when nobody is driving a screen.
+    url: https://www.youtube.com/watch?v=REPLACE_ME
+    channel: your_channel
+    start: 900
+
+  - id: busy-screen-two-presenters
+    facet: >-
+      Two presenters over a dense, fast-changing screen share. Probes the
+      multimodal case the corpus is built for: on-screen text captured as
+      screen_content while dialogue is still attributed to the right of two
+      voices.
+    url: https://www.youtube.com/watch?v=REPLACE_ME
+    channel: your_channel
+    start: 300

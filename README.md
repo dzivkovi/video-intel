@@ -285,6 +285,10 @@ snippet above, which is trimmed for readability.
 | transcript_max_duration_seconds | 7200 | Videos longer than this are dropped from the auto-transcript set with a WARNING naming the manual recipe. Mind maps are unaffected |
 | chunk_minutes | 30 | Split a transcript longer than this into per-window Gemini calls. Lower it on dense material such as keynotes |
 
+### Newer model is not automatically better
+
+The repo only changes the default `model` on a measured scorecard, never on a spec sheet or a release date: run `python scripts/model_eval.py --candidate <model> --incumbent gemini-3.7-flash` against your own fixtures in `tests/evals/model_fixtures.yaml` (copy `model_fixtures.yaml.example`; the six fixture shapes are committed, the videos are yours to pick) and record the result as a card under `tests/evals/model-cards/`. The `gemini-3.8-flash` evaluation is the worked example: on the four-presenter-panel fixture 3.7 held a lower median max_gap_s (46s vs 68s) across three rolls each, and 3.8 dropped the speakers and screen_content tasks entirely on one of those rolls, so the owner chose to stay on `gemini-3.7-flash` (see [issue #219](https://github.com/dzivkovi/video-intel/issues/219) and [the scorecard](tests/evals/model-cards/gemini-3.8-flash.md)). Each cell is noisy even for the identical model and input: the same monologue fixture rolled 175s then 21s on two runs of `gemini-3.8-flash`. Roll any cell that matters to your decision at least three times before believing a single number.
+
 ### Channel Settings
 
 | Field | Required | Description |
