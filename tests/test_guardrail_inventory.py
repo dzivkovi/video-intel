@@ -304,3 +304,68 @@ class TestTheCitationMechanismHolds:
             "no core bullet cites another core principle, so the "
             "definition-versus-citation distinction is currently unexercised"
         )
+
+
+#: Phrases that point at a neighbour by POSITION rather than by name. They were
+#: all correct inside one monolithic file and several broke the moment the file
+#: was split - the citing bullet kept its text verbatim while the bullet it
+#: pointed at moved to another file, so the line-based inverse check saw nothing.
+POSITIONAL_REFERENCES = (
+    "entry above",
+    "entry below",
+    "rule above",
+    "rule below",
+    "guardrail above",
+    "guardrail below",
+    "bullet above",
+    "bullet below",
+    "the entry below",
+    "the section above",
+)
+
+
+class TestNoGuardrailPointsAtANeighbourByPosition:
+    """A rule file is read in isolation, so "above" and "below" are meaningless
+    in it and actively misleading once a bullet moves.
+
+    Five of these shipped broken in the first cut of this split, found by an
+    adversarial review rather than by any check - including one in the core
+    pointing at a guardrail that had moved into a rule file Codex never loads.
+    Reference a rule by name and file, never by position.
+    """
+
+    def test_no_rule_file_uses_a_positional_reference(self):
+        offenders = []
+        for rf in _rule_files():
+            text = _normalize(rf.read_text(encoding="utf-8"))
+            for phrase in POSITIONAL_REFERENCES:
+                if phrase in text:
+                    offenders.append(f"{rf.name}: {phrase!r}")
+        assert not offenders, (
+            "positional references in a path-scoped rule file, which is read in "
+            "isolation - name the rule and its file instead:\n  " + "\n  ".join(offenders)
+        )
+
+    def test_the_core_does_not_point_below_at_something_that_moved(self):
+        """The core keeps 14 bullets; anything it points at "below" must still be
+        one of them. This is the instance that mattered most: the core is what a
+        reviewer that does not auto-load rule files actually reads."""
+        text = _normalize(CORE.read_text(encoding="utf-8"))
+        offenders = [p for p in ("guardrail below", "entry below", "rule below") if p in text]
+        assert not offenders, (
+            f"the core points at {offenders} - if the target moved into a rule file, "
+            "a reviewer reading only CLAUDE.md follows it to nothing"
+        )
+
+    def test_the_scan_detects_a_positional_reference_when_one_exists(self):
+        """Companion, so a scan that silently matched nothing could not pass.
+
+        The first cut asserted that these phrases appear somewhere in `docs/`,
+        which was a claim about an unrelated corpus and simply false. The
+        property that matters is that the DETECTOR fires, so it is tested
+        directly on synthetic text.
+        """
+        synthetic = _normalize("See the quality-assessor guardrail below for the rest.")
+        assert any(p in synthetic for p in POSITIONAL_REFERENCES)
+        clean = _normalize("See the quality-assessor guardrail in `.claude/rules/transcript.md`.")
+        assert not any(p in clean for p in POSITIONAL_REFERENCES)
