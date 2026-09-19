@@ -2,60 +2,71 @@
 
 **Question:** which model should re-derive the ~1,000 preview-era mindmaps, if any? Roughly $25 of spend plus a taxonomy rebuild and a re-index rides on it.
 
-**Verdict: the three models are indistinguishable, and the measurable gain is the PROMPT, not the model. If you re-derive, use the incumbent `gemini-3.7-flash`. Whether to re-derive at all is a spend decision, not a measurement one.**
+**Verdict: do not re-derive. The three models are indistinguishable from each other, and on a fair like-for-like comparison none of them beats the artifacts already on disk.**
+
+> **This card was corrected before merge.** The first version claimed the gain was PR #233's prompt fix. A claims audit found that a third of the sample's on-disk artifacts were built by a *different prompt on a different input modality*, which manufactured the entire apparent gain. The corrected analysis is below, and the retraction is kept rather than quietly edited out - see "What the first version got wrong".
 
 ## Sample
 
-30 preview-era videos with Gemini transcripts and mindmaps on disk, across 25 channels, including `ashmaurya` (4 videos) as the low-entity-density control. **27 of 30 carry a canonical name** derived from the video description, against the ticket's abandon floor of 20. 138 distinct canonical names; 355 ground-truth name groups in total.
+30 preview-era videos with Gemini transcripts and mindmaps on disk, **one video each from 30 distinct channels**. All 30 verified preview-era (`model: gemini-3-flash-preview` in every meta, processed 2026-04-02 to 2026-08-14). **27 of 30 carry a description-derived canonical name**, against the ticket's abandon floor of 20. 355 ground-truth name groups.
 
-Ground truth is description-derived canonical names (GitHub `owner/repo` slugs and product domains, with channel-boilerplate domains excluded) unioned with the repeated-proper-noun transcript heuristic - the same scorer as PR #233, now with the description half actually populated, which it was not when the original claim was made.
+**There is no low-entity-density control channel.** The sample builder was written to include `ashmaurya` for that purpose and silently included none, because `ashmaurya` was ingested on 2026-09-17 and therefore has no preview-era artifacts at all. The one-video-per-channel shape gives breadth but provides no repeated-video variance check, so the between-roll SDs below are the only variance evidence this card carries.
 
-## Results
+Ground truth is description-derived canonical names unioned with the repeated-proper-noun transcript heuristic. **Its precision is imperfect**: spot-checking finds `engineerprompt.ai` and `ycombinator.com` (each channel's own domain), a rotating sponsor domain, and link shorteners among the "names". That junk is unreachable for every arm about equally, so it raises the noise floor rather than favouring one model - but the ground truth should not be described as clean.
 
-Two rolls per model, the shipped `mindmap-from-transcript.md` prompt, text-only against the on-disk transcripts. The on-disk arm is the existing artifact and has no roll variance by construction.
+## Headline result: the three models cannot be told apart
 
-| Arm | roll 0 | roll 1 | mean | between-roll SD | vs on-disk | guards |
-|---|---|---|---|---|---|---|
-| **on-disk** (preview-era artifacts) | - | - | **0.3481** | - | - | - |
-| `gemini-3-flash-preview` | 0.384 | 0.359 | **0.3715** | 0.0177 | +0.0234 | OK |
-| `gemini-3.7-flash` | 0.376 | 0.412 | **0.3940** | 0.0255 | +0.0459 | OK |
-| `gemini-3.8-flash` | 0.390 | 0.375 | **0.3825** | 0.0106 | +0.0344 | OK |
+Two rolls per model, the shipped `mindmap-from-transcript.md` prompt, text-only against the on-disk transcripts. Statistics computed from full-precision per-roll values, not from the rounded display column.
 
-All five guard metrics held on every roll at the calibrated 0.20 tolerance.
+| Arm | roll 0 | roll 1 | mean | between-roll SD | guards |
+|---|---|---|---|---|---|
+| `gemini-3-flash-preview` | 0.38398 | 0.35929 | **0.37164** | 0.01746 | OK |
+| `gemini-3.7-flash` | 0.37639 | 0.41182 | **0.39411** | 0.02505 | OK |
+| `gemini-3.8-flash` | 0.39047 | 0.37516 | **0.38281** | 0.01082 | OK |
 
-## The ticket's own abandon criterion fires
+**The ticket's pre-registered abandon criterion fires.** Largest between-roll SD **0.02505** exceeds the best between-model difference **0.02247**. The instrument cannot resolve which model is better, and more rolls would only measure the null more precisely.
 
-> *"the first roll shows between-roll SD exceeding the best between-model difference - the instrument cannot resolve the question, and more rolls only buy precision on a null"*
+An independent check corroborates it. Per-video paired comparison across 29 commonly-scored videos: preview against 3.7 is 7 wins / 10 losses / 12 ties; 3.7 against 3.8 is 13 / 10 / 6. **No model dominates the pairing.**
 
-- Best between-model difference: **0.0225** (0.3715 to 0.3940)
-- Largest between-roll SD: **0.0255**
+## The comparison that decides the spend, done like-for-like
 
-**0.0255 > 0.0225.** The instrument cannot tell the three models apart. Do not read 3.7's 0.394 as better than 3.8's 0.383 or preview's 0.372 - that ordering is inside the noise, and more rolls would only measure the null more precisely.
+The whole-sample numbers above cannot be compared against the on-disk arm, because **10 of the 30 on-disk artifacts were not built from a transcript at all**:
 
-## What the measurement DOES resolve, and it is not what the ticket expected
+| on-disk `prompt` provenance | count |
+|---|---|
+| `mindmap-from-transcript` | 20 |
+| `mindmap-knowledge` (video path) | 6 |
+| absent (legacy) | 4 |
 
-Every model, including **`gemini-3-flash-preview` itself**, scores higher than the preview-era artifacts on disk. Same model, same transcripts, same scorer: **0.3715 today against 0.3481 on disk.**
+`mindmap-knowledge` consumes video frames and audio, not the transcript text. For those 10 videos "same transcripts, same scorer, only the prompt differs" is simply untrue - the on-disk artifact never saw the transcript.
 
-The only variable between those two numbers is the prompt. Those artifacts were generated before PR #233 added the naming rule to `mindmap-from-transcript.md`.
+Restricting to the **20 videos whose on-disk artifact genuinely came from `mindmap-from-transcript`** (19 score, one has no ground truth) gives the only apples-to-apples test of whether re-generating helps:
 
-**So the gain on offer is the prompt fix, not a model upgrade.** That reframes the decision: re-derivation buys #233's naming improvement across ~1,000 artifacts, and the model you use to buy it does not measurably matter.
+| Arm | matched-subset mean recall (n=19) | vs on-disk |
+|---|---|---|
+| **on-disk** | **0.3539** | - |
+| `gemini-3-flash-preview` | 0.3450 | **-0.0089** |
+| `gemini-3.7-flash` | 0.3585 | +0.0046 |
+| `gemini-3.8-flash` | 0.3483 | -0.0056 |
 
-It also closes the loop on the original claim. PR #233 reported on-disk 0.415 against 0.274 for "today's model" and read it as a model-era regression. Issue #235 diagnosed that as a sampling confound. This run confirms the direction is in fact **reversed**: today's models on today's prompt beat the artifacts on disk, by about 0.02 to 0.05.
+**The cleanest available comparison - the same model, re-run today, against its own output on disk - shows no gain and a slight loss.** All three deltas are far inside the roll-to-roll spread on this subset (3.7's two rolls were 0.320 and 0.397).
 
-## Decision rule, applied literally
+So the decision rule's "beats the on-disk arm by more than the between-roll SD" test **fails for every model** once the comparison is made fairly. Per the rule's own second clause, the on-disk artifacts stay and re-derivation closes as not worth it.
 
-> *"a model is preferred for re-derivation only if its mean recall beats the on-disk arm by more than the between-roll SD on that sample, with every guard holding."*
+## What the first version of this card got wrong
 
-All three models clear it. But since they cannot be told apart from each other, "preferred" collapses to "any of them", and the correct default is the incumbent - there is no evidence to justify a switch, and the repo's standing rule is that `DEFAULT_MODEL` changes only on a measured scorecard.
+It reported +0.0234 to +0.0459 against on-disk across the whole 30-video sample and read that as PR #233's naming rule paying off.
+
+**That gain lives almost entirely in the 10 mismatched videos.** On those, the video-sourced on-disk artifact scores ~0.337 while every arm's transcript-sourced regeneration scores 0.41 to 0.49. That is the already-documented transcript-versus-video modality effect - CLAUDE.md records it as transcript-sourced 0.393 against video-sourced lower - and PR #233 never touched `mindmap-knowledge.md`.
+
+The error is worth naming precisely because it is the same shape as the one this ticket was filed to correct. Issue #235 exists because PR #233 compared two arms that differed in more than the variable being studied. **The first version of this card did it again, one layer down.** The lesson is not "check the sample" in the abstract - it is that a provenance field (`meta.json`'s `prompt`) recorded the answer the whole time and was never read.
 
 ## What this does NOT establish
 
-- **That 3.8 is better or worse than 3.7 for anything.** This measured the mindmap step only, text-only, on 30 videos. The transcript step is issue #219 and is a different measurement on a different harness.
-- **That the recall gain is worth $25.** +0.046 mean recall is roughly a 13% relative improvement on a metric whose ground truth is part heuristic. That is a spend judgment, and it belongs to the operator.
-- **Generalization beyond these 30 videos.** Two rolls over one sample says nothing about unseen videos, and the sample skews to channels that carry description links.
+- **That re-derivation could never help.** It establishes that on 19 like-for-like videos it does not, by a margin the instrument cannot resolve. A different sample, or a metric other than named-entity recall, could say otherwise.
+- **Anything about 3.8 for the transcript step.** That is issue #219, a different harness and a different measurement.
+- **Generalization.** Two rolls over one sample, skewed toward channels that carry description links, says nothing about unseen videos.
 
 ## Cost
 
-665,610 prompt tokens per arm (identical across all three - same inputs), 148,764 to 202,476 output tokens per arm. 180 text calls total. Comfortably inside the ticket's $6 hard cap.
-
-Nothing was written into the corpus. Generated mindmaps went to a scratch directory.
+665,610 prompt tokens per arm (identical across all three - same inputs), 148,764 to 202,476 output tokens per arm, 180 text calls. Inside the ticket's $6 hard cap. Nothing was written into the corpus; generated mindmaps went to a scratch directory.
