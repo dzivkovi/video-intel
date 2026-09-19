@@ -60,7 +60,7 @@ def paths(tmp_path):
 
 
 def _stub_captions(monkeypatch, snippets, *, generated: bool = True):
-    monkeypatch.setattr(vi, "fetch_english_captions", lambda _vid: _captions(snippets, generated=generated))
+    monkeypatch.setattr(vi, "fetch_english_captions", lambda _vid, **_kw: _captions(snippets, generated=generated))
 
 
 def _write_flagged_gemini_meta(paths, **extra) -> None:

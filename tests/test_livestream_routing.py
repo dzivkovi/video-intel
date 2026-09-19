@@ -74,7 +74,7 @@ def _stub_gemini(monkeypatch, *, prompt_tokens=5000, payload=None, raises=None, 
 def _stub_captions(monkeypatch, captions, *, fetches=None):
     """Stub fetch_english_captions; `fetches` (a list) records every fetch."""
 
-    def fake_fetch(video_id):
+    def fake_fetch(video_id, **_kw):
         if fetches is not None:
             fetches.append(video_id)
         return captions

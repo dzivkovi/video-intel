@@ -100,7 +100,7 @@ class TestEveryWriterPersistsItToDisk:
         assert _meta(chan, "2026-09-11-test")["description"] == DESC
 
     def test_captions_writer(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(vi, "fetch_english_captions", lambda vid: CaptionsResult([(0.0, "hi")], True, "en"))
+        monkeypatch.setattr(vi, "fetch_english_captions", lambda vid, **_kw: CaptionsResult([(0.0, "hi")], True, "en"))
         chan = tmp_path / "chan"
         chan.mkdir()
         vi.process_transcript(

@@ -192,7 +192,7 @@ class TestCaptionsSource:
         calls = []
         _stub_gemini(monkeypatch, prompt_tokens=5000, calls=calls)
         monkeypatch.setattr(
-            vi, "fetch_english_captions", lambda vid: CaptionsResult([(0.0, "spoken words")], True, "en")
+            vi, "fetch_english_captions", lambda vid, **_kw: CaptionsResult([(0.0, "spoken words")], True, "en")
         )
         (_, status), tpath, mpath = _run(tmp_path, "yt-captions")
         assert "captions" in status
@@ -202,7 +202,7 @@ class TestCaptionsSource:
 
     def test_yt_captions_no_captions_errors(self, tmp_path, monkeypatch):
         _stub_gemini(monkeypatch, prompt_tokens=5000)
-        monkeypatch.setattr(vi, "fetch_english_captions", lambda vid: None)
+        monkeypatch.setattr(vi, "fetch_english_captions", lambda vid, **_kw: None)
         (_, status), tpath, _ = _run(tmp_path, "yt-captions")
         assert "no captions" in status
         assert not tpath.exists()
@@ -213,7 +213,7 @@ class TestCaptionsSource:
         monkeypatch.setattr(
             vi,
             "fetch_english_captions",
-            lambda vid: CaptionsResult([(5.0, "before"), (15.0, "inside"), (25.0, "after")], True, "en"),
+            lambda vid, **_kw: CaptionsResult([(5.0, "before"), (15.0, "inside"), (25.0, "after")], True, "en"),
         )
         (_, status), tpath, _ = _run(tmp_path, "yt-captions", start_offset=10, end_offset=20)
         assert "captions" in status
@@ -226,7 +226,7 @@ class TestAutoFailover:
     def test_auto_falls_back_on_gemini_exception(self, tmp_path, monkeypatch):
         _stub_gemini(monkeypatch, prompt_tokens=5000, raises=RuntimeError("400 INVALID_ARGUMENT"))
         monkeypatch.setattr(
-            vi, "fetch_english_captions", lambda vid: CaptionsResult([(0.0, "fallback text")], True, "en")
+            vi, "fetch_english_captions", lambda vid, **_kw: CaptionsResult([(0.0, "fallback text")], True, "en")
         )
         (_, status), _, mpath = _run(tmp_path, "auto")
         assert "captions" in status
@@ -237,7 +237,7 @@ class TestAutoFailover:
     def test_auto_falls_back_on_confabulation(self, tmp_path, monkeypatch):
         _stub_gemini(monkeypatch, prompt_tokens=0, payload=_CONFAB_PAYLOAD)
         monkeypatch.setattr(
-            vi, "fetch_english_captions", lambda vid: CaptionsResult([(0.0, "real captions")], True, "en")
+            vi, "fetch_english_captions", lambda vid, **_kw: CaptionsResult([(0.0, "real captions")], True, "en")
         )
         (_, status), _, mpath = _run(tmp_path, "auto")
         assert "captions" in status
@@ -245,7 +245,7 @@ class TestAutoFailover:
 
     def test_auto_no_captions_falls_through_to_gemini_error(self, tmp_path, monkeypatch):
         _stub_gemini(monkeypatch, prompt_tokens=5000, raises=RuntimeError("boom"))
-        monkeypatch.setattr(vi, "fetch_english_captions", lambda vid: None)
+        monkeypatch.setattr(vi, "fetch_english_captions", lambda vid, **_kw: None)
         (_, status), tpath, _ = _run(tmp_path, "auto")
         assert status.startswith("error")
         assert not tpath.exists()
@@ -255,7 +255,9 @@ class TestAutoFailover:
         # the bounded retries are exhausted, auto falls back to captions.
         _stub_gemini(monkeypatch, prompt_tokens=5000, raw_text="this is not json at all {{{")
         monkeypatch.setattr(
-            vi, "fetch_english_captions", lambda vid: CaptionsResult([(0.0, "salvaged via captions")], True, "en")
+            vi,
+            "fetch_english_captions",
+            lambda vid, **_kw: CaptionsResult([(0.0, "salvaged via captions")], True, "en"),
         )
         (_, status), _, mpath = _run(tmp_path, "auto")
         assert "captions" in status
