@@ -118,9 +118,8 @@ class TestEveryGuardrailStillResolves:
             if probe and probe not in haystack:
                 unresolved.append((g["slug"], probe))
 
-        assert not unresolved, (
-            "these guardrails resolve nowhere - they were deleted, not moved:\n"
-            + "\n".join(f"  {s}: looked for {p!r}" for s, p in unresolved)
+        assert not unresolved, "these guardrails resolve nowhere - they were deleted, not moved:\n" + "\n".join(
+            f"  {s}: looked for {p!r}" for s, p in unresolved
         )
 
     def test_the_resolution_check_is_not_vacuous(self):
@@ -180,10 +179,7 @@ class TestEveryNamedTestContractExists:
     pointing at a test file that does not exist is a rule nobody can verify."""
 
     def test_no_named_test_file_is_missing(self):
-        text = "\n".join(
-            [CORE.read_text(encoding="utf-8")]
-            + [p.read_text(encoding="utf-8") for p in _rule_files()]
-        )
+        text = "\n".join([CORE.read_text(encoding="utf-8")] + [p.read_text(encoding="utf-8") for p in _rule_files()])
         named = sorted({m for m in re.findall(r"tests/[A-Za-z0-9_/]+\.py", text)})
         assert len(named) >= 50, f"only {len(named)} test contracts found; the text looks truncated"
         missing = [t for t in named if not (ROOT / t).exists()]
