@@ -1,0 +1,222 @@
+{
+ "engineerprompt/2026-02-28-the-problem-every-ai-company-is-hiding": [
+  "axios.com",
+  "bain.com",
+  "bloomberg.com",
+  "datacenterknowledge.com",
+  "deloitte.com",
+  "engineerprompt.ai",
+  "everstream.ai",
+  "github.com",
+  "google-gemini/gemini-cli",
+  "ko-fi.com",
+  "networkworld.com",
+  "openai.com",
+  "pcgamer.com",
+  "theregister.com",
+  "tinyurl.com",
+  "venturebeat.com"
+ ],
+ "mark_kashef/2024-05-19-how-to-add-claude-in-chatgpt": [
+  "collabedit.com",
+  "promptadvisers.com",
+  "replit.com"
+ ],
+ "natebjones/2025-11-30-agents-will-kill-your-ul-by-2026-unless-you-build-this-instead": [],
+ "chase_h_ai/2026-03-21-10-cli-tools-that-make-claude-code-unstoppable": [
+  "AlexsJones/llmfit",
+  "FFmpeg/FFmpeg",
+  "HKUDS/CLI-Anything",
+  "cli/cli",
+  "github.com",
+  "googleworkspace/cli",
+  "microsoft/playwright-cli",
+  "stripe/stripe-cli",
+  "supabase/cli",
+  "teng-lin/notebooklm-py",
+  "vercel/vercel"
+ ],
+ "seankochel/2025-10-07-9-mcp-servers-thatll-make-vibe-coders-cry-tears-of-joy": [
+  "github.com",
+  "github/github-mcp-server",
+  "linear.app",
+  "microsoft/playwright-mcp",
+  "perplexity.ai",
+  "pieces.app",
+  "semgrep/semgrep",
+  "smithery.ai",
+  "supabase.com",
+  "upstash/context7"
+ ],
+ "ycombinator/2026-01-29-why-your-startup-website-isnt-converting": [
+  "getalai.com",
+  "juicebox.ai",
+  "leapingai.com",
+  "lumari.io",
+  "thehog.ai",
+  "ycombinator.com"
+ ],
+ "thenextnewthingai/2026-02-11-just-give-claude-these-skills": [
+  "coreyhaines31/marketingskills",
+  "github.com",
+  "thenextnewthing.ai"
+ ],
+ "aidotengineer/2025-08-06-2025-is-the-year-of-evals-just-like-2024-and-2023-and-john-dickerson-ceo-mozilla": [
+  "jpdickerson.com",
+  "mozilla.ai"
+ ],
+ "everyinc/2026-08-12-microsofts-vision-for-an-internet-made-for-agents-with-cto-kevin-scott-best-of-t": [
+  "attio.com",
+  "features/copilot",
+  "github.com",
+  "microsoft/NLWeb"
+ ],
+ "samwitteveenai/2026-01-21-beating-cowork-with-open-source-cowork": [
+  "eigent-ai/eigent",
+  "eigent.ai",
+  "github.com",
+  "samwit/llm-tutorials"
+ ],
+ "simonscrapes/2026-04-23-every-claude-code-memory-system-compared-so-you-dont-have-to": [
+  "MemPalace/mempalace",
+  "NateBJones-Projects/OB1",
+  "dub.sh",
+  "github.com",
+  "mem0.ai",
+  "zilliztech/memsearch"
+ ],
+ "gregisenberg/2025-07-23-the-6-best-ai-agency-niches-to-make-50kmo-data-backed": [
+  "boringmarketing.com",
+  "graphed.com",
+  "ideabrowser.com",
+  "thevibemarketer.com"
+ ],
+ "arize/2026-06-08-how-phoenix-became-the-standard-for-ai-observability": [
+  "Arize-ai/phoenix",
+  "arize.com",
+  "github.com"
+ ],
+ "brockmesarich/2026-07-06-master-claude-for-marketing-in-72-minutes-full-course": [
+  "aquavoice.com",
+  "blotato.com",
+  "firecrawl.dev",
+  "higgsfield.ai"
+ ],
+ "vanishinggradients/2026-01-09-beyond-vibe-coding-learn-effective-ai-assisted-coding-in-4-minutes": [
+  "github.com",
+  "intellectronica/wikipedia-flashcards-agent",
+  "luma.com",
+  "maven.com"
+ ],
+ "colemedin/2026-03-05-is-software-engineering-finally-dead": [
+  "anthropic.com",
+  "dynamous.ai",
+  "entrepreneur.com",
+  "fortune.com",
+  "futurism.com",
+  "lennysnewsletter.com",
+  "opsera.ai",
+  "storyboard18.com",
+  "techcrunch.com",
+  "tomshardware.com",
+  "ycombinator.com"
+ ],
+ "graceleungyl/2025-12-16-claude-code-just-built-me-an-ai-agent-team-claude-code-skills-mcp": [
+  "anthropics/skills",
+  "clickhubspot.com",
+  "github.com",
+  "graceleung.com",
+  "modelcontextprotocol/servers"
+ ],
+ "austinmarchese/2026-05-11-how-y-combinators-ceo-actually-uses-claude-code": [
+  "accio.com",
+  "buildpartner.ai",
+  "garrytan/gstack",
+  "github.com",
+  "the-ai-playbook.com"
+ ],
+ "ramjad/2026-02-06-learn-claude-code-agent-teams-in-12-minutes": [
+  "anthropic.com",
+  "anthropics/claude-code",
+  "anthropics/claudes-c-compiler",
+  "cal.com",
+  "github.com",
+  "hyperwhisper.com",
+  "impello.ai",
+  "marckrenn/claude-code-changelog",
+  "ray-amjad/hyperwhisper-app",
+  "rayamjad.com"
+ ],
+ "twist/2026-07-10-danny-bernstein-left-big-tech-to-fund-farm-bots-e2310": [
+  "amazon.com",
+  "bonsairobotics.ai",
+  "capitalfactory.com",
+  "deere.com",
+  "driscolls.com",
+  "figma.com",
+  "naturipefarms.com",
+  "netsuite.ai",
+  "squarespace.com",
+  "taproduce.com",
+  "taylorfarms.com",
+  "therobotreport.com",
+  "wga.com",
+  "wonderful.com",
+  "ysecurity.io"
+ ],
+ "claude/2026-05-27-the-problem-solvers-michele-catasta-at-replit": [
+  "claude.com"
+ ],
+ "saminyasar/2026-06-24-claude-seedance-25-just-changed-content-creation-forever-tutorial": [
+  "Samin12/first-last-frame-video-skill",
+  "Samin12/property-marketing-kit",
+  "github.com",
+  "higgsfield.ai"
+ ],
+ "benai92/2026-05-20-every-claude-cowork-feature-explained-clearly": [
+  "apify.com",
+  "make.com",
+  "promptcowboy.ai",
+  "relevanceai.com",
+  "sendspark.com"
+ ],
+ "sean-c-davis/2026-04-19-automating-content-production-tasks-with-claude-cowork": [],
+ "indydevdan/2026-06-01-pi-coding-agent-observability-html-specs-with-gemini-35-flash-and-gpt-image-2": [
+  "agenticengineer.com",
+  "claude.com",
+  "disler/pi-agent-observability",
+  "earendil-works/pi-mono",
+  "github.com",
+  "openai.com",
+  "pi.dev"
+ ],
+ "propertydaily/2025-11-30-can-toronto-homeowners-keep-paying-their-mortgages-under-pressure": [],
+ "systemsmadebetter/2026-06-20-i-used-claude-to-optimise-my-site-for-ai-search-seo": [
+  "AgricIDaniel/claude-seo",
+  "bettercreating.com",
+  "forbes.com",
+  "github.com",
+  "tinyurl.com",
+  "vercel.com"
+ ],
+ "matgpod/2026-06-03-how-to-use-codex-as-your-ai-data-analyst": [
+  "clickhubspot.com",
+  "openai.com",
+  "sundaskhalid.com"
+ ],
+ "lennyspodcast/2025-07-20-anthropic-co-founder-agi-predictions-leaving-openai-what-keeps-him-up-at-night-b": [
+  "amazon.com",
+  "anthropic.com",
+  "assemblyai.com",
+  "fin.ai",
+  "lennysnewsletter.com",
+  "lucidlink.com",
+  "marketingaiinstitute.com",
+  "netflix.com",
+  "sauce.app",
+  "unitree.com"
+ ],
+ "tripledart/2026-06-24-how-to-become-a-better-performance-marketer-ppc-fundamentals-explained-ai-workfl": [
+  "tripledart.com"
+ ]
+}
