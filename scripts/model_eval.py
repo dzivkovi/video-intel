@@ -50,6 +50,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import yaml
 
 import video_intel as v
+from timestamp_utils import timestamp_tolerance
 
 REPO = Path(__file__).resolve().parent.parent
 _FIXTURES_REAL = REPO / "tests" / "evals" / "model_fixtures.yaml"
@@ -93,8 +94,20 @@ def _secs(stamp: str) -> int | None:
     return None
 
 
-def score(raw: str, usage: dict, model: str, seg_secs: int, wall: float | None) -> dict:
-    """Score one run. Every field here is a dimension a model can regress on."""
+def score(
+    raw: str,
+    usage: dict,
+    model: str,
+    seg_secs: int,
+    wall: float | None,
+    start_secs: int | None = None,
+) -> dict:
+    """Score one run. Every field here is a dimension a model can regress on.
+
+    ``start_secs`` (issue #219) is the fixture's requested ``start`` offset. It
+    is what lets a cell state whether it actually measured the window it asked
+    for. Default ``None`` keeps every pre-#219 caller scoring exactly as before.
+    """
     parsed, err = v.try_parse_transcript_json(raw)
     # A top-level list is Gemini returning the envelope wrapped in an array. The
     # pipeline recovers from it, but it IS a malformation and a model that emits
@@ -111,6 +124,25 @@ def score(raw: str, usage: dict, model: str, seg_secs: int, wall: float | None) 
     # trailing gap even though its text may run to the end.
     trailing = (seg_secs - (stamps[-1] - stamps[0])) if stamps else seg_secs
     chars = sum(len(e.get("text") or "") for e in tr)
+
+    # Issue #219: does this cell measure the window it asked for?
+    #
+    # Issue #141 spent weeks on a suspicion that `start_offset` had stopped
+    # clipping, and the harness could not answer it. Worse, `trailing` goes
+    # NEGATIVE when the returned span runs past the window, and
+    # `max(gaps + [trailing])` then silently discards it - so an unclipped cell
+    # scored as if nothing were wrong. A scorecard that cannot tell a clipped
+    # run from an unclipped one cannot defend its own cost numbers.
+    #
+    # `start_secs is None` means the caller did not say, so no claim is made -
+    # NOT that the window was fine.
+    tol = timestamp_tolerance(seg_secs)
+    window_exceeded = None
+    first_stamp_offset = None
+    if start_secs is not None and stamps:
+        first_stamp_offset = stamps[0] - start_secs
+        span_end = stamps[-1] - start_secs
+        window_exceeded = bool(span_end > seg_secs + tol or abs(first_stamp_offset) > tol)
 
     pin, pout, promo = PRICING.get(model, (None, None, None))
     itok = usage.get("prompt") or 0
@@ -129,6 +161,10 @@ def score(raw: str, usage: dict, model: str, seg_secs: int, wall: float | None) 
         "max_gap_s": max(gaps + [trailing]) if (gaps or stamps) else None,
         "median_gap_s": sorted(gaps)[len(gaps) // 2] if gaps else None,
         "trailing_gap_s": trailing if stamps else None,
+        # None = not checked (caller passed no start), True = this cell did not
+        # measure its window and must not feed the verdict means.
+        "window_exceeded": window_exceeded,
+        "first_stamp_offset_s": first_stamp_offset,
         "chars": chars,
         "screen_content": len(env.get("screen_content") or []),
         "speakers": len(env.get("speakers") or []),
@@ -210,10 +246,21 @@ def run_one(client, types, fx: dict, model: str, thinking: str | None, seg: int,
         raw_p.write_text(raw, encoding="utf-8")
         use_p.write_text(json.dumps(usage), encoding="utf-8")
         print(f"  [live]   {tag}  {wall:.1f}s")
-    row = score(raw, usage, model, seg, wall)
+    row = score(raw, usage, model, seg, wall, start_secs=fx.get("start"))
     row["fixture"] = fx["id"]
     row["prompt_override"] = override
     return row
+
+
+def cell_measured_its_window(row: dict) -> bool:
+    """False only when this cell is KNOWN to have missed its window (#219).
+
+    `window_exceeded` is tri-state and the distinction is load-bearing: `None`
+    means no claim was made (the caller passed no `start_secs`, or nothing came
+    back to measure), and treating that as a failure would drop every legacy
+    cached row out of the verdict. Only an explicit `True` excludes a cell.
+    """
+    return row.get("window_exceeded") is not True
 
 
 def render(rows: list[dict], models: list[str], manifest: dict, incumbent: str | None) -> str:
@@ -245,14 +292,23 @@ def render(rows: list[dict], models: list[str], manifest: dict, incumbent: str |
         ("spk", "speakers", 4),
         ("think", "thinking_tok", 6),
         ("$/vid-hr", "cost_per_video_hour", 9),
+        # Issue #219: a reader of the rendered card must be able to see that a
+        # cell did not measure its own window. Without this column the flag
+        # existed only in the JSON sidecar, which nothing read.
+        ("window", "window_ok", 8),
     ]
     out.append("| " + " | ".join(c[0] for c in cols) + " |")
     out.append("|" + "|".join("---" for _ in cols) + "|")
     for r in rows:
         if r.get("error"):
-            out.append(f"| {r['fixture']} | {r['model']} | **ERROR** | | | | | | |")
-            out.append(f"| | | `{r['error']}` | | | | | | |")
+            out.append(f"| {r['fixture']} | {r['model']} | **ERROR** | | | | | | | |")
+            out.append(f"| | | `{r['error']}` | | | | | | | |")
             continue
+        # Rendered, not just stored: "WINDOW MISSED" is what a human sees.
+        r = dict(r)
+        r["window_ok"] = (
+            "**MISSED**" if r.get("window_exceeded") is True else ("ok" if r.get("window_exceeded") is False else "-")
+        )
         out.append("| " + " | ".join(str(r.get(c[1], "")) for c in cols) + " |")
     out += ["", "## Per-facet notes", ""]
     by_id = {f["id"]: f for f in manifest["fixtures"]}
@@ -263,10 +319,21 @@ def render(rows: list[dict], models: list[str], manifest: dict, incumbent: str |
         for m in models:
             if m == incumbent:
                 continue
-            mine = [r for r in rows if r["model"] == m and not r.get("error")]
-            theirs = [r for r in rows if r["model"] == incumbent and not r.get("error")]
+            # Issue #219: a cell that did not measure its own window must not
+            # feed the comparison that decides a model swap. Its max_gap_s can
+            # look healthy (see the test contract) and its cost is derived from
+            # tokens billed for a window it did not get.
+            mine = [r for r in rows if r["model"] == m and not r.get("error") and cell_measured_its_window(r)]
+            theirs = [r for r in rows if r["model"] == incumbent and not r.get("error") and cell_measured_its_window(r)]
+            excluded = sum(1 for r in rows if r["model"] in (m, incumbent) and r.get("window_exceeded") is True)
+            if excluded:
+                out.append(
+                    f"- **{excluded} cell(s) excluded from this comparison: the returned span "
+                    f"did not match the requested window.** Their numbers describe a different "
+                    f"segment than the fixture asked for."
+                )
             if not mine or not theirs:
-                out.append(f"- `{m}`: insufficient data (a run errored).")
+                out.append(f"- `{m}`: insufficient data (a run errored, or every cell missed its window).")
                 continue
             g_new = [r["max_gap_s"] for r in mine if r["max_gap_s"] is not None]
             g_old = [r["max_gap_s"] for r in theirs if r["max_gap_s"] is not None]
