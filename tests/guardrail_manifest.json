@@ -1,0 +1,468 @@
+{
+ "captured_from": "CLAUDE.md at 787f321, before the issue #242 split",
+ "baseline_chars": 274900,
+ "baseline_bullets": 59,
+ "guardrails": [
+  {
+   "slug": "bounded-retries-only",
+   "title": "Bounded retries only",
+   "tests": [],
+   "chars_before": 319
+  },
+  {
+   "slug": "prompt-is-a-refusal-on-every",
+   "title": "`prompt == 0` is a refusal on every Gemini-watches-the-video call: `process_transcript` (single-shot), `process_mindmap(source=\"video\")`, and each chu",
+   "tests": [
+    "tests/test_captions_failover.py",
+    "tests/test_chunked_confab_guard.py",
+    "tests/test_gemini_common.py",
+    "tests/test_mindmap_confabulation_guard.py",
+    "tests/test_usage_shape_guard_parity.py",
+    "tests/usage_shapes.py"
+   ],
+   "chars_before": 5069
+  },
+  {
+   "slug": "completed-livestream-vods-route-captions-first",
+   "title": "Completed-livestream VODs route captions-first and never get a fallback mindmap-from-video call (issue #120)",
+   "tests": [
+    "tests/test_livestream_routing.py"
+   ],
+   "chars_before": 4596
+  },
+  {
+   "slug": "writer-side-meta-reads-go-through",
+   "title": "Writer-side meta reads go through `_read_meta_best_effort`, never a bare `json.loads`, and the two failure classes stay apart (issue #124)",
+   "tests": [
+    "tests/test_meta_best_effort.py"
+   ],
+   "chars_before": 3303
+  },
+  {
+   "slug": "cmd_transcript-and-_cmd_process_url-resolve-the-channel",
+   "title": "`cmd_transcript` and `_cmd_process_url` resolve the channel dict through `channel_config_by_name`, and every config-reading decision on one invocation",
+   "tests": [
+    "tests/test_manual_url_transcript_source.py"
+   ],
+   "chars_before": 2354
+  },
+  {
+   "slug": "scan-chunks-too-and-an-output",
+   "title": "`scan` chunks too, and an output-cap truncation has its own status (issue #128)",
+   "tests": [
+    "tests/test_output_cap_truncation.py"
+   ],
+   "chars_before": 3386
+  },
+  {
+   "slug": "a-dropped-socket-is-retried-once",
+   "title": "A dropped socket is retried once; a refusal never is; and a step that produced nothing exits 3 (issue #129)",
+   "tests": [
+    "tests/test_transcript_quality_guard.py",
+    "tests/test_transport_retry_and_partial_exit.py"
+   ],
+   "chars_before": 7296
+  },
+  {
+   "slug": "a-test-that-asserts-on-an",
+   "title": "A test that asserts on an exit code must assert the CODE, not merely that `SystemExit` was raised (issue #185)",
+   "tests": [
+    "tests/test_file_size_guard_exit.py"
+   ],
+   "chars_before": 1666
+  },
+  {
+   "slug": "a-verifier-must-use-the-writer",
+   "title": "A verifier must use the WRITER's path, never re-derive its own - and the test that proves it cannot be a stub test",
+   "tests": [
+    "tests/test_transport_retry_and_partial_exit.py"
+   ],
+   "chars_before": 1999
+  },
+  {
+   "slug": "concept-accumulation-during-batch-extraction-is",
+   "title": "Concept accumulation during batch extraction is ONE helper, `accumulate_concepts_into_taxonomy`, never two copies (issue #176; ADR-0010)",
+   "tests": [
+    "tests/test_concepts_accumulation.py"
+   ],
+   "chars_before": 5797
+  },
+  {
+   "slug": "a-healthy-shaped-transcript-can-still",
+   "title": "A healthy-shaped transcript can still be silently corrupt, and `assess_transcript_artifact` is the one place that judges it (issue #157)",
+   "tests": [
+    "tests/test_chunk_window_mismatch.py",
+    "tests/test_chunked_transcript.py",
+    "tests/test_transcript_quality_guard.py"
+   ],
+   "chars_before": 15850
+  },
+  {
+   "slug": "topics-are-a-curation-layer-and",
+   "title": "Topics are a curation layer, and `topics.json` is derived from its inputs, never negotiated with (issue #146)",
+   "tests": [
+    "tests/test_config_backup.py",
+    "tests/test_topics.py"
+   ],
+   "chars_before": 17756
+  },
+  {
+   "slug": "timestamp-helpers-live-in-scripts-timestamp_utils",
+   "title": "Timestamp helpers live in `scripts/timestamp_utils.py`, and that module is the import-weight firebreak (issue #152)",
+   "tests": [
+    "tests/test_intel_graph.py",
+    "tests/test_timestamp_utils.py",
+    "tests/test_utils.py"
+   ],
+   "chars_before": 2061
+  },
+  {
+   "slug": "chunked-transcription-caps-gemini-s-thinking",
+   "title": "Chunked transcription caps Gemini's thinking budget",
+   "tests": [],
+   "chars_before": 1282
+  },
+  {
+   "slug": "scan-has-no-artifact-of-its",
+   "title": "`scan` has no artifact of its own, so a mindmap-less channel needs a different completion marker (issue #226)",
+   "tests": [
+    "tests/test_scan_completion_mode.py"
+   ],
+   "chars_before": 3260
+  },
+  {
+   "slug": "captions_over_duration_seconds-routes-a-long-video-to",
+   "title": "`captions_over_duration_seconds` routes a long video to the free caption track instead of dropping it, and it deliberately BEATS the max-duration guar",
+   "tests": [
+    "tests/test_captions_over_duration.py"
+   ],
+   "chars_before": 4826
+  },
+  {
+   "slug": "config-snapshots-are-automatic-and-mandatory",
+   "title": "Config snapshots are AUTOMATIC and mandatory; never re-document them as a manual step",
+   "tests": [
+    "tests/test_channelless_snapshot_guard.py",
+    "tests/test_config_backup.py"
+   ],
+   "chars_before": 7259
+  },
+  {
+   "slug": "the-mindmap-prompt-keeps-naming-load",
+   "title": "The mindmap prompt keeps naming load-bearing, and the EXAMPLE is half of why (issue #228)",
+   "tests": [
+    "tests/evals/mindmap_entity_recall.py",
+    "tests/test_mindmap_naming_rule.py"
+   ],
+   "chars_before": 6138
+  },
+  {
+   "slug": "the-transcript-model-is-chosen-by",
+   "title": "The transcript model is chosen by MEASUREMENT against the incumbent, never by spec sheet - and the invariant is BOUNDED thinking, not zero",
+   "tests": [
+    "tests/test_per_step_models.py"
+   ],
+   "chars_before": 2586
+  },
+  {
+   "slug": "voyage-batch-halving-has-a-floor",
+   "title": "Voyage batch-halving has a floor",
+   "tests": [
+    "tests/test_index.py"
+   ],
+   "chars_before": 1288
+  },
+  {
+   "slug": "wrapper-normalization-runs-at-both-the",
+   "title": "Wrapper normalization runs at BOTH the full-parse and salvage layers",
+   "tests": [],
+   "chars_before": 884
+  },
+  {
+   "slug": "cyrillic-stripping-is-scoped-to-_normalize_task_wrapper",
+   "title": "Cyrillic stripping is scoped to `_normalize_task_wrapper` only",
+   "tests": [],
+   "chars_before": 541
+  },
+  {
+   "slug": "a-scoped-write-must-be-scoped",
+   "title": "A scoped write must be scoped on BOTH sides - what it collects AND what it replaces (issue #183)",
+   "tests": [
+    "tests/test_scoped_index.py"
+   ],
+   "chars_before": 5373
+  },
+  {
+   "slug": "probe-before-you-pay",
+   "title": "Probe before you pay",
+   "tests": [],
+   "chars_before": 408
+  },
+  {
+   "slug": "timestamps-are-data-not-decoration",
+   "title": "Timestamps are data, not decoration",
+   "tests": [],
+   "chars_before": 355
+  },
+  {
+   "slug": "a-parser-s-accepted-timestamp-shape",
+   "title": "A parser's accepted timestamp shape must match what the WRITER emits, and the minute field is UNBOUNDED (issue #195)",
+   "tests": [
+    "tests/test_chunk_boundary_minutes.py"
+   ],
+   "chars_before": 4780
+  },
+  {
+   "slug": "an-eval-number-is-only-a",
+   "title": "An eval number is only a retrieval measurement once the ruler is proven intact (issue #190)",
+   "tests": [
+    "tests/evals/test_instrument.py",
+    "tests/evals/test_metrics.py",
+    "tests/test_hybrid_search_dedup.py"
+   ],
+   "chars_before": 7760
+  },
+  {
+   "slug": "the-living-docs-are-checked-against",
+   "title": "The living docs are checked against the CLI mechanically (issue #204)",
+   "tests": [
+    "tests/test_default_prompt_name.py",
+    "tests/test_docs_currency.py"
+   ],
+   "chars_before": 5923
+  },
+  {
+   "slug": "manual-url-channel-resolution-is-one",
+   "title": "Manual `--url` channel resolution is ONE helper pair, never a private copy (issue #205)",
+   "tests": [
+    "tests/test_manual_url_channel_matching.py"
+   ],
+   "chars_before": 8472
+  },
+  {
+   "slug": "config-channels-has-one-reader-configured_channels",
+   "title": "`config[\"channels\"]` has ONE reader, `configured_channels`, and `strict` is the design decision (issue #213)",
+   "tests": [
+    "tests/test_configured_channels.py"
+   ],
+   "chars_before": 4395
+  },
+  {
+   "slug": "default_prompt-has-one-fallback-default_prompt_name-issue",
+   "title": "`default_prompt` has ONE fallback, `DEFAULT_PROMPT_NAME` (issue #210)",
+   "tests": [
+    "tests/test_default_prompt_name.py"
+   ],
+   "chars_before": 4090
+  },
+  {
+   "slug": "a-prompt-name-becomes-a-path",
+   "title": "A prompt name becomes a path in ONE place, and an override never resolves silently or by accident (issue #221)",
+   "tests": [
+    "tests/test_channel_knob_preflight.py",
+    "tests/test_prompt_dirs.py"
+   ],
+   "chars_before": 3928
+  },
+  {
+   "slug": "a-refused-caption-request-is-not",
+   "title": "A refused caption request is not a video without captions, and the library already knew (issue #231)",
+   "tests": [
+    "tests/test_captions_block_vs_absent.py"
+   ],
+   "chars_before": 4457
+  },
+  {
+   "slug": "a-model-scorecard-states-whether-it",
+   "title": "A model scorecard states whether it measured the window it asked for (issue #219, carried from #141)",
+   "tests": [
+    "tests/test_model_eval_window_fidelity.py"
+   ],
+   "chars_before": 1899
+  },
+  {
+   "slug": "skill-parity-same-diff-not-follow",
+   "title": "Skill-parity: same diff, not follow-up",
+   "tests": [],
+   "chars_before": 378
+  },
+  {
+   "slug": "paraphrase-verification-uses-search-vector-not",
+   "title": "Paraphrase verification uses `search --vector`, not `Grep`",
+   "tests": [],
+   "chars_before": 423
+  },
+  {
+   "slug": "video-id-is-the-identity-slug",
+   "title": "Video id is the identity, slug is decoration",
+   "tests": [],
+   "chars_before": 522
+  },
+  {
+   "slug": "every-writer-that-replaces-a-transcript",
+   "title": "Every writer that REPLACES a transcript owns every field that describes that transcript (issue #182)",
+   "tests": [
+    "tests/test_captions_quality_flags.py"
+   ],
+   "chars_before": 6823
+  },
+  {
+   "slug": "the-youtube-description-rides-the-identity",
+   "title": "The YouTube `description` rides the identity seam and must never reach the index (issue #224)",
+   "tests": [
+    "tests/test_video_description.py"
+   ],
+   "chars_before": 2954
+  },
+  {
+   "slug": "every-transcript-meta-write-stamps-full",
+   "title": "Every transcript meta write stamps full identity",
+   "tests": [
+    "tests/test_identity_meta.py"
+   ],
+   "chars_before": 1085
+  },
+  {
+   "slug": "shorts-identity-is-duration-s-or",
+   "title": "Shorts identity is `duration < 60s OR /shorts/<id> HEAD returns 200`",
+   "tests": [],
+   "chars_before": 635
+  },
+  {
+   "slug": "prune-shorts-deletion-uses-an-explicit",
+   "title": "Prune-shorts deletion uses an explicit suffix allowlist, not a wildcard glob",
+   "tests": [
+    "tests/test_skip_shorts.py"
+   ],
+   "chars_before": 643
+  },
+  {
+   "slug": "dedupe-s-canonical-selection-must-re",
+   "title": "Dedupe's canonical selection must re-use `transcript_quality_flags_are_severe()`, never re-implement severity (issue #159; hardened by a dual-review p",
+   "tests": [
+    "tests/test_transcript_quality_guard.py",
+    "tests/test_video_id_dedup.py"
+   ],
+   "chars_before": 3683
+  },
+  {
+   "slug": "out-of-scope-for-cleanup-flags",
+   "title": "Out of scope for cleanup flags",
+   "tests": [],
+   "chars_before": 357
+  },
+  {
+   "slug": "skip-is-per-mode-now-skip_modes",
+   "title": "Skip is per-mode now (`skip_modes` array), not a boolean",
+   "tests": [],
+   "chars_before": 905
+  },
+  {
+   "slug": "long-video-transcript-guard-runs-in",
+   "title": "Long-video transcript guard runs in `cmd_scan`'s transcript loop, not the mindmap loop",
+   "tests": [
+    "tests/test_skip_long_videos.py"
+   ],
+   "chars_before": 762
+  },
+  {
+   "slug": "per-transcript-timeout-uses-a-daemon",
+   "title": "Per-transcript timeout uses a daemon thread, never `ThreadPoolExecutor` or `signal.alarm`",
+   "tests": [
+    "tests/test_transcript_timeout.py"
+   ],
+   "chars_before": 916
+  },
+  {
+   "slug": "skip_video_ids-is-the-reactive-cost-saving",
+   "title": "`skip_video_ids` is the reactive cost-saving primitive; runs pre-enrich",
+   "tests": [],
+   "chars_before": 820
+  },
+  {
+   "slug": "headline-digest-headline_digest-true-is-a",
+   "title": "Headline digest (`headline_digest: true`) is a bounded, reversible reporting feature - never a discovery framework (issue #113)",
+   "tests": [
+    "tests/test_headline_digest.py"
+   ],
+   "chars_before": 3199
+  },
+  {
+   "slug": "one-compiled-interest-model-ranks-both",
+   "title": "One compiled interest model ranks BOTH personalized surfaces (issue #115)",
+   "tests": [
+    "tests/test_personalization_profile.py"
+   ],
+   "chars_before": 5014
+  },
+  {
+   "slug": "chunked-transcript-voice-dedup-is-by",
+   "title": "Chunked-transcript voice dedup is by name, not voice integer",
+   "tests": [],
+   "chars_before": 761
+  },
+  {
+   "slug": "a-malformed-gemini-entry-must-never",
+   "title": "A malformed Gemini entry must never crash an already-paid transcript call, on EITHER merge layer, and not just inside the merge functions themselves",
+   "tests": [
+    "tests/test_chunked_merge_malformed_entries.py",
+    "tests/test_merge_malformed_entries.py",
+    "tests/test_transcript_quality_guard.py"
+   ],
+   "chars_before": 8733
+  },
+  {
+   "slug": "both-process-url-and-process-file",
+   "title": "Both `process --url` AND `process --file` chunk the transcript on long videos",
+   "tests": [],
+   "chars_before": 967
+  },
+  {
+   "slug": "both-process-url-and-process-file-2",
+   "title": "Both `process --url` AND `process --file` invert ordering: transcript first, mindmap-from-transcript second",
+   "tests": [
+    "tests/test_mindmap_from_transcript.py"
+   ],
+   "chars_before": 1244
+  },
+  {
+   "slug": "resolve_mindmap_source-four-value-contract-is-load",
+   "title": "`resolve_mindmap_source` four-value contract is load-bearing",
+   "tests": [
+    "tests/test_transcript_quality_guard.py"
+   ],
+   "chars_before": 2614
+  },
+  {
+   "slug": "config-knob-resolvers-resolve_transcript_source-resolve_mindmap_source-are",
+   "title": "Config-knob resolvers (`resolve_transcript_source`, `resolve_mindmap_source`) are guarded at EVERY call site - single-video, scan-per-channel, AND the",
+   "tests": [
+    "tests/test_chunk_minutes_guards.py"
+   ],
+   "chars_before": 7730
+  },
+  {
+   "slug": "validate_channel_knobs-makes-scan-dry-run-a",
+   "title": "`validate_channel_knobs` makes `scan --dry-run` a real preflight, and it is REPORT-ONLY - moving a skip into it is a behavior change, not a fix (issue",
+   "tests": [
+    "tests/test_channel_knob_preflight.py",
+    "tests/test_manual_url_transcript_source.py"
+   ],
+   "chars_before": 16143
+  },
+  {
+   "slug": "mindmap-is-the-ai-s-discovery",
+   "title": "Mindmap is the AI's discovery surface and must always run on `process --url`",
+   "tests": [],
+   "chars_before": 429
+  },
+  {
+   "slug": "mindmap-from-video-and-single-shot",
+   "title": "Mindmap-from-video and single-shot transcript default to `MEDIA_RESOLUTION_LOW`",
+   "tests": [
+    "tests/test_mindmap_media_resolution.py"
+   ],
+   "chars_before": 1323
+  }
+ ]
+}
