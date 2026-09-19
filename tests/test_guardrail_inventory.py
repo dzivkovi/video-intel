@@ -26,6 +26,7 @@ nowhere is a protection that was deleted rather than moved.
 from __future__ import annotations
 
 import json
+import pathlib
 import re
 from pathlib import Path
 
@@ -172,6 +173,56 @@ class TestARuleFileCanActuallyLoad:
         fm = _frontmatter(RULES_DIR / path)
         dead = [g for g in (fm.get("paths") or []) if not list(ROOT.glob(g))]
         assert not dead, f"{path} declares globs that match no file: {dead}"
+
+
+#: The file each rule's content is ABOUT. Declaring globs that match something
+#: is not the same as declaring the trigger that makes the rule fire when its
+#: own subject is edited - a reviewer falsified the weaker check by replacing
+#: search-index.md's entire path list with README.md, and all 27 cases still
+#: passed while the rule had stopped firing for `scripts/video_intel.py`.
+REQUIRED_TRIGGERS = {
+    "transcript.md": ["scripts/video_intel.py", "scripts/youtube_captions.py"],
+    "scan-config.md": ["scripts/video_intel.py"],
+    "search-index.md": ["scripts/video_intel.py"],
+    "evals.md": ["scripts/model_eval.py"],
+    "briefings.md": ["scripts/video_intel.py"],
+    "docs-currency.md": ["tests/test_docs_currency.py", "README.md"],
+    "intelligence-layer.md": ["scripts/intel_graph.py"],
+    "translate-bcs.md": ["scripts/translate_video.py"],
+}
+
+
+class TestEachRuleFiresForTheCodeItGoverns:
+    """The gap between "this glob matches a file" and "this rule loads when its
+    own subject is edited".
+
+    A rule about the transcript path that lists only test files never fires
+    during a transcript edit. Nothing reports that; the rule simply stops
+    protecting anything, which is the silent-deletion failure this whole ticket
+    exists to prevent, one layer down.
+    """
+
+    def test_the_trigger_map_covers_every_rule_file(self):
+        """A new rule file must be classified, exactly like CONFIG_BACKUP_COMMANDS.
+        Without this, adding one silently opts it out of the coverage check."""
+        on_disk = {p.name for p in _rule_files()}
+        assert on_disk == set(REQUIRED_TRIGGERS), (
+            f"rule files without a declared trigger: {sorted(on_disk - set(REQUIRED_TRIGGERS))}; "
+            f"triggers naming no rule file: {sorted(set(REQUIRED_TRIGGERS) - on_disk)}"
+        )
+
+    @pytest.mark.parametrize("name", sorted(REQUIRED_TRIGGERS))
+    def test_the_rule_declares_a_path_matching_its_own_subject(self, name):
+        rule = RULES_DIR / name
+        if not rule.exists():
+            pytest.skip(f"{name} not present")
+        globs = _frontmatter(rule).get("paths") or []
+        for required in REQUIRED_TRIGGERS[name]:
+            covered = any(required == g or pathlib.PurePath(required).match(g) for g in globs)
+            assert covered, (
+                f"{name} declares no path matching {required}, the file its own content "
+                f"governs, so it will not load when that file is edited. Declared: {globs}"
+            )
 
 
 class TestEveryNamedTestContractExists:
