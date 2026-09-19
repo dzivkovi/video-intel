@@ -46,6 +46,8 @@ description: >
 
 # Video Intel
 
+**Editing this plugin's code?** The per-subsystem review guardrails are NOT all in `CLAUDE.md`. They live in `.claude/rules/*.md` and auto-load when a session reads a matching source path - `transcript.md`, `scan-config.md`, `search-index.md`, `evals.md`, `briefings.md`, `docs-currency.md`, `intelligence-layer.md`, `translate-bcs.md`. They are binding. A reviewer that does not auto-load them (Codex reads `AGENTS.md` and `CLAUDE.md` only) must be handed the file for the subsystem under review.
+
 Multimodal video scanning and transcription powered by Gemini.
 
 ## What This Skill Does
