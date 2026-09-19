@@ -283,8 +283,15 @@ class TestDatedSnapshotsAreImmutable:
         backup_config_if_changed(corpus, config_path=cfg)
         cfg.write_bytes(CFG_B)
         backup_config_if_changed(corpus, config_path=cfg)
-        cfg.write_bytes(b"model: x\nchannels: []\n")
+        # A third DISTINCT edit. It used to be `channels: []`, chosen only as
+        # an arbitrary third variant - but issue #156 now declines a
+        # channel-less config that would overwrite a channel-ful record, so
+        # that fixture exercised the new guard rather than the suffix
+        # numbering this test is about. The intent is unchanged; only the
+        # variant is.
+        cfg.write_bytes(b"model: x\nchannels:\n  - name: gamma\n")
         third = backup_config_if_changed(corpus, config_path=cfg)
+        assert third is not None, "a third channel-ful edit must still snapshot"
         assert third.name.endswith("-3.yaml"), third.name
 
 

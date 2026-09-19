@@ -563,6 +563,49 @@ CONFIG_BACKUP_COMMANDS = frozenset(
 )
 
 
+def _config_bytes_declare_channels(raw: bytes) -> bool | None:
+    """Does this config text name any usable channel? (issue #156)
+
+    Returns True/False, or **None when the question cannot be answered** - an
+    unparseable config, or one whose top level is not a mapping. None is not
+    False: refusing to snapshot on a parse failure would invent a new way for
+    the backup to stop backing up, which is the exact failure mode the whole
+    feature exists to prevent (invariant 4).
+
+    Channel-counting goes through `configured_channels`, never a re-derived
+    `raw.get("channels")`: that helper is the ONE reader of the key (issue
+    #213) and already knows the four ordinary YAML shapes that name no usable
+    channel. A second definition here is how the two would drift.
+    """
+    try:
+        parsed = yaml.safe_load(raw.decode("utf-8"))
+    except Exception:
+        # Deliberately broad, and the width is the point. This is the FIRST
+        # code path in this function's history that semantically parses
+        # `config.latest.yaml` - before it, `latest` was only ever byte-compared
+        # - so it is a new risk surface on a file nobody validates.
+        #
+        # A narrow `(yaml.YAMLError, UnicodeDecodeError, ValueError)` tuple was
+        # the first cut and a review reproduced its gap: a deeply nested
+        # document raises `RecursionError`, which is none of those. That escapes
+        # into `cmd_scan`'s own unwrapped call to `backup_config_if_changed`
+        # (the deliberate "point of record, before any fetch" duplicate), where
+        # `main()`'s bare try/finally has no `except` - so a corrupted backup
+        # mirror would crash an entire scan on an otherwise healthy corpus.
+        # That directly contradicts this function's invariant 3, "it never
+        # aborts the caller".
+        #
+        # The contract here is already "None means cannot tell", and EVERY
+        # failure to parse means exactly that, so there is no shape for which a
+        # narrower catch would give a better answer - only shapes for which it
+        # gives a traceback instead of an answer. Same reasoning as
+        # `_read_meta_best_effort`'s deliberately broad catch.
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return bool(configured_channels(parsed, strict=False))
+
+
 def backup_config_if_changed(output_dir: Path, *, config_path: Path | None = None) -> Path | None:
     """Mirror the resolved config into ``output_dir/_config-backups/`` when it changed.
 
@@ -597,6 +640,17 @@ def backup_config_if_changed(output_dir: Path, *, config_path: Path | None = Non
        reproduces the exact month-long gap this function exists to prevent.
     5. **Env-var-resolved configs are skipped, loudly.** ``VIDEO_INTEL_OUTPUT_DIR``
        names a directory, not a config file, so there are no bytes to copy.
+    6. **A channel-less config never overwrites a channel-ful record** (issue
+       #156). ``config.yaml`` is gitignored, so a worktree resolves the
+       user-level ``~/.video-intel/config.yaml`` - which points at the SAME
+       corpus and has no ``channels:`` at all. Observed on the live corpus
+       2026-08-23: a 778-byte channel-less snapshot landed beside 40KB
+       59-channel ones. That run got lucky on ordering; had it run last,
+       ``config.latest.yaml`` would claim zero channels and every later scan
+       would content-compare against a record that is actively wrong.
+       The rule is about the RESOLVED CONFIG, not about which command
+       resolved it - the ``nugget`` exemption in ``WRITES_BUT_EXEMPT`` is one
+       instance of this hazard, not the whole of it.
     """
     source = config_path if config_path is not None else _LAST_RESOLVED_PATH
     if source is None:
@@ -621,6 +675,34 @@ def backup_config_if_changed(output_dir: Path, *, config_path: Path | None = Non
         # Unreadable latest is not proof the config is unchanged, so fall
         # through and write a fresh snapshot rather than assume safety.
         log.warning("Config backup: cannot read %s (%s); writing a new snapshot.", latest, e)
+
+    # Issue #156: refuse to let a channel-less config overwrite a record that
+    # HAS channels. Narrow on purpose - only the zero-vs-nonzero case, never a
+    # "large drop" heuristic. A deliberate prune from 59 channels to 3 is a
+    # legitimate edit that must still snapshot, and "how big a drop is
+    # suspicious" is exactly the kind of invented threshold this repo has
+    # learned not to ship (issue #228).
+    incoming_has_channels = _config_bytes_declare_channels(current)
+    if incoming_has_channels is False:
+        try:
+            latest_bytes = latest.read_bytes() if latest.exists() else None
+        except OSError as e:
+            # Unreadable latest is not evidence it is channel-less, and the
+            # fall-through above already decided to write a fresh snapshot.
+            log.warning("Config backup: cannot read %s to check it for channels (%s).", latest, e)
+            latest_bytes = None
+        if latest_bytes is not None and _config_bytes_declare_channels(latest_bytes):
+            log.warning(
+                "Config backup DECLINED: the resolved config (%s, via %s) names no channels, "
+                "but %s does. Refusing to overwrite the record of the channel list that "
+                "produced this corpus. This is the expected result when running from a git "
+                "worktree or any checkout with no plugin-local config.yaml - the corpus is "
+                "untouched and nothing else about this command is affected.",
+                source,
+                _LAST_RESOLVED_SOURCE or "unknown",
+                latest.name,
+            )
+            return None
 
     stamp = datetime.now(UTC).strftime("%Y-%m-%d")
     try:

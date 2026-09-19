@@ -258,7 +258,21 @@ class TestTheAccessorIsTheOnlyReader:
                     # `strict=True` -> always strict. `strict=not args.channel`
                     # -> strict for a whole-list run, which is what the rule is
                     # about, so it counts as strict here. No keyword -> lenient.
-                    is_strict = strict_kw is not None
+                    #
+                    # Issue #156 added the first EXPLICIT `strict=False` call
+                    # site, and presence-only classification called it strict -
+                    # recording a lenient caller as strict in the very table
+                    # whose job is accurate classification. A literal bool is
+                    # now read for its VALUE; any non-literal (the
+                    # `not args.channel` shape) keeps the presence rule.
+                    if strict_kw is None:
+                        is_strict = False
+                    elif isinstance(strict_kw.value, ast.Constant) and isinstance(
+                        strict_kw.value.value, bool
+                    ):
+                        is_strict = strict_kw.value.value
+                    else:
+                        is_strict = True
                     found[fn.name] = found.get(fn.name, False) or is_strict
 
         # The one place that is neither: the accessor's own recursion-free body.
@@ -302,6 +316,10 @@ class TestRequireChannelsConfigNoLongerAcceptsTruthyGarbage:
 # for a whole-list run and lenient when a channel is named, which is why they
 # read as strict here.
 EXPECTED_STRICTNESS = {
+    # Issue #156. Lenient on purpose: this runs inside `backup_config_if_changed`,
+    # which must never abort the command that triggered it (invariant 3), and
+    # `strict=True` would sys.exit out of a backup helper.
+    "_config_bytes_declare_channels": False,
     "require_channels_config": False,
     "cmd_scan": True,
     "cmd_concepts": True,
