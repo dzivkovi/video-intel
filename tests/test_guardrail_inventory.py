@@ -184,3 +184,72 @@ class TestEveryNamedTestContractExists:
         assert len(named) >= 50, f"only {len(named)} test contracts found; the text looks truncated"
         missing = [t for t in named if not (ROOT / t).exists()]
         assert not missing, f"guardrails name test files that do not exist: {missing}"
+
+
+class TestTheCitationMechanismHolds:
+    """Six cross-cutting principles are stated once in the core and cited by
+    tag from the rule files, so a per-feature entry keeps the case-specific
+    WHAT and drops the re-derivation of WHY.
+
+    A citation pointing at a tag that does not exist is a dangling reference
+    in a binding rules file: the reader is told to go somewhere that has
+    nothing. That is the failure this guards.
+    """
+
+    #: A tag is short and never spans a line. The first cut used
+    #: ``[^\]]+`` which crossed newlines and swallowed whole paragraphs when
+    #: a bracket went unclosed, so the check reported nonsense instead of
+    #: dangling references.
+    TAG_RE = r"\[core: ([^\]\n]{1,24})\]"
+
+    #: A tag at the HEAD of a bullet defines the principle. The same tag
+    #: appearing inline is a citation, and the core is allowed to cite itself -
+    #: probe-before-pay cites real-caller for the ordering-test rule. Conflating
+    #: the two made "defined exactly once" fail on a legitimate cross-reference.
+    DEFINE_RE = r"(?m)^- \*\*\[core: ([^\]\n]{1,24})\]"
+
+    def _core_tags(self) -> set[str]:
+        """Tags DEFINED in the core, not merely mentioned."""
+        return set(re.findall(self.DEFINE_RE, CORE.read_text(encoding="utf-8")))
+
+    def test_the_core_defines_the_six_principles(self):
+        expected = {
+            "writer's-path",
+            "real-caller",
+            "identity #66",
+            "one-definition",
+            "probe-before-pay",
+            "#124 read-guard",
+        }
+        assert self._core_tags() == expected, (
+            "the core's principle tags changed. Adding one is fine, but every "
+            "rule-file citation of a removed tag becomes a dangling reference."
+        )
+
+    def test_every_citation_resolves_to_a_real_tag(self):
+        defined = self._core_tags()
+        dangling = []
+        for rf in _rule_files():
+            for tag in re.findall(self.TAG_RE, rf.read_text(encoding="utf-8")):
+                if tag not in defined:
+                    dangling.append((rf.name, tag))
+        assert not dangling, f"citations naming no core principle: {dangling}"
+
+    def test_a_tag_is_defined_exactly_once(self):
+        """Two canonical statements of one principle is the disease this whole
+        consolidation treats, one level up. Counts DEFINITIONS only: a core
+        bullet citing another core principle inline is correct and expected."""
+        tags = re.findall(self.DEFINE_RE, CORE.read_text(encoding="utf-8"))
+        dupes = {t for t in tags if tags.count(t) > 1}
+        assert not dupes, f"a principle is DEFINED more than once in the core: {sorted(dupes)}"
+
+    def test_the_core_cites_itself_at_least_once(self):
+        """Companion, so the definition-vs-citation distinction is not vacuous:
+        if the core stopped citing itself, `DEFINE_RE` and a plain tag search
+        would agree and the distinction above would be untested."""
+        defined = len(re.findall(self.DEFINE_RE, CORE.read_text(encoding="utf-8")))
+        mentioned = len(re.findall(self.TAG_RE, CORE.read_text(encoding="utf-8")))
+        assert mentioned > defined, (
+            "no core bullet cites another core principle, so the "
+            "definition-versus-citation distinction is currently unexercised"
+        )
