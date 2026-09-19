@@ -252,6 +252,17 @@ def run_one(client, types, fx: dict, model: str, thinking: str | None, seg: int,
     return row
 
 
+def cell_measured_its_window(row: dict) -> bool:
+    """False only when this cell is KNOWN to have missed its window (#219).
+
+    `window_exceeded` is tri-state and the distinction is load-bearing: `None`
+    means no claim was made (the caller passed no `start_secs`, or nothing came
+    back to measure), and treating that as a failure would drop every legacy
+    cached row out of the verdict. Only an explicit `True` excludes a cell.
+    """
+    return row.get("window_exceeded") is not True
+
+
 def render(rows: list[dict], models: list[str], manifest: dict, incumbent: str | None) -> str:
     stamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
     out = [f"# Model scorecard - {', '.join(models)}", "", f"Generated {stamp} by `scripts/model_eval.py`.", ""]
@@ -281,14 +292,23 @@ def render(rows: list[dict], models: list[str], manifest: dict, incumbent: str |
         ("spk", "speakers", 4),
         ("think", "thinking_tok", 6),
         ("$/vid-hr", "cost_per_video_hour", 9),
+        # Issue #219: a reader of the rendered card must be able to see that a
+        # cell did not measure its own window. Without this column the flag
+        # existed only in the JSON sidecar, which nothing read.
+        ("window", "window_ok", 8),
     ]
     out.append("| " + " | ".join(c[0] for c in cols) + " |")
     out.append("|" + "|".join("---" for _ in cols) + "|")
     for r in rows:
         if r.get("error"):
-            out.append(f"| {r['fixture']} | {r['model']} | **ERROR** | | | | | | |")
-            out.append(f"| | | `{r['error']}` | | | | | | |")
+            out.append(f"| {r['fixture']} | {r['model']} | **ERROR** | | | | | | | |")
+            out.append(f"| | | `{r['error']}` | | | | | | | |")
             continue
+        # Rendered, not just stored: "WINDOW MISSED" is what a human sees.
+        r = dict(r)
+        r["window_ok"] = (
+            "**MISSED**" if r.get("window_exceeded") is True else ("ok" if r.get("window_exceeded") is False else "-")
+        )
         out.append("| " + " | ".join(str(r.get(c[1], "")) for c in cols) + " |")
     out += ["", "## Per-facet notes", ""]
     by_id = {f["id"]: f for f in manifest["fixtures"]}
@@ -299,10 +319,21 @@ def render(rows: list[dict], models: list[str], manifest: dict, incumbent: str |
         for m in models:
             if m == incumbent:
                 continue
-            mine = [r for r in rows if r["model"] == m and not r.get("error")]
-            theirs = [r for r in rows if r["model"] == incumbent and not r.get("error")]
+            # Issue #219: a cell that did not measure its own window must not
+            # feed the comparison that decides a model swap. Its max_gap_s can
+            # look healthy (see the test contract) and its cost is derived from
+            # tokens billed for a window it did not get.
+            mine = [r for r in rows if r["model"] == m and not r.get("error") and cell_measured_its_window(r)]
+            theirs = [r for r in rows if r["model"] == incumbent and not r.get("error") and cell_measured_its_window(r)]
+            excluded = sum(1 for r in rows if r["model"] in (m, incumbent) and r.get("window_exceeded") is True)
+            if excluded:
+                out.append(
+                    f"- **{excluded} cell(s) excluded from this comparison: the returned span "
+                    f"did not match the requested window.** Their numbers describe a different "
+                    f"segment than the fixture asked for."
+                )
             if not mine or not theirs:
-                out.append(f"- `{m}`: insufficient data (a run errored).")
+                out.append(f"- `{m}`: insufficient data (a run errored, or every cell missed its window).")
                 continue
             g_new = [r["max_gap_s"] for r in mine if r["max_gap_s"] is not None]
             g_old = [r["max_gap_s"] for r in theirs if r["max_gap_s"] is not None]

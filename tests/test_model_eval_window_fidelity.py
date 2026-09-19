@@ -26,7 +26,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from model_eval import score  # noqa: E402
+from model_eval import cell_measured_its_window, render, score  # noqa: E402
 
 USAGE = {"prompt": 1, "candidates": 1, "thoughts": 0}
 
@@ -156,3 +156,76 @@ class TestTheCachedRealRunsAllPass:
             checked += 1
 
         assert checked >= 4, f"only {checked} cached cells were checked; the cache looks incomplete"
+
+
+def _row(fixture, model, window_exceeded, *, max_gap=30, cost=0.3):
+    return {
+        "fixture": fixture,
+        "model": model,
+        "envelope_shape": "dict",
+        "segments": 20,
+        "max_gap_s": max_gap,
+        "screen_content": 1,
+        "speakers": 2,
+        "thinking_tok": 0,
+        "cost_per_video_hour": cost,
+        "window_exceeded": window_exceeded,
+    }
+
+
+MANIFEST = {"fixtures": [{"id": "a", "facet": "x"}, {"id": "b", "facet": "y"}]}
+
+
+class TestTheFlagReachesTheHumanFacingCard:
+    """A review found the first cut computed the flag and then nothing read it.
+    The in-code comment promised "must not feed the verdict means" and no
+    consumer enforced it, so a repeat of #141 would have produced the same
+    misleading scorecard. A flag only in a JSON sidecar nobody reads is not a
+    guard, it is a note to self."""
+
+    def test_a_missed_window_is_visible_in_the_rendered_table(self):
+        rows = [_row("a", "m1", False), _row("b", "m1", True)]
+        md = render(rows, ["m1"], MANIFEST, None)
+        assert "MISSED" in md, "a reader of the card cannot see that a cell missed its window"
+
+    def test_a_clean_cell_renders_as_ok_and_an_unchecked_one_does_not_claim(self):
+        md = render([_row("a", "m1", False), _row("b", "m1", None)], ["m1"], MANIFEST, None)
+        assert "| ok |" in md
+        assert "| - |" in md, "an unchecked cell must not be rendered as verified"
+
+
+class TestTheFlagReachesTheVerdict:
+    def test_a_missed_cell_is_excluded_from_the_comparison(self):
+        """Its max_gap_s can look perfectly healthy - that is the whole point of
+        the #141 shape - and its cost is derived from tokens billed for a window
+        it did not get."""
+        rows = [
+            _row("a", "m1", False, max_gap=30, cost=0.30),
+            _row("b", "m1", True, max_gap=30, cost=0.90),
+            _row("a", "m0", False, max_gap=40, cost=0.33),
+        ]
+        md = render(rows, ["m0", "m1"], MANIFEST, "m0")
+        assert "excluded from this comparison" in md
+        assert "1 cell(s) excluded" in md
+
+    def test_a_clean_run_says_nothing_about_exclusions(self):
+        """The note must not fire on healthy data, or it becomes noise."""
+        rows = [_row("a", "m1", False), _row("a", "m0", False)]
+        md = render(rows, ["m0", "m1"], MANIFEST, "m0")
+        assert "excluded from this comparison" not in md
+
+    def test_legacy_rows_with_no_flag_are_still_compared(self):
+        """Every cached row predating #219 has no `window_exceeded` key.
+        Dropping those would empty the verdict for the incumbent's own card."""
+        rows = [_row("a", "m1", None), _row("a", "m0", None)]
+        md = render(rows, ["m0", "m1"], MANIFEST, "m0")
+        assert "insufficient data" not in md
+        assert "excluded from this comparison" not in md
+
+
+class TestTheHelperIsTriState:
+    def test_only_an_explicit_true_excludes(self):
+        assert cell_measured_its_window({"window_exceeded": False}) is True
+        assert cell_measured_its_window({"window_exceeded": None}) is True
+        assert cell_measured_its_window({}) is True
+        assert cell_measured_its_window({"window_exceeded": True}) is False
