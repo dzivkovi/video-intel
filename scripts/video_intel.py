@@ -574,7 +574,27 @@ def _config_bytes_declare_channels(raw: bytes) -> bool | None:
     """
     try:
         parsed = yaml.safe_load(raw.decode("utf-8"))
-    except (yaml.YAMLError, UnicodeDecodeError, ValueError):
+    except Exception:
+        # Deliberately broad, and the width is the point. This is the FIRST
+        # code path in this function's history that semantically parses
+        # `config.latest.yaml` - before it, `latest` was only ever byte-compared
+        # - so it is a new risk surface on a file nobody validates.
+        #
+        # A narrow `(yaml.YAMLError, UnicodeDecodeError, ValueError)` tuple was
+        # the first cut and a review reproduced its gap: a deeply nested
+        # document raises `RecursionError`, which is none of those. That escapes
+        # into `cmd_scan`'s own unwrapped call to `backup_config_if_changed`
+        # (the deliberate "point of record, before any fetch" duplicate), where
+        # `main()`'s bare try/finally has no `except` - so a corrupted backup
+        # mirror would crash an entire scan on an otherwise healthy corpus.
+        # That directly contradicts this function's invariant 3, "it never
+        # aborts the caller".
+        #
+        # The contract here is already "None means cannot tell", and EVERY
+        # failure to parse means exactly that, so there is no shape for which a
+        # narrower catch would give a better answer - only shapes for which it
+        # gives a traceback instead of an answer. Same reasoning as
+        # `_read_meta_best_effort`'s deliberately broad catch.
         return None
     if not isinstance(parsed, dict):
         return None

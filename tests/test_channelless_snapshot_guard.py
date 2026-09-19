@@ -223,3 +223,42 @@ class TestTheHelperReusesTheOneReader:
             src = tmp_path / "config.yaml"
             src.write_bytes(raw)
             assert vi.backup_config_if_changed(tmp_path, config_path=src) is None
+
+
+class TestReadingTheRecordCanNeverCrashTheCaller:
+    """Found by review, reproduced live: the first cut caught only
+    `(yaml.YAMLError, UnicodeDecodeError, ValueError)`.
+
+    This PR introduced the FIRST code path that semantically parses
+    `config.latest.yaml` - before it, `latest` was only ever byte-compared - so
+    it is a new risk surface on a file nobody validates. A deeply nested
+    document raises `RecursionError`, which none of those three cover, and it
+    escapes into `cmd_scan`'s own UNWRAPPED call to `backup_config_if_changed`
+    (the deliberate "point of record, before any fetch" duplicate). `main()`'s
+    dispatch is a bare try/finally with no `except`, so a corrupted backup
+    mirror would end an entire scan on an otherwise healthy corpus - a direct
+    contradiction of invariant 3, "it never aborts the caller".
+    """
+
+    def test_a_recursion_bomb_in_latest_does_not_escape(self, tmp_path, monkeypatch):
+        _seed_latest(tmp_path, b"a: " + b"[" * 3000 + b"]" * 3000)
+        # Must return, not raise. Writing is the CORRECT outcome: an unparseable
+        # record cannot be shown to have channels, so nothing is protected.
+        assert _run(tmp_path, CHANNELLESS, monkeypatch) is not None
+
+    def test_a_recursion_bomb_in_the_incoming_config_does_not_escape(self, tmp_path, monkeypatch):
+        _seed_latest(tmp_path, CHANNELFUL)
+        assert _run(tmp_path, b"a: " + b"[" * 3000 + b"]" * 3000, monkeypatch) is not None
+
+    def test_the_helper_answers_none_rather_than_raising(self):
+        """The contract is "None means cannot tell", and every parse failure
+        means exactly that - so there is no shape for which a narrower catch
+        gives a better answer, only shapes where it gives a traceback instead
+        of an answer."""
+        assert vi._config_bytes_declare_channels(b"a: " + b"[" * 3000 + b"]" * 3000) is None
+
+    def test_the_catch_is_broad_on_purpose(self):
+        """A future tidy-up narrowing this to specific exception types would
+        reopen the crash. Same reasoning as `_read_meta_best_effort`."""
+        code = _code_without_docstring(vi._config_bytes_declare_channels)
+        assert "except Exception:" in code, "the catch was narrowed; a parse failure must never reach the caller"
