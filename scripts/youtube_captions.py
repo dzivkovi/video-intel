@@ -44,6 +44,9 @@ CAPTIONS_FAILURE_EMPTY = "empty"
 CAPTIONS_FAILURE_NO_LIBRARY = "no_library"
 CAPTIONS_FAILURE_OTHER = "other"
 
+#: The sink is a diagnostic, not a transcript of the library.
+_REASON_MESSAGE_MAX_CHARS = 300
+
 #: Stated in the log and in the meta error so the operator is never told to run
 #: a recovery that cannot work. MEASURED 2026-09-18: a block observed at 01:38
 #: was still refusing the same three video ids at 19:30 - eighteen hours, not
@@ -59,7 +62,18 @@ CAPTIONS_BLOCK_RECOVERY = (
 #: rather than a direct import because `RequestBlocked`/`IpBlocked` do not
 #: exist in older `youtube-transcript-api` releases, and importing a missing
 #: name would break the whole captions path rather than degrade one branch.
-_BLOCKED_EXC_NAMES = ("RequestBlocked", "IpBlocked", "PoTokenRequired", "YouTubeRequestFailed")
+#: `YouTubeRequestFailed` is deliberately NOT here. Read the installed library:
+#: `_transcripts.py::_raise_http_errors` raises `IpBlocked` for **429 only** and
+#: `YouTubeRequestFailed` as the catch-all for everything else
+#: `raise_for_status()` can throw - 403, 404, 500, 502, 503, a transient blip -
+#: on any of three call sites. The 2026-09-18 measurement behind this feature is
+#: entirely about `IpBlocked`; extending "YouTube is refusing you, switch to
+#: gemini" to a one-off 5xx would be an unmeasured generalization, and the
+#: operator might flip a channel off captions permanently over a blip. It falls
+#: through to `other` and keeps the old, weaker wording, which is correct for an
+#: unknown failure. `FailedToCreateConsentCookie` is left in `other` for the
+#: same reason - refusal-adjacent, but unmeasured here.
+_BLOCKED_EXC_NAMES = ("RequestBlocked", "IpBlocked", "PoTokenRequired")
 _ABSENT_EXC_NAMES = ("NoTranscriptFound", "TranscriptsDisabled", "NotTranslatable")
 _VIDEO_EXC_NAMES = ("VideoUnavailable", "VideoUnplayable", "AgeRestricted", "InvalidVideoId")
 
@@ -141,7 +155,13 @@ def fetch_english_captions(video_id: str, *, reason_sink: dict | None = None) ->
             return
         reason_sink["kind"] = kind
         reason_sink["exception"] = type(exc).__name__ if exc is not None else None
-        reason_sink["message"] = str(exc) if exc is not None else ""
+        # Truncated: the library's IpBlocked/RequestBlocked text is a ~1100-char
+        # multi-paragraph essay about proxies and Webshare with README links.
+        # Nothing reads this field today, but an unbounded blob sitting in a
+        # dict that a future change might log or persist into meta.json is a
+        # trap worth closing while it costs one line.
+        raw_message = str(exc) if exc is not None else ""
+        reason_sink["message"] = raw_message[:_REASON_MESSAGE_MAX_CHARS]
 
     try:
         from youtube_transcript_api import (

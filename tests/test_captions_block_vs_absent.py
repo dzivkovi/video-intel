@@ -23,6 +23,7 @@ Two consequences shaped the fix, and both are pinned below.
 
 from __future__ import annotations
 
+import contextlib
 import sys
 from pathlib import Path
 
@@ -272,3 +273,150 @@ class TestTheSinkIsPerCallNotShared:
         assert "captions_reason: dict = {}" in branch, (
             "the reason sink must be constructed inside the yt-captions branch"
         )
+
+
+class TestNotEveryHttpFailureIsABlock:
+    """Both review layers converged on the most ambiguous classification in the
+    set, and the first cut got it wrong.
+
+    Read the installed library: `_transcripts.py::_raise_http_errors` raises
+    `IpBlocked` for **429 only**, and `YouTubeRequestFailed` as the catch-all
+    for everything else `raise_for_status()` can throw - 403, 404, 500, 502,
+    503, a transient network blip - across three separate call sites.
+
+    The 2026-09-18 measurement behind this whole feature is entirely about
+    `IpBlocked`. Telling an operator "YouTube is refusing you, switch to gemini"
+    after a one-off 5xx is an unmeasured generalization, and they might flip a
+    channel off captions permanently over a blip. It shipped in the first cut
+    with NO test case at all, which is exactly why it survived to review.
+    """
+
+    def test_a_generic_http_failure_is_not_reported_as_a_refusal(self):
+        exc = _make(E.YouTubeRequestFailed)
+        assert yc._exception_kind(exc) == yc.CAPTIONS_FAILURE_OTHER
+        assert yc.captions_failure_is_refusal(yc._exception_kind(exc)) is False
+
+    def test_a_generic_http_failure_keeps_the_weaker_wording(self, monkeypatch, tmp_path):
+        """Caller-level: a 500 must not produce the strong block message."""
+
+        class FakeApi:
+            def list(self, video_id):
+                raise _make(E.YouTubeRequestFailed)
+
+        monkeypatch.setattr("youtube_transcript_api.YouTubeTranscriptApi", lambda *a, **k: FakeApi())
+        recorded = {}
+        monkeypatch.setattr(vi, "_record_transcript_error", lambda path, msg, **kw: recorded.update(msg=msg))
+        _prefix, status = vi.process_transcript(
+            None,
+            None,
+            {
+                "video_id": "vid123",
+                "title": "T",
+                "published": "2026-09-18T00:00:00Z",
+                "url": "https://www.youtube.com/watch?v=vid123",
+            },
+            "prompt-text",
+            "model",
+            tmp_path,
+            "2026-09-18-t",
+            transcript_source="yt-captions",
+        )
+        assert status == "error: no captions available (yt-captions)"
+        assert yc.CAPTIONS_BLOCK_RECOVERY not in recorded["msg"], (
+            "a transient HTTP failure must not be given the 18-hour-block recovery"
+        )
+
+    def test_the_consent_cookie_failure_also_stays_out_of_blocked(self):
+        """Refusal-adjacent but unmeasured here. Left in `other` on purpose -
+        widening on a hunch is the same error as the one above, inverted."""
+        klass = getattr(E, "FailedToCreateConsentCookie", None)
+        if klass is None:
+            pytest.skip("not in this youtube-transcript-api version")
+        assert yc._exception_kind(_make(klass)) == yc.CAPTIONS_FAILURE_OTHER
+
+    @pytest.mark.parametrize(
+        "name,expected",
+        [
+            ("VideoUnplayable", yc.CAPTIONS_FAILURE_VIDEO),
+            ("InvalidVideoId", yc.CAPTIONS_FAILURE_VIDEO),
+            ("NotTranslatable", yc.CAPTIONS_FAILURE_ABSENT),
+        ],
+    )
+    def test_the_remaining_named_classes_are_covered_too(self, name, expected):
+        """Named in the partition but previously untested. Harmless while only
+        BLOCKED-vs-not is branched on, and a live gap the moment anything
+        differentiates VIDEO from ABSENT from OTHER."""
+        klass = getattr(E, name, None)
+        if klass is None:
+            pytest.skip(f"{name} not in this youtube-transcript-api version")
+        assert yc._exception_kind(_make(klass)) == expected
+
+
+class TestTheLivestreamCallSiteAlsoSaysWhichHappened:
+    """The second call site, found by the Codex peer pass. `process_transcript`
+    routes a completed-livestream VOD to captions FIRST (issue #120); that
+    branch asserted "livestream VOD with no caption track" unconditionally, so
+    a refusal was still misdiagnosed there after the shared fetcher had
+    classified it correctly - the same bug surviving at a different door."""
+
+    def _drive_livestream(self, monkeypatch, tmp_path, exc):
+        class FakeApi:
+            def list(self, video_id):
+                raise exc
+
+        monkeypatch.setattr("youtube_transcript_api.YouTubeTranscriptApi", lambda *a, **k: FakeApi())
+        monkeypatch.setattr(vi, "_record_transcript_error", lambda *a, **k: None)
+        # contextlib.suppress rather than try/except/pass: the guarded Gemini
+        # attempt that follows this branch cannot run with no client, and
+        # REACHING it is the point - the routing is unchanged, only the
+        # diagnosis logged on the way past differs.
+        with contextlib.suppress(Exception):
+            vi.process_transcript(
+                None,
+                None,
+                {
+                    "video_id": "vid123",
+                    "title": "T",
+                    "published": "2026-09-18T00:00:00Z",
+                    "url": "https://www.youtube.com/watch?v=vid123",
+                },
+                "prompt-text",
+                "model",
+                tmp_path,
+                "2026-09-18-t",
+                livestream_captions_first=True,
+            )
+
+    def test_a_refusal_is_not_called_an_absent_caption_track(self, monkeypatch, tmp_path, caplog):
+        with caplog.at_level("INFO", logger="video_intel"):
+            self._drive_livestream(monkeypatch, tmp_path, _make(E.IpBlocked))
+        msgs = [r.getMessage() for r in caplog.records]
+        assert not any("livestream VOD with no caption track" in m for m in msgs), (
+            "a refused request is still being reported as an absent caption track"
+        )
+        assert any("REFUSED" in m for m in msgs)
+
+    def test_a_genuine_absence_keeps_the_original_livestream_wording(self, monkeypatch, tmp_path, caplog):
+        with caplog.at_level("INFO", logger="video_intel"):
+            self._drive_livestream(monkeypatch, tmp_path, _make(E.NoTranscriptFound))
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any("livestream VOD with no caption track" in m for m in msgs), (
+            "the correct wording for a real absence was lost"
+        )
+
+
+class TestTheSinkStaysADiagnosticNotATranscript:
+    def test_the_stored_message_is_bounded(self, monkeypatch):
+        """The library's IpBlocked text is a ~1100-character essay about proxies
+        with README links. Nothing reads this field today; an unbounded blob in
+        a dict a future change might log or persist is a trap worth closing."""
+
+        class FakeApi:
+            def list(self, video_id):
+                raise _make(E.IpBlocked)
+
+        monkeypatch.setattr("youtube_transcript_api.YouTubeTranscriptApi", lambda *a, **k: FakeApi())
+        sink: dict = {}
+        yc.fetch_english_captions("vid", reason_sink=sink)
+        assert len(sink["message"]) <= yc._REASON_MESSAGE_MAX_CHARS
+        assert sink["exception"] == "IpBlocked", "the useful field must survive truncation"
