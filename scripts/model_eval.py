@@ -50,6 +50,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import yaml
 
 import video_intel as v
+from timestamp_utils import timestamp_tolerance
 
 REPO = Path(__file__).resolve().parent.parent
 _FIXTURES_REAL = REPO / "tests" / "evals" / "model_fixtures.yaml"
@@ -93,8 +94,20 @@ def _secs(stamp: str) -> int | None:
     return None
 
 
-def score(raw: str, usage: dict, model: str, seg_secs: int, wall: float | None) -> dict:
-    """Score one run. Every field here is a dimension a model can regress on."""
+def score(
+    raw: str,
+    usage: dict,
+    model: str,
+    seg_secs: int,
+    wall: float | None,
+    start_secs: int | None = None,
+) -> dict:
+    """Score one run. Every field here is a dimension a model can regress on.
+
+    ``start_secs`` (issue #219) is the fixture's requested ``start`` offset. It
+    is what lets a cell state whether it actually measured the window it asked
+    for. Default ``None`` keeps every pre-#219 caller scoring exactly as before.
+    """
     parsed, err = v.try_parse_transcript_json(raw)
     # A top-level list is Gemini returning the envelope wrapped in an array. The
     # pipeline recovers from it, but it IS a malformation and a model that emits
@@ -111,6 +124,25 @@ def score(raw: str, usage: dict, model: str, seg_secs: int, wall: float | None) 
     # trailing gap even though its text may run to the end.
     trailing = (seg_secs - (stamps[-1] - stamps[0])) if stamps else seg_secs
     chars = sum(len(e.get("text") or "") for e in tr)
+
+    # Issue #219: does this cell measure the window it asked for?
+    #
+    # Issue #141 spent weeks on a suspicion that `start_offset` had stopped
+    # clipping, and the harness could not answer it. Worse, `trailing` goes
+    # NEGATIVE when the returned span runs past the window, and
+    # `max(gaps + [trailing])` then silently discards it - so an unclipped cell
+    # scored as if nothing were wrong. A scorecard that cannot tell a clipped
+    # run from an unclipped one cannot defend its own cost numbers.
+    #
+    # `start_secs is None` means the caller did not say, so no claim is made -
+    # NOT that the window was fine.
+    tol = timestamp_tolerance(seg_secs)
+    window_exceeded = None
+    first_stamp_offset = None
+    if start_secs is not None and stamps:
+        first_stamp_offset = stamps[0] - start_secs
+        span_end = stamps[-1] - start_secs
+        window_exceeded = bool(span_end > seg_secs + tol or abs(first_stamp_offset) > tol)
 
     pin, pout, promo = PRICING.get(model, (None, None, None))
     itok = usage.get("prompt") or 0
@@ -129,6 +161,10 @@ def score(raw: str, usage: dict, model: str, seg_secs: int, wall: float | None) 
         "max_gap_s": max(gaps + [trailing]) if (gaps or stamps) else None,
         "median_gap_s": sorted(gaps)[len(gaps) // 2] if gaps else None,
         "trailing_gap_s": trailing if stamps else None,
+        # None = not checked (caller passed no start), True = this cell did not
+        # measure its window and must not feed the verdict means.
+        "window_exceeded": window_exceeded,
+        "first_stamp_offset_s": first_stamp_offset,
         "chars": chars,
         "screen_content": len(env.get("screen_content") or []),
         "speakers": len(env.get("speakers") or []),
@@ -210,7 +246,7 @@ def run_one(client, types, fx: dict, model: str, thinking: str | None, seg: int,
         raw_p.write_text(raw, encoding="utf-8")
         use_p.write_text(json.dumps(usage), encoding="utf-8")
         print(f"  [live]   {tag}  {wall:.1f}s")
-    row = score(raw, usage, model, seg, wall)
+    row = score(raw, usage, model, seg, wall, start_secs=fx.get("start"))
     row["fixture"] = fx["id"]
     row["prompt_override"] = override
     return row
