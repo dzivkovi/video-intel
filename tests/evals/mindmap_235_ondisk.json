@@ -1,0 +1,12 @@
+{
+ "videos": 30,
+ "videos_with_ground_truth": 29,
+ "mean_recall": 0.3481424389280252,
+ "names_found": 125,
+ "names_expected": 355,
+ "quantitative_details": 113,
+ "timestamped_bullets": 1191,
+ "bullets": 1065,
+ "themes": 148,
+ "subthemes": 280
+}
