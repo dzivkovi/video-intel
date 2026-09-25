@@ -65,6 +65,12 @@ class TestProbeLiveStatus:
         _stub_subprocess(monkeypatch, stdout="was_live\n")
         assert vi.probe_live_status("abcdefghijk") == "was_live"
 
+    def test_the_last_non_empty_line_is_the_verdict(self, monkeypatch):
+        """A stray leading line (a notice yt-dlp printed anyway) must not hide the status."""
+        _install_probe_exe(monkeypatch)
+        _stub_subprocess(monkeypatch, stdout="[youtube] abcdefghijk: Downloading webpage\nnot_live\n\n")
+        assert vi.probe_live_status("abcdefghijk") == "not_live"
+
     @pytest.mark.parametrize("stdout", ["", "NA", "garbage", "not_live extra words"])
     def test_unknown_output_is_unknown_not_a_verdict(self, monkeypatch, stdout):
         _install_probe_exe(monkeypatch)
@@ -123,6 +129,21 @@ class TestRefineWasLivestream:
         _install_probe_exe(monkeypatch)
         _stub_subprocess(monkeypatch, stdout="was_live")
         assert vi.refine_was_livestream("abcdefghijk", True) is True
+
+    def test_one_video_is_probed_once_per_process(self, monkeypatch):
+        """Two consumers can ask about one video; the second ask must not spawn yt-dlp again."""
+        _install_probe_exe(monkeypatch)
+        calls: list = []
+        _stub_subprocess(monkeypatch, stdout="not_live", calls=calls)
+
+        assert vi.refine_was_livestream("abcdefghijk", True) is False
+        assert vi.refine_was_livestream("abcdefghijk", True) is False
+        assert vi.refine_was_livestream("zzzzzzzzzzz", True) is False
+
+        assert [argv[-1] for argv, _ in calls] == [
+            "https://www.youtube.com/watch?v=abcdefghijk",
+            "https://www.youtube.com/watch?v=zzzzzzzzzzz",
+        ]
 
     @pytest.mark.parametrize("stdout", ["post_live", "is_live", "is_upcoming"])
     def test_other_live_statuses_keep_the_flag(self, monkeypatch, stdout):
@@ -221,6 +242,8 @@ class TestCmdScanPremiereRefinement:
 
         vi.cmd_scan(_scan_args(), self._config(tmp_path))
 
+        # Both consumers asked (the transcript router, then the mindmap
+        # suppression on the failed transcript); the memo keeps it to ONE probe.
         assert captured["probed"] == ["prem1"]
         assert captured["transcript"] == [("prem1", False)], "a premiere is an ordinary upload: Gemini first"
         assert captured["mindmap"] == [("prem1", "video")], (
@@ -257,10 +280,12 @@ class TestCmdScanPremiereRefinement:
         vi.cmd_scan(_scan_args(), self._config(tmp_path))
 
         assert captured["probed"] == ["prem1"], "only Data-API-flagged videos pay for a probe"
-        assert dict(captured["transcript"]) == {"reg1": False, "prem1": False}
+        # Sorted because the transcript stage runs under a thread pool; list
+        # equality (not dict) so a duplicate dispatch for one id cannot hide.
+        assert sorted(captured["transcript"]) == [("prem1", False), ("reg1", False)]
 
     def test_explicit_channel_gemini_still_wins_without_needing_the_probe(self, tmp_path, monkeypatch):
-        """The #120 escape hatch is untouched: an explicit gemini is Gemini-first whatever the probe says."""
+        """The #120 escape hatch is untouched: an explicit gemini is Gemini-first, and it never pays a probe."""
         videos = [{"video_id": "vod1", "title": "Live VOD", "published": "2026-06-13"}]
         captured = _scan_setup(monkeypatch, videos, {"vod1": _FLAGGED}, {}, live_status="was_live")
         config = self._config(tmp_path)
@@ -269,6 +294,34 @@ class TestCmdScanPremiereRefinement:
         vi.cmd_scan(_scan_args(), config)
 
         assert captured["transcript"] == [("vod1", False)]
+        assert captured["probed"] == [], "a probe cannot change an explicit gemini's routing, so it is never spent"
+
+    def test_an_already_processed_flagged_video_is_not_probed(self, tmp_path, monkeypatch):
+        """The scan re-lists a processed video every run; the probe must not be paid every run."""
+        videos = [{"video_id": "vod1", "title": "Live VOD", "published": "2026-06-13"}]
+        captured = _scan_setup(monkeypatch, videos, {"vod1": _FLAGGED}, {}, live_status="not_live")
+        ch_dir = tmp_path / "ch"
+        ch_dir.mkdir()
+        prefix = vi.video_file_prefix(videos[0])
+        (ch_dir / f"{prefix}.transcript.md").write_text("# done\n", encoding="utf-8")
+        (ch_dir / f"{prefix}.mindmap.md").write_text("# done\n", encoding="utf-8")
+        (ch_dir / f"{prefix}.meta.json").write_text(
+            '{"video_id": "vod1", "modes_completed": ["transcript", "mindmap"]}', encoding="utf-8"
+        )
+
+        vi.cmd_scan(_scan_args(), self._config(tmp_path))
+
+        assert captured["transcript"] == [] and captured["mindmap"] == []
+        assert captured["probed"] == [], "nothing was going to be routed, so nothing may be probed"
+
+    def test_dry_run_never_probes(self, tmp_path, monkeypatch):
+        videos = [{"video_id": "vod1", "title": "Live VOD", "published": "2026-06-13"}]
+        captured = _scan_setup(monkeypatch, videos, {"vod1": _FLAGGED}, {}, live_status="not_live")
+
+        vi.cmd_scan(_scan_args(dry_run=True), self._config(tmp_path))
+
+        assert captured["transcript"] == [] and captured["mindmap"] == []
+        assert captured["probed"] == [], "a preview spends no network on classification"
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +334,18 @@ def _preflight_flagged(monkeypatch):
     monkeypatch.setenv("YOUTUBE_API_KEY", "fake-key")
     monkeypatch.setattr(vi, "require_youtube", lambda: lambda *a, **kw: object())
     monkeypatch.setattr(vi, "fetch_preflight_status", lambda _yt, ids: {vid: dict(_FLAGGED) for vid in ids})
+
+
+def _recording_probe(monkeypatch, live_status):
+    """Stub the probe and return the list of ids it was asked about."""
+    probed: list[str] = []
+
+    def fake_probe(video_id):
+        probed.append(video_id)
+        return live_status
+
+    monkeypatch.setattr(vi, "probe_live_status", fake_probe)
+    return probed
 
 
 def _transcript_args(**overrides):
@@ -346,6 +411,23 @@ class TestManualTranscriptUrl:
 
         assert transcript_wired.calls[0]["livestream_captions_first"] is True
 
+    def test_explicit_cli_gemini_never_probes(self, transcript_wired, monkeypatch):
+        probed = _recording_probe(monkeypatch, "was_live")
+
+        vi.cmd_transcript(_transcript_args(transcript_source="gemini"), _CONFIG_PLAIN)
+
+        assert transcript_wired.calls[0]["livestream_captions_first"] is False
+        assert probed == []
+
+    def test_explicit_channel_gemini_never_probes(self, transcript_wired, monkeypatch):
+        probed = _recording_probe(monkeypatch, "was_live")
+        config = {"channels": [{"name": "alpha", "url": "https://youtube.com/@alpha", "transcript_source": "gemini"}]}
+
+        vi.cmd_transcript(_transcript_args(), config)
+
+        assert transcript_wired.calls[0]["livestream_captions_first"] is False
+        assert probed == []
+
 
 class TestManualProcessUrl:
     """The second manual door: process --url resolves the flag through the same helper."""
@@ -364,11 +446,18 @@ class TestManualProcessUrl:
         monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
         _preflight_flagged(monkeypatch)
         _install_probe_exe(monkeypatch)
-        monkeypatch.setattr(vi, "probe_live_status", lambda _vid: live_status)
+        self.probed = _recording_probe(monkeypatch, live_status)
         return recorder
 
-    def _args(self):
-        return _transcript_args(topic=None, captions_over_duration=None)
+    def _args(self, **overrides):
+        return _transcript_args(topic=None, captions_over_duration=None, **overrides)
+
+    def test_explicit_cli_gemini_never_probes(self, monkeypatch, tmp_path):
+        recorder = self._wire(monkeypatch, tmp_path, live_status="was_live")
+        with contextlib.suppress(SystemExit):
+            vi.cmd_process(self._args(transcript_source="gemini"), _CONFIG_PLAIN)
+        assert recorder.calls and recorder.calls[0]["livestream_captions_first"] is False
+        assert self.probed == []
 
     def test_a_premiere_is_gemini_first(self, monkeypatch, tmp_path):
         recorder = self._wire(monkeypatch, tmp_path, live_status="not_live")

@@ -1953,6 +1953,13 @@ _KNOWN_LIVE_STATUSES = frozenset({"is_live", "is_upcoming", "was_live", "not_liv
 #: Memo for the executable lookup, keyed "exe" once resolved. A dict rather than
 #: an lru_cache so a test can reset it with one setattr.
 _PREMIERE_PROBE_EXE_MEMO: dict = {}
+#: Per-process memo of probe verdicts by video id. The refinement is asked for
+#: LAZILY at each consumer of the flag (the transcript router and the mindmap
+#: suppression can both ask about one video), so the second ask must not spawn
+#: a second yt-dlp. Plain dict on purpose: the scan's stages run their
+#: closures under a ThreadPoolExecutor, and a lost race here costs one
+#: duplicate probe, never a wrong verdict.
+_PREMIERE_PROBE_RESULTS: dict[str, bool] = {}
 
 
 def _premiere_probe_executable() -> str | None:
@@ -2016,30 +2023,41 @@ def refine_was_livestream(video_id: str, api_flag: bool) -> bool:
     the flag: an absent signal must never become a positive "premiere" verdict,
     which would send a genuine livestream's unfetchable URI to Gemini.
 
-    Both #120 consumers read the refined value - the captions-first routing AND
-    the mindmap-from-video suppression - because a premiere's URI is fetchable,
-    so neither #120 measure applies to it.
+    Consumers call this LAZILY, as the LAST term of their own decision, so the
+    probe is paid only when the raw flag would otherwise change the outcome:
+    the transcript router asks after ``livestream_captions_first_applies`` (an
+    explicit ``transcript_source: gemini`` never probes), the mindmap
+    suppression asks only when it would otherwise fire, and neither an
+    already-processed video nor a ``--dry-run`` preview reaches either ask.
+    Both #120 consumers therefore see the refined value - a premiere's URI is
+    fetchable, so neither #120 measure applies to it - and one video is probed
+    at most once per process whichever consumer asks first.
     """
     if not api_flag:
         return False
     if _premiere_probe_executable() is None:
         return True
+    if video_id in _PREMIERE_PROBE_RESULTS:
+        return _PREMIERE_PROBE_RESULTS[video_id]
     status = probe_live_status(video_id)
+    verdict = True
     if status == PREMIERE_LIVE_STATUS_NOT_LIVE:
         log.info(
             "  %s: liveStreamingDetails present but yt-dlp live_status=not_live - an aired PREMIERE of an "
             "ordinary upload, routing as a regular upload (issue #245).",
             video_id,
         )
-        return False
-    if status is None:
+        verdict = False
+    elif status is None:
         log.warning(
             "  %s: liveStreamingDetails present and yt-dlp could not classify it (missing, timed out, or "
-            "returned no live_status); keeping captions-first routing. If this is a premiered upload, "
-            "re-run with --transcript-source gemini (issue #245).",
+            "returned no live_status); keeping captions-first routing. If this is a premiered upload, set "
+            "transcript_source: gemini on its channel, or run transcript --url / process --url with "
+            "--transcript-source gemini (issue #245).",
             video_id,
         )
-    return True
+    _PREMIERE_PROBE_RESULTS[video_id] = verdict
+    return verdict
 
 
 def fetch_preflight_status(youtube, video_ids: list[str]) -> dict[str, dict]:
@@ -2093,14 +2111,13 @@ def _lookup_was_livestream(video_id: str) -> bool:
     try:
         yt_build = require_youtube()
         yt = yt_build("youtube", "v3", developerKey=yt_key)
-        api_flag = bool(fetch_preflight_status(yt, [video_id]).get(video_id, {}).get("was_livestream"))
+        # This is the RAW Data API verdict, same as the scan pre-flight's. The
+        # issue #245 premiere refinement is asked for lazily by each consumer,
+        # never here, so an explicit transcript_source: gemini pays no probe.
+        return bool(fetch_preflight_status(yt, [video_id]).get(video_id, {}).get("was_livestream"))
     except Exception as e:
         log.warning("Could not classify livestream status for %s: %s", video_id, e)
         return False
-    # Issue #245: the Data API cannot tell an aired premiere from a livestream;
-    # the same refinement the scan pre-flight applies runs here, so the manual
-    # commands and the scan agree about one video.
-    return refine_was_livestream(video_id, api_flag)
 
 
 def should_skip_video_mindmap_for_livestream(
@@ -7505,10 +7522,12 @@ def cmd_scan(args, config):
             else:
                 # Issue #120: carry the completed-livestream flag on the video
                 # dict so the transcript and mindmap loops below can route on it
-                # without a second API call. Issue #245: refine it first - an
-                # aired premiere carries the same Data API shape, and only a
-                # flagged video pays for the yt-dlp probe.
-                v["was_livestream"] = refine_was_livestream(v["video_id"], bool(status.get("was_livestream")))
+                # without a second API call. This is the RAW Data API verdict:
+                # issue #245's premiere refinement is asked for lazily by those
+                # two consumers, so a video the is_processed filter drops, a
+                # --dry-run preview, or an explicit transcript_source: gemini
+                # channel never pays for a yt-dlp probe here.
+                v["was_livestream"] = bool(status.get("was_livestream"))
                 # Issue #224: prefer the pre-flight copy. A video absent from
                 # the pre-flight response yields {}, and a keyword-search video
                 # carries only a truncated description, so only a non-empty
@@ -7831,7 +7850,13 @@ def cmd_scan(args, config):
                             prefix=video_file_prefix(v),
                             transcript_source=per_video_source.get(video_file_prefix(v), transcript_source),
                             transcript_timeout_seconds=transcript_timeout_seconds,
-                            livestream_captions_first=(vod_captions_first and bool(v.get("was_livestream"))),
+                            # Issue #245: the probe is the LAST term, so it is
+                            # paid only when captions-first would otherwise apply.
+                            livestream_captions_first=(
+                                vod_captions_first
+                                and bool(v.get("was_livestream"))
+                                and refine_was_livestream(v["video_id"], True)
+                            ),
                             duration_seconds=_parse_iso8601_duration(v.get("duration_iso")),
                             chunk_minutes=chunk_minutes,
                         ): v
@@ -7937,11 +7962,14 @@ def cmd_scan(args, config):
                 # back to mindmap-from-video would hard-fail or confabulate the
                 # same way, so the call is never spent. The issue #119 prompt=0
                 # guard remains the backstop for any path that still gets here.
+                # Issue #245: ask the raw predicate first, then confirm with
+                # the premiere probe only when the suppression would fire - a
+                # premiere's URI is fetchable, so it keeps its video fallback.
                 if should_skip_video_mindmap_for_livestream(
                     was_livestream=bool(v.get("was_livestream")),
                     resolved_source=src,
                     transcript_status=_transcript_results.get(v_prefix),
-                ):
+                ) and refine_was_livestream(v["video_id"], True):
                     return v_prefix, LIVESTREAM_MINDMAP_SKIP_STATUS
                 if src == "transcript":
                     return process_mindmap(
@@ -8684,8 +8712,12 @@ def _cmd_transcript_impl(args, config):
         # covers a channel-level gemini too - the same view _cmd_process_url
         # has always had. Two adjacent decisions on one invocation must not
         # read different views of the same config.
-        vod_captions_first = was_livestream and livestream_captions_first_applies(
-            transcript_source, channel_cfg, cli_transcript_source
+        vod_captions_first = (
+            was_livestream
+            and livestream_captions_first_applies(transcript_source, channel_cfg, cli_transcript_source)
+            # Issue #245: probe last, only once the cheap gates say captions-first
+            # would otherwise apply - an explicit gemini never pays for it.
+            and refine_was_livestream(video["video_id"], True)
         )
         if was_livestream:
             log.info(
@@ -9068,13 +9100,17 @@ def _cmd_process_url(args, config):
     # Provenance rule: captions-first only when nobody explicitly asked for
     # Gemini. Both provenances are available here - the channel dict and the
     # CLI flag - so this is the one site that exercises the full precedence.
-    vod_captions_first = was_livestream and livestream_captions_first_applies(
-        transcript_source, channel_cfg, getattr(args, "transcript_source", None)
+    vod_captions_first = (
+        was_livestream
+        and livestream_captions_first_applies(transcript_source, channel_cfg, getattr(args, "transcript_source", None))
+        # Issue #245: probe last, only once the cheap gates say captions-first
+        # would otherwise apply - an explicit gemini never pays for it.
+        and refine_was_livestream(video_id, True)
     )
     if was_livestream:
         log.info(
             "    VOD transcript routing: %s",
-            "captions-first" if vod_captions_first else "Gemini-first (explicit transcript_source=gemini)",
+            "captions-first" if vod_captions_first else "Gemini-first",
         )
 
     # Step 1/3: transcript (chunked if long, per PR #51 path).
@@ -9223,11 +9259,14 @@ def _cmd_process_url(args, config):
     # step, which by this branch's own precondition just failed - so this
     # path exits EXIT_PARTIAL, not 0 (issue #129 changed that; before, a
     # livestream VOD with no transcript and no mindmap exited 0).
+    # Issue #245: the raw predicate gates; the premiere probe confirms only when
+    # the suppression would fire, so a premiere keeps its video fallback and an
+    # ordinary run never pays for the probe here.
     if should_skip_video_mindmap_for_livestream(
         was_livestream=was_livestream,
         resolved_source=resolved_source,
         transcript_status=transcript_status,
-    ):
+    ) and refine_was_livestream(video_id, True):
         log.warning("  Step 2/3: mindmap [%s]", LIVESTREAM_MINDMAP_SKIP_STATUS)
         _log_livestream_recovery_recipe(video, channel_name)
         log.info("  Step 3/3: concepts [skipped (no mindmap)]")

@@ -92,10 +92,11 @@ def no_premiere_probe():
     """
     import video_intel as vi
 
-    saved = vi._PREMIERE_PROBE_EXE_MEMO
+    saved_exe, saved_results = vi._PREMIERE_PROBE_EXE_MEMO, vi._PREMIERE_PROBE_RESULTS
     vi._PREMIERE_PROBE_EXE_MEMO = {"exe": None}
+    vi._PREMIERE_PROBE_RESULTS = {}
     yield
-    vi._PREMIERE_PROBE_EXE_MEMO = saved
+    vi._PREMIERE_PROBE_EXE_MEMO, vi._PREMIERE_PROBE_RESULTS = saved_exe, saved_results
 
 
 @pytest.fixture
