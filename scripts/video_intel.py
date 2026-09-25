@@ -7837,31 +7837,54 @@ def cmd_scan(args, config):
                 transcript_videos.append(v)
             if transcript_videos:
                 log.info("  Generating transcripts (%d videos)...", len(transcript_videos))
+
+                def _transcribe_with_lazy_probe(
+                    v: dict,
+                    *,
+                    # Per-channel values bound as defaults, like the mindmap
+                    # closure below, so the worker never reads a loop variable
+                    # the channel loop has since moved on from.
+                    _per_video_source: dict = per_video_source,
+                    _source_default: str = transcript_source,
+                    _prompt: str = transcript_prompt,
+                    _ch_name: str = ch_name,
+                    _timeout: int | float = transcript_timeout_seconds,
+                    _vod_captions_first: bool = vod_captions_first,
+                    _chunk_minutes: int = chunk_minutes,
+                ):
+                    # Runs INSIDE the worker, not in the submit loop: an
+                    # argument evaluated at `executor.submit(...)` time runs on
+                    # the main thread before any job starts, so the issue #245
+                    # probe (~5 s each) would serialize ahead of the whole
+                    # stage - 288 flagged videos is 24 minutes of nothing
+                    # (Codex peer pass). The probe is also the LAST term, so a
+                    # video the issue #227 duration gate already sent to
+                    # yt-captions (process_transcript takes that branch before
+                    # it ever reads the livestream flag) pays no probe either.
+                    v_prefix = video_file_prefix(v)
+                    v_source = _per_video_source.get(v_prefix, _source_default)
+                    return _scan_transcribe_one(
+                        client=client,
+                        types=types,
+                        video=v,
+                        prompt_text=_prompt,
+                        model=model,
+                        channel_dir=output_dir / _ch_name,
+                        prefix=v_prefix,
+                        transcript_source=v_source,
+                        transcript_timeout_seconds=_timeout,
+                        livestream_captions_first=(
+                            _vod_captions_first
+                            and v_source != TRANSCRIPT_SOURCE_YT_CAPTIONS
+                            and bool(v.get("was_livestream"))
+                            and refine_was_livestream(v["video_id"], True)
+                        ),
+                        duration_seconds=_parse_iso8601_duration(v.get("duration_iso")),
+                        chunk_minutes=_chunk_minutes,
+                    )
+
                 with ThreadPoolExecutor(max_workers=max_parallel) as executor:
-                    futures = {
-                        executor.submit(
-                            _scan_transcribe_one,
-                            client=client,
-                            types=types,
-                            video=v,
-                            prompt_text=transcript_prompt,
-                            model=model,
-                            channel_dir=output_dir / ch_name,
-                            prefix=video_file_prefix(v),
-                            transcript_source=per_video_source.get(video_file_prefix(v), transcript_source),
-                            transcript_timeout_seconds=transcript_timeout_seconds,
-                            # Issue #245: the probe is the LAST term, so it is
-                            # paid only when captions-first would otherwise apply.
-                            livestream_captions_first=(
-                                vod_captions_first
-                                and bool(v.get("was_livestream"))
-                                and refine_was_livestream(v["video_id"], True)
-                            ),
-                            duration_seconds=_parse_iso8601_duration(v.get("duration_iso")),
-                            chunk_minutes=chunk_minutes,
-                        ): v
-                        for v in transcript_videos
-                    }
+                    futures = {executor.submit(_transcribe_with_lazy_probe, v): v for v in transcript_videos}
                     for future in as_completed(futures):
                         v = futures[future]
                         prefix, status = future.result()

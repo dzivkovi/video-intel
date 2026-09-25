@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import subprocess
+import threading
 from argparse import Namespace
 from types import SimpleNamespace
 
@@ -197,10 +198,11 @@ def _scan_setup(monkeypatch, videos, statuses, transcript_result, *, live_status
     monkeypatch.setattr(vi, "fetch_preflight_status", lambda _yt, ids: {vid: statuses.get(vid, {}) for vid in ids})
     monkeypatch.setattr(vi, "_is_youtube_short_url", lambda video_id: False)
 
-    captured: dict = {"transcript": [], "mindmap": [], "probed": []}
+    captured: dict = {"transcript": [], "mindmap": [], "probed": [], "probe_threads": []}
 
     def fake_probe(video_id):
         captured["probed"].append(video_id)
+        captured["probe_threads"].append(threading.current_thread().name)
         return live_status
 
     _install_probe_exe(monkeypatch)
@@ -322,6 +324,29 @@ class TestCmdScanPremiereRefinement:
 
         assert captured["transcript"] == [] and captured["mindmap"] == []
         assert captured["probed"] == [], "a preview spends no network on classification"
+
+    def test_the_probe_runs_in_the_worker_not_the_submit_loop(self, tmp_path, monkeypatch):
+        """An argument evaluated at executor.submit() time runs on the main thread, serially,
+        before any job starts - 5 s per flagged video ahead of the whole stage (Codex peer pass)."""
+        videos = [{"video_id": "prem1", "title": "Premiered talk", "published": "2026-06-13"}]
+        captured = _scan_setup(monkeypatch, videos, {"prem1": _FLAGGED}, {}, live_status="not_live")
+
+        vi.cmd_scan(_scan_args(), self._config(tmp_path))
+
+        assert captured["probed"] == ["prem1"]
+        assert captured["probe_threads"] and all(name != "MainThread" for name in captured["probe_threads"])
+
+    def test_a_flagged_video_routed_to_captions_by_duration_is_not_probed(self, tmp_path, monkeypatch):
+        """captions_over_duration_seconds (#227) already decided yt-captions; the flag cannot change that."""
+        videos = [{"video_id": "vod1", "title": "Long VOD", "published": "2026-06-13"}]
+        captured = _scan_setup(monkeypatch, videos, {"vod1": _FLAGGED}, {}, live_status="not_live")
+        config = self._config(tmp_path)
+        config["channels"][0]["captions_over_duration_seconds"] = 600  # the stubbed duration is PT20M
+
+        vi.cmd_scan(_scan_args(), config)
+
+        assert captured["transcript"] == [("vod1", False)]
+        assert captured["probed"] == [], "process_transcript takes the yt-captions branch before it reads the flag"
 
 
 # ---------------------------------------------------------------------------
