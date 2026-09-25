@@ -73,6 +73,32 @@ class _CapturingVoyage:
         return SimpleNamespace(embeddings=[[0.0] * 1024])
 
 
+@pytest.fixture(autouse=True)
+def no_premiere_probe():
+    """Pin yt-dlp as ABSENT for every test (issue #245).
+
+    `refine_was_livestream` spawns yt-dlp for any video the Data API flagged as
+    a livestream, and this machine has yt-dlp on PATH - so without this pin,
+    every pre-#245 livestream test would hit the network and take five seconds
+    per flagged id. With the executable memo pre-set to None the probe never
+    runs and the flag is kept, which is byte-for-byte the pre-#245 routing.
+    Tests that exercise the probe itself override the memo explicitly.
+
+    Deliberately does NOT request `monkeypatch`: a conftest autouse fixture is
+    set up before a module's own autouse fixtures, so requesting `monkeypatch`
+    here moves its teardown AFTER theirs - and `test_skip_long_videos`'
+    `_clear_caches` then calls `cache_clear()` on an attribute a test had
+    patched to a plain lambda (measured: 1 teardown ERROR in the full suite).
+    """
+    import video_intel as vi
+
+    saved_exe, saved_results = vi._PREMIERE_PROBE_EXE_MEMO, vi._PREMIERE_PROBE_RESULTS
+    vi._PREMIERE_PROBE_EXE_MEMO = {"exe": None}
+    vi._PREMIERE_PROBE_RESULTS = {}
+    yield
+    vi._PREMIERE_PROBE_EXE_MEMO, vi._PREMIERE_PROBE_RESULTS = saved_exe, saved_results
+
+
 @pytest.fixture
 def fake_lancedb(monkeypatch):
     """Wire up a capturing LanceDB stack and return the builder for assertions.

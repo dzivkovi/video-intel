@@ -40,6 +40,8 @@ pip install google-genai google-api-python-client pyyaml youtube-transcript-api
 pip install lancedb voyageai
 ```
 
+Optional, not a Python package: **`yt-dlp` on PATH** lets `scan` and the manual `--url` commands tell an aired premiere apart from a livestream VOD (the YouTube API reports both the same way). Without it, premiered uploads route to the caption track and lose their slides unless the channel sets `transcript_source: gemini` explicitly. Install it with `pip install yt-dlp`, `winget install yt-dlp`, `brew install yt-dlp`, or your package manager.
+
 ## Install
 
 ### Claude Code (recommended)

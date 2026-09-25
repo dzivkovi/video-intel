@@ -1911,10 +1911,153 @@ def _is_completed_livestream(item: dict) -> bool:
     it has not aired and is skipped by ``preflight_skip_reason`` instead. A
     missing ``liveBroadcastContent`` is treated as "not a live broadcast now",
     which matches YouTube's own ``none`` default.
+
+    This is the RAW Data API verdict, and it is deliberately kept pure. An
+    aired PREMIERE of an ordinary upload carries the same resource, so a
+    True here still has to pass through ``refine_was_livestream`` (issue
+    #245) before anything routes on it.
     """
     if not item.get("liveStreamingDetails"):
         return False
     return item.get("snippet", {}).get("liveBroadcastContent") not in ("upcoming", "live")
+
+
+# Issue #245: telling an aired premiere apart from a livestream VOD.
+#
+# The Data API attaches `liveStreamingDetails` to an aired PREMIERE of an
+# ordinary upload exactly as to a genuine livestream and exposes no field that
+# separates them, so issue #120's classifier routed premieres captions-first:
+# speech-only transcripts, no SCREEN blocks, status `complete`, exit 0. On one
+# conference channel 20 such transcripts accumulated silently over two months.
+#
+# YouTube's watch page DOES carry the distinction - `videoDetails.isLiveContent`
+# - and yt-dlp exposes it as `live_status`: `not_live` for a premiere, `was_live`
+# for a real livestream. Measured on the videos that motivated #120: 8/8
+# premieres `not_live`, 9/9 livestreams `was_live`, including both hard-400
+# cases. yt-dlp derives `not_live` only from an EXPLICIT False in
+# `isLive`/`isLiveContent` (`'not_live' if False in (is_live, live_content) else
+# None`, yt_dlp/extractor/youtube/_video.py at 2026.06.09), so a missing field
+# yields None, never `not_live` - the value is positive evidence.
+#
+# Duration was measured and rejected as a discriminator: premieres in the
+# corpus run up to 81 minutes and real livestreams that hard-400'd start at
+# 1h44m, a 23-minute band. So was the live-window-minus-duration delta (a real
+# stream showed +133 s, inside the premiere countdown band).
+PREMIERE_PROBE_EXECUTABLE = "yt-dlp"
+#: Measured at ~5 s per video on the reference machine; a 3x margin. A timeout
+#: keeps the Data API flag (captions-first), so a slow probe costs slides on one
+#: video, never a wrong Gemini spend.
+PREMIERE_PROBE_TIMEOUT_SECONDS = 15
+PREMIERE_LIVE_STATUS_NOT_LIVE = "not_live"
+_KNOWN_LIVE_STATUSES = frozenset({"is_live", "is_upcoming", "was_live", "not_live", "post_live"})
+#: Memo for the executable lookup, keyed "exe" once resolved. A dict rather than
+#: an lru_cache so a test can reset it with one setattr.
+_PREMIERE_PROBE_EXE_MEMO: dict = {}
+#: Per-process memo of probe verdicts by video id. The refinement is asked for
+#: LAZILY at each consumer of the flag (the transcript router and the mindmap
+#: suppression can both ask about one video), so the second ask must not spawn
+#: a second yt-dlp. Plain dict on purpose: the scan's stages run their
+#: closures under a ThreadPoolExecutor, and a lost race here costs one
+#: duplicate probe, never a wrong verdict.
+_PREMIERE_PROBE_RESULTS: dict[str, bool] = {}
+
+
+def _premiere_probe_executable() -> str | None:
+    """Path to yt-dlp, resolved once per process; None (with ONE notice) when absent."""
+    if "exe" not in _PREMIERE_PROBE_EXE_MEMO:
+        exe = shutil.which(PREMIERE_PROBE_EXECUTABLE)
+        _PREMIERE_PROBE_EXE_MEMO["exe"] = exe
+        if exe is None:
+            log.info(
+                "yt-dlp not found on PATH: an aired premiere cannot be told apart from a livestream VOD "
+                "and will route captions-first (speech only, no slides). Install yt-dlp, or set "
+                "transcript_source: gemini on channels that premiere their uploads (issue #245)."
+            )
+    return _PREMIERE_PROBE_EXE_MEMO["exe"]
+
+
+def probe_live_status(video_id: str) -> str | None:
+    """yt-dlp's ``live_status`` for one video, or None when it cannot be established.
+
+    Metadata only (``--skip-download``), one video (``--no-playlist``), and the
+    user's own yt-dlp configuration is ignored so nothing can reshape the one
+    line this reads. Every failure - no executable, non-zero exit, timeout, an
+    unknown value - is None: the caller treats None as "keep the Data API's
+    verdict", never as evidence either way.
+    """
+    exe = _premiere_probe_executable()
+    if exe is None:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                exe,
+                "--skip-download",
+                "--no-playlist",
+                "--no-warnings",
+                "--ignore-config",
+                "--print",
+                "%(live_status)s",
+                f"https://www.youtube.com/watch?v={video_id}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=PREMIERE_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    if result.returncode != 0:
+        return None
+    lines = [ln.strip() for ln in (result.stdout or "").splitlines() if ln.strip()]
+    status = lines[-1] if lines else ""
+    return status if status in _KNOWN_LIVE_STATUSES else None
+
+
+def refine_was_livestream(video_id: str, api_flag: bool) -> bool:
+    """Clear the Data API's livestream flag when the video was never live content (issue #245).
+
+    Only a video the Data API already flagged is probed - a regular upload pays
+    no network here - and only a validated ``not_live`` clears the flag. A
+    missing yt-dlp, a timeout, a failed extraction or an unknown status all keep
+    the flag: an absent signal must never become a positive "premiere" verdict,
+    which would send a genuine livestream's unfetchable URI to Gemini.
+
+    Consumers call this LAZILY, as the LAST term of their own decision, so the
+    probe is paid only when the raw flag would otherwise change the outcome:
+    the transcript router asks after ``livestream_captions_first_applies`` (an
+    explicit ``transcript_source: gemini`` never probes), the mindmap
+    suppression asks only when it would otherwise fire, and neither an
+    already-processed video nor a ``--dry-run`` preview reaches either ask.
+    Both #120 consumers therefore see the refined value - a premiere's URI is
+    fetchable, so neither #120 measure applies to it - and one video is probed
+    at most once per process whichever consumer asks first.
+    """
+    if not api_flag:
+        return False
+    if _premiere_probe_executable() is None:
+        return True
+    if video_id in _PREMIERE_PROBE_RESULTS:
+        return _PREMIERE_PROBE_RESULTS[video_id]
+    status = probe_live_status(video_id)
+    verdict = True
+    if status == PREMIERE_LIVE_STATUS_NOT_LIVE:
+        log.info(
+            "  %s: liveStreamingDetails present but yt-dlp live_status=not_live - an aired PREMIERE of an "
+            "ordinary upload, routing as a regular upload (issue #245).",
+            video_id,
+        )
+        verdict = False
+    elif status is None:
+        log.warning(
+            "  %s: liveStreamingDetails present and yt-dlp could not classify it (missing, timed out, or "
+            "returned no live_status); keeping captions-first routing. If this is a premiered upload, set "
+            "transcript_source: gemini on its channel, or run transcript --url / process --url with "
+            "--transcript-source gemini (issue #245).",
+            video_id,
+        )
+    _PREMIERE_PROBE_RESULTS[video_id] = verdict
+    return verdict
 
 
 def fetch_preflight_status(youtube, video_ids: list[str]) -> dict[str, dict]:
@@ -1968,6 +2111,9 @@ def _lookup_was_livestream(video_id: str) -> bool:
     try:
         yt_build = require_youtube()
         yt = yt_build("youtube", "v3", developerKey=yt_key)
+        # This is the RAW Data API verdict, same as the scan pre-flight's. The
+        # issue #245 premiere refinement is asked for lazily by each consumer,
+        # never here, so an explicit transcript_source: gemini pays no probe.
         return bool(fetch_preflight_status(yt, [video_id]).get(video_id, {}).get("was_livestream"))
     except Exception as e:
         log.warning("Could not classify livestream status for %s: %s", video_id, e)
@@ -7376,7 +7522,11 @@ def cmd_scan(args, config):
             else:
                 # Issue #120: carry the completed-livestream flag on the video
                 # dict so the transcript and mindmap loops below can route on it
-                # without a second API call.
+                # without a second API call. This is the RAW Data API verdict:
+                # issue #245's premiere refinement is asked for lazily by those
+                # two consumers, so a video the is_processed filter drops, a
+                # --dry-run preview, or an explicit transcript_source: gemini
+                # channel never pays for a yt-dlp probe here.
                 v["was_livestream"] = bool(status.get("was_livestream"))
                 # Issue #224: prefer the pre-flight copy. A video absent from
                 # the pre-flight response yields {}, and a keyword-search video
@@ -7387,8 +7537,9 @@ def cmd_scan(args, config):
                 if v["was_livestream"]:
                     # One line PER VIDEO, not an aggregate count. YouTube attaches
                     # liveStreamingDetails to aired PREMIERES of ordinary uploads
-                    # exactly as it does to genuine livestreams, and exposes no
-                    # field that separates them - so this flag can misfire, and a
+                    # exactly as it does to genuine livestreams; issue #245 clears
+                    # those through yt-dlp when it is on PATH, but without it (or
+                    # when the probe fails) the flag can still misfire, and a
                     # premiere-every-upload channel would quietly slide to
                     # captions-only transcripts. Naming each video makes that
                     # auditable from the scan log instead of invisible.
@@ -7686,25 +7837,54 @@ def cmd_scan(args, config):
                 transcript_videos.append(v)
             if transcript_videos:
                 log.info("  Generating transcripts (%d videos)...", len(transcript_videos))
+
+                def _transcribe_with_lazy_probe(
+                    v: dict,
+                    *,
+                    # Per-channel values bound as defaults, like the mindmap
+                    # closure below, so the worker never reads a loop variable
+                    # the channel loop has since moved on from.
+                    _per_video_source: dict = per_video_source,
+                    _source_default: str = transcript_source,
+                    _prompt: str = transcript_prompt,
+                    _ch_name: str = ch_name,
+                    _timeout: int | float = transcript_timeout_seconds,
+                    _vod_captions_first: bool = vod_captions_first,
+                    _chunk_minutes: int = chunk_minutes,
+                ):
+                    # Runs INSIDE the worker, not in the submit loop: an
+                    # argument evaluated at `executor.submit(...)` time runs on
+                    # the main thread before any job starts, so the issue #245
+                    # probe (~5 s each) would serialize ahead of the whole
+                    # stage - 288 flagged videos is 24 minutes of nothing
+                    # (Codex peer pass). The probe is also the LAST term, so a
+                    # video the issue #227 duration gate already sent to
+                    # yt-captions (process_transcript takes that branch before
+                    # it ever reads the livestream flag) pays no probe either.
+                    v_prefix = video_file_prefix(v)
+                    v_source = _per_video_source.get(v_prefix, _source_default)
+                    return _scan_transcribe_one(
+                        client=client,
+                        types=types,
+                        video=v,
+                        prompt_text=_prompt,
+                        model=model,
+                        channel_dir=output_dir / _ch_name,
+                        prefix=v_prefix,
+                        transcript_source=v_source,
+                        transcript_timeout_seconds=_timeout,
+                        livestream_captions_first=(
+                            _vod_captions_first
+                            and v_source != TRANSCRIPT_SOURCE_YT_CAPTIONS
+                            and bool(v.get("was_livestream"))
+                            and refine_was_livestream(v["video_id"], True)
+                        ),
+                        duration_seconds=_parse_iso8601_duration(v.get("duration_iso")),
+                        chunk_minutes=_chunk_minutes,
+                    )
+
                 with ThreadPoolExecutor(max_workers=max_parallel) as executor:
-                    futures = {
-                        executor.submit(
-                            _scan_transcribe_one,
-                            client=client,
-                            types=types,
-                            video=v,
-                            prompt_text=transcript_prompt,
-                            model=model,
-                            channel_dir=output_dir / ch_name,
-                            prefix=video_file_prefix(v),
-                            transcript_source=per_video_source.get(video_file_prefix(v), transcript_source),
-                            transcript_timeout_seconds=transcript_timeout_seconds,
-                            livestream_captions_first=(vod_captions_first and bool(v.get("was_livestream"))),
-                            duration_seconds=_parse_iso8601_duration(v.get("duration_iso")),
-                            chunk_minutes=chunk_minutes,
-                        ): v
-                        for v in transcript_videos
-                    }
+                    futures = {executor.submit(_transcribe_with_lazy_probe, v): v for v in transcript_videos}
                     for future in as_completed(futures):
                         v = futures[future]
                         prefix, status = future.result()
@@ -7805,11 +7985,14 @@ def cmd_scan(args, config):
                 # back to mindmap-from-video would hard-fail or confabulate the
                 # same way, so the call is never spent. The issue #119 prompt=0
                 # guard remains the backstop for any path that still gets here.
+                # Issue #245: ask the raw predicate first, then confirm with
+                # the premiere probe only when the suppression would fire - a
+                # premiere's URI is fetchable, so it keeps its video fallback.
                 if should_skip_video_mindmap_for_livestream(
                     was_livestream=bool(v.get("was_livestream")),
                     resolved_source=src,
                     transcript_status=_transcript_results.get(v_prefix),
-                ):
+                ) and refine_was_livestream(v["video_id"], True):
                     return v_prefix, LIVESTREAM_MINDMAP_SKIP_STATUS
                 if src == "transcript":
                     return process_mindmap(
@@ -8552,8 +8735,12 @@ def _cmd_transcript_impl(args, config):
         # covers a channel-level gemini too - the same view _cmd_process_url
         # has always had. Two adjacent decisions on one invocation must not
         # read different views of the same config.
-        vod_captions_first = was_livestream and livestream_captions_first_applies(
-            transcript_source, channel_cfg, cli_transcript_source
+        vod_captions_first = (
+            was_livestream
+            and livestream_captions_first_applies(transcript_source, channel_cfg, cli_transcript_source)
+            # Issue #245: probe last, only once the cheap gates say captions-first
+            # would otherwise apply - an explicit gemini never pays for it.
+            and refine_was_livestream(video["video_id"], True)
         )
         if was_livestream:
             log.info(
@@ -8936,13 +9123,17 @@ def _cmd_process_url(args, config):
     # Provenance rule: captions-first only when nobody explicitly asked for
     # Gemini. Both provenances are available here - the channel dict and the
     # CLI flag - so this is the one site that exercises the full precedence.
-    vod_captions_first = was_livestream and livestream_captions_first_applies(
-        transcript_source, channel_cfg, getattr(args, "transcript_source", None)
+    vod_captions_first = (
+        was_livestream
+        and livestream_captions_first_applies(transcript_source, channel_cfg, getattr(args, "transcript_source", None))
+        # Issue #245: probe last, only once the cheap gates say captions-first
+        # would otherwise apply - an explicit gemini never pays for it.
+        and refine_was_livestream(video_id, True)
     )
     if was_livestream:
         log.info(
             "    VOD transcript routing: %s",
-            "captions-first" if vod_captions_first else "Gemini-first (explicit transcript_source=gemini)",
+            "captions-first" if vod_captions_first else "Gemini-first",
         )
 
     # Step 1/3: transcript (chunked if long, per PR #51 path).
@@ -9091,11 +9282,14 @@ def _cmd_process_url(args, config):
     # step, which by this branch's own precondition just failed - so this
     # path exits EXIT_PARTIAL, not 0 (issue #129 changed that; before, a
     # livestream VOD with no transcript and no mindmap exited 0).
+    # Issue #245: the raw predicate gates; the premiere probe confirms only when
+    # the suppression would fire, so a premiere keeps its video fallback and an
+    # ordinary run never pays for the probe here.
     if should_skip_video_mindmap_for_livestream(
         was_livestream=was_livestream,
         resolved_source=resolved_source,
         transcript_status=transcript_status,
-    ):
+    ) and refine_was_livestream(video_id, True):
         log.warning("  Step 2/3: mindmap [%s]", LIVESTREAM_MINDMAP_SKIP_STATUS)
         _log_livestream_recovery_recipe(video, channel_name)
         log.info("  Step 3/3: concepts [skipped (no mindmap)]")

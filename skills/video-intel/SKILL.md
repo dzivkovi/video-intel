@@ -77,11 +77,14 @@ Three layers, designed as a narrowing funnel.
    indexes what has aired, not what is scheduled. The same pre-flight call
    flags **completed livestream VODs** (issue #120): those route captions-first
    unless the channel explicitly sets `transcript_source: gemini` (an explicit
-   choice is honored, and is the escape hatch if the flag ever misfires on a
-   premiered upload), get at most one guarded Gemini transcript attempt when no
+   choice is honored), get at most one guarded Gemini transcript attempt when no
    caption track exists, and never fall back to mindmap-from-video afterwards -
-   the scan logs the local-file recovery recipe instead. Regular uploads are
-   unaffected.
+   the scan logs the local-file recovery recipe instead. An **aired premiere**
+   of an ordinary upload carries the same API shape; when `yt-dlp` is on PATH
+   the tool asks it for the watch page's own verdict and routes premieres as
+   the regular uploads they are, slides included (issue #245). Without yt-dlp
+   the explicit `transcript_source: gemini` is the escape hatch. Regular
+   uploads are unaffected.
 
 2. **transcript** - Generate a fused document for a single video: diarized
    speech interleaved with timestamped SCREEN sections describing what was
