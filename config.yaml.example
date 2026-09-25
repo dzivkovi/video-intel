@@ -144,7 +144,11 @@ channels:
     # and an explicit "auto" both route captions-FIRST, because livestream URIs
     # fail Gemini ingestion at a much higher rate. Writing "gemini" explicitly
     # opts out of that and keeps Gemini first, which is what you want when the
-    # captions are known-bad or the on-screen content is the point.
+    # captions are known-bad or the on-screen content is the point. An aired
+    # PREMIERE looks like a livestream to the YouTube API; with yt-dlp on PATH
+    # the tool tells them apart and routes premieres as regular uploads, and
+    # without it an explicit "gemini" is how a channel that premieres every
+    # talk keeps its slides.
     # transcript_source: auto
     #
     # prompt: override the mind map prompt for this channel only (a name from

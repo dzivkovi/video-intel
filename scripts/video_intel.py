@@ -1911,10 +1911,135 @@ def _is_completed_livestream(item: dict) -> bool:
     it has not aired and is skipped by ``preflight_skip_reason`` instead. A
     missing ``liveBroadcastContent`` is treated as "not a live broadcast now",
     which matches YouTube's own ``none`` default.
+
+    This is the RAW Data API verdict, and it is deliberately kept pure. An
+    aired PREMIERE of an ordinary upload carries the same resource, so a
+    True here still has to pass through ``refine_was_livestream`` (issue
+    #245) before anything routes on it.
     """
     if not item.get("liveStreamingDetails"):
         return False
     return item.get("snippet", {}).get("liveBroadcastContent") not in ("upcoming", "live")
+
+
+# Issue #245: telling an aired premiere apart from a livestream VOD.
+#
+# The Data API attaches `liveStreamingDetails` to an aired PREMIERE of an
+# ordinary upload exactly as to a genuine livestream and exposes no field that
+# separates them, so issue #120's classifier routed premieres captions-first:
+# speech-only transcripts, no SCREEN blocks, status `complete`, exit 0. On one
+# conference channel 20 such transcripts accumulated silently over two months.
+#
+# YouTube's watch page DOES carry the distinction - `videoDetails.isLiveContent`
+# - and yt-dlp exposes it as `live_status`: `not_live` for a premiere, `was_live`
+# for a real livestream. Measured on the videos that motivated #120: 8/8
+# premieres `not_live`, 9/9 livestreams `was_live`, including both hard-400
+# cases. yt-dlp derives `not_live` only from an EXPLICIT False in
+# `isLive`/`isLiveContent` (`'not_live' if False in (is_live, live_content) else
+# None`, yt_dlp/extractor/youtube/_video.py at 2026.06.09), so a missing field
+# yields None, never `not_live` - the value is positive evidence.
+#
+# Duration was measured and rejected as a discriminator: premieres in the
+# corpus run up to 81 minutes and real livestreams that hard-400'd start at
+# 1h44m, a 23-minute band. So was the live-window-minus-duration delta (a real
+# stream showed +133 s, inside the premiere countdown band).
+PREMIERE_PROBE_EXECUTABLE = "yt-dlp"
+#: Measured at ~5 s per video on the reference machine; a 3x margin. A timeout
+#: keeps the Data API flag (captions-first), so a slow probe costs slides on one
+#: video, never a wrong Gemini spend.
+PREMIERE_PROBE_TIMEOUT_SECONDS = 15
+PREMIERE_LIVE_STATUS_NOT_LIVE = "not_live"
+_KNOWN_LIVE_STATUSES = frozenset({"is_live", "is_upcoming", "was_live", "not_live", "post_live"})
+#: Memo for the executable lookup, keyed "exe" once resolved. A dict rather than
+#: an lru_cache so a test can reset it with one setattr.
+_PREMIERE_PROBE_EXE_MEMO: dict = {}
+
+
+def _premiere_probe_executable() -> str | None:
+    """Path to yt-dlp, resolved once per process; None (with ONE notice) when absent."""
+    if "exe" not in _PREMIERE_PROBE_EXE_MEMO:
+        exe = shutil.which(PREMIERE_PROBE_EXECUTABLE)
+        _PREMIERE_PROBE_EXE_MEMO["exe"] = exe
+        if exe is None:
+            log.info(
+                "yt-dlp not found on PATH: an aired premiere cannot be told apart from a livestream VOD "
+                "and will route captions-first (speech only, no slides). Install yt-dlp, or set "
+                "transcript_source: gemini on channels that premiere their uploads (issue #245)."
+            )
+    return _PREMIERE_PROBE_EXE_MEMO["exe"]
+
+
+def probe_live_status(video_id: str) -> str | None:
+    """yt-dlp's ``live_status`` for one video, or None when it cannot be established.
+
+    Metadata only (``--skip-download``), one video (``--no-playlist``), and the
+    user's own yt-dlp configuration is ignored so nothing can reshape the one
+    line this reads. Every failure - no executable, non-zero exit, timeout, an
+    unknown value - is None: the caller treats None as "keep the Data API's
+    verdict", never as evidence either way.
+    """
+    exe = _premiere_probe_executable()
+    if exe is None:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                exe,
+                "--skip-download",
+                "--no-playlist",
+                "--no-warnings",
+                "--ignore-config",
+                "--print",
+                "%(live_status)s",
+                f"https://www.youtube.com/watch?v={video_id}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=PREMIERE_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    if result.returncode != 0:
+        return None
+    lines = [ln.strip() for ln in (result.stdout or "").splitlines() if ln.strip()]
+    status = lines[-1] if lines else ""
+    return status if status in _KNOWN_LIVE_STATUSES else None
+
+
+def refine_was_livestream(video_id: str, api_flag: bool) -> bool:
+    """Clear the Data API's livestream flag when the video was never live content (issue #245).
+
+    Only a video the Data API already flagged is probed - a regular upload pays
+    no network here - and only a validated ``not_live`` clears the flag. A
+    missing yt-dlp, a timeout, a failed extraction or an unknown status all keep
+    the flag: an absent signal must never become a positive "premiere" verdict,
+    which would send a genuine livestream's unfetchable URI to Gemini.
+
+    Both #120 consumers read the refined value - the captions-first routing AND
+    the mindmap-from-video suppression - because a premiere's URI is fetchable,
+    so neither #120 measure applies to it.
+    """
+    if not api_flag:
+        return False
+    if _premiere_probe_executable() is None:
+        return True
+    status = probe_live_status(video_id)
+    if status == PREMIERE_LIVE_STATUS_NOT_LIVE:
+        log.info(
+            "  %s: liveStreamingDetails present but yt-dlp live_status=not_live - an aired PREMIERE of an "
+            "ordinary upload, routing as a regular upload (issue #245).",
+            video_id,
+        )
+        return False
+    if status is None:
+        log.warning(
+            "  %s: liveStreamingDetails present and yt-dlp could not classify it (missing, timed out, or "
+            "returned no live_status); keeping captions-first routing. If this is a premiered upload, "
+            "re-run with --transcript-source gemini (issue #245).",
+            video_id,
+        )
+    return True
 
 
 def fetch_preflight_status(youtube, video_ids: list[str]) -> dict[str, dict]:
@@ -1968,10 +2093,14 @@ def _lookup_was_livestream(video_id: str) -> bool:
     try:
         yt_build = require_youtube()
         yt = yt_build("youtube", "v3", developerKey=yt_key)
-        return bool(fetch_preflight_status(yt, [video_id]).get(video_id, {}).get("was_livestream"))
+        api_flag = bool(fetch_preflight_status(yt, [video_id]).get(video_id, {}).get("was_livestream"))
     except Exception as e:
         log.warning("Could not classify livestream status for %s: %s", video_id, e)
         return False
+    # Issue #245: the Data API cannot tell an aired premiere from a livestream;
+    # the same refinement the scan pre-flight applies runs here, so the manual
+    # commands and the scan agree about one video.
+    return refine_was_livestream(video_id, api_flag)
 
 
 def should_skip_video_mindmap_for_livestream(
@@ -7376,8 +7505,10 @@ def cmd_scan(args, config):
             else:
                 # Issue #120: carry the completed-livestream flag on the video
                 # dict so the transcript and mindmap loops below can route on it
-                # without a second API call.
-                v["was_livestream"] = bool(status.get("was_livestream"))
+                # without a second API call. Issue #245: refine it first - an
+                # aired premiere carries the same Data API shape, and only a
+                # flagged video pays for the yt-dlp probe.
+                v["was_livestream"] = refine_was_livestream(v["video_id"], bool(status.get("was_livestream")))
                 # Issue #224: prefer the pre-flight copy. A video absent from
                 # the pre-flight response yields {}, and a keyword-search video
                 # carries only a truncated description, so only a non-empty
@@ -7387,8 +7518,9 @@ def cmd_scan(args, config):
                 if v["was_livestream"]:
                     # One line PER VIDEO, not an aggregate count. YouTube attaches
                     # liveStreamingDetails to aired PREMIERES of ordinary uploads
-                    # exactly as it does to genuine livestreams, and exposes no
-                    # field that separates them - so this flag can misfire, and a
+                    # exactly as it does to genuine livestreams; issue #245 clears
+                    # those through yt-dlp when it is on PATH, but without it (or
+                    # when the probe fails) the flag can still misfire, and a
                     # premiere-every-upload channel would quietly slide to
                     # captions-only transcripts. Naming each video makes that
                     # auditable from the scan log instead of invisible.
