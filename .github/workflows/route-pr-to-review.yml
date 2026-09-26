@@ -79,7 +79,15 @@ jobs:
 
           echo 'PROJECT_ID='$(jq -r '.data.user.projectV2.id' project_data.json) >> "$GITHUB_ENV"
           echo 'STATUS_FIELD_ID='$(jq -r '.data.user.projectV2.fields.nodes[] | select(.name=="Status") | .id' project_data.json) >> "$GITHUB_ENV"
-          echo 'REVIEW_OPTION_ID='$(jq -r '.data.user.projectV2.fields.nodes[] | select(.name=="Status") | .options[] | select(.name=="Review") | .id' project_data.json) >> "$GITHUB_ENV"
+          # Accept "In Review" (the board's current name) and "Review" (its name
+          # before 2026-09): the column was renamed and this lookup silently
+          # returned empty, failing every PR run from 2026-09-18 on.
+          review_option_id="$(jq -r '[.data.user.projectV2.fields.nodes[] | select(.name=="Status") | .options[] | select(.name=="In Review" or .name=="Review") | .id][0] // empty' project_data.json)"
+          if [ -z "$review_option_id" ]; then
+            echo "::error::No 'In Review' or 'Review' option on the project's Status field. Options: $(jq -r '[.data.user.projectV2.fields.nodes[] | select(.name=="Status") | .options[].name] | join(", ")' project_data.json)"
+            exit 1
+          fi
+          echo "REVIEW_OPTION_ID=$review_option_id" >> "$GITHUB_ENV"
 
       - name: Add PR to project (idempotent — returns existing item if already added)
         env:
