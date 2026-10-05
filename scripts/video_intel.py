@@ -559,6 +559,12 @@ CONFIG_BACKUP_COMMANDS = frozenset(
         "dedupe",
         "prune-shorts",
         "mark-skip",
+        # Issue #247: writes `_headlines/seen.json`, which is scan state - the
+        # record of which channel list produced it must stay recoverable, so it
+        # snapshots like `scan`. It requires `channels:`, so the channel-less
+        # user-level config that makes `nugget`'s exemption necessary can never
+        # reach it.
+        "headlines",
     }
 )
 
@@ -12908,6 +12914,35 @@ HEADLINES_MAX_ZERO_SCORE = 5  # a few recent "Other headlines" (mirrors briefing
 HEADLINES_SEEN_MAX = 500  # bound seen.json so it never grows without limit
 HEADLINES_LOOKBACK_DAYS = 14  # "new" window; the seen-set is the real re-surface guard
 HEADLINE_DOMAIN_MATCH_WEIGHT = 0.5  # weak signal, mirrors rank_unseen's domain bonus
+#: Issue #247: a phrase found only in the DESCRIPTION pays this fraction of what
+#: the same phrase pays in the title. Titles are written to be clicked and are
+#: short; descriptions are long and full of boilerplate, so a raw phrase hit
+#: there is weaker evidence - but the audience profile's own triage rule
+#: ("judge by content, never by titles") says it is evidence, so it counts.
+HEADLINE_DESCRIPTION_MATCH_FACTOR = 0.5
+#: Lines of a YouTube description that are about the channel, not the video.
+#: A line matching this (case-insensitive) is dropped whole before matching so
+#: a sponsor read or a "subscribe" footer cannot lift a video. Word-bounded on
+#: purpose (review round, PR #253): a bare substring `merch` deleted "MCP for
+#: merchants" and `discount` deleted "discounted cash flow" - real content.
+#: Conservative on purpose too: a marker that also appears in real content
+#: ("agent", "model") would delete the evidence this feature exists to read.
+#: Social hosts are matched on the RAW line, before URL stripping, so
+#: `https://twitter.com/me` and `twitter.com/me` are the same footer.
+_HEADLINE_BOILERPLATE_LINE = re.compile(
+    r"\b(?:sponsor\w*|subscribe[sd]?|follow (?:me|us)|discount(?: code)?|promo code|use code|coupons?|"
+    r"affiliates?|patreon|merch(?:andise)?|newsletters?|join (?:my|our)|sign up|free trial)\b"
+    r"|\d+\s*% off"
+    r"|\b(?:linkedin|twitter|instagram|tiktok|facebook)\.com\b"
+    r"|\bx\.com/",
+    re.IGNORECASE,
+)
+#: A chapter / timestamp line: `0:00 Intro`, `(12:34) The demo`, `1:02:03 - Q&A`.
+#: Not a wall-clock time at line start (`10:00 AM webinar on MCP servers`).
+_HEADLINE_CHAPTER_LINE = re.compile(
+    r"^\s*[\(\[]?\d{1,2}:\d{2}(?::\d{2})?[\)\]]?(?!\s*[ap]\.?m\b)(\s|$|[-:])", re.IGNORECASE
+)
+_HEADLINE_URL = re.compile(r"(https?://\S+|www\.\S+)", re.IGNORECASE)
 # A bare YouTube channel id: literal "UC" + 22 url-safe base64 chars.
 _UC_CHANNEL_ID_RE = re.compile(r"^UC[0-9A-Za-z_-]{22}$")
 _YOUTUBE_HOSTS = frozenset({"youtube.com", "m.youtube.com", "youtu.be", "www.youtube.com"})
@@ -13575,8 +13610,35 @@ def collect_headline_channels(config: dict) -> list[dict]:
     return eligible
 
 
+def clean_headline_description(text: str | None) -> str:
+    """Reduce a YouTube description to the words that describe THIS video (issue #247).
+
+    Drops URLs, chapter/timestamp lines, hashtag-only lines, and any line matching
+    `_HEADLINE_BOILERPLATE_LINE` (sponsor reads, subscribe footers, social
+    handles - checked on the RAW line so a social host inside a URL still counts),
+    then normalizes like a title via `_norm_phrase`. Returns "" for a missing
+    description so `rank_headlines` can treat "no description" and "nothing
+    descriptive in it" identically.
+    """
+    if not text:
+        return ""
+    kept: list[str] = []
+    for raw_line in str(text).splitlines():
+        if _HEADLINE_BOILERPLATE_LINE.search(raw_line):
+            continue
+        line = _HEADLINE_URL.sub(" ", raw_line).strip()
+        if not line:
+            continue
+        if _HEADLINE_CHAPTER_LINE.match(line):
+            continue
+        if all(tok.startswith("#") for tok in line.split()):
+            continue
+        kept.append(line)
+    return _norm_phrase(" ".join(kept))
+
+
 def rank_headlines(videos: list[dict], profile: dict | InterestModel, taxonomy: dict | None = None) -> list[dict]:
-    """Rank metadata-only headline videos by title match against the interest profile.
+    """Rank metadata-only headline videos by title (and description) match against the profile.
 
     Headline videos carry NO concepts.json (no Gemini extraction), so `rank_unseen`
     would score every one zero and collapse to pure recency (issue #113). Instead we
@@ -13601,31 +13663,60 @@ def rank_headlines(videos: list[dict], profile: dict | InterestModel, taxonomy: 
     interest weights - inflating exactly the vaguest headlines, and only on this
     surface (the concept-evidence surface counts a video's own concept ids, which
     cannot collide this way).
+
+    Issue #247: the DESCRIPTION is evidence too (it is already on every video dict
+    since #224, zero extra quota), read through `clean_headline_description` so
+    URLs, chapter lists and sponsor boilerplate cannot lift a video. A concept
+    still pays at most once per video: at full weight when any of its phrases is
+    in the title, else at `HEADLINE_DESCRIPTION_MATCH_FACTOR` of its weight when
+    a phrase is only in the description. The phrase-claim rule spans both fields
+    (a phrase paid for in the title by a heavier concept is not paid again from
+    the description by a lighter one). Domains follow the same two tiers.
     """
     model = _as_interest_model(profile, taxonomy)
 
     scored: list[dict] = []
     for video in videos:
         title = f" {_norm_phrase(video.get('title', ''))} "
+        description = f" {clean_headline_description(video.get('description'))} "
         score = 0.0
-        matched: list[str] = []
-        hits = [(c, {p for p in c.phrases if p in title}) for c in model.concepts]
+        # Two lists so the five-label truncation below never hides a title-tier
+        # match behind description-tier ones (review round, PR #253).
+        title_labels: list[str] = []
+        description_labels: list[str] = []
+        hits = []
+        for c in model.concepts:
+            in_title = {p for p in c.phrases if p in title}
+            in_description = {p for p in c.phrases if p in description} - in_title
+            if in_title or in_description:
+                hits.append((c, in_title, in_description))
         # Heaviest concept claims a contested phrase first, so the cap keeps the
         # strongest interpretation of the evidence rather than an arbitrary one.
-        hits = sorted((h for h in hits if h[1]), key=lambda h: (-h[0].weight, h[0].concept_id))
+        hits = sorted(hits, key=lambda h: (-h[0].weight, h[0].concept_id))
         claimed: set[str] = set()
-        for concept, phrases in hits:
-            if not phrases - claimed:
+        for concept, in_title, in_description in hits:
+            fresh_title = in_title - claimed
+            fresh_description = in_description - claimed
+            if not fresh_title and not fresh_description:
                 # Every phrase this concept matched was already paid for by a
                 # heavier concept: the same words, not independent evidence.
                 continue
-            claimed |= phrases
-            score += concept.weight  # each concept pays at most once
-            matched.append(concept.label)
+            claimed |= fresh_title | fresh_description
+            # each concept pays at most once; the title tier wins when both hit
+            if fresh_title:
+                score += concept.weight
+                title_labels.append(concept.label)
+            else:
+                score += concept.weight * HEADLINE_DESCRIPTION_MATCH_FACTOR
+                description_labels.append(f"{concept.label} (description)")
         for padded_domain, domain_label in model.domain_terms:
             if padded_domain in title:
                 score += HEADLINE_DOMAIN_MATCH_WEIGHT
-                matched.append(domain_label)
+                title_labels.append(domain_label)
+            elif padded_domain in description:
+                score += HEADLINE_DOMAIN_MATCH_WEIGHT * HEADLINE_DESCRIPTION_MATCH_FACTOR
+                description_labels.append(f"{domain_label} (description)")
+        matched = title_labels + description_labels
         scored.append({**video, "score": score, "matched_concepts": matched[:5]})
     scored.sort(key=lambda v: (v["score"], v.get("published", "")), reverse=True)
     return scored
@@ -13699,7 +13790,7 @@ def render_headline_digest(youtube, config: dict, output_dir: Path, *, dry_run: 
     Metadata-only: uses the cheap uploads-playlist path plus a duration enrich for the
     Shorts filter. Makes NO Gemini calls and writes NO corpus artifacts. Non-fatal by
     construction - the caller runs it last, after wanted work. Returns the rendered
-    items (also useful for a future standalone `headlines` command). A `--dry-run`
+    items (the standalone `headlines` command, issue #247, is that caller). A `--dry-run`
     renders but does not advance `_headlines/seen.json`.
     """
     headline_channels = collect_headline_channels(config)
@@ -13800,6 +13891,46 @@ def render_headline_digest(youtube, config: dict, output_dir: Path, *, dry_run: 
 
     if not dry_run:
         advance_headlines_seen(output_dir, [v["video_id"] for v in rendered])
+    return rendered
+
+
+def cmd_headlines(args, config):
+    """Render the headline digest on its own (issue #247).
+
+    The SAME `render_headline_digest` a full `scan` ends with, with nothing in
+    front of it: no Gemini client, no corpus artifacts, metadata-only YouTube
+    calls, and `_headlines/seen.json` advanced exactly as the scan path advances
+    it (not on `--dry-run`). Requires `channels:` because the digest's channel
+    list IS the config, and snapshots the config first like `scan` does: the
+    seen-state is scan state, and the record of which channel list produced it
+    must stay recoverable.
+    """
+    require_channels_config(config)
+    if not collect_headline_channels(config):
+        # Probe before you pay: no YouTube client, no snapshot, and a message
+        # that names the knob rather than "nothing new" (review round, PR #253).
+        log.warning(
+            "No channel carries `headline_digest: true` on an `enabled: false` entry; nothing to render. "
+            "Add the flag to a channel in config.yaml to put it in the digest."
+        )
+        return []
+    yt_build = require_youtube()
+    yt_key = os.environ.get("YOUTUBE_API_KEY")
+    if not yt_key:
+        log.error(
+            "YOUTUBE_API_KEY not set. Get a free key at https://console.cloud.google.com/apis/credentials (enable YouTube Data API v3)"
+        )
+        sys.exit(1)
+    youtube = yt_build("youtube", "v3", developerKey=yt_key)
+    output_dir = resolve_output_dir(config)
+    # Before the render, like scan: the seen-state this run advances is scan
+    # state, and the channel list that produced it must be on record first.
+    backup_config_if_changed(output_dir)
+    rendered = render_headline_digest(youtube, config, output_dir, dry_run=args.dry_run)
+    if not rendered:
+        log.info("Headline digest: nothing new to surface.")
+    elif args.dry_run:
+        log.info("Headline digest: --dry-run, %d item(s) rendered and NOT marked seen.", len(rendered))
     return rendered
 
 
@@ -15504,6 +15635,16 @@ Examples:
     )
 
     # briefings command (issue #80): catch-up briefings for unseen videos
+    headlines_parser = subparsers.add_parser(
+        "headlines",
+        help=(
+            "Render the headline digest on its own: new uploads in enabled:false + headline_digest:true "
+            "channels, ranked by title and description against the interest profile. Metadata-only, no Gemini."
+        ),
+    )
+    headlines_parser.add_argument(
+        "--dry-run", action="store_true", help="Render the digest without advancing _headlines/seen.json"
+    )
     briefings_parser = subparsers.add_parser(
         "briefings",
         help="Generate catch-up briefings for videos not yet surfaced in any _briefings/ guide",
@@ -15642,6 +15783,8 @@ Examples:
             cmd_prune_shorts(args, config)
         elif args.command == "mark-skip":
             cmd_mark_skip(args, config)
+        elif args.command == "headlines":
+            cmd_headlines(args, config)
         elif args.command == "briefings":
             cmd_briefings(args, config)
         elif args.command == "profile":

@@ -3,7 +3,9 @@ name: video-intel
 description: >
   Ingest/curate side of the video intelligence plugin. Use whenever the
   user wants to modify or build the corpus: scan YouTube channels for new
-  videos and generate mind maps via Gemini; transcribe a video (URL or
+  videos and generate mind maps via Gemini; render the headline digest of
+  channels followed loosely ("any headlines", "peripheral headlines",
+  "what's new in channels I don't follow", "show me the digest"); transcribe a video (URL or
   local MP4); run the full mindmap+transcript+concepts pipeline on a local
   video; extract and normalize concepts into the taxonomy; rebuild the
   LanceDB hybrid-search index from existing transcripts; clean up
@@ -166,7 +168,7 @@ table is the canonical mapping — read it before picking a command.
 | "fully index this 3-hour talk", "transcribe this conference recording", "process this Lex Fridman episode" | `process --url URL --channel <NAME> --chunk-minutes 20` | Long-form ergonomic. Same issue #54 ordering: transcript first (auto-chunks via `--chunk-minutes`, default 30; pass a lower value on dense material, never a higher one - issue #157 lowered the default from 50 on purpose; each chunk becomes one Gemini call, merged into a single `.transcript.md` with offset-applied timestamps and a coverage-table header) then mindmap-from-transcript (one fast text call no matter how long the video) then concepts. Failure mode: per-chunk failures land as `.transcript.raw.chunkN-START-END.txt` sidecars; meta.json carries `transcript_status: partial` if any chunk failed; the resulting mindmap inherits `mindmap_source_status: partial` and a `<!-- source: partial transcript -->` HTML comment header. |
 | "run full pipeline on [local file]", "mindmap + transcript + concepts on one upload", "process this MP4" | `process --file PATH` | Local video only; single upload, lazy-skipped when artifacts already exist. **Stays on legacy mindmap-from-video** because chunking would multiply uploads (one-upload guarantee). For local files exceeding the chunk threshold, manual `--start`/`--end` segments are still the workaround. |
 | "regenerate mindmap on [URL]", "redo the mindmap for [video]", "mindmap from transcript instead of video" | `mindmap --url URL --channel <NAME>` (with on-disk transcript) | Issue #54: when a transcript is already on disk for the URL, `mindmap --url` automatically routes to the cheap text-only path. Pass `--force` to overwrite an existing mindmap. Per-channel `mindmap_source: video` forces the legacy video path even when transcript exists. |
-| "scan", "what's new", "check for new videos" | `scan` | All channels, configured `since` |
+| "scan", "what's new", "check for new videos" | `scan` | All channels, configured `since`. "What's new in channels I do NOT follow" is the `headlines` row below, not a scan |
 | "what's new from [creator]" | `scan --channel X` | Single channel, configured `since` |
 | "transcribe [creator]'s backlog", "videos I'm missing from [creator]", "catch up on [creator]" | `scan --channel X --since 2y` (or wider) | **Always `--dry-run` first** to surface scope |
 | "fully scan [creator]", "everything from [creator]" | `scan --channel X --since 2005-01-01` | **Always `--dry-run` first** — implies entire channel history |
@@ -178,6 +180,7 @@ table is the canonical mapping — read it before picking a command.
 | "rebuild topics", "which channels belong to [topic]", "why is this channel in my corpus", "update the topic index", "what videos are in my FDE thread" | `topics-build [--dry-run]` | Derived artifact; rebuildable anytime. Unions two assertion sources: briefing front-matter `video_ids` keyed by the first folder under `_briefings/` (so `_briefings/fde/**` is topic `fde`; `_briefings/nuggets/` is reserved and excluded), and per-video `topics` stamps from `--topic`. Writes `<output_dir>/topics.json`; byte-stable, and it never touches `taxonomy.json`. Read it back with `status` (per-channel rollup) or `search --topic <slug>` in the search skill. |
 | "tag this video as [topic]", "this one is for the FDE thread", "record why I pulled this in", "backfill a topic onto a video I already have" | `--topic <slug>` on `process` / `transcript` / `mindmap` (repeatable) | Merges normalized slugs into the video's meta.json `topics`. `FDE`, `fde` and `fde/` are one topic. **Recorded even when every stage lazy-skips** - provenance is the flag's whole purpose, so it is the way to tag a video that is already fully processed. Run `topics-build` afterwards to refresh the join. There is no `--remove-topic`: delete the slug from the meta (or the id from the briefing) and rebuild. |
 | "catch me up on what I missed", "what haven't I been briefed on", "videos I haven't seen yet", "generate a catch-up briefing", "fill the gaps in my viewing guides", "give me the briefing as a PDF", "a briefing I can open on my phone / share" | `briefings --unseen [--dry-run] [--since DATE] [--until DATE] [--limit N] [--pdf]` | Surfaces corpus videos absent from every existing `_briefings/**/*.md` `video_ids` list, including topic subfolders like `_briefings/sales/` (strict set difference, never re-surfaced once briefed), **across the whole corpus by default (no recency floor)**, ranked by relevance overlap with the inferred profile in `_briefings/profile.yaml` and capped to the top `N` (default 30; `--limit 0` = no cap). Each entry shows an age badge (`age 3y`) and a "By year" appendix regroups the same set chronologically. `--dry-run` previews; otherwise writes `_briefings/<date>-catch-up-unseen.md`. `--pdf` additionally writes a clickable `.pdf` beside it (bold, accent-colored, hyperlinked timestamps; needs the `[pdf]` extra). Pass `--since 30d` (or any date) to *narrow* to a recency floor. No Gemini, no `channels:` required. |
+| "any headlines", "what's new in channels I don't follow", "catch me up on what I follow loosely", "peripheral headlines", "flip through new uploads", "anything worth pulling from the digest-only channels", "show me the digest without a scan" | `headlines` (preview with `headlines --dry-run`) | Renders the headline digest on its own: new uploads (last 14 days) in `enabled: false` + `headline_digest: true` channels, ranked by title and description against the interest profile, positive matches first then a few recent "Other headlines", about 10 per run. Metadata-only (a few YouTube Data API units per digest channel), no Gemini, no corpus artifacts; needs the plugin `config.yaml` (curate side, not reachable from the globally installed search skill) and snapshots it like `scan`. **Default to `--dry-run` when the user is only asking what exists**; without it the rendered items are marked seen in `_headlines/seen.json` and never resurface, so run it bare only when they mean to consume the digest, and say so when a peek marked items seen. "Catch me up" + "loosely" / "don't follow" means this row, not `briefings --unseen` (the corpus catch-up) or `scan`. To ingest a headline that earned it, follow with `process --url <url> --channel <name>`. |
 | "why am I seeing this", "what's ranking my briefings", "show my interest profile", "what does the digest think I care about", "where is my profile", "how do I retune my recommendations" | `profile show` | Also available from the read-only `video-intel-search` skill, so this question can be asked from any project (issue #117). Read-only. Prints the resolved interest model (source: persisted vs inferred), top weighted concepts/domains, and the on-disk paths of `_briefings/profile.yaml` (ranking weights) + `_briefings/audience.md` (reader-context prose). Writes nothing. One model powers both `briefings --unseen` and the scan headline digest. |
 | "my priorities are shifting", "I care about X now", "stop showing me Y", "update my preferences", "remember that I now focus on Z" | *Edit `<output_dir>/_briefings/audience.md` in session* | Not a command. This file is the user's standing reader context and the ONLY home for a stated preference change - do not record it in a note, a memory or a new file instead. **Copy it to a dated sibling (`audience.backup-<YYYY-MM-DD>.md`) BEFORE editing**: nothing regenerates it and `profile init` refuses to overwrite it, so a bad edit is unrecoverable. Sharpen an existing pillar rather than inventing a parallel one; add to "what counts as signal" / "what counts as noise" when the user names either. Edit `profile.yaml` too only when ranking weights should actually move. Report the change and the backup path back to the user. |
 | "set up my profile", "personalize my briefings", "let me tune what surfaces first", "create my audience profile", "save the inferred profile" | `profile init` | Persists the inferred `_briefings/profile.yaml` and scaffolds `_briefings/audience.md` from the template. **Never overwrites** an existing file (even a partial/malformed one) - hand-editing is the retune path. After it runs, point the user at the two files; there is no `profile edit`. |
@@ -936,17 +939,21 @@ creators you do NOT actively follow. Add `headline_digest: true` alongside
 `enabled: false` and a full `scan` ends with an "Other headlines - new in
 channels you're not actively following" section listing their latest uploads.
 This is metadata-only - NO mindmap/transcript/concepts, NO Gemini calls, NO
-corpus artifacts. Items are ranked by title match against the same compiled
-interest model `briefings --unseen` uses (see "Personalization profile" above -
-`_briefings/profile.yaml`; positive matches first, then a few recent
-"Other headlines"), capped at ~10 per run, and a bounded `_headlines/seen.json`
-means a given upload is surfaced once, not every run. The section is skipped on
-focused `scan --channel X` runs (it is a full-scan concept) and on `--dry-run`
-the seen-set is not advanced. Requires a recognizable YouTube url or `UC...`
-channel id; non-YouTube sources (Skool, Vimeo) are ignored for the digest.
-There is no standalone `headlines` subcommand - it renders only as a trailing
-section of `scan`. Trigger phrases: "any headlines", "what's new in channels I
-don't follow", "peripheral headlines", "flip through new uploads".
+corpus artifacts. Items are ranked by title AND description match against the
+same compiled interest model `briefings --unseen` uses (see "Personalization
+profile" above - `_briefings/profile.yaml`): a phrase found only in the
+description counts for half of a title hit, after URLs, chapter lists and
+sponsor boilerplate are stripped, and a concept counts once per video.
+Positive matches first, then a few recent "Other headlines", capped at ~10 per
+run, and a bounded `_headlines/seen.json` means a given upload is surfaced
+once, not every run. The section is skipped on focused `scan --channel X` runs
+(it is a full-scan concept) and on `--dry-run` the seen-set is not advanced.
+Requires a recognizable YouTube url or `UC...` channel id; non-YouTube sources
+(Skool, Vimeo) are ignored for the digest.
+
+The digest also runs on its own, with no scan in front of it: `python scripts/video_intel.py headlines` renders exactly what a full scan would end with and advances the seen-set; `headlines --dry-run` previews without marking anything seen (prefer it when the user is only asking what exists). Metadata-only, no Gemini, no corpus artifacts; needs the plugin `config.yaml` (the channel list IS the digest's input), so it is a curate-side command and not reachable from the globally installed search skill.
+
+Trigger phrases: "any headlines", "what's new in channels I don't follow", "catch me up on the channels I follow loosely", "peripheral headlines", "flip through new uploads", "anything worth pulling from the digest-only channels".
 
 ### Prompt files
 

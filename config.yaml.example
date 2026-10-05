@@ -216,9 +216,12 @@ channels:
   # `scan` (like flipping a newspaper for a catchy title worth a manual look).
   # `enabled: false` keeps it out of the primary Gemini pipeline; the separate
   # `headline_digest: true` opt-in surfaces its latest uploads metadata-only -
-  # NO mindmap/transcript/concepts, NO corpus artifacts. Ranked by title match
-  # against _briefings/profile.yaml; a bounded _headlines/seen.json means a
-  # given upload is shown once, not every run. Requires a real YouTube url/id.
+  # NO mindmap/transcript/concepts, NO corpus artifacts. Ranked by title and
+  # description match against _briefings/profile.yaml; a bounded
+  # _headlines/seen.json means a given upload is shown once, not every run.
+  # Renders at the end of a full scan or on its own via `headlines`
+  # (`headlines --dry-run` previews without marking anything seen).
+  # Requires a real YouTube url/id.
   - name: example_headlines
     url: https://youtube.com/@peripheralcreator
     enabled: false

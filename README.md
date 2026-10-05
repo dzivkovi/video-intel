@@ -301,7 +301,7 @@ The repo only changes the default `model` on a measured scorecard, never on a sp
 | playlists | No | List of playlist names to scan (enables selective mode) |
 | keywords | No | List of search terms to scan (enables selective mode) |
 | enabled | No | `false` drops the channel from `scan` entirely, including an explicit `scan --channel <name>`, while keeping it addressable for `transcript --url --channel`, the `--file` paths and `concepts --channel`. Use it for Skool, Vimeo, members-only YouTube, and one-off creators (default: `true`) |
-| headline_digest | No | `true` on an `enabled: false` channel includes it in the metadata-only "Other headlines" digest at the end of a full scan. No Gemini calls, no corpus artifacts (default: `false`) |
+| headline_digest | No | `true` on an `enabled: false` channel includes it in the metadata-only "Other headlines" digest at the end of a full scan, or of a standalone `headlines` run. No Gemini calls, no corpus artifacts (default: `false`) |
 | mindmap_source | No | `auto` (default) builds the mind map from the transcript when one is on disk and falls back to video otherwise; `transcript` demands one; `video` forces the old path; `none` skips the mind map |
 | transcript_source | No | `gemini` (multimodal), `yt-captions` (caption track only), or `auto` (Gemini first, captions on failure). Leave it unset unless you mean it - an explicit `gemini` also opts a livestream VOD out of captions-first routing (an aired premiere is told apart from a livestream automatically when `yt-dlp` is on PATH; without it, explicit `gemini` is how a channel that premieres its uploads keeps its slides). **`yt-captions` skips the TRANSCRIPT call only, not Gemini entirely** - see the cost tiers below |
 | chunk_minutes | No | Per-channel override of the top-level chunk size |
@@ -539,7 +539,7 @@ The curation itself is authored **in-session by the assistant**, not scripted (t
 
 ### Headline digest - peripheral vision over channels you don't follow
 
-Not every creator is worth a Gemini bill. Add `headline_digest: true` alongside `enabled: false` on a channel and a full `scan` ends with an **"Other headlines - new in channels you're not actively following"** section listing their latest uploads: title, channel, date, link. That path is metadata-only - no mindmaps, no transcripts, no concepts, no Gemini calls, and nothing written into the corpus. Items are ranked by title match against your interest profile (positive matches first, then a few recent zero-score headlines), capped at ~10 per run, and a bounded `_headlines/seen.json` means a given upload is surfaced once rather than every run.
+Not every creator is worth a Gemini bill. Add `headline_digest: true` alongside `enabled: false` on a channel and a full `scan` ends with an **"Other headlines - new in channels you're not actively following"** section listing their latest uploads: title, channel, date, link. That path is metadata-only - no mindmaps, no transcripts, no concepts, no Gemini calls, and nothing written into the corpus. Items are ranked by title AND description match against your interest profile (a phrase found only in the description counts for half of a title hit, after URLs, chapter lists and sponsor boilerplate are stripped; positive matches first, then a few recent zero-score headlines), capped at ~10 per run, and a bounded `_headlines/seen.json` means a given upload is surfaced once rather than every run.
 
 ```yaml
 channels:
@@ -549,7 +549,14 @@ channels:
     headline_digest: true   # but do show me their new titles
 ```
 
-It needs a recognizable YouTube URL or `UC...` channel id (non-YouTube sources like Skool or Vimeo are ignored), it is skipped on focused `scan --channel X` runs because it is a full-scan concept, and there is no standalone `headlines` subcommand - it renders only as the trailing section of a scan.
+It needs a recognizable YouTube URL or `UC...` channel id (non-YouTube sources like Skool or Vimeo are ignored), and it is skipped on focused `scan --channel X` runs because it is a full-scan concept. To see it without paying for a scan, run it on its own:
+
+```bash
+python scripts/video_intel.py headlines            # render the digest and mark the items seen
+python scripts/video_intel.py headlines --dry-run  # preview without touching _headlines/seen.json
+```
+
+It is the same digest a full scan ends with (same ranking, same seen-state, no Gemini calls, no corpus artifacts).
 
 ### Personalization - the two files that decide what surfaces first
 
@@ -557,7 +564,7 @@ Both personalized surfaces above (the catch-up briefing and the headline digest)
 
 | File | What it is | Who reads it |
 | --- | --- | --- |
-| `profile.yaml` | Machine **ranking weights**: `interest_concepts: {concept_id: weight}` plus `interest_domains`. | `briefings --unseen` (concept overlap from each video's `concepts.json`) and the scan headline digest (title match against each concept's label/aliases). |
+| `profile.yaml` | Machine **ranking weights**: `interest_concepts: {concept_id: weight}` plus `interest_domains`. | `briefings --unseen` (concept overlap from each video's `concepts.json`) and the scan headline digest (title and description match against each concept's label/aliases). |
 | `audience.md` | Hand-written **reader context**: persona, standing pillars, current goals, what counts as signal vs noise. Prose, not weights. | The assistant, when it authors a *curated* topic briefing ("why it matters to YOU"). |
 
 ```bash
