@@ -143,7 +143,11 @@ class TestChunkedConfabulationGuard:
         status, _, meta, _ = _run(tmp_path, video, fake_types, monkeypatch, [250000, 0, 260000])
 
         assert meta["transcript_status"] == "partial"
-        assert status == "partial"
+        # Issue #248: a confab-discarded chunk is a LOST chunk, so the returned
+        # status carries the lost-chunks prefix the captions failover keys on.
+        assert status == "partial (chunks lost: 1 of 3)"
+        assert vi.chunked_transcript_lost_chunks(status)
+        assert meta["transcript_failed_chunks"] == 1
 
     def test_identity_is_still_stamped(self, tmp_path, video, fake_types, monkeypatch):
         """Issue #66 contract holds on the guarded path too."""

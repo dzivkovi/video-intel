@@ -327,14 +327,24 @@ class TestTranscriptTimeoutVsMaxDurationConsequence:
         assert problems[0][2] == KNOB_CONSEQUENCE_FAILS_TRANSCRIPTS
         assert problems[0][2] != KNOB_CONSEQUENCE_ABORTS_SCAN
 
-    @pytest.mark.parametrize("knob_name", ["transcript_max_duration_seconds", "transcript_timeout_seconds"])
-    def test_consequence_is_not_reached_when_auto_transcript_is_not_all(self, knob_name):
-        """Neither numeric knob is in `_MANUAL_COMMAND_KNOBS` - the AST walk
-        found `cmd_scan` is the only reader of either - so the NOT_REACHED
-        consequence carries no manual-command suffix for either one."""
-        problems = validate_channel_knobs({knob_name: "bad"}, {})
+    def test_max_duration_not_reached_carries_no_manual_suffix(self):
+        """`transcript_max_duration_seconds` is read by `cmd_scan` alone (AST
+        walk), so its NOT_REACHED consequence carries no manual-command suffix."""
+        problems = validate_channel_knobs({"transcript_max_duration_seconds": "bad"}, {})
 
+        assert "transcript_max_duration_seconds" not in vi._MANUAL_COMMAND_KNOBS
         assert problems[0][2] == KNOB_CONSEQUENCE_NOT_REACHED
+
+    def test_timeout_not_reached_carries_the_manual_suffix_since_248(self):
+        """Issue #248: `transcript --url` and `process --url` now resolve
+        `transcript_timeout_seconds` too (and exit 1 on a bad value), so the
+        knob is a `_MANUAL_COMMAND_KNOBS` member and NOT_REACHED carries the
+        suffix - built from the constants, never hardcoded prose."""
+        problems = validate_channel_knobs({"transcript_timeout_seconds": "bad"}, {})
+
+        assert "transcript_timeout_seconds" in vi._MANUAL_COMMAND_KNOBS
+        assert problems[0][2] == _not_reached_for("transcript_timeout_seconds")
+        assert problems[0][2].endswith(vi._MANUAL_COMMAND_SUFFIX)
 
 
 class TestReviewerVerifiedRuntimeBehavior:
