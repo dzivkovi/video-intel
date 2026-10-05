@@ -430,7 +430,9 @@ class TestConfigTemplateDocumentsEveryKnob:
         and a bare `ch.get` with no top-level twin."""
         found = _config_keys_the_code_reads()
         assert "channel_config" in found.get("transcript_source", set())
-        assert {"ch", "config"} <= found.get("transcript_timeout_seconds", set())
+        # Issue #248 moved the nested `ch.get(.., config.get(..))` idiom into
+        # `resolve_transcript_timeout_seconds`, whose receivers are these two.
+        assert {"channel_config", "config"} <= found.get("transcript_timeout_seconds", set())
         assert "channel" in found.get("headline_digest", set())
         assert "ch" in found.get("prompt", set())
         # The `(config or {}).get("channels")` shape from `configured_channels`.

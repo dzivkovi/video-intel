@@ -389,7 +389,9 @@ class TestEveryCallSiteThreadsTheDuration:
             and (n.func.attr if isinstance(n.func, ast.Attribute) else getattr(n.func, "id", None))
             == "_try_captions_transcript"
         ]
-        assert len(sites) >= 9, f"expected the module's captions call sites, found {len(sites)}"
+        # Issue #248 folded the three YouTube-URL chunked failover sites into ONE
+        # (`_finish_chunked_transcript`), so the floor dropped from 9 to 8.
+        assert len(sites) >= 8, f"expected the module's captions call sites, found {len(sites)}"
 
 
 class TestALeadingGapInACaptionTrackIsNotSevere:
