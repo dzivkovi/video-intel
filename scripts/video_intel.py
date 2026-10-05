@@ -1457,7 +1457,9 @@ KNOB_CONSEQUENCE_NOT_REACHED = "not reached with this channel's current settings
 #: operator it breaks `transcript --url` would send them hunting a failure that
 #: cannot happen. `transcript_timeout_seconds` joined this set in issue #248,
 #: when `_cmd_transcript_impl` and `_cmd_process_url` started resolving it
-#: through `resolve_transcript_timeout_seconds` (and exiting 1 on a bad value).
+#: through `resolve_transcript_timeout_seconds` (and exiting 1 on a bad value);
+#: issue #249 added `_cmd_mindmap_impl` (video branch and `--file`) and
+#: `_cmd_process_impl` as readers for the mindmap-from-video cap.
 _MANUAL_COMMAND_KNOBS = frozenset(
     {"transcript_source", "mindmap_source", "chunk_minutes", "transcript_timeout_seconds"}
 )
@@ -8094,9 +8096,11 @@ def cmd_scan(args, config):
             # the raw value is passed through exactly as before #248 - it
             # fails inside `_run_with_timeout`, inside the per-video handlers.
             log.error(
-                "[%s] invalid transcript_timeout_seconds (%s): every transcript for this channel will fail",
+                "[%s] invalid transcript_timeout_seconds (%s): every transcript for this channel will fail "
+                "(when auto_transcript: all); video mindmaps keep the default %ds cap",
                 ch_name,
                 e,
+                TRANSCRIPT_TIMEOUT_DEFAULT,
             )
             transcript_timeout_seconds = ch.get(
                 "transcript_timeout_seconds",
@@ -8841,10 +8845,8 @@ def _cmd_mindmap_impl(args, config):
         resolved_source = resolve_mindmap_source(
             channel_cfg, transcript_available=transcript_available, transcript_severe=transcript_severe
         )
-        # Issue #249: the video-fallback call takes the channel's hang budget.
-        mindmap_timeout_seconds = resolve_transcript_timeout_seconds(channel_cfg, config)
     except (ValueError, TypeError) as exc:
-        log.error("Mindmap source or transcript_timeout_seconds unresolvable for %s: %s", video_id, exc)
+        log.error("Mindmap source unresolvable for %s: %s", video_id, exc)
         sys.exit(1)
     if resolved_source == "skip":
         log.info("mindmap_source=none for channel %s; nothing to do.", channel_name)
@@ -8872,6 +8874,16 @@ def _cmd_mindmap_impl(args, config):
             transcript_path=transcript_path,
         )
     else:
+        # Issue #249: the video-fallback call takes the channel's hang budget.
+        # Resolved HERE, on the video branch only (Codex peer pass, PR #254): a
+        # typo'd knob must not block the uncapped transcript-source mindmap or
+        # a `skip`, which never make the call this budget governs. Before the
+        # duration lookup, so a typo costs no YouTube quota either.
+        try:
+            mindmap_timeout_seconds = resolve_transcript_timeout_seconds(channel_cfg, config)
+        except ValueError as exc:
+            log.error("Invalid transcript_timeout_seconds for %s: %s", video_id, exc)
+            sys.exit(1)
         # Issue #50 Gate-1 finding: Gemini caps at 10800 frames per request.
         # Preserved here only - text input has no frame cap.
         duration_seconds = _lookup_video_duration_seconds(video_id)
@@ -10185,6 +10197,7 @@ def _cmd_process_impl(args, config):
                         chunk_minutes=chunk_minutes,
                         force=transcript_force,
                         media_uri=uri,
+                        transcript_timeout_seconds=transcript_timeout_seconds,
                     )
                     return prefix, status
 
@@ -10205,6 +10218,7 @@ def _cmd_process_impl(args, config):
                         end_offset=end_offset,
                         media_uri=uri,
                         media_resolution=media_resolution_enum,
+                        transcript_timeout_seconds=transcript_timeout_seconds,
                         duration_seconds=duration_seconds,
                     )
 

@@ -200,6 +200,7 @@ class TestProcessUrlFallbackMindmapIsCappedByTheKnob:
         assert exc.value.code == 1
         meta, _ = _only_meta(tmp_path)
         assert "mindmap Gemini call exceeded" in meta["last_error"]
+        assert (meta["video_id"], meta["channel"]) == (VIDEO_ID, "alpha")
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +222,7 @@ class TestMindmapUrlIsCappedByTheKnob:
         assert elapsed < WALL_CLOCK_BOUND, f"mindmap waited out the hang ({elapsed:.1f}s)"
         meta, meta_path = _only_meta(tmp_path)
         assert "mindmap Gemini call exceeded" in meta["last_error"]
+        assert (meta["video_id"], meta["channel"]) == (VIDEO_ID, "alpha")
         assert not list(meta_path.parent.glob("*.mindmap.md"))
 
 
@@ -253,6 +255,7 @@ class TestScanFallbackMindmapIsCappedByTheKnob:
         assert elapsed < WALL_CLOCK_BOUND, f"scan waited out the hang ({elapsed:.1f}s)"
         meta, _ = _only_meta(tmp_path)
         assert "mindmap Gemini call exceeded" in meta["last_error"]
+        assert (meta["video_id"], meta["channel"]) == (VIDEO_ID, "alpha")
 
 
 # ---------------------------------------------------------------------------
@@ -322,3 +325,212 @@ class TestRunWithTimeoutLabel:
         with pytest.raises(vi.TranscriptTimeout) as exc:
             vi._run_with_timeout(lambda: time.sleep(1), 0.1)
         assert str(exc.value).startswith("transcript Gemini call exceeded")
+
+
+# ---------------------------------------------------------------------------
+# Round 2: bad knob, --file paths, text path, disabled cap
+# ---------------------------------------------------------------------------
+
+
+def _scan_harness(monkeypatch, tmp_path):
+    video = {"video_id": VIDEO_ID, "title": "A Talk", "published": "2026-08-12", "url": URL}
+    _wire_gemini_boundary(monkeypatch, tmp_path)
+    monkeypatch.setenv("YOUTUBE_API_KEY", "test")
+    monkeypatch.setattr(vi, "require_youtube", lambda: lambda *a, **kw: None)
+    monkeypatch.setattr(vi, "get_channel_id", lambda yt, url: (url, url))
+    monkeypatch.setattr(vi, "fetch_channel_videos", lambda yt, cid, since: [dict(video)])
+    monkeypatch.setattr(vi, "enrich_with_durations", lambda _yt, ids: dict.fromkeys(ids))
+    monkeypatch.setattr(vi, "fetch_preflight_status", lambda _yt, ids: {vid: {} for vid in ids})
+    monkeypatch.setattr(vi, "_is_youtube_short_url", lambda video_id: False)
+    return SimpleNamespace(dry_run=False, channel=None, force=False, since=None, model=None)
+
+
+class TestScanInvalidKnobKeepsTheMindmapCapped:
+    def test_string_knob_falls_back_to_the_default_cap_not_the_raw_value(self, tmp_path, monkeypatch, caplog):
+        scan_args = _scan_harness(monkeypatch, tmp_path)
+        monkeypatch.setattr(vi, "call_gemini", lambda *a, **kw: time.sleep(1.5))
+        monkeypatch.setattr(vi, "TRANSCRIPT_TIMEOUT_DEFAULT", 0.2)
+        config = {
+            "output_dir": str(tmp_path),
+            "channels": [
+                {
+                    "name": "alpha",
+                    "url": "https://youtube.com/@alpha",
+                    "auto_transcript": "none",
+                    "mindmap_source": "video",
+                    "transcript_timeout_seconds": "600",
+                }
+            ],
+        }
+
+        t0 = time.monotonic()
+        with caplog.at_level("ERROR"):
+            vi.cmd_scan(scan_args, config)
+        elapsed = time.monotonic() - t0
+
+        assert elapsed < WALL_CLOCK_BOUND
+        meta, _ = _only_meta(tmp_path)
+        # A closure that bound the raw "600" would surface a TypeError/ValueError text here.
+        assert "mindmap Gemini call exceeded" in meta["last_error"]
+        assert (meta["video_id"], meta["channel"], meta["title"]) == (VIDEO_ID, "alpha", "A Talk")
+        errors = [r.message for r in caplog.records if "invalid transcript_timeout_seconds" in r.message]
+        assert errors, "the invalid-knob ERROR must be logged"
+        assert any("video mindmaps keep the default" in m for m in errors)
+
+
+# ---------------------------------------------------------------------------
+# mindmap --file
+# ---------------------------------------------------------------------------
+
+
+def _file_args(mp4, **overrides):
+    return _url_args(url=None, file=str(mp4), **overrides)
+
+
+def _wire_file_boundary(monkeypatch, tmp_path, uploads):
+    _wire_gemini_boundary(monkeypatch, tmp_path)
+    monkeypatch.setattr(vi, "upload_local_video", lambda _c, _p: uploads.append(_p) or "files/xyz")
+    monkeypatch.setattr(vi, "_local_file_duration_seconds", lambda _p: 600)
+    monkeypatch.setattr(vi, "load_taxonomy", lambda _d: {"concepts": {}})
+    monkeypatch.setattr(vi, "process_concepts", lambda *a, **kw: ("p", "done"))
+
+
+def _mp4(directory):
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "talk.mp4"
+    path.write_bytes(b"fake mp4 bytes")
+    return path
+
+
+class TestMindmapFileIsCappedByTheKnob:
+    def test_channel_inferred_case(self, tmp_path, monkeypatch):
+        uploads: list = []
+        _wire_file_boundary(monkeypatch, tmp_path, uploads)
+        mp4 = _mp4(tmp_path / "alpha")
+
+        t0 = time.monotonic()
+        vi.cmd_mindmap(_file_args(mp4, channel="alpha", video_id=VIDEO_ID), _channel_config())
+
+        assert time.monotonic() - t0 < WALL_CLOCK_BOUND
+        meta, _ = _only_meta(tmp_path)
+        assert "mindmap Gemini call exceeded" in meta["last_error"]
+        assert meta["channel"] == "alpha"
+        assert meta["video_id"] == VIDEO_ID
+        assert uploads, "the upload must have happened (the cap guards the call after it)"
+
+    def test_standalone_case_uses_the_top_level_knob(self, tmp_path, monkeypatch):
+        uploads: list = []
+        _wire_file_boundary(monkeypatch, tmp_path, uploads)
+        mp4 = _mp4(tmp_path / "loose")
+        config = {"transcript_timeout_seconds": 0.2, "channels": [{"name": "alpha", "url": "https://youtube.com/@a"}]}
+
+        t0 = time.monotonic()
+        vi.cmd_mindmap(_file_args(mp4, channel=None), config)
+
+        assert time.monotonic() - t0 < WALL_CLOCK_BOUND
+        metas = list((tmp_path / "loose").glob("*.meta.json"))
+        assert len(metas) == 1
+        meta = json.loads(metas[0].read_text(encoding="utf-8"))
+        assert "mindmap Gemini call exceeded" in meta["last_error"]
+        assert meta["video_id"]
+
+    def test_bad_knob_exits_before_the_upload(self, tmp_path, monkeypatch):
+        uploads: list = []
+        _wire_file_boundary(monkeypatch, tmp_path, uploads)
+        mp4 = _mp4(tmp_path / "alpha")
+        config = _channel_config()
+        config["transcript_timeout_seconds"] = "600"
+
+        with pytest.raises(SystemExit) as exc:
+            vi.cmd_mindmap(_file_args(mp4, channel="alpha"), config)
+
+        assert exc.value.code == 1
+        assert uploads == [], "probe before pay: the upload must never happen"
+
+
+# ---------------------------------------------------------------------------
+# process --file
+# ---------------------------------------------------------------------------
+
+
+class TestProcessFileIsCappedByTheKnob:
+    def test_video_mindmap_is_capped_and_exit_is_one(self, tmp_path, monkeypatch):
+        uploads: list = []
+        _wire_file_boundary(monkeypatch, tmp_path, uploads)
+        monkeypatch.setattr(vi, "process_transcript", lambda *a, **kw: ("talk", "error: boom"))
+        mp4 = _mp4(tmp_path / "alpha")
+
+        t0 = time.monotonic()
+        with pytest.raises(SystemExit) as exc:
+            vi.cmd_process(_file_args(mp4, channel="alpha"), _channel_config())
+
+        assert time.monotonic() - t0 < WALL_CLOCK_BOUND
+        # A mindmap error is a hard failure (1), never EXIT_PARTIAL (3).
+        assert exc.value.code == 1
+        meta, _ = _only_meta(tmp_path)
+        assert "mindmap Gemini call exceeded" in meta["last_error"]
+        assert meta["channel"] == "alpha"
+
+    def test_single_shot_transcript_step_is_capped_too(self, tmp_path, monkeypatch, caplog):
+        uploads: list = []
+        _wire_file_boundary(monkeypatch, tmp_path, uploads)
+        # Real process_transcript, real mindmap: both hit the 6s sleeping call_gemini.
+        mp4 = _mp4(tmp_path / "alpha")
+
+        t0 = time.monotonic()
+        with caplog.at_level("INFO"), pytest.raises(SystemExit):
+            vi.cmd_process(_file_args(mp4, channel="alpha"), _channel_config())
+        elapsed = time.monotonic() - t0
+
+        # Uncapped, either step alone would wait out HANG_SECONDS.
+        assert elapsed < WALL_CLOCK_BOUND, f"a step waited out the hang ({elapsed:.1f}s)"
+        # The mindmap error later overwrites meta.last_error, so the transcript
+        # step's own status is read from its log line.
+        assert any("transcript Gemini call exceeded" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# mindmap --url, bad knob versus the text path
+# ---------------------------------------------------------------------------
+
+
+class TestMindmapUrlBadKnobDoesNotBlockTheTextPath:
+    def test_transcript_source_still_writes_the_mindmap(self, tmp_path, monkeypatch):
+        _wire_gemini_boundary(monkeypatch, tmp_path)
+        cdir = tmp_path / "alpha"
+        cdir.mkdir()
+        (cdir / "2026-08-12-a-talk.transcript.md").write_text("hello transcript", encoding="utf-8")
+        monkeypatch.setattr(vi, "call_gemini_text", lambda *a, **kw: "# Map\n- a")
+        config = _channel_config(mindmap_source="transcript", transcript_timeout_seconds="600s")
+
+        vi.cmd_mindmap(_url_args(), config)
+
+        assert list(cdir.glob("*.mindmap.md")), "the text-source mindmap must be written"
+
+    def test_video_source_exits_before_any_lookup(self, tmp_path, monkeypatch):
+        _wire_gemini_boundary(monkeypatch, tmp_path)
+        lookups: list = []
+        monkeypatch.setattr(vi, "_lookup_video_duration_seconds", lambda vid: lookups.append(vid) or 600)
+        config = _channel_config(mindmap_source="video", transcript_timeout_seconds="600s")
+
+        with pytest.raises(SystemExit) as exc:
+            vi.cmd_mindmap(_url_args(), config)
+
+        assert exc.value.code == 1
+        assert lookups == [], "probe before pay: no YouTube lookup for an unusable knob"
+
+
+# ---------------------------------------------------------------------------
+# Disabled cap
+# ---------------------------------------------------------------------------
+
+
+class TestZeroKnobDisablesTheCapAtTheCaller:
+    def test_mindmap_url_completes_when_the_knob_is_zero(self, tmp_path, monkeypatch):
+        _wire_gemini_boundary(monkeypatch, tmp_path)
+        monkeypatch.setattr(vi, "call_gemini", lambda *a, **kw: time.sleep(0.5) or "# Map\n- a")
+        config = _channel_config(mindmap_source="video", transcript_timeout_seconds=0)
+
+        vi.cmd_mindmap(_url_args(), config)
+
+        assert list((tmp_path / "alpha").glob("*.mindmap.md"))
