@@ -1457,7 +1457,9 @@ KNOB_CONSEQUENCE_NOT_REACHED = "not reached with this channel's current settings
 #: operator it breaks `transcript --url` would send them hunting a failure that
 #: cannot happen. `transcript_timeout_seconds` joined this set in issue #248,
 #: when `_cmd_transcript_impl` and `_cmd_process_url` started resolving it
-#: through `resolve_transcript_timeout_seconds` (and exiting 1 on a bad value).
+#: through `resolve_transcript_timeout_seconds` (and exiting 1 on a bad value);
+#: issue #249 added `_cmd_mindmap_impl` (video branch and `--file`) and
+#: `_cmd_process_impl` as readers for the mindmap-from-video cap.
 _MANUAL_COMMAND_KNOBS = frozenset(
     {"transcript_source", "mindmap_source", "chunk_minutes", "transcript_timeout_seconds"}
 )
@@ -3713,8 +3715,12 @@ class TranscriptTimeout(TimeoutError):
     """Raised when a transcript Gemini call exceeds its wall-clock budget (issue #74)."""
 
 
-def _run_with_timeout(fn: Callable, timeout_seconds: int):
+def _run_with_timeout(fn: Callable, timeout_seconds: int, *, label: str = "transcript Gemini call"):
     """Run ``fn()`` with a hard wall-clock timeout; raise ``TranscriptTimeout`` on expiry.
+
+    ``label`` names the call in the expiry message and the worker thread (issue
+    #249 added the mindmap-from-video caller; the exception class keeps its name
+    because every existing handler catches it by that name).
 
     Issue #74. A hung Gemini call never returns, and the httpx ``read`` timeout only
     bounds per-byte silence, not total time - so a slow-dribble or SDK-internal retry
@@ -3741,11 +3747,11 @@ def _run_with_timeout(fn: Callable, timeout_seconds: int):
         except BaseException as exc:  # re-raised in the caller's thread below
             box["error"] = exc
 
-    worker = threading.Thread(target=_runner, name="transcript-gemini-call", daemon=True)
+    worker = threading.Thread(target=_runner, name=label.replace(" ", "-"), daemon=True)
     worker.start()
     worker.join(timeout_seconds)
     if worker.is_alive():
-        raise TranscriptTimeout(f"transcript Gemini call exceeded {timeout_seconds}s wall-clock timeout (hang)")
+        raise TranscriptTimeout(f"{label} exceeded {timeout_seconds}s wall-clock timeout (hang)")
     if "error" in box:
         raise box["error"]
     return box.get("result")
@@ -5502,8 +5508,18 @@ def process_mindmap(
     source: str = "video",
     transcript_path: Path | None = None,
     media_resolution=None,
+    timeout_seconds: int | float = TRANSCRIPT_TIMEOUT_DEFAULT,
 ):
     """Generate a mind map for a single video.
+
+    ``timeout_seconds`` (issue #249) caps the ``source="video"`` Gemini call
+    with the same daemon-thread wall-clock helper the transcript call uses
+    (`_run_with_timeout`); on expiry the existing ``except`` below records
+    ``last_error`` and returns an ``error:`` status, so a hung call costs one
+    video and never the batch. The budget is ``transcript_timeout_seconds``
+    (callers pass the resolved knob; the default is the same constant), per
+    the knob-worthiness rubric: one hang budget, not two. The text-only
+    ``source="transcript"`` call is deliberately uncapped - no hang observed.
 
     When ``source="video"`` (default, legacy path), Gemini watches the media at
     ``video["url"]`` (or ``media_uri`` override). When ``source="transcript"``
@@ -5621,15 +5637,25 @@ def process_mindmap(
                     usage_capture.clear()
                     usage_capture.update(counts)
 
-            result = call_gemini(
-                client,
-                types,
-                effective_media_uri,
-                prompt_text,
-                model,
-                fps=fps,
-                media_resolution=effective_media_resolution,
-                on_response=_on_resp,
+            # Issue #249: the mindmap-from-video call is reached exactly when
+            # Gemini is already misbehaving (it is the fallback after a failed
+            # or partial transcript), and it had no wall-clock cap - observed
+            # blocked for 39 minutes with the 1200s httpx read timeout never
+            # firing. Same helper as the transcript call; TranscriptTimeout is
+            # an Exception, so the handler below records last_error.
+            result = _run_with_timeout(
+                lambda: call_gemini(
+                    client,
+                    types,
+                    effective_media_uri,
+                    prompt_text,
+                    model,
+                    fps=fps,
+                    media_resolution=effective_media_resolution,
+                    on_response=_on_resp,
+                ),
+                timeout_seconds,
+                label="mindmap Gemini call",
             )
             # prompt == 0 means Gemini ingested zero video tokens (gated,
             # unfetchable, or a future premiere) and generated a plausible
@@ -8052,6 +8078,38 @@ def cmd_scan(args, config):
         transcript_results: dict[str, str] = {}
 
         # Auto-transcript if configured (Step 1/2 of the inverted ordering).
+        # Issue #74: wall-clock cap so a hung Gemini call raises (-> failover
+        # under auto) instead of deadlocking the whole batch. Per-channel
+        # override > top-level > default, matching every other knob.
+        # Resolved for the WHOLE channel body (review round, PR #254): the mindmap
+        # loop reads it too (issue #249), and auto_transcript defaults to none, so
+        # resolving it inside the transcript branch left the closure unbound.
+        mindmap_timeout_seconds: int | float
+        try:
+            transcript_timeout_seconds = resolve_transcript_timeout_seconds(ch, config)
+            mindmap_timeout_seconds = transcript_timeout_seconds
+        except ValueError as e:
+            # Documented consequence (issue #169, `KNOB_CONSEQUENCE_FAILS_TRANSCRIPTS`):
+            # a bad value fails every transcript for THIS channel and the
+            # scan completes. Letting the resolver's ValueError escape here
+            # would abort the whole scan instead (review round, PR #251), so
+            # the raw value is passed through exactly as before #248 - it
+            # fails inside `_run_with_timeout`, inside the per-video handlers.
+            log.error(
+                "[%s] invalid transcript_timeout_seconds (%s): every transcript for this channel will fail "
+                "(when auto_transcript: all); video mindmaps keep the default %ds cap",
+                ch_name,
+                e,
+                TRANSCRIPT_TIMEOUT_DEFAULT,
+            )
+            transcript_timeout_seconds = ch.get(
+                "transcript_timeout_seconds",
+                config.get("transcript_timeout_seconds", TRANSCRIPT_TIMEOUT_DEFAULT),
+            )
+            # Issue #249: the mindmap closure must never receive the raw bad
+            # value - the documented consequence is about transcripts, and a
+            # video mindmap keeps the default cap instead of failing on a typo.
+            mindmap_timeout_seconds = TRANSCRIPT_TIMEOUT_DEFAULT
         auto = ch.get("auto_transcript", "none")
         if auto == "all":
             transcript_prompt = load_prompt("transcript")
@@ -8088,27 +8146,6 @@ def cmd_scan(args, config):
             # `transcript_source: gemini` on the channel is honored (documented
             # config contract), and is the escape hatch when the flag misfires.
             vod_captions_first = livestream_captions_first_applies(transcript_source, ch)
-            # Issue #74: wall-clock cap so a hung Gemini call raises (-> failover
-            # under auto) instead of deadlocking the whole batch. Per-channel
-            # override > top-level > default, matching every other knob.
-            try:
-                transcript_timeout_seconds = resolve_transcript_timeout_seconds(ch, config)
-            except ValueError as e:
-                # Documented consequence (issue #169, `KNOB_CONSEQUENCE_FAILS_TRANSCRIPTS`):
-                # a bad value fails every transcript for THIS channel and the
-                # scan completes. Letting the resolver's ValueError escape here
-                # would abort the whole scan instead (review round, PR #251), so
-                # the raw value is passed through exactly as before #248 - it
-                # fails inside `_run_with_timeout`, inside the per-video handlers.
-                log.error(
-                    "[%s] invalid transcript_timeout_seconds (%s): every transcript for this channel will fail",
-                    ch_name,
-                    e,
-                )
-                transcript_timeout_seconds = ch.get(
-                    "transcript_timeout_seconds",
-                    config.get("transcript_timeout_seconds", TRANSCRIPT_TIMEOUT_DEFAULT),
-                )
             # Long-video guard (issue #42): videos longer than the threshold
             # truncate the structured-JSON transcript response. Filter them out
             # of the transcript loop and log the manual-clipping recipe.
@@ -8336,6 +8373,7 @@ def cmd_scan(args, config):
             def _build_mindmap_call(
                 v,
                 _ch=ch,
+                _mindmap_timeout=mindmap_timeout_seconds,
                 _ch_name=ch_name,
                 _channel_dir=channel_dir_for_mindmap,
                 _video_prompt_text=prompt_text,
@@ -8411,6 +8449,9 @@ def cmd_scan(args, config):
                     prompt_name=_video_prompt_name,
                     force=args.force,
                     source="video",
+                    # Issue #249: same per-channel budget as the transcript call,
+                    # bound as a default like the transcript closure's `_timeout`.
+                    timeout_seconds=_mindmap_timeout,
                 )
 
             log.info("  Generating mind maps (%s)...", prompt_name)
@@ -8627,6 +8668,15 @@ def _cmd_mindmap_impl(args, config):
             sys.exit(1)
 
         channel_name = args.channel or infer_channel_from_file_path(input_path, output_dir, config)
+        # Issue #249: the Files-API mindmap call takes the channel's hang budget
+        # (top-level config when the file is standalone).
+        try:
+            file_timeout_seconds = resolve_transcript_timeout_seconds(
+                channel_config_by_name(config, channel_name) if channel_name else {}, config
+            )
+        except ValueError as e:
+            log.error("Invalid transcript_timeout_seconds: %s", e)
+            sys.exit(1)
 
         if args.channel:
             require_channels_config(config)
@@ -8676,6 +8726,7 @@ def _cmd_mindmap_impl(args, config):
                 channel_dir_override=identity["channel_dir"],
                 media_uri=file_uri,
                 media_resolution=media_resolution_enum,
+                timeout_seconds=file_timeout_seconds,
             )
             log.info("  %s: %s", prefix, status)
             if status == "done":
@@ -8706,6 +8757,7 @@ def _cmd_mindmap_impl(args, config):
             channel_dir_override=input_path.parent,
             media_uri=file_uri,
             media_resolution=media_resolution_enum,
+            timeout_seconds=file_timeout_seconds,
         )
         log.info("  %s: %s", prefix, status)
         if status == "done":
@@ -8822,6 +8874,16 @@ def _cmd_mindmap_impl(args, config):
             transcript_path=transcript_path,
         )
     else:
+        # Issue #249: the video-fallback call takes the channel's hang budget.
+        # Resolved HERE, on the video branch only (Codex peer pass, PR #254): a
+        # typo'd knob must not block the uncapped transcript-source mindmap or
+        # a `skip`, which never make the call this budget governs. Before the
+        # duration lookup, so a typo costs no YouTube quota either.
+        try:
+            mindmap_timeout_seconds = resolve_transcript_timeout_seconds(channel_cfg, config)
+        except ValueError as exc:
+            log.error("Invalid transcript_timeout_seconds for %s: %s", video_id, exc)
+            sys.exit(1)
         # Issue #50 Gate-1 finding: Gemini caps at 10800 frames per request.
         # Preserved here only - text input has no frame cap.
         duration_seconds = _lookup_video_duration_seconds(video_id)
@@ -8847,6 +8909,7 @@ def _cmd_mindmap_impl(args, config):
             fps=mindmap_fps,
             source="video",
             media_resolution=media_resolution_enum,
+            timeout_seconds=mindmap_timeout_seconds,
         )
     log.info("  %s: %s", prefix, status)
 
@@ -9743,6 +9806,7 @@ def _cmd_process_url(args, config):
             fps=mindmap_fps,
             prefix=prefix,
             source="video",
+            timeout_seconds=transcript_timeout_seconds,
         )
     log.info("    mindmap [%s]: %s", mindmap_prefix, mindmap_status)
     if mindmap_status.startswith("error"):
@@ -9984,8 +10048,10 @@ def _cmd_process_impl(args, config):
     channel_cfg: dict = channel_config_by_name(config, channel_name)
     try:
         chunk_minutes = resolve_chunk_minutes(channel_cfg, config, getattr(args, "chunk_minutes", None))
+        # Issue #249: the Files-API mindmap call takes the channel's hang budget too.
+        transcript_timeout_seconds = resolve_transcript_timeout_seconds(channel_cfg, config)
     except (ValueError, TypeError) as e:
-        log.error("Invalid chunk_minutes: %s", e)
+        log.error("Invalid chunk_minutes or transcript_timeout_seconds: %s", e)
         sys.exit(1)
 
     # Lazy-upload decision: gated on meta.json modes_completed, not just filesystem.
@@ -10131,6 +10197,7 @@ def _cmd_process_impl(args, config):
                         chunk_minutes=chunk_minutes,
                         force=transcript_force,
                         media_uri=uri,
+                        transcript_timeout_seconds=transcript_timeout_seconds,
                     )
                     return prefix, status
 
@@ -10151,6 +10218,7 @@ def _cmd_process_impl(args, config):
                         end_offset=end_offset,
                         media_uri=uri,
                         media_resolution=media_resolution_enum,
+                        transcript_timeout_seconds=transcript_timeout_seconds,
                         duration_seconds=duration_seconds,
                     )
 
@@ -10239,6 +10307,7 @@ def _cmd_process_impl(args, config):
                     channel_dir_override=channel_dir,
                     media_uri=uri,
                     media_resolution=media_resolution_enum,
+                    timeout_seconds=transcript_timeout_seconds,
                 )
 
             _, mindmap_status = _call_with_file_expiry_retry("mindmap", _mindmap_call)

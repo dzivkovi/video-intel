@@ -327,7 +327,15 @@ class TestManualUrlPathsHonorTheTimeoutKnob:
 
     def test_scan_uses_the_same_resolver(self):
         # [core: one-definition]; the set equality is the companion that proves the walk finds callers.
-        assert _timeout_callers() == {"cmd_scan", "_cmd_transcript_impl", "_cmd_process_url"}
+        # Issue #249 added the two mindmap-from-video resolvers (`mindmap --file`
+        # and `process --file`); the three transcript sites are unchanged.
+        assert _timeout_callers() == {
+            "cmd_scan",
+            "_cmd_transcript_impl",
+            "_cmd_process_url",
+            "_cmd_mindmap_impl",
+            "_cmd_process_impl",
+        }
 
 
 LOST = "partial (chunks lost: 1 of 2)"
