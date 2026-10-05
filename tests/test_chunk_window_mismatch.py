@@ -440,7 +440,12 @@ class TestChunkedWriterCatchesWindowMismatch:
 
         assert status == "partial"
         assert meta["transcript_status"] == "partial"
-        assert meta["transcript_quality_flags"] == ["chunk_window_mismatch_severe"], (
+        # Issue #139 added a SIBLING detector for stamps beyond the video's own
+        # duration; these fixtures deliberately put stamps past the 480s end, so
+        # its mild flag legitimately co-fires. Isolation here is from the #157
+        # gap/density/monolithic/backward-jump family, which must stay silent.
+        non_139_flags = [f for f in meta["transcript_quality_flags"] if not f.startswith("timestamp_overrun_")]
+        assert non_139_flags == ["chunk_window_mismatch_severe"], (
             "isolation broken - a pre-existing #157 flag co-fired alongside the new one"
         )
         assert meta["transcript_chunk_window_violations"] == 8
@@ -479,7 +484,12 @@ class TestChunkedWriterCatchesWindowMismatch:
 
         assert status == "done"
         assert meta["transcript_status"] == "ok", "a MILD-only flag must never demote transcript_status"
-        assert meta["transcript_quality_flags"] == ["chunk_window_mismatch_mild"], (
+        # Issue #139 added a SIBLING detector for stamps beyond the video's own
+        # duration; these fixtures deliberately put stamps past the 480s end, so
+        # its mild flag legitimately co-fires. Isolation here is from the #157
+        # gap/density/monolithic/backward-jump family, which must stay silent.
+        non_139_flags = [f for f in meta["transcript_quality_flags"] if not f.startswith("timestamp_overrun_")]
+        assert non_139_flags == ["chunk_window_mismatch_mild"], (
             "isolation broken - a pre-existing #157 flag co-fired alongside the new one"
         )
         assert meta["transcript_chunk_window_violations"] == 1
