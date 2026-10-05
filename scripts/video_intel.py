@@ -5131,6 +5131,14 @@ def assess_transcript_artifact(
     max_gap = 0
     gap_at: int | None = None
     gap_kind: str | None = None
+    # Issue #139 review (Codex peer pass): the severe verdict reads the largest
+    # LEADING-or-INTERNAL gap on its own. Tracking only the single biggest gap
+    # let a long outro (trailing, mild by design) overwrite a genuine 650s
+    # internal hole and demote it to mild - pre-existing, but excluding
+    # over-range stamps makes a trailing gap appear exactly where a bogus
+    # internal one used to be, so the masking became reachable on the issue's
+    # own shapes. `max_gap`/`gap_at`/`gap_kind` stay the persisted telemetry.
+    max_content_gap = 0
     if span_seconds is not None:
         if not coverage_seconds:
             # Zero dialogue entries inside the window: the whole window is one
@@ -5139,14 +5147,17 @@ def assess_transcript_artifact(
             max_gap = span_seconds
             gap_at = window_start
             gap_kind = "leading"
+            max_content_gap = span_seconds
         else:
             leading = coverage_seconds[0] - window_start
             if leading > max_gap:
                 max_gap, gap_at, gap_kind = leading, window_start, "leading"
+            max_content_gap = max(max_content_gap, leading)
             for prev, curr in itertools.pairwise(coverage_seconds):
                 gap = curr - prev
                 if gap > max_gap:
                     max_gap, gap_at, gap_kind = gap, prev, "internal"
+                max_content_gap = max(max_content_gap, gap)
             trailing = window_end - coverage_seconds[-1]
             if trailing > max_gap:
                 max_gap, gap_at, gap_kind = trailing, coverage_seconds[-1], "trailing"
@@ -5170,7 +5181,7 @@ def assess_transcript_artifact(
     elif density_per_min is not None and density_per_min < DENSITY_MILD_PER_MIN:
         mild.append(QUALITY_FLAG_DENSITY_MILD)
 
-    if gap_kind in ("leading", "internal") and max_gap >= BLIND_GAP_SEVERE_SECONDS:
+    if max_content_gap >= BLIND_GAP_SEVERE_SECONDS:
         severe.append(QUALITY_FLAG_BLIND_GAP_SEVERE)
     elif gap_kind == "trailing" and max_gap >= BLIND_GAP_SEVERE_SECONDS:
         # Design decision: a trailing gap never escalates past MILD on its
