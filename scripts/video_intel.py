@@ -3178,6 +3178,34 @@ def _offset_timestamp(ts: str, offset_seconds: int) -> str:
     return f"{m:02d}:{s:02d}"
 
 
+TIMESTAMP_PLACEMENT_ABSOLUTE = "absolute"
+TIMESTAMP_PLACEMENT_RELATIVE = "relative"
+TIMESTAMP_PLACEMENT_IMPLAUSIBLE = "implausible"
+
+
+def classify_timestamp_placement(total_seconds: int, chunk_start_secs: int, chunk_duration_secs: int) -> str:
+    """The ONE plausibility decision for a transcript timestamp [core: one-definition].
+
+    Returns ``TIMESTAMP_PLACEMENT_ABSOLUTE`` (already absolute, inside the
+    chunk's window plus tolerance), ``TIMESTAMP_PLACEMENT_RELATIVE`` (chunk-
+    relative, needs the chunk start added) or ``TIMESTAMP_PLACEMENT_IMPLAUSIBLE``
+    (beyond anything the window can hold - a hallucinated or stale stamp). The
+    boundary is ``chunk_duration + timestamp_tolerance(chunk_duration)``, exactly
+    as `_classify_and_offset_timestamp` has always applied it; issue #139 lifted
+    the decision out so `assess_transcript_artifact` can ask the same question
+    of a whole single-shot video (``chunk_start=0``, ``chunk_duration=duration``)
+    without a private copy of the rule. Branch order is the classifier's
+    (absolute preferred when both fit - see the caller's comment).
+    """
+    tolerance = timestamp_tolerance(chunk_duration_secs)
+    max_relative = chunk_duration_secs + tolerance
+    if chunk_start_secs > 0 and chunk_start_secs <= total_seconds <= chunk_start_secs + max_relative:
+        return TIMESTAMP_PLACEMENT_ABSOLUTE
+    if total_seconds <= max_relative:
+        return TIMESTAMP_PLACEMENT_RELATIVE
+    return TIMESTAMP_PLACEMENT_IMPLAUSIBLE
+
+
 def _classify_and_offset_timestamp(
     ts: Any,
     chunk_start_secs: int,
@@ -3240,22 +3268,22 @@ def _classify_and_offset_timestamp(
     except ValueError:
         return ts
 
-    tolerance = timestamp_tolerance(chunk_duration_secs)
-    max_relative = chunk_duration_secs + tolerance
-
     # Branch order: prefer ABSOLUTE when both interpretations are plausible
     # (e.g. value exactly at chunk_start = chunk_duration boundary). The
     # transcript prompt explicitly tells Gemini to use absolute timestamps,
     # so absolute is the expected case; relative is the defensive fallback.
     # This ordering differs from translate_video.py's apply_timestamp_offset
     # (which prefers relative-first) because translate's video-translation
-    # prompt does not carry the same instruction.
-    if chunk_start_secs > 0 and chunk_start_secs <= total <= chunk_start_secs + max_relative:
+    # prompt does not carry the same instruction. The decision itself lives in
+    # classify_timestamp_placement (issue #139) so the quality assessor asks
+    # the identical question instead of carrying a second boundary.
+    placement = classify_timestamp_placement(total, chunk_start_secs, chunk_duration_secs)
+    if placement == TIMESTAMP_PLACEMENT_ABSOLUTE:
         # Absolute: in [chunk_start, chunk_start + chunk_duration + tolerance]
         # range. Leave alone. Skipped for chunk_start=0 since absolute and
         # relative coincide there.
         pass
-    elif total <= max_relative:
+    elif placement == TIMESTAMP_PLACEMENT_RELATIVE:
         # Chunk-relative: add the chunk's start offset.
         total += chunk_start_secs
     else:
@@ -4044,6 +4072,7 @@ def _run_chunked_transcript_url(
         "transcript_blind_gap_at_seconds": whole_metrics["blind_gap_at_seconds"],
         "transcript_last_dialogue_fraction": whole_metrics["last_dialogue_fraction"],
         "transcript_dialogue_entries": whole_metrics["dialogue_entries"],
+        "transcript_timestamp_overrun_entries": whole_metrics["timestamp_overrun_entries"],
         "transcript_chunk_window_violations": chunk_window_result["total_violations"],
     }
     if confabulated_chunks:
@@ -4794,6 +4823,25 @@ QUALITY_FLAG_BACKWARD_JUMP_SEVERE = "backward_jump_severe"
 QUALITY_FLAG_DENSITY_MILD = "density_mild"
 QUALITY_FLAG_BACKWARD_JUMP_MILD = "backward_jump_mild"
 QUALITY_FLAG_TRAILING_GAP_MILD = "trailing_gap_mild"
+#: Issue #139: dialogue stamps beyond the video's own known duration (plus the
+#: classifier's tolerance). Two shapes, both MILD - a label a sweep can find,
+#: never a status change, never a rewrite of the stamps:
+#:   outlier    - the body is in range, then the stamps JUMP past the end (a
+#:                763s video with stamps at 36,060s): hallucinated stamps in an
+#:                otherwise sound transcript.
+#:   systematic - the stamps run SMOOTHLY past the stated end (first over-range
+#:                stamp 2,863s against 2,840s, then half the transcript follows).
+#:                Equally consistent with a wrong `duration_seconds` in meta.json
+#:                as with a bad transcript, so it must never be auto-remediated:
+#:                cross-check the duration source before blaming the transcript.
+QUALITY_FLAG_TIMESTAMP_OVERRUN_OUTLIER_MILD = "timestamp_overrun_outlier_mild"
+QUALITY_FLAG_TIMESTAMP_OVERRUN_SYSTEMATIC_MILD = "timestamp_overrun_systematic_mild"
+#: The gap (seconds) between the last in-range stamp and the first over-range
+#: one that separates an outlier from a systematic overrun. Reuses the blind-gap
+#: severe threshold on purpose: a jump that large would already be a severe gap
+#: if it landed inside the video, so a continuation across the end that small is
+#: "smooth" by the same yardstick the rest of this assessor uses.
+TIMESTAMP_OVERRUN_OUTLIER_JUMP_SECONDS = 600
 
 #: Issue #158: a chunk's classified dialogue stamps land outside its own
 #: ACTUAL window (see merge_chunked_transcripts' chunk_bounds docstring).
@@ -5041,10 +5089,39 @@ def assess_transcript_artifact(
     dialogue_entries = len(raw_seconds)
     sorted_seconds = sorted(raw_seconds)
 
+    # Issue #139: stamps beyond the video's own length. Only on a WHOLE-video
+    # assessment with a KNOWN duration (`window is None`): a per-chunk window
+    # is #158's business (its stamps are chunk-relative by convention here),
+    # and an unknown duration must fail SAFE - no flag on a guess. The
+    # boundary is the ONE classifier `_classify_and_offset_timestamp` uses
+    # (chunk_start=0, chunk_duration=the real duration), so "implausible" here
+    # means exactly what it means on the chunked path. The over-range stamps
+    # are then EXCLUDED from the gap/density math below: a hallucinated
+    # 36,060s stamp on a 763-second video is not evidence of a 35,000-second
+    # hole inside the video, and letting it through used to manufacture a
+    # false `blind_gap_severe` on an otherwise sound transcript (the issue's
+    # shape 1). `dialogue_entries` and `last_dialogue_fraction` stay raw -
+    # the first so a 76-entry transcript is never called monolithic over 16
+    # bad stamps, the second because `> 1.0` is itself a cheap overrun tell.
+    overrun_entries = 0
+    overrun_max_seconds = 0
+    coverage_seconds = sorted_seconds
+    if window is None and duration_seconds is not None and duration_seconds > 0 and sorted_seconds:
+        in_range = [
+            s
+            for s in sorted_seconds
+            if classify_timestamp_placement(s, 0, duration_seconds) != TIMESTAMP_PLACEMENT_IMPLAUSIBLE
+        ]
+        overrun = sorted_seconds[len(in_range) :]
+        overrun_entries = len(overrun)
+        if overrun:
+            overrun_max_seconds = overrun[-1] - duration_seconds
+            coverage_seconds = in_range
+
     density_per_min: float | None = None
     last_dialogue_fraction: float | None = None
     if span_seconds is not None and span_seconds > 0:
-        density_per_min = dialogue_entries / (span_seconds / 60.0)
+        density_per_min = len(coverage_seconds) / (span_seconds / 60.0)
         if sorted_seconds:
             last_dialogue_fraction = (sorted_seconds[-1] - window_start) / span_seconds
 
@@ -5054,23 +5131,36 @@ def assess_transcript_artifact(
     max_gap = 0
     gap_at: int | None = None
     gap_kind: str | None = None
+    # Issue #139 review (Codex peer pass): the severe verdict reads the largest
+    # LEADING-or-INTERNAL gap on its own. Tracking only the single biggest gap
+    # let a long outro (trailing, mild by design) overwrite a genuine 650s
+    # internal hole and demote it to mild - pre-existing, but excluding
+    # over-range stamps makes a trailing gap appear exactly where a bogus
+    # internal one used to be, so the masking became reachable on the issue's
+    # own shapes. `max_gap`/`gap_at`/`gap_kind` stay the persisted telemetry.
+    max_content_gap = 0
     if span_seconds is not None:
-        if not sorted_seconds:
-            # Zero dialogue entries: the whole window is one blind gap.
+        if not coverage_seconds:
+            # Zero dialogue entries inside the window: the whole window is one
+            # blind gap (including the #139 case where EVERY stamp is beyond
+            # the stated duration - nothing covers the video as described).
             max_gap = span_seconds
             gap_at = window_start
             gap_kind = "leading"
+            max_content_gap = span_seconds
         else:
-            leading = sorted_seconds[0] - window_start
+            leading = coverage_seconds[0] - window_start
             if leading > max_gap:
                 max_gap, gap_at, gap_kind = leading, window_start, "leading"
-            for prev, curr in itertools.pairwise(sorted_seconds):
+            max_content_gap = max(max_content_gap, leading)
+            for prev, curr in itertools.pairwise(coverage_seconds):
                 gap = curr - prev
                 if gap > max_gap:
                     max_gap, gap_at, gap_kind = gap, prev, "internal"
-            trailing = window_end - sorted_seconds[-1]
+                max_content_gap = max(max_content_gap, gap)
+            trailing = window_end - coverage_seconds[-1]
             if trailing > max_gap:
-                max_gap, gap_at, gap_kind = trailing, sorted_seconds[-1], "trailing"
+                max_gap, gap_at, gap_kind = trailing, coverage_seconds[-1], "trailing"
 
     severe: list[str] = []
     mild: list[str] = []
@@ -5091,7 +5181,7 @@ def assess_transcript_artifact(
     elif density_per_min is not None and density_per_min < DENSITY_MILD_PER_MIN:
         mild.append(QUALITY_FLAG_DENSITY_MILD)
 
-    if gap_kind in ("leading", "internal") and max_gap >= BLIND_GAP_SEVERE_SECONDS:
+    if max_content_gap >= BLIND_GAP_SEVERE_SECONDS:
         severe.append(QUALITY_FLAG_BLIND_GAP_SEVERE)
     elif gap_kind == "trailing" and max_gap >= BLIND_GAP_SEVERE_SECONDS:
         # Design decision: a trailing gap never escalates past MILD on its
@@ -5104,6 +5194,21 @@ def assess_transcript_artifact(
     elif max_backward_jump >= BACKWARD_JUMP_MILD_SECONDS:
         mild.append(QUALITY_FLAG_BACKWARD_JUMP_MILD)
 
+    if overrun_entries:
+        # Issue #139, the two shapes. Outlier when the stamps JUMP past the end
+        # (the body is in range, then a leap); systematic when they continue
+        # smoothly across it. With no in-range stamp at all the continuity
+        # cannot be judged and a wrong duration is the likelier story, so that
+        # case is systematic (cross-check the duration source first).
+        in_range_tail = coverage_seconds[-1] if coverage_seconds else None
+        first_over = sorted_seconds[len(coverage_seconds)]
+        jump = first_over - in_range_tail if in_range_tail is not None else 0
+        mild.append(
+            QUALITY_FLAG_TIMESTAMP_OVERRUN_OUTLIER_MILD
+            if jump > TIMESTAMP_OVERRUN_OUTLIER_JUMP_SECONDS
+            else QUALITY_FLAG_TIMESTAMP_OVERRUN_SYSTEMATIC_MILD
+        )
+
     return {
         "dialogue_entries": dialogue_entries,
         "density_per_min": density_per_min,
@@ -5112,6 +5217,8 @@ def assess_transcript_artifact(
         "blind_gap_at_seconds": gap_at,
         "blind_gap_kind": gap_kind,
         "max_backward_jump_seconds": max_backward_jump,
+        "timestamp_overrun_entries": overrun_entries,
+        "timestamp_overrun_max_seconds": overrun_max_seconds,
         "severe": severe,
         "mild": mild,
     }
@@ -6609,6 +6716,7 @@ TRANSCRIPT_ARTIFACT_FIELDS: tuple[str, ...] = (
     "transcript_blind_gap_at_seconds",
     "transcript_last_dialogue_fraction",
     "transcript_dialogue_entries",
+    "transcript_timestamp_overrun_entries",
     "transcript_chunk_window_violations",
     "transcript_output_tokens",
     "transcript_finish_reason",
@@ -6830,6 +6938,7 @@ def _try_captions_transcript(
         "transcript_blind_gap_at_seconds": quality_metrics["blind_gap_at_seconds"],
         "transcript_last_dialogue_fraction": quality_metrics["last_dialogue_fraction"],
         "transcript_dialogue_entries": quality_metrics["dialogue_entries"],
+        "transcript_timestamp_overrun_entries": quality_metrics["timestamp_overrun_entries"],
     }
     if reason:
         fields["transcript_failover_reason"] = reason
@@ -7172,6 +7281,7 @@ def process_transcript(
                 "transcript_blind_gap_at_seconds": quality_metrics["blind_gap_at_seconds"],
                 "transcript_last_dialogue_fraction": quality_metrics["last_dialogue_fraction"],
                 "transcript_dialogue_entries": quality_metrics["dialogue_entries"],
+                "transcript_timestamp_overrun_entries": quality_metrics["timestamp_overrun_entries"],
             }
             update_meta(
                 meta_path,
@@ -7248,6 +7358,7 @@ def process_transcript(
                 "transcript_blind_gap_at_seconds": salvage_quality_metrics["blind_gap_at_seconds"],
                 "transcript_last_dialogue_fraction": salvage_quality_metrics["last_dialogue_fraction"],
                 "transcript_dialogue_entries": salvage_quality_metrics["dialogue_entries"],
+                "transcript_timestamp_overrun_entries": salvage_quality_metrics["timestamp_overrun_entries"],
             }
             if truncated:
                 salvage_fields["transcript_output_tokens"] = usage_capture.get("candidates")
