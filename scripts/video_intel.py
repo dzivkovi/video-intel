@@ -12921,36 +12921,27 @@ HEADLINE_DOMAIN_MATCH_WEIGHT = 0.5  # weak signal, mirrors rank_unseen's domain 
 #: ("judge by content, never by titles") says it is evidence, so it counts.
 HEADLINE_DESCRIPTION_MATCH_FACTOR = 0.5
 #: Lines of a YouTube description that are about the channel, not the video.
-#: A line containing any of these (case-insensitive) is dropped before matching
-#: so a sponsor read or a "subscribe" footer cannot lift a video. Conservative
-#: on purpose: a marker that also appears in real content ("agent", "model")
-#: would delete the evidence this feature exists to read.
-_HEADLINE_BOILERPLATE_MARKERS: tuple[str, ...] = (
-    "sponsor",
-    "subscribe",
-    "follow me",
-    "follow us",
-    "discount",
-    "promo code",
-    "use code",
-    "coupon",
-    "affiliate",
-    "patreon",
-    "merch",
-    "newsletter",
-    "join my",
-    "join our",
-    "sign up",
-    "% off",
-    "free trial",
-    "linkedin.com",
-    "twitter.com",
-    "instagram.com",
-    "tiktok.com",
-    "x.com/",
+#: A line matching this (case-insensitive) is dropped whole before matching so
+#: a sponsor read or a "subscribe" footer cannot lift a video. Word-bounded on
+#: purpose (review round, PR #253): a bare substring `merch` deleted "MCP for
+#: merchants" and `discount` deleted "discounted cash flow" - real content.
+#: Conservative on purpose too: a marker that also appears in real content
+#: ("agent", "model") would delete the evidence this feature exists to read.
+#: Social hosts are matched on the RAW line, before URL stripping, so
+#: `https://twitter.com/me` and `twitter.com/me` are the same footer.
+_HEADLINE_BOILERPLATE_LINE = re.compile(
+    r"\b(?:sponsor\w*|subscribe[sd]?|follow (?:me|us)|discount(?: code)?|promo code|use code|coupons?|"
+    r"affiliates?|patreon|merch(?:andise)?|newsletters?|join (?:my|our)|sign up|free trial)\b"
+    r"|\d+\s*% off"
+    r"|\b(?:linkedin|twitter|instagram|tiktok|facebook)\.com\b"
+    r"|\bx\.com/",
+    re.IGNORECASE,
 )
 #: A chapter / timestamp line: `0:00 Intro`, `(12:34) The demo`, `1:02:03 - Q&A`.
-_HEADLINE_CHAPTER_LINE = re.compile(r"^\s*[\(\[]?\d{1,2}:\d{2}(?::\d{2})?[\)\]]?(\s|$|[-:])")
+#: Not a wall-clock time at line start (`10:00 AM webinar on MCP servers`).
+_HEADLINE_CHAPTER_LINE = re.compile(
+    r"^\s*[\(\[]?\d{1,2}:\d{2}(?::\d{2})?[\)\]]?(?!\s*[ap]\.?m\b)(\s|$|[-:])", re.IGNORECASE
+)
 _HEADLINE_URL = re.compile(r"(https?://\S+|www\.\S+)", re.IGNORECASE)
 # A bare YouTube channel id: literal "UC" + 22 url-safe base64 chars.
 _UC_CHANNEL_ID_RE = re.compile(r"^UC[0-9A-Za-z_-]{22}$")
@@ -13622,23 +13613,23 @@ def collect_headline_channels(config: dict) -> list[dict]:
 def clean_headline_description(text: str | None) -> str:
     """Reduce a YouTube description to the words that describe THIS video (issue #247).
 
-    Drops URLs, chapter/timestamp lines, hashtag-only lines, and any line carrying
-    a `_HEADLINE_BOILERPLATE_MARKERS` term (sponsor reads, subscribe footers,
-    social handles), then normalizes like a title via `_norm_phrase`. Returns ""
-    for a missing description so `rank_headlines` can treat "no description" and
-    "nothing descriptive in it" identically.
+    Drops URLs, chapter/timestamp lines, hashtag-only lines, and any line matching
+    `_HEADLINE_BOILERPLATE_LINE` (sponsor reads, subscribe footers, social
+    handles - checked on the RAW line so a social host inside a URL still counts),
+    then normalizes like a title via `_norm_phrase`. Returns "" for a missing
+    description so `rank_headlines` can treat "no description" and "nothing
+    descriptive in it" identically.
     """
     if not text:
         return ""
     kept: list[str] = []
     for raw_line in str(text).splitlines():
+        if _HEADLINE_BOILERPLATE_LINE.search(raw_line):
+            continue
         line = _HEADLINE_URL.sub(" ", raw_line).strip()
         if not line:
             continue
         if _HEADLINE_CHAPTER_LINE.match(line):
-            continue
-        lowered = line.lower()
-        if any(marker in lowered for marker in _HEADLINE_BOILERPLATE_MARKERS):
             continue
         if all(tok.startswith("#") for tok in line.split()):
             continue
@@ -13689,7 +13680,10 @@ def rank_headlines(videos: list[dict], profile: dict | InterestModel, taxonomy: 
         title = f" {_norm_phrase(video.get('title', ''))} "
         description = f" {clean_headline_description(video.get('description'))} "
         score = 0.0
-        matched: list[str] = []
+        # Two lists so the five-label truncation below never hides a title-tier
+        # match behind description-tier ones (review round, PR #253).
+        title_labels: list[str] = []
+        description_labels: list[str] = []
         hits = []
         for c in model.concepts:
             in_title = {p for p in c.phrases if p in title}
@@ -13709,15 +13703,20 @@ def rank_headlines(videos: list[dict], profile: dict | InterestModel, taxonomy: 
                 continue
             claimed |= fresh_title | fresh_description
             # each concept pays at most once; the title tier wins when both hit
-            score += concept.weight if fresh_title else concept.weight * HEADLINE_DESCRIPTION_MATCH_FACTOR
-            matched.append(concept.label if fresh_title else f"{concept.label} (description)")
+            if fresh_title:
+                score += concept.weight
+                title_labels.append(concept.label)
+            else:
+                score += concept.weight * HEADLINE_DESCRIPTION_MATCH_FACTOR
+                description_labels.append(f"{concept.label} (description)")
         for padded_domain, domain_label in model.domain_terms:
             if padded_domain in title:
                 score += HEADLINE_DOMAIN_MATCH_WEIGHT
-                matched.append(domain_label)
+                title_labels.append(domain_label)
             elif padded_domain in description:
                 score += HEADLINE_DOMAIN_MATCH_WEIGHT * HEADLINE_DESCRIPTION_MATCH_FACTOR
-                matched.append(f"{domain_label} (description)")
+                description_labels.append(f"{domain_label} (description)")
+        matched = title_labels + description_labels
         scored.append({**video, "score": score, "matched_concepts": matched[:5]})
     scored.sort(key=lambda v: (v["score"], v.get("published", "")), reverse=True)
     return scored
@@ -13791,7 +13790,7 @@ def render_headline_digest(youtube, config: dict, output_dir: Path, *, dry_run: 
     Metadata-only: uses the cheap uploads-playlist path plus a duration enrich for the
     Shorts filter. Makes NO Gemini calls and writes NO corpus artifacts. Non-fatal by
     construction - the caller runs it last, after wanted work. Returns the rendered
-    items (also useful for a future standalone `headlines` command). A `--dry-run`
+    items (the standalone `headlines` command, issue #247, is that caller). A `--dry-run`
     renders but does not advance `_headlines/seen.json`.
     """
     headline_channels = collect_headline_channels(config)
@@ -13907,6 +13906,14 @@ def cmd_headlines(args, config):
     must stay recoverable.
     """
     require_channels_config(config)
+    if not collect_headline_channels(config):
+        # Probe before you pay: no YouTube client, no snapshot, and a message
+        # that names the knob rather than "nothing new" (review round, PR #253).
+        log.warning(
+            "No channel carries `headline_digest: true` on an `enabled: false` entry; nothing to render. "
+            "Add the flag to a channel in config.yaml to put it in the digest."
+        )
+        return []
     yt_build = require_youtube()
     yt_key = os.environ.get("YOUTUBE_API_KEY")
     if not yt_key:
@@ -13916,6 +13923,8 @@ def cmd_headlines(args, config):
         sys.exit(1)
     youtube = yt_build("youtube", "v3", developerKey=yt_key)
     output_dir = resolve_output_dir(config)
+    # Before the render, like scan: the seen-state this run advances is scan
+    # state, and the channel list that produced it must be on record first.
     backup_config_if_changed(output_dir)
     rendered = render_headline_digest(youtube, config, output_dir, dry_run=args.dry_run)
     if not rendered:

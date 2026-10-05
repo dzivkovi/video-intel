@@ -564,7 +564,7 @@ Both personalized surfaces above (the catch-up briefing and the headline digest)
 
 | File | What it is | Who reads it |
 | --- | --- | --- |
-| `profile.yaml` | Machine **ranking weights**: `interest_concepts: {concept_id: weight}` plus `interest_domains`. | `briefings --unseen` (concept overlap from each video's `concepts.json`) and the scan headline digest (title match against each concept's label/aliases). |
+| `profile.yaml` | Machine **ranking weights**: `interest_concepts: {concept_id: weight}` plus `interest_domains`. | `briefings --unseen` (concept overlap from each video's `concepts.json`) and the scan headline digest (title and description match against each concept's label/aliases). |
 | `audience.md` | Hand-written **reader context**: persona, standing pillars, current goals, what counts as signal vs noise. Prose, not weights. | The assistant, when it authors a *curated* topic briefing ("why it matters to YOU"). |
 
 ```bash

@@ -34,7 +34,9 @@ description: >
   is ranking my briefings", "show my interest profile", "where is my
   profile", "what does the digest think I care about" - `profile show`
   prints the resolved interest model and the paths of the two files
-  that produce it, and writes nothing. For scanning new
+  that produce it, and writes nothing. For the digest ITSELF ("show me
+  the headlines", "what's new in channels I don't follow") use the
+  `video-intel` skill's `headlines` command, not this one. For scanning new
   videos, transcribing, generating mindmaps, rebuilding the index,
   persisting or initializing the profile, or any other write operation on the
   corpus - including generating a catch-up briefing (`briefings --unseen`)

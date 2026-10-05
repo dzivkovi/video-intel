@@ -263,3 +263,118 @@ class TestHeadlinesIsRegisteredAndDispatched:
         )
         assert proc.returncode == 0, proc.stderr
         assert "--dry-run" in proc.stdout
+
+
+class TestCleanerKeepsRealContent:
+    def test_merchants_not_treated_as_merch(self):
+        assert "merchants" in vi.clean_headline_description("MCP for merchants and e-commerce")
+
+    def test_discounted_kept(self):
+        assert "discounted cash flow" in vi.clean_headline_description("discounted cash flow with MCP")
+
+    def test_wall_clock_time_line_kept(self):
+        assert "webinar on mcp servers" in vi.clean_headline_description("10:00 AM webinar on MCP servers")
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "Sponsored by Acme",
+            "MCP: https://twitter.com/mychannel",
+            "MCP: twitter.com/mychannel",
+            "www.example.com/mcp-guide",
+        ],
+    )
+    def test_boilerplate_and_url_only_lines_dropped(self, line):
+        assert vi.clean_headline_description(line) == ""
+
+
+class TestTitleTierLabelsSurviveTruncation:
+    def test_title_label_first_and_present_among_five(self):
+        words = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf"]
+        concepts = {f"d.c{i}": {"preferred_label": f"Concept {i}", "aliases": [w]} for i, w in enumerate(words, 1)}
+        concepts["d.title"] = {"preferred_label": "Title Concept", "aliases": ["zulu"]}
+        taxonomy = {"concepts": concepts}
+        interest = {f"d.c{i}": i for i in range(1, 8)}
+        interest["d.title"] = 1
+        profile = {"interest_concepts": interest, "interest_domains": []}
+        video = {"video_id": "x", "title": "All about zulu", "description": "We cover " + " ".join(words)}
+        got = _score(video, profile, taxonomy)
+        assert got["matched_concepts"][0] == "Title Concept"
+        assert len(got["matched_concepts"]) == 5
+        # 8 concepts matched, so truncation really happened
+        assert got["score"] == 1 + sum(range(1, 8)) * FACTOR
+
+
+class TestTitleOnlyParityIsFrozen:
+    # Pins the pre-#247 title-only ranking (no description key), so the description
+    # tier can never change title scores.
+    TITLES = (
+        "Building with MCP servers",
+        "RAG vs MCP showdown",
+        "A deep dive into RAG pipelines",
+        "Why ai agents fail",
+        "My cat did something cute",
+        "Retrieval Augmented Generation explained",
+    )
+    EXPECTED = (
+        ("t1", 8.0, ["Model Context Protocol", "Retrieval Augmented Generation"]),
+        ("t0", 5.0, ["Model Context Protocol"]),
+        ("t5", 3.0, ["Retrieval Augmented Generation"]),
+        ("t2", 3.0, ["Retrieval Augmented Generation"]),
+        ("t3", 0.5, ["ai agents"]),
+        ("t4", 0.0, []),
+    )
+
+    def test_exact_tuples(self):
+        videos = [
+            {"video_id": f"t{i}", "title": t, "published": f"2026-07-0{i + 1}"} for i, t in enumerate(self.TITLES)
+        ]
+        ranked = vi.rank_headlines(videos, _profile(), _taxonomy())
+        got = tuple((v["video_id"], v["score"], v["matched_concepts"]) for v in ranked)
+        assert got == self.EXPECTED
+
+
+class TestBackupRunsBeforeRender:
+    def test_order(self, monkeypatch, tmp_path):
+        _stub_headline_fetch(monkeypatch, [{"video_id": "v1", "title": "MCP deep dive", "published": "2026-07-01"}])
+        monkeypatch.setattr("video_intel.require_youtube", lambda: lambda *a, **k: object())
+        monkeypatch.setenv("YOUTUBE_API_KEY", "fake")
+        events = []
+        monkeypatch.setattr("video_intel.backup_config_if_changed", lambda out: events.append("backup"))
+        real_render = vi.render_headline_digest
+
+        def _render(*a, **k):
+            events.append("render")
+            return real_render(*a, **k)
+
+        monkeypatch.setattr("video_intel.render_headline_digest", _render)
+        vi.cmd_headlines(SimpleNamespace(dry_run=True), _headline_config(tmp_path))
+        assert events == ["backup", "render"]
+
+
+class TestNoFlaggedChannelMessage:
+    def test_warns_and_never_builds_youtube_client(self, monkeypatch, tmp_path, caplog):
+        called = []
+        monkeypatch.setattr("video_intel.require_youtube", lambda: called.append("yt"))
+        config = {
+            "output_dir": str(tmp_path),
+            "channels": [{"name": "plain", "url": "https://youtube.com/@p", "enabled": False}],
+        }
+        with caplog.at_level("WARNING"):
+            assert vi.cmd_headlines(SimpleNamespace(dry_run=False), config) == []
+        assert "headline_digest: true" in caplog.text
+        assert called == []
+
+
+class TestHeadlinesNeverNamesGemini:
+    FORBIDDEN = ("create_client", "call_gemini", "call_gemini_text", "require_gemini")
+
+    def test_headline_functions_make_no_gemini_calls(self):
+        tree = _module_tree()
+        for name in self.FORBIDDEN:
+            callers = _enclosing_callers(tree, name)
+            assert "cmd_headlines" not in callers, name
+            assert "render_headline_digest" not in callers, name
+
+    def test_walk_is_not_vacuous(self):
+        assert "cmd_scan" in _enclosing_callers(_module_tree(), "create_client")
