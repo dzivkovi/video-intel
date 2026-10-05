@@ -75,12 +75,16 @@ def _args(**overrides):
 class _Captions:
     """Recording stand-in for fetch_english_captions."""
 
-    def __init__(self, result):
+    def __init__(self, result, kind="absent"):
         self.result = result
+        self.kind = kind  # failure kind reported through reason_sink when result is None
         self.calls: list[str] = []
 
-    def __call__(self, video_id):
+    def __call__(self, video_id, *, reason_sink=None):
         self.calls.append(video_id)
+        if self.result is None and reason_sink is not None:
+            reason_sink["kind"] = self.kind
+            reason_sink["exception"] = "IpBlocked" if self.kind == "blocked" else None
         return self.result
 
 
@@ -174,7 +178,10 @@ class TestTranscriptUrlLostChunkUnderAutoWithNoCaptionTrack:
         assert meta["transcript_failed_chunks"] == 1
         assert not list(cdir.glob("*.chunked-partial.txt"))
         assert "--chunk-minutes 10" in caplog.text
-        assert "--transcript-source yt-captions" in caplog.text
+        # Review round: this run just PROVED the video has no caption track, so
+        # recommending `yt-captions` would be a remedy that cannot work.
+        assert "--transcript-source yt-captions" not in caplog.text
+        assert "no caption track to fill it" in caplog.text
 
 
 class TestAQualityOnlyPartialNeverTriggersTheFailover:
@@ -283,6 +290,9 @@ class TestManualUrlPathsHonorTheTimeoutKnob:
         assert resolve({"transcript_timeout_seconds": 5}, {"transcript_timeout_seconds": 9}) == 5
         assert resolve({}, {"transcript_timeout_seconds": 9}) == 9
         assert resolve({}, {}) == vi.TRANSCRIPT_TIMEOUT_DEFAULT
+        assert resolve({"transcript_timeout_seconds": 0}, {}) == 0
+        assert resolve({"transcript_timeout_seconds": -1}, {}) == -1
+        assert resolve({"transcript_timeout_seconds": 2.5}, {}) == 2.5
         for bad in (True, "600", [600]):
             with pytest.raises(ValueError):
                 resolve({"transcript_timeout_seconds": bad}, {})
@@ -318,3 +328,191 @@ class TestManualUrlPathsHonorTheTimeoutKnob:
     def test_scan_uses_the_same_resolver(self):
         # [core: one-definition]; the set equality is the companion that proves the walk finds callers.
         assert _timeout_callers() == {"cmd_scan", "_cmd_transcript_impl", "_cmd_process_url"}
+
+
+LOST = "partial (chunks lost: 1 of 2)"
+_VIDEO = {"video_id": "abcdefghijk", "url": URL, "title": "A Talk", "published": "2026-08-12"}
+_PREFIX = "2026-08-12-a-talk"
+
+
+def _finish(cdir, status, *, force=False):
+    return vi._finish_chunked_transcript(
+        status,
+        video=_VIDEO,
+        channel_dir=cdir,
+        prefix=_PREFIX,
+        transcript_source="auto",
+        captions_already_tried=False,
+        force=force,
+        duration_seconds=3600,
+        chunk_minutes=30,
+    )
+
+
+def _seed(tmp_path, transcript_text):
+    cdir = tmp_path / "alpha"
+    cdir.mkdir()
+    (cdir / f"{_PREFIX}.transcript.md").write_text(transcript_text, encoding="utf-8")
+    meta = {"video_id": "abcdefghijk", "channel": "alpha", "video_url": URL, "title": "A Talk"}
+    (cdir / f"{_PREFIX}.meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    return cdir
+
+
+class TestProcessUrlLostChunkUnderAutoFillsWithCaptions:
+    def test_process_url_failover_is_driven_under_auto(self, wired, monkeypatch):
+        captions = _with_track()
+        monkeypatch.setattr(vi, "fetch_english_captions", captions)
+        monkeypatch.setattr(vi, "resolve_model", lambda *_a, **_kw: "stub-model")
+        monkeypatch.setattr(vi, "process_mindmap", lambda *a, **kw: ("p", "done"))
+        monkeypatch.setattr(vi, "process_concepts", lambda *a, **kw: ("p", "done"))
+        try:
+            vi.cmd_process(_args(), CONFIG_AUTO)
+        except SystemExit as e:
+            assert e.code in (0, 3)
+
+        prefix, meta, cdir = _meta(wired)
+        assert len(captions.calls) == 1
+        assert meta["transcript_source"] == "youtube_captions"
+        assert (cdir / f"{prefix}.transcript.raw.chunked-partial.txt").exists()
+
+
+class TestForceIsOnlyForcedForLostChunks:
+    def test_error_status_never_clobbers_a_prior_artifact(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(vi, "fetch_english_captions", _with_track())
+        cdir = _seed(tmp_path, "PRIOR GOOD TRANSCRIPT")
+
+        _finish(cdir, "error: all chunks failed parsing", force=False)
+
+        assert (cdir / f"{_PREFIX}.transcript.md").read_text(encoding="utf-8") == "PRIOR GOOD TRANSCRIPT"
+        assert not list(cdir.glob("*chunked-partial*"))
+
+    def test_lost_chunks_status_replaces_this_run_own_partial(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(vi, "fetch_english_captions", _with_track())
+        cdir = _seed(tmp_path, "THIS RUN PARTIAL")
+
+        _finish(cdir, LOST, force=False)
+
+        assert "THIS RUN PARTIAL" not in (cdir / f"{_PREFIX}.transcript.md").read_text(encoding="utf-8")
+        sidecar = cdir / f"{_PREFIX}.transcript.raw.chunked-partial.txt"
+        assert sidecar.read_text(encoding="utf-8") == "THIS RUN PARTIAL"
+
+
+class TestRemedyLinesAreRunnable:
+    def test_small_chunks_and_captions_available(self, caplog):
+        caplog.set_level(logging.WARNING)
+        vi._log_lost_chunks_remedy(_VIDEO, "alpha", 5, "partial (chunks lost: 1 of 3)")
+        assert "--chunk-minutes" not in caplog.text
+        assert "--transcript-source yt-captions" in caplog.text
+
+    def test_nothing_left_to_run(self, caplog):
+        caplog.set_level(logging.WARNING)
+        vi._log_lost_chunks_remedy(_VIDEO, "alpha", 5, "partial (chunks lost: 1 of 3)", captions_available=False)
+        assert "--chunk-minutes" not in caplog.text
+        assert "--transcript-source yt-captions" not in caplog.text
+        assert "what remains" in caplog.text
+
+    def test_large_chunks_suggest_ten(self, caplog):
+        caplog.set_level(logging.WARNING)
+        vi._log_lost_chunks_remedy(_VIDEO, "alpha", 30, "partial (chunks lost: 1 of 3)")
+        assert "--chunk-minutes 10" in caplog.text
+
+
+class TestRefusedCaptionsKeepTheCaptionsRemedy:
+    def test_refusal_keeps_partial_and_the_captions_line(self, wired, monkeypatch, caplog):
+        monkeypatch.setattr(vi, "fetch_english_captions", _Captions(None, kind="blocked"))
+        caplog.set_level(logging.WARNING)
+
+        vi.cmd_transcript(_args(), CONFIG_AUTO)
+
+        prefix, _meta_json, cdir = _meta(wired)
+        assert "FAILED (timeout)" in (cdir / f"{prefix}.transcript.md").read_text(encoding="utf-8")
+        assert "REFUSED" in caplog.text
+        assert "--transcript-source yt-captions" in caplog.text
+        assert not list(cdir.glob("*chunked-partial*"))
+
+
+class TestSidecarNeverClobbersAnEarlierOne:
+    def _setup(self, tmp_path):
+        cdir = _seed(tmp_path, "B")
+        earlier = cdir / f"{_PREFIX}.transcript.raw.chunked-partial.txt"
+        earlier.write_text("A", encoding="utf-8")
+        return cdir, earlier
+
+    def test_no_track_leaves_only_the_earlier_sidecar(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(vi, "fetch_english_captions", _Captions(None))
+        cdir, earlier = self._setup(tmp_path)
+
+        _finish(cdir, LOST)
+
+        assert earlier.read_text(encoding="utf-8") == "A"
+        assert list(cdir.glob("*chunked-partial*")) == [earlier]
+
+    def test_track_keeps_both_partials(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(vi, "fetch_english_captions", _with_track())
+        cdir, earlier = self._setup(tmp_path)
+
+        _finish(cdir, LOST)
+
+        assert earlier.read_text(encoding="utf-8") == "A"
+        others = [p for p in cdir.glob("*chunked-partial*.txt") if p != earlier]
+        assert len(others) == 1
+        assert others[0].read_text(encoding="utf-8") == "B"
+
+
+class TestScanTailIsInsideThePerVideoNet:
+    def test_a_raising_tail_keeps_the_gemini_status(self, wired, monkeypatch):
+        def boom(*_a, **_kw):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(vi, "_finish_chunked_transcript", boom)
+
+        _prefix, status = vi._scan_transcribe_one(
+            client=object(),
+            types=_TYPES,
+            video=_VIDEO,
+            prompt_text="PROMPT",
+            model="stub-model",
+            channel_dir=wired / "alpha",
+            prefix=_PREFIX,
+            transcript_source="auto",
+            transcript_timeout_seconds=30,
+            livestream_captions_first=False,
+            duration_seconds=3600,
+            chunk_minutes=30,
+        )
+
+        assert status.startswith("partial (chunks lost")
+
+
+class TestScanSurvivesABadTimeoutKnob:
+    def test_bad_knob_on_one_channel_does_not_abort_the_scan(self, tmp_path, monkeypatch):
+        bad = {**_VIDEO, "video_id": "bad1", "url": "https://www.youtube.com/watch?v=bad1"}
+        good = {**_VIDEO, "video_id": "good1", "url": "https://www.youtube.com/watch?v=good1"}
+        videos = {"https://example.com/a": [bad], "https://example.com/b": [good]}
+        monkeypatch.setenv("GEMINI_API_KEY", "test")
+        monkeypatch.setenv("YOUTUBE_API_KEY", "test")
+        monkeypatch.setattr(vi, "require_gemini", lambda: (None, None))
+        monkeypatch.setattr(vi, "require_youtube", lambda: lambda *a, **kw: None)
+        monkeypatch.setattr(vi, "create_client", lambda *a, **kw: None)
+        monkeypatch.setattr(vi, "get_channel_id", lambda yt, url: (url, url))
+        monkeypatch.setattr(vi, "fetch_channel_videos", lambda yt, cid, since: list(videos.get(cid, [])))
+        monkeypatch.setattr(vi, "enrich_with_durations", lambda _yt, ids: dict.fromkeys(ids))
+        monkeypatch.setattr(vi, "fetch_preflight_status", lambda _yt, ids: {vid: {} for vid in ids})
+        monkeypatch.setattr(vi, "_is_youtube_short_url", lambda video_id: False)
+        seen: list[str] = []
+
+        def fake_transcript(*args, **kwargs):
+            video = args[2] if len(args) > 2 else kwargs["video"]
+            seen.append(video["video_id"])
+            return video["video_id"], "done"
+
+        monkeypatch.setattr(vi, "process_transcript", fake_transcript)
+        monkeypatch.setattr(vi, "process_mindmap", lambda *a, **kw: ("p", "done"))
+        bad_channel = {"name": "a", "url": "https://example.com/a", "auto_transcript": "all"}
+        bad_channel["transcript_timeout_seconds"] = "600"
+        good_channel = {"name": "b", "url": "https://example.com/b", "auto_transcript": "all"}
+        config = {"output_dir": str(tmp_path), "channels": [bad_channel, good_channel]}
+
+        vi.cmd_scan(SimpleNamespace(dry_run=False, channel=None, force=False, since=None, model=None), config)
+
+        assert "good1" in seen

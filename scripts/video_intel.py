@@ -1447,10 +1447,14 @@ KNOB_CONSEQUENCE_NOT_REACHED = "not reached with this channel's current settings
 #: Appended to NOT_REACHED for the knobs the manual single-video commands ALSO
 #: resolve off the same channel dict (issue #127), where they exit 1 on the same
 #: typo. Established by walking every command body's AST, not assumed:
-#: `transcript_max_duration_seconds` and `transcript_timeout_seconds` are read
-#: by `cmd_scan` ALONE, so telling the operator they break `transcript --url`
-#: would send them hunting a failure that cannot happen.
-_MANUAL_COMMAND_KNOBS = frozenset({"transcript_source", "mindmap_source", "chunk_minutes"})
+#: `transcript_max_duration_seconds` is read by `cmd_scan` ALONE, so telling the
+#: operator it breaks `transcript --url` would send them hunting a failure that
+#: cannot happen. `transcript_timeout_seconds` joined this set in issue #248,
+#: when `_cmd_transcript_impl` and `_cmd_process_url` started resolving it
+#: through `resolve_transcript_timeout_seconds` (and exiting 1 on a bad value).
+_MANUAL_COMMAND_KNOBS = frozenset(
+    {"transcript_source", "mindmap_source", "chunk_minutes", "transcript_timeout_seconds"}
+)
 _MANUAL_COMMAND_SUFFIX = ", but still fails the manual transcript/mindmap/process --channel commands"
 #: The two consequences that STOP the channel body. Once one has fired, every
 #: knob checked later in the runtime order is unreachable, so its own
@@ -1511,6 +1515,11 @@ def validate_channel_knobs(
     `except Exception` handlers on BOTH the single-shot and chunked transcript
     paths, so it degrades to a per-video `error:` status and the scan completes
     normally. The two knobs look identical in the source and behave differently.
+    Since issue #248 `cmd_scan` resolves it through
+    `resolve_transcript_timeout_seconds` and deliberately passes the raw value
+    through on `ValueError`, so this consequence is preserved by construction
+    rather than by accident; the manual `--url --channel` commands exit 1 on the
+    same typo, which is why the knob is now in `_MANUAL_COMMAND_KNOBS`.
     """
     problems: list[tuple[str, str, str]] = []
     transcript_all = channel_config.get("auto_transcript", "none") == "all"
@@ -4096,14 +4105,24 @@ def chunked_captions_failover_applies(
     return str(status or "").startswith("error") or chunked_transcript_lost_chunks(status)
 
 
-def _log_lost_chunks_remedy(video: dict, channel_name: str, chunk_minutes: int, status: str) -> None:
+def _log_lost_chunks_remedy(
+    video: dict,
+    channel_name: str,
+    chunk_minutes: int,
+    status: str,
+    *,
+    captions_available: bool = True,
+) -> None:
     """Name a remedy that WORKS for a chunked run that lost chunks (issue #248).
 
     The generic "re-run to fill the gap" re-issues the same call that just hung;
     observed 2026-10-02, the same chunk hung on two consecutive runs. What did
     work: smaller chunks (a hang on a 30-minute window cleared at 10), or the
-    caption track (1,105 cues in about 9 seconds). Both are printed ready to
-    paste, per the remedy-must-be-runnable rule.
+    caption track (1,105 cues in about 9 seconds). Each line is printed only
+    when it can actually run (remedy-must-be-runnable): no smaller chunk size
+    when the run was already at the 5-minute floor, and no captions recipe when
+    this run just proved the video has no caption track. A REFUSED caption
+    request (issue #231) keeps the captions line - the track may well exist.
     """
     smaller = 10 if chunk_minutes > 10 else max(5, chunk_minutes // 2)
     log.warning(
@@ -4111,17 +4130,24 @@ def _log_lost_chunks_remedy(video: dict, channel_name: str, chunk_minutes: int, 
         video.get("video_id", "?"),
         status,
     )
-    log.warning(
-        "         python scripts/video_intel.py transcript --url %s --channel %s --force --chunk-minutes %d",
-        video.get("url", ""),
-        channel_name,
-        smaller,
-    )
-    log.warning(
-        "         python scripts/video_intel.py transcript --url %s --channel %s --force --transcript-source yt-captions",
-        video.get("url", ""),
-        channel_name,
-    )
+    if smaller < chunk_minutes:
+        log.warning(
+            "         python scripts/video_intel.py transcript --url %s --channel %s --force --chunk-minutes %d",
+            video.get("url", ""),
+            channel_name,
+            smaller,
+        )
+    if captions_available:
+        log.warning(
+            "         python scripts/video_intel.py transcript --url %s --channel %s --force --transcript-source yt-captions",
+            video.get("url", ""),
+            channel_name,
+        )
+    if smaller >= chunk_minutes and not captions_available:
+        log.warning(
+            "         (already at the smallest chunk size and no caption track: `--start/--end` on the lost window,"
+            " or `mark-skip --mode transcript`, are what remains)"
+        )
 
 
 def _finish_chunked_transcript(
@@ -4158,13 +4184,32 @@ def _finish_chunked_transcript(
     transcript_path = channel_dir / f"{prefix}.transcript.md"
     meta_path = channel_dir / f"{prefix}.meta.json"
     lost = chunked_transcript_lost_chunks(status)
+    captions_available = True
     if chunked_captions_failover_applies(status, transcript_source, captions_already_tried=captions_already_tried):
         sidecar: Path | None = None
         if lost and transcript_path.exists():
             # Copy, never move: if captions turn out to be absent the partial
-            # must still be canonical and nothing has to be moved back.
+            # must still be canonical and nothing has to be moved back. Never
+            # clobber an earlier run's sidecar either (Codex peer pass): a
+            # forced rerun after a successful replacement would otherwise
+            # overwrite partial A with partial B and, if captions then fail,
+            # the cleanup below would delete the only surviving copy of A.
             sidecar = channel_dir / f"{prefix}{CHUNKED_PARTIAL_SIDECAR_SUFFIX}"
-            shutil.copyfile(transcript_path, sidecar)
+            if sidecar.exists():
+                stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+                sidecar = channel_dir / f"{prefix}{CHUNKED_PARTIAL_SIDECAR_SUFFIX[: -len('.txt')]}.{stamp}.txt"
+            try:
+                shutil.copyfile(transcript_path, sidecar)
+            except OSError as e:
+                # Best effort: the sidecar is forensics, not the artifact. A
+                # cloud-mount hiccup here must not abort the failover (or, on
+                # the scan path, the whole run).
+                log.warning("    %s: could not keep the Gemini partial as %s (%s)", prefix, sidecar.name, e)
+                sidecar = None
+        # Fresh sink per call (issue #231): absence and refusal need different
+        # words, and the remedy below must not recommend captions the video
+        # does not have.
+        captions_reason: dict = {}
         reason = (
             f"chunked transcript lost chunks ({status}): captions replaced the whole video; "
             f"the Gemini partial is kept in {sidecar.name if sidecar else 'no sidecar'}"
@@ -4183,6 +4228,7 @@ def _finish_chunked_transcript(
             # caller's own force keeps its pre-#248 meaning there.
             force=True if lost else force,
             duration_seconds=duration_seconds,
+            reason_sink=captions_reason,
         )
         if fb is not None:
             _, captions_status = fb
@@ -4196,11 +4242,24 @@ def _finish_chunked_transcript(
                 )
             return captions_status
         if sidecar is not None:
+            # Remove only the copy THIS call created; an earlier run's sidecar
+            # has a different name and is never touched.
             sidecar.unlink(missing_ok=True)
         if lost:
-            log.warning("    %s: %s - no caption track to fill it; keeping the Gemini partial", prefix, status)
+            if captions_failure_is_refusal(captions_reason.get("kind")):
+                log.warning(
+                    "    %s: %s - caption request REFUSED (%s), so whether a track exists is unknown; "
+                    "keeping the Gemini partial. %s",
+                    prefix,
+                    status,
+                    captions_reason.get("exception") or "blocked",
+                    CAPTIONS_BLOCK_RECOVERY,
+                )
+            else:
+                captions_available = False
+                log.warning("    %s: %s - no caption track to fill it; keeping the Gemini partial", prefix, status)
     if lost:
-        _log_lost_chunks_remedy(video, channel_dir.name, chunk_minutes, status)
+        _log_lost_chunks_remedy(video, channel_dir.name, chunk_minutes, status, captions_available=captions_available)
     return status
 
 
@@ -4277,17 +4336,23 @@ def _scan_transcribe_one(
             status = f"error: {e}"
         # Issues #60/#248: one shared tail decides the captions failover (whole
         # run failed, OR chunks were lost under `auto`) and logs the remedy.
-        status = _finish_chunked_transcript(
-            status,
-            video=video,
-            channel_dir=channel_dir,
-            prefix=prefix,
-            transcript_source=transcript_source,
-            captions_already_tried=livestream_captions_first,
-            force=False,
-            duration_seconds=duration_seconds,
-            chunk_minutes=chunk_minutes,
-        )
+        # Same contract as the chunked call above: `future.result()` in the
+        # scan loop is unguarded, so the tail must not be able to abort the
+        # scan either - a failover that raises keeps the Gemini status.
+        try:
+            status = _finish_chunked_transcript(
+                status,
+                video=video,
+                channel_dir=channel_dir,
+                prefix=prefix,
+                transcript_source=transcript_source,
+                captions_already_tried=livestream_captions_first,
+                force=False,
+                duration_seconds=duration_seconds,
+                chunk_minutes=chunk_minutes,
+            )
+        except Exception as e:
+            log.warning("    %s: captions failover raised (%s); keeping status %r", prefix, e, status)
         if status.startswith("error"):
             _log_chunk_recovery_recipe(video, duration_seconds, chunk_minutes)
         return prefix, status
@@ -7909,7 +7974,24 @@ def cmd_scan(args, config):
             # Issue #74: wall-clock cap so a hung Gemini call raises (-> failover
             # under auto) instead of deadlocking the whole batch. Per-channel
             # override > top-level > default, matching every other knob.
-            transcript_timeout_seconds = resolve_transcript_timeout_seconds(ch, config)
+            try:
+                transcript_timeout_seconds = resolve_transcript_timeout_seconds(ch, config)
+            except ValueError as e:
+                # Documented consequence (issue #169, `KNOB_CONSEQUENCE_FAILS_TRANSCRIPTS`):
+                # a bad value fails every transcript for THIS channel and the
+                # scan completes. Letting the resolver's ValueError escape here
+                # would abort the whole scan instead (review round, PR #251), so
+                # the raw value is passed through exactly as before #248 - it
+                # fails inside `_run_with_timeout`, inside the per-video handlers.
+                log.error(
+                    "[%s] invalid transcript_timeout_seconds (%s): every transcript for this channel will fail",
+                    ch_name,
+                    e,
+                )
+                transcript_timeout_seconds = ch.get(
+                    "transcript_timeout_seconds",
+                    config.get("transcript_timeout_seconds", TRANSCRIPT_TIMEOUT_DEFAULT),
+                )
             # Long-video guard (issue #42): videos longer than the threshold
             # truncate the structured-JSON transcript response. Filter them out
             # of the transcript loop and log the manual-clipping recipe.
