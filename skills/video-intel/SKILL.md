@@ -224,15 +224,22 @@ any of these are true:
 - The implied scope is more than ~10 new videos
 - The channel name was fuzzy and required config-file resolution
 - `auto_transcript: all` is set on the target channel (each new video =
-  3 Gemini calls — 1 expensive transcript reading video frames + audio,
-  plus 2 cheap text-only calls: mindmap-from-transcript and concepts)
+  3 Gemini calls: a transcript that scales with video length, a cheap
+  mindmap-from-transcript, and a concepts call that carries the WHOLE
+  taxonomy and costs the same for a 5-minute or a 2-hour video)
 
-Report the count of new videos and the estimated Gemini call count.
-Per video with `auto_transcript: all`: 1 expensive transcript call +
-2 cheap text-only calls (mindmap-from-transcript + concepts). With
-`auto_transcript: none`: 1 expensive mindmap-from-video call (legacy
-path, used when no transcript is on disk). Wait for the user's go-ahead
-before running the real scan.
+Report the count of new videos, their total duration, and a cost estimate
+in money, not just a call count. Use the formula and measured rates in
+[docs/cost-model.md](../../docs/cost-model.md); never quote concepts as
+"cheap". Two things move the number most: how many video-hours go through
+the Gemini transcript (captions-routed videos cost nothing there), and
+whether concepts run back to back (`scan`, `concepts --channel X`: cache
+hits, a few cents each) or interleaved one video at a time (`process --url`
+in a loop: cache misses, roughly five times more). For a hand-picked list,
+run `transcript` and `mindmap` per video, then one `concepts --channel X`
+per channel at the end. With `auto_transcript: none`: 1 expensive
+mindmap-from-video call (legacy path, used when no transcript is on disk).
+Wait for the user's go-ahead before running the real scan.
 
 ## When processing fails
 
