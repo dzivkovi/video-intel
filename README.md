@@ -749,6 +749,8 @@ The one number to anchor on: a full transcript costs **~$0.33 per video-hour** o
 
 The two mind-map rows are for a mind map built from the video itself, which only happens on a channel with no transcript. With `auto_transcript: all` the mind map is a text-only call over the transcript and costs a small fraction of the transcript row.
 
+**The concepts step is not cheap on a large corpus.** Every concepts call carries the whole taxonomy (about 270k tokens once the corpus holds a few thousand videos), so it costs the same per video whatever the length, and it depends on Gemini's cache: a few cents when calls run back to back (`scan`, `concepts --channel X`), several times more when they are interleaved one video at a time (`process --url` in a loop). Measured unit rates, a per-run estimating formula and a real monthly breakdown are in [docs/cost-model.md](docs/cost-model.md).
+
 **Free tier** covers 8 hours of input video per day. When active, input tokens
 cost nothing and output tokens ($3/M) become nearly the entire bill — about
 $0.05 per video. Steady-state weekly scans of 30 videos fit comfortably within
