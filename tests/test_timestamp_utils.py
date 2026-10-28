@@ -359,6 +359,7 @@ class TestStandaloneScriptImportIsolation:
             "burst_report",
             "corpus_walk",
             "atlas_build",
+            "atlas_render",
         ],
     )
     def test_import_succeeds_with_heavy_deps_blocked(self, module):

@@ -10,6 +10,7 @@ The corpus catalog and the Creator Atlas wiki are different tools that happen to
 - **Not a sharing format.** Choosing what a second person may see (an access policy, a filtered export) is a separate layer, tracked as [issue #262](https://github.com/dzivkovi/video-intel/issues/262). Do not hand the full file to anyone.
 - **No transcript text.** The catalog carries derived material only (headings, concept labels, timestamps) and links out to the source. The build never opens a transcript file; it only notes whether one exists.
 - **Read-only and free.** No Gemini call, no network, no write anywhere in the corpus except the one output file.
+- **Has a page.** `scripts/atlas_render.py` turns the file into `catalog.html`; see "See it as a page" below.
 
 ## Build it
 
@@ -30,6 +31,25 @@ For example, to write a scratch copy somewhere else:
 ```bash
 python scripts/atlas_build.py --corpus <output_dir> --out <scratch_dir> --generated-at 2026-10-28
 ```
+
+## See it as a page
+
+```bash
+python scripts/atlas_render.py --atlas <output_dir>/_atlas/atlas.json
+```
+
+This writes `<output_dir>/_atlas/catalog.html`, one self-contained file that opens from disk by double-click (pass `--out` to put it elsewhere). Everything is inside the file, so a copy works on any machine; the only thing the page ever fetches is the YouTube thumbnail per video, built from each row's own watch URL, and the Thumbnails button turns that off. It is as private as the atlas it embeds.
+
+What the page gives you:
+
+- **Cards**: thumbnail, title, channel (click it to filter), date, length; the mind map's branch headings double as the deep links, with the second they jump to; six concept chips (a chip narrows the set); an "Already seen" line when the video is in a briefing or has a wiki page.
+- **Compact**: a dated table of contents, newest first, 200 rows a page.
+- **Grid**: channel by month, last 24 months by default with a link to all months; darker means more videos; a cell lists exactly those videos.
+- A filter rail (channel, topic, year, month, transcript quality, briefing and wiki membership) whose counts update against every other filter; search where every word must match somewhere in title, headings, concepts or channel, with title hits first; a URL hash that carries the whole view, so a bookmark reopens it; a dark theme by default and a light one behind the button.
+
+Rebuild the page after every atlas rebuild. It refuses to overwrite a `catalog.html` it did not write itself (no `atlas_render.py` generator marker in the file), the same rule the atlas build applies to `atlas.json`.
+
+The page follows the plain rules of good data display: one accent colour for data and grey for everything else, warning colours only on transcript problems, the finding stated as a sentence with its denominators under the title, and rows ordered by size so the eye reads top-down (the "storytelling with data" school).
 
 ## Read the summary line
 

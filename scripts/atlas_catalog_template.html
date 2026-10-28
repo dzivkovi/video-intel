@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="generator" content="atlas_render.py">
 <title>Corpus catalog</title>
 <link rel="icon" href="data:,">
 <script>
@@ -276,7 +277,7 @@
 
   // ---------- helpers ----------
   // Every corpus value goes through textContent or setAttribute; nothing from the data
-  // ever reaches innerHTML.
+  // is ever parsed as markup.
   function el(tag, attrs, text) {
     var e = document.createElement(tag);
     if (attrs) {
@@ -322,7 +323,7 @@
 
   // ---------- load ----------
   var raw = document.getElementById("atlas-data").textContent.trim();
-  if (!raw || raw === "__ATLAS_" + "DATA__") { showFatal("No catalog data is embedded. Build this page with render_catalog.py."); return; }
+  if (!raw || raw === "__ATLAS_" + "DATA__") { showFatal("No catalog data is embedded. Build this page with scripts/atlas_render.py."); return; }
   var atlas;
   try { atlas = JSON.parse(raw); } catch (e) { showFatal("The embedded catalog data could not be parsed."); return; }
 
