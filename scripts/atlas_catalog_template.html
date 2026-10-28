@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="generator" content="atlas_render.py">
 <title>Corpus catalog</title>
 <link rel="icon" href="data:,">
 <script>
@@ -276,7 +277,7 @@
 
   // ---------- helpers ----------
   // Every corpus value goes through textContent or setAttribute; nothing from the data
-  // ever reaches innerHTML.
+  // is ever parsed as markup.
   function el(tag, attrs, text) {
     var e = document.createElement(tag);
     if (attrs) {
@@ -322,13 +323,14 @@
 
   // ---------- load ----------
   var raw = document.getElementById("atlas-data").textContent.trim();
-  if (!raw || raw === "__ATLAS_" + "DATA__") { showFatal("No catalog data is embedded. Build this page with render_catalog.py."); return; }
+  if (!raw || raw === "__ATLAS_" + "DATA__") { showFatal("No catalog data is embedded. Build this page with scripts/atlas_render.py."); return; }
   var atlas;
   try { atlas = JSON.parse(raw); } catch (e) { showFatal("The embedded catalog data could not be parsed."); return; }
 
   var rows = Array.isArray(atlas.rows) ? atlas.rows : [];
   var N = rows.length;
   var conceptLabels = atlas.concepts || {};
+  function labelOf(id) { return Object.prototype.hasOwnProperty.call(conceptLabels, id) ? conceptLabels[id] : id; }
   var summary = atlas.summary || {};
   var PAGE = 50, TOC_PAGE = 200;
   var QUALITY = ["complete", "partial", "truncated", "severe", "skipped", "unknown", "none"];
@@ -355,7 +357,7 @@
     quality: makeDim("ql", "Transcript quality", "one"),
     briefing: makeDim("br", "Already in a briefing", "one", yesNo),
     wiki: makeDim("wk", "Has wiki page", "one", yesNo),
-    concept: makeDim("cn", "Concept", "all", function (v) { return conceptLabels[v] || v; })
+    concept: makeDim("cn", "Concept", "all", labelOf)
   };
   var DIMS = [D.channel, D.topic, D.year, D.month, D.quality, D.briefing, D.wiki, D.concept];
   var RAIL_DIMS = [D.channel, D.topic, D.year, D.month, D.quality, D.briefing, D.wiki];
@@ -386,12 +388,14 @@
     var t = [r.title].concat(r.aliases || []).join(" ");
     titleLower[i] = String(r.title || "").toLowerCase();
     titleText[i] = " " + tokens(t).join(" ") + " ";
-    var other = [r.channel].concat(r.synopsis || [], (r.concept_ids || []).map(function (id) { return conceptLabels[id] || id; }));
+    var other = [r.channel].concat(r.synopsis || [], (r.concept_ids || []).map(labelOf));
     otherText[i] = " " + tokens(other.join(" ")).join(" ") + " ";
   }
 
   // ---------- state ----------
   var state = { q: "", view: "list", n: PAGE, allMonths: false };
+  // The one definition of "a page" for the current view; every reset of state.n goes through it.
+  function pageSize() { return state.view === "compact" ? TOC_PAGE : PAGE; }
   var GRID_MONTHS = 24;
 
   function serialize() {
@@ -402,7 +406,7 @@
     });
     if (state.view !== "list") p.set("v", state.view);
     if (state.allMonths) p.set("gm", "all");
-    if (state.n !== (state.view === "compact" ? TOC_PAGE : PAGE)) p.set("n", String(state.n));
+    if (state.n !== pageSize()) p.set("n", String(state.n));
     return p.toString();
   }
   function parse(hash) {
@@ -410,7 +414,7 @@
     state.q = p.get("q") || "";
     state.view = p.get("v") === "grid" ? "grid" : p.get("v") === "compact" ? "compact" : "list";
     state.allMonths = p.get("gm") === "all";
-    var step = state.view === "compact" ? TOC_PAGE : PAGE;
+    var step = pageSize();
     var n = parseInt(p.get("n") || "", 10);
     state.n = n > 0 ? Math.max(step, Math.ceil(n / step) * step) : step;
     DIMS.forEach(function (d) {
@@ -618,13 +622,15 @@
     // Headings double as the deep links: a heading that has a timestamp in the mindmap
     // is rendered as the link itself, so there is no second row repeating the same text.
     var syn = r.synopsis || [];
-    var byLabel = new Map();
-    (r.deep_links || []).forEach(function (dl) { if (safeUrl(dl.url) && !byLabel.has(dl.label)) byLabel.set(dl.label, dl); });
+    // Deep links arrive in branch order, at most one per branch; walking them with a cursor keeps a
+    // heading paired with its own link even when two headings share one cleaned label.
+    var links = (r.deep_links || []).filter(function (dl) { return safeUrl(dl.url); });
+    var cursor = 0;
     if (syn.length) {
       var ol = card.appendChild(el("ul", { class: "syn" }));
       syn.forEach(function (sTxt, k) {
         var li = ol.appendChild(el("li", k >= 3 ? { class: "hidden" } : null));
-        var dl = byLabel.get(sTxt);
+        var dl = cursor < links.length && links[cursor].label === sTxt ? links[cursor++] : null;
         if (dl) {
           li.appendChild(el("a", { href: dl.url, target: "_blank", rel: "noopener noreferrer", title: "Open at " + fmtDur(dl.seconds) }, sTxt));
           li.appendChild(el("span", { class: "t" }, fmtDur(dl.seconds)));
@@ -817,7 +823,7 @@
   document.getElementById("q").addEventListener("input", function (ev) {
     var v = ev.target.value;
     clearTimeout(debounce);
-    debounce = setTimeout(function () { state.q = v; state.n = PAGE; commit(false); }, 160);
+    debounce = setTimeout(function () { state.q = v; state.n = pageSize(); commit(false); }, 160);
   });
   function setView(v) { if (state.view === v) return; state.view = v; state.n = v === "compact" ? TOC_PAGE : PAGE; commit(true); }
   document.getElementById("view-list").addEventListener("click", function () { setView("list"); });
@@ -826,8 +832,9 @@
   document.getElementById("more-btn").addEventListener("click", function () { state.n += PAGE; writeHash(false); renderList(compute()); });
   document.getElementById("more-toc-btn").addEventListener("click", function () { state.n += TOC_PAGE; writeHash(false); renderCompact(compute()); });
   document.getElementById("clear-all").addEventListener("click", function () {
+    clearTimeout(debounce);
     DIMS.forEach(function (d) { d.sel.clear(); });
-    state.q = ""; state.n = PAGE; document.getElementById("q").value = "";
+    state.q = ""; state.n = pageSize(); document.getElementById("q").value = "";
     commit(true);
   });
 
@@ -849,12 +856,12 @@
     var b = ev.target.closest("button");
     if (!b) return;
     if (b.hasAttribute("data-expand")) { var de = dimByKey(b.getAttribute("data-expand")); de.expanded = !de.expanded; render(); return; }
-    if (b.hasAttribute("data-remove-cn")) { D.concept.sel.delete(parseInt(b.getAttribute("data-remove-cn"), 10)); state.n = PAGE; commit(true); return; }
+    if (b.hasAttribute("data-remove-cn")) { D.concept.sel.delete(parseInt(b.getAttribute("data-remove-cn"), 10)); state.n = pageSize(); commit(true); return; }
     var d = dimByKey(b.getAttribute("data-dim"));
     if (!d) return;
     var c = parseInt(b.getAttribute("data-code"), 10);
     if (d.sel.has(c)) d.sel.delete(c); else d.sel.add(c);
-    state.n = PAGE;
+    state.n = pageSize();
     commit(true);
   });
 
@@ -863,12 +870,12 @@
     if (!b) return;
     if (b.hasAttribute("data-ch")) {
       D.channel.sel = new Set([parseInt(b.getAttribute("data-ch"), 10)]);
-      state.n = PAGE; commit(true); window.scrollTo(0, 0);
+      state.n = pageSize(); commit(true); window.scrollTo(0, 0);
       return;
     }
     if (b.hasAttribute("data-cn")) {
       var c = parseInt(b.getAttribute("data-cn"), 10);
-      if (!D.concept.sel.has(c)) { D.concept.sel.add(c); state.n = PAGE; commit(true); window.scrollTo(0, 0); }
+      if (!D.concept.sel.has(c)) { D.concept.sel.add(c); state.n = pageSize(); commit(true); window.scrollTo(0, 0); }
       return;
     }
     if (b.hasAttribute("data-allchips")) {
@@ -892,7 +899,7 @@
     if (mc === undefined) return;
     D.channel.sel = new Set([parseInt(td.getAttribute("data-ch"), 10)]);
     D.month.sel = new Set([mc]);
-    state.view = "list"; state.n = PAGE;
+    state.view = "list"; state.n = pageSize();
     commit(true);
     window.scrollTo(0, 0);
   }
@@ -909,8 +916,10 @@
   matrix.addEventListener("focusin", readout);
 
   function fromLocation() {
+    clearTimeout(debounce);
     var before = serialize();
     parse(location.hash);
+    document.getElementById("q").value = state.q;
     if (serialize() !== before || !rendered) { rendered = true; render(); }
   }
   var rendered = false;

@@ -172,7 +172,7 @@ All commands support `--force` to regenerate existing output files. Gemini-calli
 | [`evals.md`](.claude/rules/evals.md) | the retrieval eval, model scorecards, model choice, the mindmap prompt |
 | [`briefings.md`](.claude/rules/briefings.md) | briefings, the headline digest, the personalization profile |
 | [`docs-currency.md`](.claude/rules/docs-currency.md) | README, INSTALLATION, `docs/`, the SKILL.md files |
-| [`intelligence-layer.md`](.claude/rules/intelligence-layer.md) | `intel_graph.py`, `lead_lag_report.py`, `burst_report.py`, `sdsm_network.py`, `wiki_atlas.py`, `atlas_build.py`, `corpus_walk.py` |
+| [`intelligence-layer.md`](.claude/rules/intelligence-layer.md) | `intel_graph.py`, `lead_lag_report.py`, `burst_report.py`, `sdsm_network.py`, `wiki_atlas.py`, `atlas_build.py`, `atlas_render.py`, `corpus_walk.py` |
 | [`translate-bcs.md`](.claude/rules/translate-bcs.md) | `translate_video.py`, its prompts, its tests (operationally separate) |
 
 **A reviewer that does not auto-load them must be handed the matching file.** Codex reads `AGENTS.md` and `CLAUDE.md` only, never `.claude/rules/`, so a peer-review brief has to name the rule file for the subsystem under review or the pass silently loses every guardrail that governs it.
