@@ -187,7 +187,7 @@ REQUIRED_TRIGGERS = {
     "evals.md": ["scripts/model_eval.py"],
     "briefings.md": ["scripts/video_intel.py"],
     "docs-currency.md": ["tests/test_docs_currency.py", "README.md"],
-    "intelligence-layer.md": ["scripts/intel_graph.py"],
+    "intelligence-layer.md": ["scripts/intel_graph.py", "scripts/atlas_build.py", "scripts/corpus_walk.py"],
     "translate-bcs.md": ["scripts/translate_video.py"],
 }
 

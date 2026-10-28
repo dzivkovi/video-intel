@@ -1016,3 +1016,52 @@ class TestSchema:
         mutate(doc["rows"][0])
         with pytest.raises(jsonschema.ValidationError):
             jsonschema.Draft202012Validator(_schema()).validate(doc)
+
+
+# ---------------------------------------------------------------------------
+# Docs and skill parity (U4): every documented flag is a real flag
+# ---------------------------------------------------------------------------
+
+REPO = pathlib.Path(__file__).resolve().parent.parent
+#: The two places a reader is told how to run the catalog build.
+DOCS_WITH_INVOCATIONS = ("docs/atlas.md", "skills/video-intel/SKILL.md")
+#: One invocation: the script name, then tokens up to a backtick, a table pipe
+#: or the end of the line (a code span or a fenced block both end there).
+_INVOCATION_RE = re.compile(r"python\s+scripts/atlas_build\.py((?:[ \t]+[^\s`|]+)*)")
+
+
+def _documented_invocations(text: str) -> list[list[str]]:
+    """Every `atlas_build.py` invocation in `text`, as its argument tokens."""
+    return [m.group(1).split() for m in _INVOCATION_RE.finditer(text)]
+
+
+def _parser_flags() -> set[str]:
+    return {opt for action in ab.build_parser()._actions for opt in action.option_strings}
+
+
+class TestDocumentedFlagsExist:
+    """A doc that tells the reader to pass a flag `build_parser()` lacks sends
+    them straight into an argparse error. The case list comes from the DOCS,
+    so a typo'd or retired flag in either file fails here by name."""
+
+    @pytest.mark.parametrize("doc", DOCS_WITH_INVOCATIONS)
+    def test_every_documented_flag_is_a_real_flag(self, doc):
+        known = _parser_flags()
+        invocations = _documented_invocations((REPO / doc).read_text(encoding="utf-8"))
+        unknown = sorted({tok.split("=", 1)[0] for args in invocations for tok in args if tok.startswith("--")} - known)
+        assert not unknown, f"{doc} documents atlas_build.py flags the parser does not have: {unknown}"
+
+    @pytest.mark.parametrize("doc", DOCS_WITH_INVOCATIONS)
+    def test_each_doc_has_at_least_one_invocation_with_corpus(self, doc):
+        """Non-vacuity: an extractor that stops matching would turn the test
+        above into `assert not set()` forever."""
+        invocations = _documented_invocations((REPO / doc).read_text(encoding="utf-8"))
+        assert invocations, f"no atlas_build.py invocation found in {doc}"
+        assert any("--corpus" in args for args in invocations), f"no invocation in {doc} passes --corpus"
+
+    def test_the_extractor_sees_a_bad_flag(self):
+        """Positive control on synthetic text, independent of the real docs."""
+        found = _documented_invocations("| `python scripts/atlas_build.py --corpus <dir> --bogus` | x --nope |")
+        assert found == [["--corpus", "<dir>", "--bogus"]]
+        assert "--bogus" not in _parser_flags()
+        assert {"--corpus", "--out", "--generated-at"} <= _parser_flags()

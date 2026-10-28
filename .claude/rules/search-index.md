@@ -3,9 +3,11 @@ description: The vector/FTS index, hybrid and concept search, concepts.json to t
 paths:
   - scripts/video_intel.py
   - prompts/concepts.md
+  - scripts/corpus_walk.py
   - docs/search-internals.md
   - docs/topics-layer.md
   - skills/video-intel-search/SKILL.md
+  - tests/test_corpus_walk.py
   - tests/test_concepts_accumulation.py
   - tests/test_concept_rank_specificity.py
   - tests/test_topics.py
