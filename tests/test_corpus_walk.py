@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import pathlib
 import subprocess
 import sys
@@ -301,3 +302,227 @@ class TestBriefingVideoCounts:
     def test_missing_dir_is_empty(self, tmp_path):
         assert cw.briefing_video_counts(tmp_path / "_briefings") == {}
         assert cw.load_seen_video_ids(tmp_path / "_briefings") == set()
+
+
+# ---------------------------------------------------------------------------
+# Walker (unit U6): sibling index, one record per video_id, counters
+# ---------------------------------------------------------------------------
+
+
+def _video(
+    channel_dir,
+    prefix,
+    video_id,
+    *,
+    title=None,
+    channel=None,
+    mindmap=False,
+    concepts=False,
+    transcript=False,
+    meta=None,
+):
+    """Write one synthetic video's artifacts; returns the meta path."""
+    channel_dir.mkdir(parents=True, exist_ok=True)
+    data = {"video_id": video_id, "title": title if title is not None else prefix, "published": "2026-01-01"}
+    if channel is not None:
+        data["channel"] = channel
+    if meta is not None:
+        data = meta
+    meta_path = channel_dir / f"{prefix}{cw.META_SUFFIX}"
+    meta_path.write_text(json.dumps(data), encoding="utf-8")
+    if mindmap:
+        (channel_dir / f"{prefix}{cw.MINDMAP_SUFFIX}").write_text("# m\n", encoding="utf-8")
+    if concepts:
+        (channel_dir / f"{prefix}{cw.CONCEPTS_SUFFIX}").write_text('{"concepts": []}', encoding="utf-8")
+    if transcript:
+        (channel_dir / f"{prefix}{cw.TRANSCRIPT_SUFFIX}").write_text("t\n", encoding="utf-8")
+    return meta_path
+
+
+def _partitions(result):
+    return result.metas == len(result.records) + result.duplicates + result.skipped + result.no_id
+
+
+class TestChannelSiblingIndex:
+    def test_a_bracketed_prefix_finds_its_mindmap_literally(self, tmp_path):
+        ch = tmp_path / "alpha"
+        prefix = "2026-01-01-[live]-title"
+        _video(ch, prefix, "vid1", mindmap=True)
+        index = cw.channel_sibling_index(ch)
+        assert set(index[prefix]) == {cw.META_SUFFIX, cw.MINDMAP_SUFFIX}
+        assert index[prefix][cw.MINDMAP_SUFFIX] == ch / f"{prefix}{cw.MINDMAP_SUFFIX}"
+
+    def test_corrupt_sidecar_raw_sidecar_and_srt_are_not_in_the_index(self, tmp_path):
+        ch = tmp_path / "alpha"
+        _video(ch, "p", "vid1")
+        (ch / "p.meta.corrupt.json").write_text("{", encoding="utf-8")
+        (ch / "p.transcript.raw.txt").write_text("raw", encoding="utf-8")
+        (ch / "p.en.srt").write_text("1", encoding="utf-8")
+        assert cw.channel_sibling_index(ch) == {"p": {cw.META_SUFFIX: ch / "p.meta.json"}}
+
+    def test_a_directory_named_like_an_artifact_is_not_a_sibling(self, tmp_path):
+        ch = tmp_path / "alpha"
+        _video(ch, "p", "vid1")
+        (ch / "p.mindmap.md").mkdir()
+        assert cw.channel_sibling_index(ch) == {"p": {cw.META_SUFFIX: ch / "p.meta.json"}}
+
+
+class TestIterMetaRecords:
+    def test_duplicate_id_yields_one_record_with_the_richer_title_and_an_alias(self, tmp_path):
+        ch = tmp_path / "alpha"
+        _video(ch, "2026-01-01-a-old", "vid1", title="Old title")
+        _video(ch, "2026-01-01-b-new", "vid1", title="New title", mindmap=True, concepts=True)
+        result = cw.iter_meta_records(tmp_path)
+        assert len(result.records) == 1
+        rec = result.records[0]
+        assert rec.prefix == "2026-01-01-b-new"
+        assert rec.meta["title"] == "New title"
+        assert rec.aliases == ["Old title"]
+        assert [loser.prefix for loser in rec.losers] == ["2026-01-01-a-old"]
+        assert result.duplicates == 1
+
+    def test_an_equal_count_tie_keeps_the_first_in_sorted_order(self, tmp_path):
+        # Falsified once with `>=`: the later record won and this went red.
+        ch = tmp_path / "alpha"
+        _video(ch, "b-second", "vid1", title="Second", mindmap=True)
+        _video(ch, "a-first", "vid1", title="First", concepts=True)
+        rec = cw.iter_meta_records(tmp_path).records[0]
+        assert rec.prefix == "a-first"
+        assert rec.aliases == ["Second"]
+
+    def test_the_transcript_never_counts_toward_the_winner(self, tmp_path):
+        # Falsified once by adding TRANSCRIPT_SUFFIX to the counted suffixes:
+        # the 2-2 tie then kept the first record and this went red.
+        ch = tmp_path / "alpha"
+        _video(ch, "a-transcript-mindmap", "vid1", transcript=True, mindmap=True)
+        _video(ch, "b-mindmap-concepts", "vid1", mindmap=True, concepts=True)
+        rec = cw.iter_meta_records(tmp_path).records[0]
+        assert rec.prefix == "b-mindmap-concepts"
+
+    def test_duplicate_alias_titles_are_deduplicated_and_exclude_the_winner(self, tmp_path):
+        ch = tmp_path / "alpha"
+        _video(ch, "a", "vid1", title="Same")
+        _video(ch, "b", "vid1", title="Same")
+        _video(ch, "c", "vid1", title="Win", mindmap=True)
+        _video(ch, "d", "vid1", title="Win")
+        rec = cw.iter_meta_records(tmp_path).records[0]
+        assert rec.prefix == "c"
+        assert rec.aliases == ["Same"]
+
+    def test_the_same_id_in_two_channel_folders_lists_both_channels(self, tmp_path):
+        _video(tmp_path / "alpha", "p1", "vid1", mindmap=True)
+        _video(tmp_path / "beta", "p2", "vid1")
+        result = cw.iter_meta_records(tmp_path)
+        assert len(result.records) == 1
+        rec = result.records[0]
+        assert rec.channel == "alpha"
+        assert rec.channels == ["alpha", "beta"]
+        assert rec.channel_dir == tmp_path / "alpha"
+
+    def test_excluded_folders_are_skipped_and_their_metas_counted(self, tmp_path):
+        for name in ("_wiki", "_atlas", "_quarantine", "_standalone", ".lancedb"):
+            _video(tmp_path / name, "p", f"id-{name}")
+        (tmp_path / "empty").mkdir()
+        result = cw.iter_meta_records(tmp_path)
+        assert result.records == []
+        assert result.excluded_metas == 5
+        assert result.metas == 0
+
+    def test_a_non_existent_corpus_is_an_empty_result(self, tmp_path):
+        result = cw.iter_meta_records(tmp_path / "nope")
+        assert result.records == []
+        counters = (result.metas, result.duplicates, result.skipped, result.no_id, result.excluded_metas)
+        assert counters == (0, 0, 0, 0, 0)
+        assert result.skipped_files == []
+
+    def test_the_counters_partition_the_input(self, tmp_path, caplog):
+        ch = tmp_path / "alpha"
+        _video(ch, "good", "vid-good")
+        _video(ch, "dup-a", "vid-dup")
+        _video(ch, "dup-b", "vid-dup")
+        _video(ch, "int-id", 123)
+        torn = ch / f"torn{cw.META_SUFFIX}"
+        torn.write_bytes(b'{"video_id": "x", "title": "\xd0')
+        _video(tmp_path / "_quarantine", "q", "vid-q")
+        with caplog.at_level(logging.WARNING, logger="video_intel.corpus_walk"):
+            result = cw.iter_meta_records(tmp_path)
+        assert result.metas == 5
+        assert len(result.records) == 2
+        assert result.duplicates == 1
+        assert result.skipped == 1
+        assert result.no_id == 1
+        assert result.excluded_metas == 1
+        assert result.skipped_files == [str(torn)]
+        assert _partitions(result)
+        assert any("int-id.meta.json" in r.getMessage() for r in _warnings(caplog))
+
+    def test_one_iterdir_per_channel_folder(self, tmp_path, monkeypatch):
+        for i in range(6):
+            _video(tmp_path / "alpha", f"p{i}", f"a{i}", mindmap=True, concepts=True)
+        _video(tmp_path / "beta", "p", "b0")
+        calls: dict[str, int] = {}
+        real = os.scandir
+
+        def counting(path):
+            calls[pathlib.Path(path).name] = calls.get(pathlib.Path(path).name, 0) + 1
+            return real(path)
+
+        monkeypatch.setattr(cw.os, "scandir", counting)
+        result = cw.iter_meta_records(tmp_path)
+        assert len(result.records) == 7
+        assert calls["alpha"] == 1
+        assert calls["beta"] == 1
+
+    def test_a_non_string_channel_falls_back_to_the_folder_with_a_warning(self, tmp_path, caplog):
+        _video(tmp_path / "alpha", "p", "vid1", meta={"video_id": "vid1", "channel": ["x"]})
+        with caplog.at_level(logging.WARNING, logger="video_intel.corpus_walk"):
+            rec = cw.iter_meta_records(tmp_path).records[0]
+        assert rec.channel == "alpha"
+        assert rec.channels == ["alpha"]
+        assert any("`channel`" in r.getMessage() for r in _warnings(caplog))
+
+    def test_a_meta_channel_differing_from_its_folder_is_kept(self, tmp_path):
+        _video(tmp_path / "alpha", "p", "vid1", channel="Alpha Creator")
+        _video(tmp_path / "beta", "q", "vid2", channel="Alpha Creator")
+        _video(tmp_path / "gamma", "r", "vid2")
+        by_id = {r.video_id: r for r in cw.iter_meta_records(tmp_path).records}
+        assert by_id["vid1"].channel == "Alpha Creator"
+        assert by_id["vid1"].channels == ["Alpha Creator"]
+        assert by_id["vid2"].channels == ["Alpha Creator", "gamma"]
+
+    def test_records_are_sorted_by_channel_then_prefix(self, tmp_path):
+        _video(tmp_path / "beta", "a", "v3")
+        _video(tmp_path / "alpha", "b", "v2")
+        _video(tmp_path / "alpha", "a", "v1")
+        assert [(r.channel, r.prefix) for r in cw.iter_meta_records(tmp_path).records] == [
+            ("alpha", "a"),
+            ("alpha", "b"),
+            ("beta", "a"),
+        ]
+
+
+class TestCollectCorpusVideosIsAProjection:
+    def test_same_ids_and_chosen_titles_as_the_walker(self, tmp_path):
+        ch = tmp_path / "alpha"
+        _video(ch, "a-old", "vid1", title="Old")
+        _video(ch, "b-new", "vid1", title="New", mindmap=True)
+        _video(ch, "c-tie", "vid2", title="Tie first", concepts=True)
+        _video(ch, "d-tie", "vid2", title="Tie second", mindmap=True)
+        _video(tmp_path / "beta", "e", "vid1", title="Elsewhere")
+        _video(ch, "f", "vid3", title="Solo", mindmap=True, concepts=True)
+        walker = {r.video_id: r.meta["title"] for r in cw.iter_meta_records(tmp_path).records}
+        projected = {v["video_id"]: v["title"] for v in vi.collect_corpus_videos(tmp_path)}
+        assert projected == walker
+        assert walker == {"vid1": "New", "vid2": "Tie first", "vid3": "Solo"}
+
+    def test_the_projection_keeps_its_paths_url_fallback_and_topic_union(self, tmp_path):
+        ch = tmp_path / "alpha"
+        _video(ch, "a", "vid1", meta={"video_id": "vid1", "title": "A", "topics": ["sales"]})
+        _video(ch, "b", "vid1", title="B", mindmap=True)
+        [rec] = vi.collect_corpus_videos(tmp_path)
+        assert rec["title"] == "B"
+        assert rec["url"] == "https://www.youtube.com/watch?v=vid1"
+        assert rec["mindmap_path"] == ch / "b.mindmap.md"
+        assert rec["concepts_path"] is None
+        assert rec["topics"] == ["sales"]
+        assert rec["channel"] == "alpha"

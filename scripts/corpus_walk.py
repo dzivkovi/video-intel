@@ -27,7 +27,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections import Counter
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -116,6 +118,193 @@ def artifact_count(record: dict) -> int:
 
 #: The name `video_intel` has always used; kept bound to the same function.
 _artifact_count = artifact_count
+
+#: The four per-video artifact suffixes a channel's sibling index knows about.
+#: Matched by exact `endswith`, so `.meta.corrupt.json`, the `.transcript.raw*`
+#: sidecars and translate-bcs `.srt` files are never mistaken for one of them.
+SIBLING_SUFFIXES = (META_SUFFIX, CONCEPTS_SUFFIX, MINDMAP_SUFFIX, TRANSCRIPT_SUFFIX)
+
+#: The suffixes the duplicate-id winner rule counts: the same two-artifact rule
+#: as `artifact_count` (mindmap, concepts). A transcript or any other sidecar
+#: never counts, so a transcript-plus-mindmap record cannot beat a
+#: mindmap-plus-concepts one and silently change which title briefings show.
+WINNER_ARTIFACT_SUFFIXES = (MINDMAP_SUFFIX, CONCEPTS_SUFFIX)
+
+
+def channel_sibling_index(channel_dir: Path) -> dict[str, dict[str, Path]]:
+    """prefix -> {suffix -> path} for one channel folder, from ONE `iterdir()`.
+
+    On a cloud-mounted corpus a directory listing is the expensive call, so a
+    channel is listed once and every video's siblings come out of that one
+    listing. Matching is literal (`endswith` on the four known suffixes, the
+    prefix is the filename minus the suffix), never a glob: a bracketed title
+    like `2026-01-01-[live]-title` is glob syntax and would lose its siblings
+    (the `wiki_concepts.sibling_artifacts` lesson, issue #150). Only regular
+    files are indexed. `os.scandir` answers `is_file()` from the listing
+    itself (the directory entry's attributes on Windows, `d_type` on Linux),
+    so the file-type check costs no stat per artifact on the Drive mount.
+    """
+    index: dict[str, dict[str, Path]] = {}
+    with os.scandir(channel_dir) as entries:
+        for entry in entries:
+            name = entry.name
+            for suffix in SIBLING_SUFFIXES:
+                if name.endswith(suffix) and len(name) > len(suffix):
+                    if entry.is_file():
+                        index.setdefault(name[: -len(suffix)], {})[suffix] = Path(entry.path)
+                    break
+    return index
+
+
+def _sibling_artifact_count(siblings: dict[str, Path]) -> int:
+    return sum(1 for suffix in WINNER_ARTIFACT_SUFFIXES if suffix in siblings)
+
+
+@dataclass
+class MetaRecord:
+    """One readable meta with a usable `video_id`, plus its sibling artifacts.
+
+    On a winner, `losers` holds the other records that share its `video_id`
+    (title rotation, or one id filed under two channel folders), `aliases` the
+    losing titles and `channels` every channel the id was found under.
+    """
+
+    video_id: str
+    prefix: str
+    channel: str
+    channel_dir: Path
+    meta: dict
+    siblings: dict[str, Path]
+    losers: list[MetaRecord] = field(default_factory=list)
+    aliases: list[str] = field(default_factory=list)
+    channels: list[str] = field(default_factory=list)
+
+
+@dataclass
+class WalkResult:
+    """Winners plus counters that partition the eligible metas.
+
+    Invariant: ``metas == len(records) + duplicates + skipped + no_id``.
+    ``excluded_metas`` counts metas under `.`/`_` top-level folders, which are
+    never walked and so sit outside that partition.
+    """
+
+    records: list[MetaRecord] = field(default_factory=list)
+    metas: int = 0
+    duplicates: int = 0
+    skipped: int = 0
+    no_id: int = 0
+    excluded_metas: int = 0
+    skipped_files: list[str] = field(default_factory=list)
+
+
+def _record_channel(meta: dict, channel_dir: Path, meta_name: str) -> str:
+    channel = meta.get("channel")
+    if isinstance(channel, str) and channel:
+        return channel
+    # `channels` is sorted and rolled up per topic, so a non-string breaks the
+    # ordering downstream. The folder the meta actually lives in is the
+    # accurate fallback, not an invented label.
+    log.warning(
+        "  %s: `channel` is %s, not a non-empty string; using the folder name %s",
+        meta_name,
+        "missing" if channel is None else f"a {type(channel).__name__}",
+        channel_dir.name,
+    )
+    return channel_dir.name
+
+
+def _count_excluded_metas(folder: Path) -> int:
+    """Metas directly inside an excluded top-level folder, counted, never read."""
+    try:
+        with os.scandir(folder) as entries:
+            return sum(1 for entry in entries if entry.name.endswith(META_SUFFIX) and entry.is_file())
+    except OSError as exc:
+        log.warning("cannot list %s: %s", folder, exc)
+        return 0
+
+
+def iter_meta_records(corpus: Path) -> WalkResult:
+    """Walk every channel folder once and return one record per `video_id`.
+
+    Channel folders (`is_channel_dir`) are walked in sorted name order and
+    each folder's metas in sorted prefix order. A meta `read_json_best_effort`
+    rejects counts as `skipped`; a JSON object whose `video_id` fails
+    `usable_video_id` counts as `no_id` with a WARNING naming the file (never
+    `str()`-coerced: `123` must not merge with a real `"123"`). Records that
+    share an id are grouped: the winner has strictly more mindmap-plus-concepts
+    siblings, and a tie keeps the FIRST record in walk order; every other
+    record counts as a duplicate and hangs off the winner. Reading never
+    writes. A corpus that does not exist yields an empty result.
+    """
+    result = WalkResult()
+    if not corpus.is_dir():
+        return result
+    folders = sorted(corpus.iterdir(), key=lambda p: p.name)
+    by_id: dict[str, MetaRecord] = {}
+    for folder in folders:
+        if not folder.is_dir():
+            continue
+        if not is_channel_dir(folder):
+            result.excluded_metas += _count_excluded_metas(folder)
+            continue
+        try:
+            index = channel_sibling_index(folder)
+        except OSError as exc:
+            log.warning("cannot list channel folder %s: %s", folder, exc)
+            continue
+        for prefix in sorted(index):
+            siblings = index[prefix]
+            meta_path = siblings.get(META_SUFFIX)
+            if meta_path is None:
+                continue
+            result.metas += 1
+            meta = read_json_best_effort(meta_path, result.skipped_files)
+            if meta is None:
+                result.skipped += 1
+                continue
+            video_id = meta.get("video_id")
+            if not usable_video_id(video_id):
+                log.warning(
+                    "  %s: `video_id` is %s, not a non-empty string; skipping this meta",
+                    meta_path.name,
+                    "missing" if video_id is None else f"a {type(video_id).__name__}",
+                )
+                result.no_id += 1
+                continue
+            record = MetaRecord(
+                video_id=video_id,
+                prefix=prefix,
+                channel=_record_channel(meta, folder, meta_path.name),
+                channel_dir=folder,
+                meta=meta,
+                siblings=siblings,
+            )
+            existing = by_id.get(video_id)
+            if existing is None:
+                by_id[video_id] = record
+                continue
+            result.duplicates += 1
+            if _sibling_artifact_count(record.siblings) > _sibling_artifact_count(existing.siblings):
+                record.losers = [existing, *existing.losers]
+                existing.losers = []
+                by_id[video_id] = record
+            else:
+                existing.losers.append(record)
+    for winner in by_id.values():
+        # Losers in walk order, so aliases follow the sorted (folder, prefix) order.
+        winner.losers.sort(key=lambda r: (r.channel_dir.name, r.prefix))
+        own_title = winner.meta.get("title")
+        aliases: list[str] = []
+        for loser in winner.losers:
+            title = loser.meta.get("title")
+            if isinstance(title, str) and title and title != own_title and title not in aliases:
+                aliases.append(title)
+        winner.aliases = aliases
+        winner.channels = sorted({winner.channel, *(loser.channel for loser in winner.losers)})
+    result.records = sorted(by_id.values(), key=lambda r: (r.channel, r.prefix, r.channel_dir.name))
+    return result
+
 
 # ---------------------------------------------------------------------------
 # Transcript status and quality flags (as persisted in meta.json)

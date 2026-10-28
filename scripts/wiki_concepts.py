@@ -42,7 +42,7 @@ from pathlib import Path
 
 from wiki_atlas import slugify
 
-from corpus_walk import frontmatter_value
+from corpus_walk import CONCEPTS_SUFFIX, META_SUFFIX, MINDMAP_SUFFIX, frontmatter_value
 from timestamp_utils import TIMESTAMP_TOKEN_PATTERN, parse_time_to_seconds, timestamped_url
 
 log = logging.getLogger(__name__)
@@ -53,10 +53,6 @@ GENERATOR_VERSION = "1"
 DEFAULT_TOP_N = 20
 MIN_STABLE_CHANNELS = 3
 MIN_AS_MENTIONED_FALLBACK_LEN = 4
-
-CONCEPTS_SUFFIX = ".concepts.json"
-META_SUFFIX = ".meta.json"
-MINDMAP_SUFFIX = ".mindmap.md"
 
 # Basename of the Map-of-Content page (issue #150 FIX1b). Distinct from the
 # generic "index" so a bare `[[index]]` wikilink in an Obsidian vault that

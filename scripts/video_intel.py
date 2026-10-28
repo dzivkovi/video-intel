@@ -62,6 +62,7 @@ from corpus_walk import (  # noqa: F401 - re-exports
     briefing_video_counts,
     is_channel_dir,
     is_skipped_meta,
+    iter_meta_records,
     load_seen_video_ids,
     parse_front_matter,
     read_json_best_effort,
@@ -69,7 +70,7 @@ from corpus_walk import (  # noqa: F401 - re-exports
     usable_video_id,
 )
 from corpus_walk import SEVERE_QUALITY_FLAGS as _SEVERE_QUALITY_FLAGS  # noqa: F401
-from corpus_walk import artifact_count as _artifact_count
+from corpus_walk import artifact_count as _artifact_count  # noqa: F401 - kept bound
 from gemini_common import (
     MAX_RETRIES_TRANSPORT,
     build_permissive_safety_settings,
@@ -12951,87 +12952,48 @@ _MINDMAP_TIMESTAMP_RE = re.compile(r"\((\d{1,3}):(\d{2})(?::(\d{2}))?\)")
 def collect_corpus_videos(output_dir: Path) -> list[dict]:
     """One record per unique video_id that has a meta.json, across all channel dirs.
 
-    Skips dot-dirs and underscore-dirs (e.g. _briefings) so human-note folders
-    are never mistaken for channels. Each record carries the catch-up fields
-    plus paths to the mindmap/concepts siblings (None when absent). When a
-    video_id has duplicate metas (title-rotation, pre-dedupe), the most complete
-    record wins so a video is never surfaced twice in one briefing.
+    A projection over `corpus_walk.iter_meta_records` (issue #260), so
+    briefings, topics-build and the catalog share one identity rule, one
+    sibling lookup and one duplicate tie-break instead of three walkers that
+    could drift. That walker skips dot-dirs and underscore-dirs (e.g.
+    _briefings) so human-note folders are never mistaken for channels, reads
+    each meta through the shared best-effort reader, and skips a meta whose
+    `video_id` is not a string with a WARNING naming the file. When a video_id
+    has duplicate metas (title-rotation, pre-dedupe), the most complete record
+    wins so a video is never surfaced twice in one briefing. Each record
+    carries the catch-up fields plus paths to the mindmap/concepts siblings
+    (None when absent).
     """
-    by_id: dict[str, dict] = {}
-    if not output_dir.is_dir():
-        return []
-    channel_dirs = [d for d in output_dir.iterdir() if is_channel_dir(d)]
-    skipped: list[str] = []
-    for channel_dir in sorted(channel_dirs):
-        for meta_path in sorted(channel_dir.glob(f"*{META_SUFFIX}")):
-            # The shared reader (issue #124 bytes-then-decode, `(ValueError,
-            # OSError)`) also requires a JSON OBJECT: a meta that parsed to a
-            # list used to raise AttributeError on `.get` below and kill every
-            # caller of this walker, `topics-build` included (issue #260).
-            meta = read_json_best_effort(meta_path, skipped)
-            if meta is None:
-                continue
-            video_id = meta.get("video_id")
-            if not video_id:
-                continue
-            if not usable_video_id(video_id):
-                # A non-string id is malformed data, and it poisons every
-                # `sorted()` downstream that mixes it with real ids (Python
-                # refuses to order an int against a str), so one bad meta used
-                # to abort a whole `topics-build`. Skip it, name the file, and
-                # do NOT coerce: `str(123)` would merge it with a real "123".
-                log.warning(
-                    "  %s: `video_id` is a %s, not a string; skipping this meta",
-                    meta_path.name,
-                    type(video_id).__name__,
-                )
-                continue
-            channel = meta.get("channel") or channel_dir.name
-            if not isinstance(channel, str):
-                # `channels` is sorted and rolled up per topic, so a non-string
-                # here breaks the same ordering. The folder the meta actually
-                # lives in is the accurate fallback, not an invented label.
-                log.warning(
-                    "  %s: `channel` is a %s, not a string; using the folder name %s",
-                    meta_path.name,
-                    type(channel).__name__,
-                    channel_dir.name,
-                )
-                channel = channel_dir.name
-            prefix = meta_path.name[: -len(META_SUFFIX)]
-            mindmap_path = channel_dir / f"{prefix}{MINDMAP_SUFFIX}"
-            concepts_path = channel_dir / f"{prefix}{CONCEPTS_SUFFIX}"
-            record = {
-                "video_id": video_id,
-                "title": meta.get("title", prefix),
+    videos: list[dict] = []
+    for rec in iter_meta_records(output_dir).records:
+        meta = rec.meta
+        # Issue #146: the topic layer joins through this same video_id
+        # identity (contract C9), so the meta-asserted topics ride along on the
+        # record instead of forcing a second walk of every meta.json under a
+        # different - and driftable - join rule. Topics are UNIONed across
+        # duplicate metas rather than inherited from the completeness winner:
+        # an operator can stamp --topic before a title rotation, leaving the
+        # tag on the meta that later loses the tie-break.
+        topics = normalize_meta_topics(meta.get("topics"), label=f"{rec.prefix}{META_SUFFIX}")
+        if rec.losers:
+            union = set(topics)
+            for loser in rec.losers:
+                union |= set(normalize_meta_topics(loser.meta.get("topics"), label=f"{loser.prefix}{META_SUFFIX}"))
+            topics = sorted(union)
+        videos.append(
+            {
+                "video_id": rec.video_id,
+                "title": meta.get("title", rec.prefix),
                 "published": meta.get("published", ""),
-                "channel": channel,
-                "url": meta.get("video_url") or f"https://www.youtube.com/watch?v={video_id}",
-                "mindmap_path": mindmap_path if mindmap_path.exists() else None,
-                "concepts_path": concepts_path if concepts_path.exists() else None,
+                "channel": rec.channel,
+                "url": meta.get("video_url") or f"https://www.youtube.com/watch?v={rec.video_id}",
+                "mindmap_path": rec.siblings.get(MINDMAP_SUFFIX),
+                "concepts_path": rec.siblings.get(CONCEPTS_SUFFIX),
                 "processed": meta.get("processed", ""),
-                # Issue #146: the topic layer joins through this same video_id
-                # identity (contract C9), so the meta-asserted topics ride along
-                # on the record instead of forcing a second walk of every
-                # meta.json under a different - and driftable - join rule.
-                "topics": normalize_meta_topics(meta.get("topics"), label=meta_path.name),
+                "topics": topics,
             }
-            # Dedupe by video_id - title-rotation can leave >1 meta per id, and a
-            # set-difference against prior briefings won't catch a same-corpus dup.
-            # Keep the most complete record so ranking has concepts to work with.
-            existing = by_id.get(video_id)
-            if existing is None or _artifact_count(record) > _artifact_count(existing):
-                if existing is not None:
-                    # Topics are UNIONed across duplicate metas rather than
-                    # inherited from the completeness winner. An operator can
-                    # stamp --topic before a title rotation, leaving the tag on
-                    # the meta that later loses the tie-break; taking only the
-                    # winner's list would silently delete that membership.
-                    record["topics"] = sorted(set(record["topics"]) | set(existing["topics"]))
-                by_id[video_id] = record
-            elif record["topics"]:
-                existing["topics"] = sorted(set(existing["topics"]) | set(record["topics"]))
-    return list(by_id.values())
+        )
+    return videos
 
 
 def _parse_iso_date(value: str):
