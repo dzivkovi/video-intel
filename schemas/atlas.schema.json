@@ -1,0 +1,160 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dzivkovi/video-intel/blob/main/schemas/atlas.schema.json",
+  "title": "video-intel corpus catalog (atlas.json)",
+  "description": "One derived catalog of a video-intel corpus, written by scripts/atlas_build.py. Keys appear in the order listed here. Every free-text value is plain text taken from the corpus: renderers must escape it before inserting it into HTML or Markdown.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "generator",
+    "generator_version",
+    "generated_from",
+    "generated_at",
+    "summary",
+    "concepts",
+    "rows"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"const": 1},
+    "generator": {"const": "atlas_build.py"},
+    "generator_version": {"type": "string"},
+    "generated_from": {
+      "type": "string",
+      "description": "The corpus folder name only, never a path."
+    },
+    "generated_at": {
+      "type": ["string", "null"],
+      "description": "The --generated-at value verbatim, else the newest processed stamp (UTC), else the newest published date, else null. Never the wall clock."
+    },
+    "summary": {"$ref": "#/$defs/summary"},
+    "concepts": {
+      "type": "object",
+      "description": "Concept id to preferred label, for the ids the rows reference. Labels are plain text.",
+      "additionalProperties": {"type": "string", "contentMediaType": "text/plain"}
+    },
+    "rows": {
+      "type": "array",
+      "description": "One row per video_id, sorted by (published, video_id) with an empty published first.",
+      "items": {"$ref": "#/$defs/row"}
+    }
+  },
+  "$defs": {
+    "count": {"type": "integer", "minimum": 0},
+    "summary": {
+      "type": "object",
+      "required": [
+        "channels",
+        "topics",
+        "unthreaded",
+        "unthreaded_share",
+        "metas",
+        "rows",
+        "duplicates",
+        "skipped",
+        "no_id",
+        "excluded_metas",
+        "warnings"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "channels": {"type": "object", "additionalProperties": {"$ref": "#/$defs/count"}},
+        "topics": {"type": "object", "additionalProperties": {"$ref": "#/$defs/count"}},
+        "unthreaded": {"$ref": "#/$defs/count"},
+        "unthreaded_share": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "metas": {"$ref": "#/$defs/count"},
+        "rows": {"$ref": "#/$defs/count"},
+        "duplicates": {"$ref": "#/$defs/count"},
+        "skipped": {"$ref": "#/$defs/count"},
+        "no_id": {"$ref": "#/$defs/count"},
+        "excluded_metas": {"$ref": "#/$defs/count"},
+        "warnings": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "deep_link": {
+      "type": "object",
+      "required": ["label", "seconds", "url"],
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "type": "string",
+          "contentMediaType": "text/plain",
+          "description": "A mindmap branch heading. Plain text from the corpus: renderers must escape it."
+        },
+        "seconds": {"type": "integer", "minimum": 0},
+        "url": {"type": "string"}
+      }
+    },
+    "row": {
+      "type": "object",
+      "required": [
+        "video_id",
+        "title",
+        "channel",
+        "channels",
+        "published",
+        "duration_seconds",
+        "url",
+        "transcript_quality",
+        "transcript_flag_count",
+        "synopsis",
+        "deep_links",
+        "concept_ids",
+        "topics",
+        "in_briefings",
+        "briefing_count",
+        "wiki",
+        "aliases"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "video_id": {"type": "string", "minLength": 1},
+        "title": {
+          "type": "string",
+          "contentMediaType": "text/plain",
+          "description": "The video title. Plain text from the corpus: renderers must escape it."
+        },
+        "channel": {"type": "string"},
+        "channels": {"type": "array", "items": {"type": "string"}},
+        "published": {
+          "type": "string",
+          "description": "YYYY-MM-DD, or an empty string when the meta has no usable date."
+        },
+        "duration_seconds": {"type": ["integer", "null"]},
+        "url": {"type": ["string", "null"]},
+        "transcript_quality": {
+          "type": "string",
+          "enum": ["severe", "truncated", "partial", "complete", "skipped", "unknown", "none"]
+        },
+        "transcript_flag_count": {"$ref": "#/$defs/count"},
+        "synopsis": {
+          "type": "array",
+          "description": "The mindmap branch headings in order.",
+          "items": {
+            "type": "string",
+            "contentMediaType": "text/plain",
+            "description": "Plain text from the corpus: renderers must escape it."
+          }
+        },
+        "deep_links": {"type": "array", "maxItems": 3, "items": {"$ref": "#/$defs/deep_link"}},
+        "concept_ids": {"type": "array", "items": {"type": "string"}},
+        "topics": {"type": "array", "items": {"type": "string"}},
+        "in_briefings": {"type": "boolean"},
+        "briefing_count": {"$ref": "#/$defs/count"},
+        "wiki": {
+          "type": "object",
+          "required": ["creator", "concepts"],
+          "additionalProperties": false,
+          "properties": {
+            "creator": {"type": ["string", "null"]},
+            "concepts": {"type": "array", "items": {"type": "string"}}
+          }
+        },
+        "aliases": {
+          "type": "array",
+          "items": {"type": "string", "contentMediaType": "text/plain"}
+        }
+      }
+    }
+  }
+}

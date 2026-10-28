@@ -608,3 +608,411 @@ class TestWalkerFields:
         assert (a["channel"], a["channels"], a["aliases"]) == ("chanA", ["chanA", "chanB"], ["Old title"])
         assert _row(result, "c")["channel"] == "chanC"
         assert result.summary["duplicates"] == 1
+
+
+# ---------------------------------------------------------------------------
+# U5: writer, CLI, schema, determinism
+# ---------------------------------------------------------------------------
+
+SCHEMA_PATH = pathlib.Path(__file__).resolve().parent.parent / "schemas" / "atlas.schema.json"
+HEADER_KEYS = [
+    "schema_version",
+    "generator",
+    "generator_version",
+    "generated_from",
+    "generated_at",
+    "summary",
+    "concepts",
+    "rows",
+]
+FIXED_STAMP = "2026-10-28T00:00:00Z"
+STDOUT_RE = re.compile(
+    r"atlas_build: wrote atlas\.json to (?P<where>\S+) "
+    r"\(metas=(?P<metas>\d+) rows=(?P<rows>\d+) duplicates=(?P<duplicates>\d+) "
+    r"skipped=(?P<skipped>\d+) no_id=(?P<no_id>\d+) excluded_metas=(?P<excluded>\d+) "
+    r"unthreaded=(?P<unthreaded>\d+) \((?P<share>n/a|\d+\.\d%)\) warnings=(?P<warnings>\d+)\)"
+)
+
+
+def _run_main(capsys, corpus, *extra):
+    code = ab.main(["--corpus", str(corpus), *extra])
+    out = capsys.readouterr().out
+    return code, out
+
+
+def _atlas_path(corpus):
+    return corpus / "_atlas" / "atlas.json"
+
+
+def _parse_line(out):
+    lines = out.splitlines()
+    assert len(lines) == 1, lines
+    match = STDOUT_RE.fullmatch(lines[0])
+    assert match, lines[0]
+    return match
+
+
+def _partitions(match):
+    n = {k: int(match[k]) for k in ("metas", "rows", "duplicates", "skipped", "no_id")}
+    return n["metas"] == n["rows"] + n["duplicates"] + n["skipped"] + n["no_id"]
+
+
+class TestCli:
+    def test_happy_path_writes_file_and_one_counts_only_line(self, tmp_path, capsys):
+        corpus = _happy_corpus(tmp_path)
+        code, out = _run_main(capsys, corpus)
+        assert code == 0
+        assert _atlas_path(corpus).is_file()
+        match = _parse_line(out)
+        assert match["where"] == "video-intel/_atlas"
+        assert (match["metas"], match["rows"], match["duplicates"]) == ("4", "4", "0")
+        assert (match["skipped"], match["no_id"], match["excluded"]) == ("0", "0", "0")
+        assert (match["unthreaded"], match["share"], match["warnings"]) == ("3", "75.0%", "0")
+        assert _partitions(match)
+        for leak in ("chanA", "chanB", "chanC", "chanD", "sales", str(tmp_path), "Agents", "Агенти"):
+            assert leak not in out
+
+    def test_partition_holds_with_duplicates_and_no_id(self, tmp_path, capsys):
+        corpus = _happy_corpus(tmp_path)
+        _video(corpus, "chanE", "2026-01-20-dup", "aaaaaaaaaa1", published="2026-01-20")
+        _video(corpus, "chanE", "2026-01-21-noid", "x", meta={"title": "no id here"})
+        (corpus / "chanE" / "2026-01-22-bad.meta.json").write_text("{not json", encoding="utf-8")
+        _, out = _run_main(capsys, corpus)
+        match = _parse_line(out)
+        assert int(match["metas"]) == 7
+        assert (match["duplicates"], match["no_id"], match["skipped"]) == ("1", "1", "1")
+        assert _partitions(match)
+
+    def test_empty_corpus_still_prints_and_partitions(self, tmp_path, capsys):
+        corpus = tmp_path / "empty"
+        corpus.mkdir()
+        code, out = _run_main(capsys, corpus)
+        assert code == 0
+        match = _parse_line(out)
+        assert (match["metas"], match["rows"], match["share"]) == ("0", "0", "n/a")
+        assert _partitions(match)
+        assert json.loads(_atlas_path(corpus).read_bytes())["rows"] == []
+
+    def test_missing_corpus_exits_non_zero(self, tmp_path):
+        with pytest.raises(SystemExit) as exc:
+            ab.main(["--corpus", str(tmp_path / "nope")])
+        assert exc.value.code not in (0, None)
+        assert "corpus not found" in str(exc.value.code)
+
+    def test_out_flag_redirects_the_file(self, tmp_path, capsys):
+        corpus = _happy_corpus(tmp_path)
+        out_dir = tmp_path / "elsewhere"
+        _, out = _run_main(capsys, corpus, "--out", str(out_dir))
+        assert (out_dir / ab.ATLAS_FILENAME).is_file()
+        assert not _atlas_path(corpus).exists()
+        assert _parse_line(out)["where"] == "video-intel/elsewhere"
+
+    def test_output_file_set_is_only_atlas_json(self, tmp_path, capsys):
+        corpus = _happy_corpus(tmp_path)
+        atlas_dir = corpus / "_atlas"
+        atlas_dir.mkdir()
+        (atlas_dir / "atlas-policy.yaml").write_text("owner: me\n", encoding="utf-8")
+        _run_main(capsys, corpus)
+        names = sorted(p.name for p in atlas_dir.iterdir())
+        assert names == ["atlas-policy.yaml", "atlas.json"]
+        for name in names:
+            for suffix in (".meta.json", ".concepts.json", ".mindmap.md", ".transcript.md"):
+                assert not name.endswith(suffix)
+
+
+class TestDeterminism:
+    def test_two_runs_with_fixed_stamp_are_byte_identical(self, tmp_path, capsys):
+        corpus = _happy_corpus(tmp_path)
+        _run_main(capsys, corpus, "--generated-at", FIXED_STAMP)
+        first = _atlas_path(corpus).read_bytes()
+        _run_main(capsys, corpus, "--generated-at", FIXED_STAMP)
+        assert _atlas_path(corpus).read_bytes() == first
+        assert json.loads(first)["generated_at"] == FIXED_STAMP
+
+    def test_generated_at_string_is_verbatim(self, tmp_path, capsys):
+        corpus = _happy_corpus(tmp_path)
+        _run_main(capsys, corpus, "--generated-at", "whenever, really")
+        assert json.loads(_atlas_path(corpus).read_bytes())["generated_at"] == "whenever, really"
+
+    def test_default_stamp_is_max_processed_in_utc(self, tmp_path, capsys):
+        corpus = _happy_corpus(tmp_path)
+        _video(corpus, "chanE", "2026-01-02-e1", "eeeeeeeeeee", extra={"processed": "2026-04-01T10:00:00+02:00"})
+        _video(corpus, "chanE", "2026-01-03-e2", "eeeeeeeeee2", extra={"processed": "2026-03-01T00:00:00"})
+        _run_main(capsys, corpus)
+        first = _atlas_path(corpus).read_bytes()
+        assert json.loads(first)["generated_at"] == "2026-04-01T08:00:00+00:00"
+        _run_main(capsys, corpus)
+        assert _atlas_path(corpus).read_bytes() == first
+
+    def test_no_processed_falls_back_to_max_published(self, tmp_path, capsys):
+        corpus = _happy_corpus(tmp_path)
+        _video(corpus, "chanE", "2026-01-02-e1", "eeeeeeeeeee", extra={"processed": "not a date"})
+        _run_main(capsys, corpus)
+        assert json.loads(_atlas_path(corpus).read_bytes())["generated_at"] == "2026-03-01"
+
+    def test_neither_gives_null(self, tmp_path, capsys):
+        corpus = tmp_path / "c"
+        _video(corpus, "chanA", "x1", "aaaaaaaaaa1", published=None)
+        _run_main(capsys, corpus)
+        assert json.loads(_atlas_path(corpus).read_bytes())["generated_at"] is None
+
+    def test_module_never_reads_the_wall_clock(self):
+        source = pathlib.Path(ab.__file__).read_text(encoding="utf-8")
+        assert "json.dumps" in source  # non-vacuity: the scan reads the real module
+        for call in ("now(", "utcnow(", "today(", "time.time("):
+            assert call not in source, call
+
+
+class TestBytes:
+    def _bytes(self, tmp_path, capsys):
+        corpus = _happy_corpus(tmp_path)
+        _run_main(capsys, corpus, "--generated-at", FIXED_STAMP)
+        return corpus, _atlas_path(corpus).read_bytes()
+
+    def test_lf_only_and_one_trailing_newline(self, tmp_path, capsys):
+        _, data = self._bytes(tmp_path, capsys)
+        assert b"\r\n" not in data
+        assert data.endswith(b"}\n") and not data.endswith(b"\n\n")
+
+    def test_cyrillic_is_raw_utf8(self, tmp_path, capsys):
+        _, data = self._bytes(tmp_path, capsys)
+        assert "Агенти и алати".encode() in data
+        assert b"\\u04" not in data
+
+    def test_nan_is_rejected_before_the_file_is_touched(self, tmp_path, capsys, monkeypatch):
+        corpus, before = self._bytes(tmp_path, capsys)
+        real = ab.build_rows
+
+        def with_nan(path):
+            result = real(path)
+            result.rows[0]["duration_seconds"] = float("nan")
+            return result
+
+        monkeypatch.setattr(ab, "build_rows", with_nan)
+        with pytest.raises(ValueError):
+            ab.main(["--corpus", str(corpus)])
+        assert _atlas_path(corpus).read_bytes() == before
+        assert [p.name for p in (corpus / "_atlas").iterdir()] == ["atlas.json"]
+
+    def test_strings_are_nfc_normalized(self):
+        doc = {"rows": [], "k": ["Café"]}
+        assert "Café".encode() in ab.serialize_atlas(doc)
+        assert "Café".encode() not in ab.serialize_atlas(doc)
+
+    def test_unsorted_rows_are_refused_not_resorted(self):
+        rows = [{"published": "2026-02-01", "video_id": "b"}, {"published": "2026-01-01", "video_id": "a"}]
+        with pytest.raises(ValueError, match="sorted"):
+            ab.serialize_atlas({"rows": rows})
+
+
+class TestKeyOrder:
+    def test_header_and_row_keys_in_schema_order(self, tmp_path, capsys):
+        corpus = _happy_corpus(tmp_path)
+        _run_main(capsys, corpus)
+        pairs_seen = []
+
+        def hook(pairs):
+            pairs_seen.append([k for k, _ in pairs])
+            return dict(pairs)
+
+        doc = json.loads(_atlas_path(corpus).read_bytes(), object_pairs_hook=hook)
+        assert pairs_seen[-1] == HEADER_KEYS
+        assert list(doc) == HEADER_KEYS
+        row_key_lists = [keys for keys in pairs_seen if keys and keys[0] == "video_id"]
+        assert len(row_key_lists) == 4
+        assert all(keys == ROW_KEYS for keys in row_key_lists)
+        assert list(doc["concepts"]) == sorted(doc["concepts"])
+        assert list(doc["summary"]["channels"]) == sorted(doc["summary"]["channels"])
+        assert doc["generated_from"] == "video-intel"
+        assert doc["generator"] == ab.GENERATOR_NAME == "atlas_build.py"
+        assert (doc["schema_version"], doc["generator_version"]) == (1, "1")
+
+
+class TestOwnership:
+    def _existing(self, corpus, writer):
+        atlas_dir = corpus / "_atlas"
+        atlas_dir.mkdir(parents=True)
+        target = atlas_dir / "atlas.json"
+        writer(target)
+        return target
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            '{"generator": "wiki_concepts.py", "rows": []}',
+            '[{"generator": "atlas_build.py"}]',
+            '{"rows": []}',
+            "{not json",
+        ],
+        ids=["foreign-generator", "json-list", "missing-key", "not-json"],
+    )
+    def test_refuses_and_leaves_bytes_untouched(self, tmp_path, body):
+        corpus = _happy_corpus(tmp_path)
+        target = self._existing(corpus, lambda p: p.write_text(body, encoding="utf-8"))
+        before = target.read_bytes()
+        with pytest.raises(SystemExit) as exc:
+            ab.main(["--corpus", str(corpus)])
+        assert exc.value.code not in (0, None)
+        assert "refusing to overwrite" in str(exc.value.code)
+        assert ab.GENERATOR_NAME in str(exc.value.code)
+        assert target.read_bytes() == before
+        assert sorted(p.name for p in target.parent.iterdir()) == ["atlas.json"]
+
+    def test_refuses_an_unreadable_target(self, tmp_path):
+        corpus = _happy_corpus(tmp_path)
+        target = self._existing(corpus, lambda p: p.mkdir())
+        with pytest.raises(SystemExit) as exc:
+            ab.main(["--corpus", str(corpus)])
+        assert exc.value.code not in (0, None)
+        assert "refusing to overwrite" in str(exc.value.code)
+        assert target.is_dir()
+
+    def test_own_file_is_overwritten(self, tmp_path):
+        corpus = _happy_corpus(tmp_path)
+        target = self._existing(corpus, lambda p: p.write_text('{"generator": "atlas_build.py"}', encoding="utf-8"))
+        assert ab.main(["--corpus", str(corpus)]) == 0
+        assert len(json.loads(target.read_bytes())["rows"]) == 4
+
+
+class TestAtomicity:
+    def _seed(self, tmp_path, capsys):
+        corpus = _happy_corpus(tmp_path)
+        _run_main(capsys, corpus, "--generated-at", FIXED_STAMP)
+        return corpus, _atlas_path(corpus).read_bytes()
+
+    def test_serializer_failure_keeps_previous_file_and_leaves_no_temp(self, tmp_path, capsys, monkeypatch):
+        corpus, before = self._seed(tmp_path, capsys)
+
+        def boom(document):
+            raise RuntimeError("serializer failed")
+
+        monkeypatch.setattr(ab, "serialize_atlas", boom)
+        with pytest.raises(RuntimeError):
+            ab.main(["--corpus", str(corpus)])
+        assert _atlas_path(corpus).read_bytes() == before
+        assert [p.name for p in (corpus / "_atlas").iterdir()] == ["atlas.json"]
+
+    def test_replace_failure_removes_the_temp(self, tmp_path, capsys, monkeypatch):
+        corpus, before = self._seed(tmp_path, capsys)
+        calls = []
+
+        def fail_replace(src, dst):
+            calls.append((pathlib.Path(src), pathlib.Path(dst)))
+            raise OSError("replace failed")
+
+        monkeypatch.setattr(ab.os, "replace", fail_replace)
+        with pytest.raises(OSError):
+            ab.main(["--corpus", str(corpus)])
+        assert len(calls) == 1
+        src, dst = calls[0]
+        assert ab.TEMP_SUFFIX_PATTERN.fullmatch(src.name) and src.parent == dst.parent
+        assert _atlas_path(corpus).read_bytes() == before
+        assert [p.name for p in (corpus / "_atlas").iterdir()] == ["atlas.json"]
+
+    def test_leftover_temp_is_swept_and_nothing_else(self, tmp_path, capsys):
+        corpus, _ = self._seed(tmp_path, capsys)
+        atlas_dir = corpus / "_atlas"
+        kept = ["notes.tmp", "atlas-policy.yaml", "atlas.json.tmp", "atlas.json.12x.tmp"]
+        for name in ("atlas.json.12345.tmp", *kept):
+            (atlas_dir / name).write_text("x", encoding="utf-8")
+        _run_main(capsys, corpus)
+        assert sorted(p.name for p in atlas_dir.iterdir()) == sorted(["atlas.json", *kept])
+
+    def test_temp_pattern_shape(self):
+        assert ab.TEMP_SUFFIX_PATTERN.fullmatch("atlas.json.12345.tmp")
+        for name in ("atlas.json.tmp", "xatlas.json.1.tmp", "atlas.json.1.tmp.bak", "notes.tmp", "atlas.json.12x.tmp"):
+            assert not ab.TEMP_SUFFIX_PATTERN.fullmatch(name), name
+
+
+def _schema():
+    return json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+
+
+_JSON_TYPES = {
+    "string": lambda v: isinstance(v, str),
+    "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+    "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+    "boolean": lambda v: isinstance(v, bool),
+    "null": lambda v: v is None,
+    "array": lambda v: isinstance(v, list),
+    "object": lambda v: isinstance(v, dict),
+}
+
+
+def _resolve(prop, schema):
+    while "$ref" in prop:
+        prop = schema["$defs"][prop["$ref"].rsplit("/", 1)[-1]]
+    return prop
+
+
+def _structural_row_errors(row, row_schema, schema=None):
+    """A stdlib check of one row against the schema's own row definition."""
+    schema = schema or _schema()
+    errors = []
+    required = row_schema["required"]
+    if list(row) != required:
+        errors.append(f"keys {list(row)} != {required}")
+    for key, value in row.items():
+        prop = row_schema["properties"].get(key)
+        if prop is None:
+            errors.append(f"extra key {key}")
+            continue
+        types = _resolve(prop, schema).get("type")
+        assert types, f"schema property {key} has no type; the structural check would be vacuous"
+        types = [types] if isinstance(types, str) else types
+        if not any(_JSON_TYPES[t](value) for t in types):
+            errors.append(f"{key}: {value!r} not {types}")
+    return errors
+
+
+class TestSchema:
+    def _doc(self, tmp_path, capsys):
+        corpus = _happy_corpus(tmp_path)
+        _run_main(capsys, corpus)
+        return json.loads(_atlas_path(corpus).read_bytes())
+
+    def test_schema_orders_match_the_module(self):
+        schema = _schema()
+        assert schema["$schema"] == "https://json-schema.org/draft/2020-12/schema"
+        assert schema["required"] == HEADER_KEYS == list(schema["properties"])
+        row = schema["$defs"]["row"]
+        assert row["required"] == ROW_KEYS == list(ab.ROW_KEYS) == list(row["properties"])
+        assert row["additionalProperties"] is False
+        for plain in (row["properties"]["title"], row["properties"]["synopsis"]["items"]):
+            assert plain["contentMediaType"] == "text/plain"
+        assert schema["$defs"]["deep_link"]["properties"]["label"]["contentMediaType"] == "text/plain"
+
+    def test_structural_check_passes_every_written_row(self, tmp_path, capsys):
+        doc = self._doc(tmp_path, capsys)
+        row_schema = _schema()["$defs"]["row"]
+        assert doc["rows"]
+        for row in doc["rows"]:
+            assert _structural_row_errors(row, row_schema) == []
+
+    def test_structural_check_rejects_an_extra_key_and_a_bad_type(self, tmp_path, capsys):
+        row = self._doc(tmp_path, capsys)["rows"][0]
+        row_schema = _schema()["$defs"]["row"]
+        assert _structural_row_errors({**row, "description": "leak"}, row_schema)
+        assert _structural_row_errors({**row, "briefing_count": "3"}, row_schema)
+
+    def test_written_file_validates_under_jsonschema(self, tmp_path, capsys):
+        jsonschema = pytest.importorskip("jsonschema")
+        doc = self._doc(tmp_path, capsys)
+        jsonschema.Draft202012Validator.check_schema(_schema())
+        jsonschema.Draft202012Validator(_schema()).validate(doc)
+
+    @pytest.mark.parametrize(
+        "mutate",
+        [
+            lambda row: row.pop("video_id"),
+            lambda row: row.update(transcript_quality="great"),
+            lambda row: row.update(description="leak"),
+        ],
+        ids=["missing-video-id", "unknown-quality", "extra-key"],
+    )
+    def test_jsonschema_rejects_a_bad_row(self, tmp_path, capsys, mutate):
+        jsonschema = pytest.importorskip("jsonschema")
+        doc = self._doc(tmp_path, capsys)
+        mutate(doc["rows"][0])
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.Draft202012Validator(_schema()).validate(doc)

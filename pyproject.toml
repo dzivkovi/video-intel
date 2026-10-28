@@ -35,6 +35,9 @@ dev = [
     # (clickable-link counts, sample-structure drift guard) never run.
     "reportlab>=4",
     "pypdf",
+    # Validates the written atlas.json against schemas/atlas.schema.json;
+    # without it those checks importorskip and only the stdlib check runs.
+    "jsonschema",
 ]
 
 [tool.setuptools]

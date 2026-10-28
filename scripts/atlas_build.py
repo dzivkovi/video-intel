@@ -3,8 +3,10 @@
 
 `build_rows(corpus)` walks a video-intel corpus once and returns one catalog
 row per `video_id`, plus the referenced-concept label lookup and a summary.
-Nothing is written to disk here; the writer and CLI live beside this in the
-same module once they ship.
+`main` serializes that into `<corpus>/_atlas/atlas.json` (or `--out`) and
+prints one counts-only line:
+
+    python scripts/atlas_build.py --corpus <output_dir> [--out DIR] [--generated-at STAMP]
 
 Contracts this module keeps:
 
@@ -23,13 +25,25 @@ Contracts this module keeps:
 * **Inputs are untrusted text.** Titles, headings and labels are stripped of
   C0/C1 controls and bidi overrides, NFC-normalized and capped; `<` and
   markdown link syntax stay literal, so renderers must escape them.
+* **Byte-stable output, no wall clock.** `generated_at` comes from
+  `--generated-at`, else the newest `processed` stamp, else the newest
+  `published` date, else null. Unchanged inputs give identical bytes.
+* **Single-file ownership.** An existing `atlas.json` is replaced only when
+  its `generator` key is exactly `GENERATOR_NAME`; the write goes through a
+  same-directory temp and one `os.replace`.
+* **Counts-only stdout.** The one stdout line never names a channel, topic,
+  title or path; per-file detail goes to stderr through the logger.
 """
 
 from __future__ import annotations
 
+import argparse
 import datetime as dt
+import json
 import logging
+import os
 import re
+import sys
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
@@ -55,6 +69,16 @@ from corpus_walk import (
 from timestamp_utils import timestamp_tolerance, youtube_deep_link
 
 log = logging.getLogger("video_intel.atlas_build")
+
+#: The `generator` header value; ownership of an existing `atlas.json` (KTD8).
+GENERATOR_NAME = "atlas_build.py"
+GENERATOR_VERSION = "1"
+SCHEMA_VERSION = 1
+ATLAS_FILENAME = "atlas.json"
+ATLAS_DIRNAME = "_atlas"
+#: The only temp shape this generator writes (`atlas.json.<pid>.tmp`) and the
+#: only thing the start-of-run sweep may remove.
+TEMP_SUFFIX_PATTERN = re.compile(r"atlas\.json\.[0-9]+\.tmp")
 
 #: Row keys in schema order (R11).
 ROW_KEYS = (
@@ -448,3 +472,176 @@ def build_rows(corpus: Path) -> BuildResult:
         max_processed=max(processed).isoformat() if processed else None,
         max_published=max(published) if published else None,
     )
+
+
+# ---------------------------------------------------------------------------
+# Document, serialization and the single-file writer
+# ---------------------------------------------------------------------------
+
+
+def build_header(corpus: Path, result: BuildResult, generated_at: str | None = None) -> dict:
+    """The whole `atlas.json` document, keys in schema order (R12).
+
+    `generated_at` (KTD4): the caller's string verbatim when given, else the
+    newest parseable `processed` (UTC), else the newest `published` date, else
+    None. Never the wall clock: a clock stamp would make every unchanged
+    rebuild a new file on the Drive mount.
+    """
+    if generated_at is None:
+        generated_at = result.max_processed or result.max_published
+    summary = dict(result.summary)
+    for key in ("channels", "topics"):
+        if key in summary:
+            summary[key] = dict(sorted(summary[key].items()))
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "generator": GENERATOR_NAME,
+        "generator_version": GENERATOR_VERSION,
+        "generated_from": corpus.name,
+        "generated_at": generated_at,
+        "summary": summary,
+        "concepts": dict(sorted(result.concepts.items())),
+        "rows": result.rows,
+    }
+
+
+def _nfc(value: object) -> object:
+    if isinstance(value, str):
+        return unicodedata.normalize("NFC", value)
+    if isinstance(value, dict):
+        return {_nfc(k): _nfc(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_nfc(v) for v in value]
+    return value
+
+
+def _row_sort_key(row: dict) -> tuple[str, str]:
+    return (row.get("published") or "", row.get("video_id") or "")
+
+
+def serialize_atlas(document: dict) -> bytes:
+    """UTF-8 bytes of `document`: NFC text, no NaN, LF only, one trailing newline.
+
+    Rows must already be sorted by (`published`, `video_id`); an unsorted list
+    is refused rather than silently re-sorted, because it means the builder's
+    order contract broke. A NaN or infinity raises ValueError here, before any
+    file is touched.
+    """
+    keys = [_row_sort_key(row) for row in document.get("rows", [])]
+    if keys != sorted(keys):
+        raise ValueError("atlas rows are not sorted by (published, video_id)")
+    text = json.dumps(_nfc(document), ensure_ascii=False, allow_nan=False, indent=2)
+    return (text + "\n").encode("utf-8")
+
+
+def check_ownership(path: Path) -> None:
+    """Refuse (SystemExit) unless `path` is absent or stamped by this generator.
+
+    Fail-closed, as `wiki_concepts.write_pages` is: an unreadable file, a file
+    that is not a JSON object, and one without a `generator` key are all
+    refused, never overwritten.
+    """
+    if not path.exists():
+        return
+    data = read_json_best_effort(path, [])
+    if data is None:
+        reason = "unreadable or not a JSON object"
+    else:
+        owner = data.get("generator")
+        if owner == GENERATOR_NAME:
+            return
+        reason = f"generated by '{owner}'" if owner else "not stamped by any generator (no `generator` key)"
+    raise SystemExit(
+        f"refusing to overwrite {path}: it is {reason}, not {GENERATOR_NAME}. "
+        "Move the file aside, or point --out at a directory not shared with another generator's output."
+    )
+
+
+def sweep_stale_temps(out_dir: Path) -> None:
+    """Remove leftover `atlas.json.<pid>.tmp` files from a crashed run; nothing else."""
+    if not out_dir.is_dir():
+        return
+    for path in sorted(out_dir.iterdir()):
+        if TEMP_SUFFIX_PATTERN.fullmatch(path.name) and path.is_file():
+            log.info("removing a leftover temp from an earlier run: %s", path)
+            path.unlink()
+
+
+def write_atlas(out_dir: Path, document: bytes) -> Path:
+    """Write serialized `document` to `out_dir/atlas.json` atomically; return that path.
+
+    Ownership is checked first (KTD8). The bytes go to `atlas.json.<pid>.tmp`
+    in the same directory and are moved into place with one `os.replace`; the
+    temp is removed in `finally` whenever it survives. `os.replace` on a
+    cloud-synced mount is best effort (ADR-0016).
+    """
+    target = out_dir / ATLAS_FILENAME
+    check_ownership(target)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    temp = out_dir / f"{ATLAS_FILENAME}.{os.getpid()}.tmp"
+    try:
+        temp.write_bytes(document)
+        os.replace(temp, target)
+    finally:
+        if temp.exists():
+            temp.unlink()
+    return target
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Build the corpus catalog (_atlas/atlas.json) from a video-intel corpus, read-only (issue #260)."
+    )
+    parser.add_argument("--corpus", type=Path, required=True, help="Path to the corpus (output_dir), read-only")
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help=f"Output folder for {ATLAS_FILENAME} (default: <corpus>/{ATLAS_DIRNAME})",
+    )
+    parser.add_argument(
+        "--generated-at",
+        default=None,
+        help="Value for the generated_at header, emitted verbatim "
+        "(default: the newest processed stamp, else the newest published date)",
+    )
+    return parser
+
+
+def summary_line(out_dir: Path, corpus: Path, summary: dict) -> str:
+    """The one stdout line: counts only, never a channel, topic, title or path."""
+    rows = summary["rows"]
+    share = f"{100 * summary['unthreaded'] / rows:.1f}%" if rows else "n/a"
+    return (
+        f"atlas_build: wrote {ATLAS_FILENAME} to {corpus.name}/{out_dir.name} "
+        f"(metas={summary['metas']} rows={rows} duplicates={summary['duplicates']} "
+        f"skipped={summary['skipped']} no_id={summary['no_id']} excluded_metas={summary['excluded_metas']} "
+        f"unthreaded={summary['unthreaded']} ({share}) warnings={len(summary['warnings'])})"
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s", stream=sys.stderr)
+    args = build_parser().parse_args(argv)
+    corpus = args.corpus.resolve()
+    if not corpus.is_dir():
+        sys.exit(f"corpus not found: {corpus}")
+    out_dir = args.out.resolve() if args.out else corpus / ATLAS_DIRNAME
+
+    sweep_stale_temps(out_dir)
+    # Refuse before the walk too: a foreign file should not cost a full corpus read.
+    check_ownership(out_dir / ATLAS_FILENAME)
+    result = build_rows(corpus)
+    document = serialize_atlas(build_header(corpus, result, args.generated_at))
+    write_atlas(out_dir, document)
+    print(summary_line(out_dir, corpus, result.summary))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
