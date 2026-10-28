@@ -46,8 +46,6 @@ _VIDEO_INTEL_REEXPORTS = [
     ("CONCEPTS_SUFFIX", "CONCEPTS_SUFFIX"),
     ("MINDMAP_SUFFIX", "MINDMAP_SUFFIX"),
     ("TRANSCRIPT_SUFFIX", "TRANSCRIPT_SUFFIX"),
-    ("_artifact_count", "artifact_count"),
-    ("_artifact_count", "_artifact_count"),
     ("QUALITY_FLAG_MONOLITHIC_SEVERE", "QUALITY_FLAG_MONOLITHIC_SEVERE"),
     ("QUALITY_FLAG_BLIND_GAP_SEVERE", "QUALITY_FLAG_BLIND_GAP_SEVERE"),
     ("QUALITY_FLAG_BACKWARD_JUMP_SEVERE", "QUALITY_FLAG_BACKWARD_JUMP_SEVERE"),
@@ -95,8 +93,6 @@ class TestMovedNamesAreOneObject:
             "usable_video_id",
             "read_json_best_effort",
             "is_channel_dir",
-            "_artifact_count",
-            "artifact_count",
             "transcript_quality_flags_are_severe",
             "is_skipped_meta",
             "parse_front_matter",
@@ -261,11 +257,35 @@ class TestIsChannelDir:
         assert not cw.is_channel_dir(tmp_path / "taxonomy.json")
 
 
-class TestArtifactCount:
-    def test_counts_only_mindmap_and_concepts(self):
-        assert cw.artifact_count({"mindmap_path": "m", "concepts_path": "c", "transcript_path": "t"}) == 2
-        assert cw.artifact_count({"mindmap_path": None, "concepts_path": "c"}) == 1
-        assert cw.artifact_count({}) == 0
+class TestSevereFlagsRejectsANonList:
+    @pytest.mark.parametrize("flags", [7, "monolithic_severe", {"monolithic_severe": True}, 1.5, True])
+    def test_a_scalar_or_mapping_is_not_severe_and_does_not_raise(self, flags):
+        # An int used to pass the `if not flags` guard and raise TypeError on
+        # iteration, aborting the whole catalog build over one meta.
+        assert cw.transcript_quality_flags_are_severe(flags) is False
+
+    def test_a_list_is_still_judged(self):
+        assert cw.transcript_quality_flags_are_severe(["monolithic_severe"]) is True
+        assert cw.transcript_quality_flags_are_severe(["blind_gap_mild"]) is False
+        assert cw.transcript_quality_flags_are_severe(None) is False
+        assert cw.transcript_quality_flags_are_severe([]) is False
+
+    def test_the_set_the_chunked_writer_passes_is_still_judged(self):
+        # video_intel's chunked writer accumulates flags into a set before
+        # sorting; a list-only check would read every chunked severe as healthy.
+        assert cw.transcript_quality_flags_are_severe({"monolithic_severe", "blind_gap_mild"}) is True
+        assert cw.transcript_quality_flags_are_severe({"blind_gap_mild"}) is False
+
+
+class TestOneWinnerRule:
+    def test_the_record_dict_counter_is_gone_on_purpose(self):
+        # The winner rule had two definitions (a record-dict counter with no
+        # production caller, and `_sibling_artifact_count`); a second copy is
+        # how two rules drift [core: one-definition].
+        assert not hasattr(cw, "artifact_count")
+        assert not hasattr(cw, "_artifact_count")
+        assert not hasattr(vi, "_artifact_count")
+        assert cw.WINNER_ARTIFACT_SUFFIXES == (cw.MINDMAP_SUFFIX, cw.CONCEPTS_SUFFIX)
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +382,20 @@ class TestBriefingVideoCounts:
         # The pre-move str() coercion of truthy non-strings is preserved.
         assert cw.load_seen_video_ids(briefings) == {"a", "b", "123", "c"}
 
+    def test_a_non_utf8_briefing_is_skipped_and_the_others_counted(self, tmp_path, caplog):
+        briefings = tmp_path / "_briefings"
+        _write_briefing(briefings, "good.md", ["a"])
+        torn = briefings / "torn.md"
+        torn.write_bytes(b"---\nvideo_ids: [b]\ntitle: \xd0\n---\n")
+        skipped: list[str] = []
+        with caplog.at_level(logging.WARNING, logger="video_intel.corpus_walk"):
+            counts = cw.briefing_video_counts(briefings, skipped)
+        assert counts == {"a": 1}
+        assert skipped == [str(torn)]
+        assert any("torn.md" in r.getMessage() for r in _warnings(caplog))
+        # load_seen_video_ids keeps its one-argument signature.
+        assert cw.load_seen_video_ids(briefings) == {"a"}
+
     def test_missing_dir_is_empty(self, tmp_path):
         assert cw.briefing_video_counts(tmp_path / "_briefings") == {}
         assert cw.load_seen_video_ids(tmp_path / "_briefings") == set()
@@ -452,6 +486,20 @@ class TestIterMetaRecords:
         rec = cw.iter_meta_records(tmp_path).records[0]
         assert rec.prefix == "a-first"
         assert rec.aliases == ["Second"]
+
+    def test_an_equal_count_tie_follows_filename_order_not_prefix_order(self, tmp_path):
+        # `foo-2.meta.json` sorts before `foo.meta.json` ('-' < '.'), but the
+        # bare prefix `foo` sorts before `foo-2`. The pre-#260 walker took the
+        # first of sorted(glob('*.meta.json')); falsified by sorting on the bare
+        # prefix, which kept `foo` and went red.
+        ch = tmp_path / "alpha"
+        _video(ch, "2026-01-01-foo", "vid1", title="Plain", mindmap=True)
+        _video(ch, "2026-01-01-foo-2", "vid1", title="Suffixed", mindmap=True)
+        pre_260_first = sorted(ch.glob(f"*{cw.META_SUFFIX}"))[0].name[: -len(cw.META_SUFFIX)]
+        assert pre_260_first == "2026-01-01-foo-2"
+        rec = cw.iter_meta_records(tmp_path).records[0]
+        assert rec.prefix == pre_260_first
+        assert rec.aliases == ["Plain"]
 
     def test_the_transcript_never_counts_toward_the_winner(self, tmp_path):
         # Falsified once by adding TRANSCRIPT_SUFFIX to the counted suffixes:

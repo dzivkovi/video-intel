@@ -70,7 +70,6 @@ from corpus_walk import (  # noqa: F401 - re-exports
     usable_video_id,
 )
 from corpus_walk import SEVERE_QUALITY_FLAGS as _SEVERE_QUALITY_FLAGS  # noqa: F401
-from corpus_walk import artifact_count as _artifact_count  # noqa: F401 - kept bound
 from gemini_common import (
     MAX_RETRIES_TRANSPORT,
     build_permissive_safety_settings,

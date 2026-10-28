@@ -373,6 +373,21 @@ class TestTranscriptQuality:
         ("v-unknown", {"transcript_status": "weird-literal"}, False, "unknown"),
         ("v-sibling", {}, True, "unknown"),
         ("v-none", {}, False, "none"),
+        # Precedence: a severe flag outranks any status, a status outranks skip_modes.
+        (
+            "v-severe-partial",
+            {"transcript_status": "partial", "transcript_quality_flags": ["blind_gap_severe"]},
+            False,
+            "severe",
+        ),
+        (
+            "v-severe-trunc",
+            {"transcript_status": "truncated_output", "transcript_quality_flags": ["monolithic_severe"]},
+            False,
+            "severe",
+        ),
+        ("v-skip-partial", {"skip_modes": ["transcript"], "transcript_status": "partial"}, False, "partial"),
+        ("v-legacy-skip", {"skip": True}, False, "skipped"),
     )
 
     def test_quality_mapping_in_order(self, tmp_path):
@@ -385,6 +400,17 @@ class TestTranscriptQuality:
         dumped = json.dumps(result.rows)
         assert "skip_reason" not in dumped
         assert "SKIPREASON-CANARY" not in dumped
+
+    def test_a_scalar_flags_field_does_not_abort_the_build(self, tmp_path):
+        corpus = tmp_path / "c"
+        _video(
+            corpus, "chanA", "2026-01-01-a", "a", extra={"transcript_status": "partial", "transcript_quality_flags": 7}
+        )
+        _video(corpus, "chanA", "2026-01-01-b", "b", extra={"transcript_status": "complete"})
+        result = ab.build_rows(corpus)
+        assert len(result.rows) == 2
+        assert _row(result, "a")["transcript_quality"] == "partial"
+        assert _row(result, "a")["transcript_flag_count"] == 0
 
     def test_flag_count_counts_only_string_entries(self, tmp_path):
         corpus = tmp_path / "c"
@@ -424,6 +450,21 @@ class TestWikiBriefingsAndPaths:
                 assert str(tmp_path) not in text
                 assert "My Drive" not in text
                 assert not drive.search(text)
+
+
+class TestNonUtf8Briefing:
+    def test_build_rows_and_main_complete_over_a_torn_briefing(self, tmp_path, capsys):
+        corpus = _happy_corpus(tmp_path)
+        _write_json(corpus / "_briefings" / "good.md", "---\nvideo_ids: [bbbbbbbbbb1]\n---\n")
+        torn = corpus / "_briefings" / "torn.md"
+        torn.write_bytes(b"---\nvideo_ids: [aaaaaaaaaa1]\ntitle: \xd0\n---\n")
+        result = ab.build_rows(corpus)
+        assert _row(result, "bbbbbbbbbb1")["briefing_count"] == 1
+        assert _row(result, "aaaaaaaaaa1")["briefing_count"] == 0
+        assert str(torn) in result.skipped_files
+        code, _ = _run_main(capsys, corpus)
+        assert code == 0
+        assert _atlas_path(corpus).is_file()
 
 
 class TestFreeTextMetaFields:
@@ -705,7 +746,14 @@ class TestCli:
         _, out = _run_main(capsys, corpus, "--out", str(out_dir))
         assert (out_dir / ab.ATLAS_FILENAME).is_file()
         assert not _atlas_path(corpus).exists()
-        assert _parse_line(out)["where"] == "video-intel/elsewhere"
+        # Outside the corpus only the folder's own name is printed, never a
+        # path that would hint at where the corpus or the copy lives.
+        assert _parse_line(out)["where"] == "elsewhere"
+
+    def test_out_inside_the_corpus_keeps_the_corpus_relative_form(self, tmp_path, capsys):
+        corpus = _happy_corpus(tmp_path)
+        _, out = _run_main(capsys, corpus, "--out", str(corpus / "_scratch"))
+        assert _parse_line(out)["where"] == "video-intel/_scratch"
 
     def test_output_file_set_is_only_atlas_json(self, tmp_path, capsys):
         corpus = _happy_corpus(tmp_path)
@@ -718,6 +766,67 @@ class TestCli:
         for name in names:
             for suffix in (".meta.json", ".concepts.json", ".mindmap.md", ".transcript.md"):
                 assert not name.endswith(suffix)
+
+
+REFUSED_RE = re.compile(
+    r"atlas_build: did not write atlas\.json: (?P<n>\d+) channel folder\(s\) could not be listed "
+    r"\(metas=\d+ rows=\d+ duplicates=\d+ skipped=\d+ no_id=\d+ excluded_metas=\d+ unlistable=(?P<unlistable>\d+)\)"
+)
+
+
+def _deny_listing(monkeypatch, folder_name):
+    """Make `os.scandir` raise PermissionError for one folder, everything else real."""
+    real = ab.os.scandir
+
+    def scandir(path="."):
+        if pathlib.Path(path).name == folder_name:
+            raise PermissionError(13, "Access is denied", str(path))
+        return real(path)
+
+    monkeypatch.setattr(ab.os, "scandir", scandir)
+
+
+class TestUnlistableChannel:
+    def test_an_unlistable_channel_keeps_the_previous_catalog_and_exits_2(self, tmp_path, capsys, monkeypatch):
+        # Falsified by removing main's early return: the catalog was rewritten
+        # without chanB, with a valid-looking partition, and this went red.
+        corpus = _happy_corpus(tmp_path)
+        _run_main(capsys, corpus, "--generated-at", FIXED_STAMP)
+        before = _atlas_path(corpus).read_bytes()
+        _deny_listing(monkeypatch, "chanB")
+        code, out = _run_main(capsys, corpus, "--generated-at", FIXED_STAMP)
+        assert code == 2
+        assert _atlas_path(corpus).read_bytes() == before
+        assert sorted(p.name for p in (corpus / "_atlas").iterdir()) == ["atlas.json"]
+        lines = out.splitlines()
+        assert len(lines) == 1, lines
+        match = REFUSED_RE.fullmatch(lines[0])
+        assert match, lines[0]
+        assert (match["n"], match["unlistable"]) == ("1", "1")
+        assert "chanB" not in out
+
+    def test_build_rows_reports_the_code_and_the_count(self, tmp_path, monkeypatch):
+        corpus = _happy_corpus(tmp_path)
+        _deny_listing(monkeypatch, "chanB")
+        result = ab.build_rows(corpus)
+        assert result.summary["unlistable_channels"] == 1
+        assert "channel_unlistable" in result.summary["warnings"]
+        assert "bbbbbbbbbb1" not in {r["video_id"] for r in result.rows}
+
+    def test_an_unlistable_excluded_folder_is_counted_apart_and_still_writes(self, tmp_path, capsys, monkeypatch):
+        corpus = _happy_corpus(tmp_path)
+        (corpus / "_quarantine").mkdir()
+        _deny_listing(monkeypatch, "_quarantine")
+        code, out = _run_main(capsys, corpus)
+        assert code == 0
+        doc = json.loads(_atlas_path(corpus).read_bytes())
+        assert (doc["summary"]["unlistable_channels"], doc["summary"]["unlistable_excluded"]) == (0, 1)
+        assert "excluded_unlistable" in doc["summary"]["warnings"]
+        assert _parse_line(out)
+
+    def test_a_healthy_build_reports_zero_unlistable(self, tmp_path):
+        summary = ab.build_rows(_happy_corpus(tmp_path)).summary
+        assert (summary["unlistable_channels"], summary["unlistable_excluded"]) == (0, 0)
 
 
 class TestDeterminism:
@@ -757,10 +866,23 @@ class TestDeterminism:
         assert json.loads(_atlas_path(corpus).read_bytes())["generated_at"] is None
 
     def test_module_never_reads_the_wall_clock(self):
+        # One clock read is allowed: `_file_age_seconds`, which only decides
+        # whether a leftover temp is old enough to sweep and never reaches the
+        # output. Every other line of the module is scanned.
+        import ast
+
         source = pathlib.Path(ab.__file__).read_text(encoding="utf-8")
         assert "json.dumps" in source  # non-vacuity: the scan reads the real module
-        for call in ("now(", "utcnow(", "today(", "time.time("):
-            assert call not in source, call
+        helper = next(
+            n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name == "_file_age_seconds"
+        )
+        allowed = set(range(helper.lineno, helper.end_lineno + 1))
+        lines = source.splitlines()
+        clock_lines = [i for i, line in enumerate(lines, 1) if "time.time(" in line]
+        assert clock_lines and set(clock_lines) <= allowed, clock_lines
+        outside = "\n".join(line for i, line in enumerate(lines, 1) if i not in allowed)
+        for call in ("now(", "utcnow(", "today(", "time.time(", "monotonic("):
+            assert call not in outside, call
 
 
 class TestBytes:
@@ -846,12 +968,22 @@ class TestOwnership:
         ],
         ids=["foreign-generator", "json-list", "missing-key", "not-json"],
     )
-    def test_refuses_and_leaves_bytes_untouched(self, tmp_path, body):
+    def test_refuses_and_leaves_bytes_untouched(self, tmp_path, monkeypatch, body):
         corpus = _happy_corpus(tmp_path)
         target = self._existing(corpus, lambda p: p.write_text(body, encoding="utf-8"))
         before = target.read_bytes()
+        walks = []
+        real_build_rows = ab.build_rows
+
+        def spy_build_rows(path):
+            walks.append(path)
+            return real_build_rows(path)
+
+        monkeypatch.setattr(ab, "build_rows", spy_build_rows)
         with pytest.raises(SystemExit) as exc:
             ab.main(["--corpus", str(corpus)])
+        # Refused BEFORE the walk: a foreign file must not cost a full corpus read.
+        assert walks == []
         assert exc.value.code not in (0, None)
         assert "refusing to overwrite" in str(exc.value.code)
         assert ab.GENERATOR_NAME in str(exc.value.code)
@@ -870,6 +1002,19 @@ class TestOwnership:
     def test_own_file_is_overwritten(self, tmp_path):
         corpus = _happy_corpus(tmp_path)
         target = self._existing(corpus, lambda p: p.write_text('{"generator": "atlas_build.py"}', encoding="utf-8"))
+        assert ab.main(["--corpus", str(corpus)]) == 0
+        assert len(json.loads(target.read_bytes())["rows"]) == 4
+
+    def test_own_file_larger_than_the_meta_cap_is_overwritten(self, tmp_path):
+        # The live catalog is 6.1 MB, past the 4 MB per-meta default cap: the
+        # ownership read must use the atlas cap, or the next rebuild is refused.
+        import corpus_walk as cw
+
+        corpus = _happy_corpus(tmp_path)
+        filler = [{"video_id": f"v{i:07d}", "pad": "x" * 200} for i in range(cw.DEFAULT_MAX_JSON_BYTES // 200 + 10)]
+        body = json.dumps({"generator": ab.GENERATOR_NAME, "rows": filler})
+        target = self._existing(corpus, lambda p: p.write_text(body, encoding="utf-8"))
+        assert target.stat().st_size > cw.DEFAULT_MAX_JSON_BYTES
         assert ab.main(["--corpus", str(corpus)]) == 0
         assert len(json.loads(target.read_bytes())["rows"]) == 4
 
@@ -909,14 +1054,65 @@ class TestAtomicity:
         assert _atlas_path(corpus).read_bytes() == before
         assert [p.name for p in (corpus / "_atlas").iterdir()] == ["atlas.json"]
 
+    @staticmethod
+    def _age(path, seconds):
+        stamp = path.stat().st_mtime - seconds
+        ab.os.utime(path, (stamp, stamp))
+
     def test_leftover_temp_is_swept_and_nothing_else(self, tmp_path, capsys):
         corpus, _ = self._seed(tmp_path, capsys)
         atlas_dir = corpus / "_atlas"
         kept = ["notes.tmp", "atlas-policy.yaml", "atlas.json.tmp", "atlas.json.12x.tmp"]
         for name in ("atlas.json.12345.tmp", *kept):
             (atlas_dir / name).write_text("x", encoding="utf-8")
+            self._age(atlas_dir / name, ab.STALE_TEMP_MIN_AGE_SECONDS + 60)
         _run_main(capsys, corpus)
         assert sorted(p.name for p in atlas_dir.iterdir()) == sorted(["atlas.json", *kept])
+
+    def test_a_young_temp_is_left_alone(self, tmp_path, capsys):
+        # A temp this fresh may be a concurrent build's live write.
+        corpus, _ = self._seed(tmp_path, capsys)
+        young = corpus / "_atlas" / "atlas.json.12345.tmp"
+        young.write_text("x", encoding="utf-8")
+        code, _ = _run_main(capsys, corpus)
+        assert code == 0
+        assert young.read_text(encoding="utf-8") == "x"
+
+    def test_an_old_temp_is_removed(self, tmp_path, capsys):
+        corpus, _ = self._seed(tmp_path, capsys)
+        old = corpus / "_atlas" / "atlas.json.12345.tmp"
+        old.write_text("x", encoding="utf-8")
+        self._age(old, ab.STALE_TEMP_MIN_AGE_SECONDS + 60)
+        _run_main(capsys, corpus)
+        assert not old.exists()
+
+    def test_an_unlink_that_raises_is_logged_and_the_build_continues(self, tmp_path, capsys, monkeypatch, caplog):
+        corpus, _ = self._seed(tmp_path, capsys)
+        old = corpus / "_atlas" / "atlas.json.12345.tmp"
+        old.write_text("x", encoding="utf-8")
+        self._age(old, ab.STALE_TEMP_MIN_AGE_SECONDS + 60)
+        real_unlink = pathlib.Path.unlink
+
+        def unlink(self, *a, **k):
+            if self.name == old.name:
+                raise PermissionError(13, "Access is denied", str(self))
+            return real_unlink(self, *a, **k)
+
+        monkeypatch.setattr(pathlib.Path, "unlink", unlink)
+        with caplog.at_level(logging.WARNING, logger="video_intel.atlas_build"):
+            code, out = _run_main(capsys, corpus)
+        assert code == 0
+        assert _parse_line(out)
+        assert old.exists()
+        assert any("atlas.json.12345.tmp" in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+
+    def test_an_unlistable_out_dir_is_logged_not_raised(self, tmp_path, monkeypatch, caplog):
+        out_dir = tmp_path / "_atlas"
+        out_dir.mkdir()
+        _deny_listing(monkeypatch, "_atlas")
+        with caplog.at_level(logging.WARNING, logger="video_intel.atlas_build"):
+            ab.sweep_stale_temps(out_dir)
+        assert any("_atlas" in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
 
     def test_temp_pattern_shape(self):
         assert ab.TEMP_SUFFIX_PATTERN.fullmatch("atlas.json.12345.tmp")

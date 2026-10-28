@@ -9,6 +9,7 @@ import textwrap
 import pytest
 
 from timestamp_utils import (
+    is_youtube_deep_linkable,
     normalize_mm_ss_zero_timestamp,
     normalize_timestamp,
     parse_time_to_seconds,
@@ -195,6 +196,47 @@ class TestYoutubeDeepLink:
     )
     def test_rejects_everything_else(self, url):
         assert youtube_deep_link(url, 245) is None
+        assert is_youtube_deep_linkable(url) is False
+
+    @pytest.mark.parametrize("keyword", ["live"])
+    def test_accepts_the_live_path_form(self, keyword):
+        url = f"https://www.youtube.com/{keyword}/dQw4w9WgXcQ"
+        assert youtube_deep_link(url, 245) == f"{url}?t=245"
+        assert is_youtube_deep_linkable(url) is True
+        with_query = f"https://www.youtube.com/{keyword}/dQw4w9WgXcQ?feature=share"
+        assert youtube_deep_link(with_query, 245) == f"{with_query}&t=245"
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://www.youtube.com/channel/UCabcdefghijklmnopqrstuv",
+            "https://www.youtube.com/channel/dQw4w9WgXcQ",
+            "https://www.youtube.com/live/goldcast-ab12cd34",
+            "https://www.youtube.com/live/short",
+            "https://www.youtube.com/live/",
+            # /embed/ reads start= and ignores t=; Shorts do not seek reliably.
+            # A t= there is a link that never jumps, so neither form qualifies.
+            "https://www.youtube.com/embed/dQw4w9WgXcQ",
+            "https://www.youtube.com/shorts/dQw4w9WgXcQ",
+            "https://www.youtube.com/xlive/dQw4w9WgXcQ",
+            "http://www.youtube.com/live/dQw4w9WgXcQ",
+            "https://fathom.video/live/dQw4w9WgXcQ",
+        ],
+    )
+    def test_rejects_other_paths_and_bad_ids_on_the_path_forms(self, url):
+        assert youtube_deep_link(url, 245) is None
+        assert is_youtube_deep_linkable(url) is False
+
+    def test_the_predicate_agrees_with_the_link_builder(self):
+        # One rule: `youtube_deep_link` returns a link exactly when the predicate is True.
+        for url in (
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://youtu.be/dQw4w9WgXcQ",
+            "https://www.youtube.com/live/dQw4w9WgXcQ",
+            "https://www.youtube.com/watch?v=goldcast-ab12cd34",
+            "https://fathom.video/share/x",
+        ):
+            assert (youtube_deep_link(url, 1) is not None) is is_youtube_deep_linkable(url), url
 
 
 class TestReExportsStayReExports:

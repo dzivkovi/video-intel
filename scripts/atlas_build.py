@@ -44,6 +44,7 @@ import logging
 import os
 import re
 import sys
+import time
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
@@ -67,7 +68,7 @@ from corpus_walk import (
     read_text_best_effort,
     transcript_quality_flags_are_severe,
 )
-from timestamp_utils import timestamp_tolerance, youtube_deep_link
+from timestamp_utils import is_youtube_deep_linkable, timestamp_tolerance, youtube_deep_link
 
 log = logging.getLogger("video_intel.atlas_build")
 
@@ -80,6 +81,9 @@ ATLAS_DIRNAME = "_atlas"
 #: The only temp shape this generator writes (`atlas.json.<pid>.tmp`) and the
 #: only thing the start-of-run sweep may remove.
 TEMP_SUFFIX_PATTERN = re.compile(r"atlas\.json\.[0-9]+\.tmp")
+#: A matching temp younger than this is left alone by the sweep: it may be a
+#: concurrent build's live write rather than a crashed run's leftover.
+STALE_TEMP_MIN_AGE_SECONDS = 3600
 
 #: Row keys in schema order (R11).
 ROW_KEYS = (
@@ -113,6 +117,10 @@ MAX_MINDMAP_BYTES = 4 * 1024 * 1024
 #: lines at the top; a block longer than this has no closing `---` in view and
 #: reads as no frontmatter.
 WIKI_FRONTMATTER_BYTES = 8 * 1024
+#: Read cap for an EXISTING `atlas.json` during the ownership check. The
+#: catalog itself is megabytes (6.1 MB on the live corpus), far past the
+#: per-meta default, and a cap that small would refuse every rebuild.
+MAX_ATLAS_BYTES = 256 * 1024 * 1024
 #: At most this many deep links per row (R7).
 MAX_DEEP_LINKS = 3
 
@@ -230,7 +238,7 @@ def deep_links(mindmap_text: str, url: str | None, duration: int | None) -> list
     (when the duration is known) and whose seconds no earlier link used, wins.
     No qualifying leaf means no link: a timestamp is never invented.
     """
-    if youtube_deep_link(url, 0) is None:
+    if not is_youtube_deep_linkable(url):
         return []
     limit = None if duration is None else duration + timestamp_tolerance(duration)
     links: list[dict] = []
@@ -244,12 +252,12 @@ def deep_links(mindmap_text: str, url: str | None, duration: int | None) -> list
             continue
         if entry.seconds in used_seconds or (limit is not None and entry.seconds > limit):
             continue
-        link = youtube_deep_link(url, entry.seconds)
-        if link is None:
-            continue
         done_branches.add(branch)
         used_seconds.add(entry.seconds)
-        links.append({"label": clean_text(branch), "seconds": entry.seconds, "url": link})
+        # The URL passed the gate above, so the link builder cannot refuse it here.
+        links.append(
+            {"label": clean_text(branch), "seconds": entry.seconds, "url": youtube_deep_link(url, entry.seconds)}
+        )
     return links
 
 
@@ -295,24 +303,30 @@ def _read_mindmap(path: Path | None, skipped: list[str]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _read_lookup(path: Path, name: str, skipped: list[str], warnings: set[str]) -> dict | None:
-    """The `name` key of a lookup JSON as a dict, or None with a warning code."""
+#: Warning-code stems for the two corpus-wide lookups. Every code a lookup
+#: raises (`<code>_missing`, `<code>_malformed`) is built from one of these.
+TOPICS_CODE = "topics"
+TAXONOMY_CODE = "taxonomy"
+
+
+def _read_lookup(path: Path, name: str, code: str, skipped: list[str], warnings: set[str]) -> dict | None:
+    """The `name` key of a lookup JSON as a dict, or None with a `<code>_...` warning code."""
     before = len(skipped)
     data = read_json_best_effort(path, skipped, max_bytes=MAX_LOOKUP_JSON_BYTES)
     if data is None:
-        warnings.add(f"{path.stem}_malformed" if len(skipped) > before else f"{path.stem}_missing")
+        warnings.add(f"{code}_malformed" if len(skipped) > before else f"{code}_missing")
         return None
     inner = data.get(name)
     if not isinstance(inner, dict):
         log.warning("%s: `%s` is not an object; ignoring it", path, name)
-        warnings.add(f"{path.stem}_malformed")
+        warnings.add(f"{code}_malformed")
         return None
     return inner
 
 
 def topics_by_video(corpus: Path, skipped: list[str], warnings: set[str]) -> dict[str, list[str]]:
     """video_id -> sorted topic slugs, inverted once from `topics.json`."""
-    topics = _read_lookup(corpus / "topics.json", "topics", skipped, warnings)
+    topics = _read_lookup(corpus / "topics.json", "topics", TOPICS_CODE, skipped, warnings)
     by_video: dict[str, set[str]] = {}
     if topics is None:
         return {}
@@ -330,7 +344,7 @@ def topics_by_video(corpus: Path, skipped: list[str], warnings: set[str]) -> dic
                 malformed = True
     if malformed:
         log.warning("%s: some topic entries are malformed; they were ignored", corpus / "topics.json")
-        warnings.add("topics_malformed")
+        warnings.add(f"{TOPICS_CODE}_malformed")
     return {vid: sorted(slugs) for vid, slugs in by_video.items()}
 
 
@@ -365,7 +379,7 @@ def wiki_page_keys(corpus: Path, skipped: list[str]) -> tuple[set[str], set[str]
 
 def concept_labels(corpus: Path, referenced: set[str], skipped: list[str], warnings: set[str]) -> dict[str, str]:
     """id -> preferred label for referenced ids; the label falls back to the id."""
-    taxonomy = _read_lookup(corpus / "taxonomy.json", "concepts", skipped, warnings) or {}
+    taxonomy = _read_lookup(corpus / "taxonomy.json", "concepts", TAXONOMY_CODE, skipped, warnings) or {}
     labels: dict[str, str] = {}
     for cid in sorted(referenced):
         entry = taxonomy.get(cid)
@@ -403,7 +417,7 @@ def build_rows(corpus: Path) -> BuildResult:
     skipped = list(walk.skipped_files)
     warnings: set[str] = set()
     topics = topics_by_video(corpus, skipped, warnings)
-    briefing_counts = briefing_video_counts(corpus / "_briefings")
+    briefing_counts = briefing_video_counts(corpus / "_briefings", skipped)
     wiki_creators, wiki_concept_ids = wiki_page_keys(corpus, skipped)
 
     rows: list[dict] = []
@@ -445,6 +459,10 @@ def build_rows(corpus: Path) -> BuildResult:
             processed.append(stamp)
     rows.sort(key=_row_sort_key)
 
+    if walk.unlistable_channels:
+        warnings.add("channel_unlistable")
+    if walk.unlistable_excluded:
+        warnings.add("excluded_unlistable")
     referenced = {cid for row in rows for cid in row["concept_ids"]}
     labels = concept_labels(corpus, referenced, skipped, warnings)
     unthreaded = sum(1 for row in rows if not row["topics"])
@@ -460,6 +478,8 @@ def build_rows(corpus: Path) -> BuildResult:
         "skipped": walk.skipped,
         "no_id": walk.no_id,
         "excluded_metas": walk.excluded_metas,
+        "unlistable_channels": walk.unlistable_channels,
+        "unlistable_excluded": walk.unlistable_excluded,
         "warnings": sorted(warnings),
     }
     return BuildResult(
@@ -532,7 +552,7 @@ def check_ownership(path: Path) -> None:
     refused, never overwritten.
     """
     unusable: list[str] = []
-    data = read_json_best_effort(path, unusable)
+    data = read_json_best_effort(path, unusable, max_bytes=MAX_ATLAS_BYTES)
     if data is None and not unusable:
         return  # absent: nothing to own
     if data is None:
@@ -548,8 +568,25 @@ def check_ownership(path: Path) -> None:
     )
 
 
+def _file_age_seconds(path: Path) -> float:
+    """Seconds since `path` was last modified.
+
+    The module's ONE clock read, and it decides only whether a leftover temp
+    is old enough to sweep; it never reaches the output, so `generated_at`
+    stays clock-free (`TestDeterminism::test_module_never_reads_the_wall_clock`
+    exempts exactly this function).
+    """
+    return time.time() - path.stat().st_mtime
+
+
 def sweep_stale_temps(out_dir: Path) -> None:
-    """Remove leftover `atlas.json.<pid>.tmp` files from a crashed run; nothing else."""
+    """Remove leftover `atlas.json.<pid>.tmp` files from a crashed run; nothing else.
+
+    A temp younger than `STALE_TEMP_MIN_AGE_SECONDS` is left alone: it may be
+    another build's live write, and deleting it would make that build's
+    `os.replace` fail. Every listing, stat and unlink failure is a WARNING,
+    never a crash: a temp the sweep cannot remove costs disk, not the build.
+    """
     try:
         with os.scandir(out_dir) as entries:
             temps = sorted(
@@ -557,9 +594,20 @@ def sweep_stale_temps(out_dir: Path) -> None:
             )
     except (FileNotFoundError, NotADirectoryError):
         return
+    except OSError as exc:
+        log.warning("cannot list %s to sweep leftover temps: %s", out_dir, exc)
+        return
     for path in temps:
-        log.info("removing a leftover temp from an earlier run: %s", path)
-        path.unlink()
+        try:
+            if _file_age_seconds(path) < STALE_TEMP_MIN_AGE_SECONDS:
+                log.info("leaving a recent temp alone (another build may own it): %s", path)
+                continue
+            log.info("removing a leftover temp from an earlier run: %s", path)
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            log.warning("cannot remove leftover temp %s: %s", path, exc)
 
 
 def write_atlas(out_dir: Path, document: bytes) -> Path:
@@ -608,14 +656,37 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def summary_line(out_dir: Path, corpus: Path, summary: dict) -> str:
-    """The one stdout line: counts only, never a channel, topic, title or path."""
+    """The one stdout line: counts only, never a channel, topic, title or path.
+
+    The location is `<corpus name>/<folder name>` when the output folder sits
+    inside the corpus, and only the folder's own name when `--out` points
+    elsewhere: prefixing the corpus name there would claim a location the file
+    is not in.
+    """
     rows = summary["rows"]
     share = f"{100 * summary['unthreaded'] / rows:.1f}%" if rows else "n/a"
+    where = f"{corpus.name}/{out_dir.name}" if out_dir.is_relative_to(corpus) else out_dir.name
     return (
-        f"atlas_build: wrote {ATLAS_FILENAME} to {corpus.name}/{out_dir.name} "
+        f"atlas_build: wrote {ATLAS_FILENAME} to {where} "
         f"(metas={summary['metas']} rows={rows} duplicates={summary['duplicates']} "
         f"skipped={summary['skipped']} no_id={summary['no_id']} excluded_metas={summary['excluded_metas']} "
         f"unthreaded={summary['unthreaded']} ({share}) warnings={len(summary['warnings'])})"
+    )
+
+
+#: Exit code when the walk could not list a channel folder: nothing is written,
+#: so the previous catalog survives.
+EXIT_UNLISTABLE = 2
+
+
+def refused_line(summary: dict) -> str:
+    """The one stdout line when an unlistable channel stops the write: counts only."""
+    n = summary["unlistable_channels"]
+    return (
+        f"atlas_build: did not write {ATLAS_FILENAME}: {n} channel folder(s) could not be listed "
+        f"(metas={summary['metas']} rows={summary['rows']} duplicates={summary['duplicates']} "
+        f"skipped={summary['skipped']} no_id={summary['no_id']} excluded_metas={summary['excluded_metas']} "
+        f"unlistable={n})"
     )
 
 
@@ -631,6 +702,12 @@ def main(argv: list[str] | None = None) -> int:
     # Refuse before the walk too: a foreign file should not cost a full corpus read.
     check_ownership(out_dir / ATLAS_FILENAME)
     result = build_rows(corpus)
+    if result.summary["unlistable_channels"]:
+        # A channel the walk could not list is absent from every counter, so
+        # the partition still balances; publishing would ship a catalog with
+        # that channel silently missing. Keep the previous file instead.
+        print(refused_line(result.summary))
+        return EXIT_UNLISTABLE
     document = serialize_atlas(build_header(corpus, result, args.generated_at))
     write_atlas(out_dir, document)
     print(summary_line(out_dir, corpus, result.summary))

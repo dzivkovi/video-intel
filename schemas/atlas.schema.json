@@ -54,6 +54,8 @@
         "skipped",
         "no_id",
         "excluded_metas",
+        "unlistable_channels",
+        "unlistable_excluded",
         "warnings"
       ],
       "additionalProperties": false,
@@ -68,6 +70,16 @@
         "skipped": {"$ref": "#/$defs/count"},
         "no_id": {"$ref": "#/$defs/count"},
         "excluded_metas": {"$ref": "#/$defs/count"},
+        "unlistable_channels": {
+          "description": "Channel folders whose listing failed. Always 0 in a written file: the build refuses to write (exit 2) when any channel folder cannot be listed.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 0
+        },
+        "unlistable_excluded": {
+          "description": "Underscore- or dot-prefixed folders whose listing failed; their metas are missing from excluded_metas.",
+          "$ref": "#/$defs/count"
+        },
         "warnings": {"type": "array", "items": {"type": "string"}}
       }
     },

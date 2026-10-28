@@ -138,23 +138,15 @@ def usable_video_id(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
-def artifact_count(record: dict) -> int:
-    """How many of a video's optional artifacts (mindmap, concepts) are present."""
-    return sum(1 for key in ("mindmap_path", "concepts_path") if record.get(key))
-
-
-#: The name `video_intel` has always used; kept bound to the same function.
-_artifact_count = artifact_count
-
 #: The four per-video artifact suffixes a channel's sibling index knows about.
 #: Matched by exact `endswith`, so `.meta.corrupt.json`, the `.transcript.raw*`
 #: sidecars and translate-bcs `.srt` files are never mistaken for one of them.
 SIBLING_SUFFIXES = (META_SUFFIX, CONCEPTS_SUFFIX, MINDMAP_SUFFIX, TRANSCRIPT_SUFFIX)
 
-#: The suffixes the duplicate-id winner rule counts: the same two-artifact rule
-#: as `artifact_count` (mindmap, concepts). A transcript or any other sidecar
-#: never counts, so a transcript-plus-mindmap record cannot beat a
-#: mindmap-plus-concepts one and silently change which title briefings show.
+#: The suffixes the duplicate-id winner rule counts (mindmap, concepts), read by
+#: `_sibling_artifact_count`, the ONE definition of that rule. A transcript or
+#: any other sidecar never counts, so a transcript-plus-mindmap record cannot
+#: beat a mindmap-plus-concepts one and silently change which title briefings show.
 WINNER_ARTIFACT_SUFFIXES = (MINDMAP_SUFFIX, CONCEPTS_SUFFIX)
 
 
@@ -184,6 +176,7 @@ def channel_sibling_index(channel_dir: Path) -> dict[str, dict[str, Path]]:
 
 
 def _sibling_artifact_count(siblings: dict[str, Path]) -> int:
+    """The duplicate-id winner rule: how many `WINNER_ARTIFACT_SUFFIXES` siblings a record has."""
     return sum(1 for suffix in WINNER_ARTIFACT_SUFFIXES if suffix in siblings)
 
 
@@ -214,6 +207,14 @@ class WalkResult:
     Invariant: ``metas == len(records) + duplicates + skipped + no_id``.
     ``excluded_metas`` counts metas under `.`/`_` top-level folders, which are
     never walked and so sit outside that partition.
+
+    ``unlistable_channels`` counts channel folders whose listing raised
+    OSError: their metas are in NO counter, so the partition above still
+    balances while a whole channel is missing. A caller that publishes the
+    walk must treat a non-zero value as a failed walk, not a smaller corpus.
+    ``unlistable_excluded`` is the same for excluded folders, whose metas are
+    then missing from ``excluded_metas``. Folder names go to the WARNING log
+    only, never into a counter or a result field.
     """
 
     records: list[MetaRecord] = field(default_factory=list)
@@ -222,6 +223,8 @@ class WalkResult:
     skipped: int = 0
     no_id: int = 0
     excluded_metas: int = 0
+    unlistable_channels: int = 0
+    unlistable_excluded: int = 0
     skipped_files: list[str] = field(default_factory=list)
 
 
@@ -241,21 +244,33 @@ def _record_channel(meta: dict, channel_dir: Path, meta_name: str) -> str:
     return channel_dir.name
 
 
-def _count_excluded_metas(folder: Path) -> int:
-    """Metas directly inside an excluded top-level folder, counted, never read."""
+def _count_excluded_metas(folder: Path) -> int | None:
+    """Metas directly inside an excluded top-level folder, counted, never read; None when unlistable."""
     try:
         with os.scandir(folder) as entries:
             return sum(1 for entry in entries if entry.name.endswith(META_SUFFIX) and entry.is_file())
     except OSError as exc:
-        log.warning("cannot list %s: %s", folder, exc)
-        return 0
+        log.warning("cannot list excluded folder %s: %s", folder, exc)
+        return None
+
+
+def _meta_filename_key(prefix: str) -> str:
+    """Sort key for a prefix: its meta FILENAME, never the bare prefix.
+
+    The pre-#260 walker took the first of `sorted(glob("*.meta.json"))`, and
+    the two orders disagree: `x-foo-2.meta.json` sorts before `x-foo.meta.json`
+    ('-' < '.'), while the bare prefix `x-foo` sorts before `x-foo-2`. Sorting
+    on the prefix flipped which record won an equal-count tie, and so which
+    title briefings show.
+    """
+    return prefix + META_SUFFIX
 
 
 def iter_meta_records(corpus: Path) -> WalkResult:
     """Walk every channel folder once and return one record per `video_id`.
 
     Channel folders (`is_channel_dir`) are walked in sorted name order and
-    each folder's metas in sorted prefix order. A meta `read_json_best_effort`
+    each folder's metas in sorted meta FILENAME order (`_meta_filename_key`). A meta `read_json_best_effort`
     rejects counts as `skipped`; a JSON object whose `video_id` fails
     `usable_video_id` counts as `no_id` with a WARNING naming the file (never
     `str()`-coerced: `123` must not merge with a real `"123"`). Records that
@@ -277,14 +292,21 @@ def iter_meta_records(corpus: Path) -> WalkResult:
     by_id: dict[str, MetaRecord] = {}
     for name, folder in folders:
         if not _is_channel_name(name):
-            result.excluded_metas += _count_excluded_metas(folder)
+            excluded = _count_excluded_metas(folder)
+            if excluded is None:
+                result.unlistable_excluded += 1
+            else:
+                result.excluded_metas += excluded
             continue
         try:
             index = channel_sibling_index(folder)
         except OSError as exc:
+            # Counted, not just logged: a skipped channel leaves the partition
+            # balanced, so the count is the only signal a caller can act on.
             log.warning("cannot list channel folder %s: %s", folder, exc)
+            result.unlistable_channels += 1
             continue
-        for prefix in sorted(index):
+        for prefix in sorted(index, key=_meta_filename_key):
             siblings = index[prefix]
             meta_path = siblings.get(META_SUFFIX)
             if meta_path is None:
@@ -323,8 +345,8 @@ def iter_meta_records(corpus: Path) -> WalkResult:
             else:
                 existing.losers.append(record)
     for winner in by_id.values():
-        # Losers in walk order, so aliases follow the sorted (folder, prefix) order.
-        winner.losers.sort(key=lambda r: (r.channel_dir.name, r.prefix))
+        # Losers in walk order, so aliases follow the sorted (folder, filename) order.
+        winner.losers.sort(key=lambda r: (r.channel_dir.name, _meta_filename_key(r.prefix)))
         own_title = winner.meta.get("title")
         aliases: list[str] = []
         for loser in winner.losers:
@@ -333,7 +355,7 @@ def iter_meta_records(corpus: Path) -> WalkResult:
                 aliases.append(title)
         winner.aliases = aliases
         winner.channels = sorted({winner.channel, *(loser.channel for loser in winner.losers)})
-    result.records = sorted(by_id.values(), key=lambda r: (r.channel, r.prefix, r.channel_dir.name))
+    result.records = sorted(by_id.values(), key=lambda r: (r.channel, _meta_filename_key(r.prefix), r.channel_dir.name))
     return result
 
 
@@ -381,15 +403,22 @@ SEVERE_QUALITY_FLAGS = frozenset(
 )
 
 
-def transcript_quality_flags_are_severe(flags: list | None) -> bool:
+#: The container shapes `transcript_quality_flags_are_severe` judges. A list is
+#: the persisted shape; the chunked writer passes the `set` it accumulates into
+#: before sorting, so a set (and its tuple/frozenset siblings) must stay judged.
+_FLAG_COLLECTION_TYPES = (list, tuple, set, frozenset)
+
+
+def transcript_quality_flags_are_severe(flags: list | set | None) -> bool:
     """Whether a PERSISTED transcript_quality_flags list contains a severe flag.
 
     The single place every consumer (the writers computing transcript_status,
     resolve_mindmap_source's containment check, the process orchestrators'
     exit-code gate, dedupe's canonical selection) re-derives severity from
     what actually landed in meta.json, rather than each hand-rolling its own
-    membership test against SEVERE_QUALITY_FLAGS. A missing or empty list is
-    not severe.
+    membership test against SEVERE_QUALITY_FLAGS. A missing or empty list,
+    or a value that is not a list (or the set the chunked writer accumulates
+    into), is not severe.
 
     Issue #159 dual-review: the membership test filters to string entries
     (`if isinstance(f, str)`) BEFORE evaluating `f in SEVERE_QUALITY_FLAGS`,
@@ -406,12 +435,15 @@ def transcript_quality_flags_are_severe(flags: list | None) -> bool:
     runs on a value that is guaranteed hashable, so no entry shape can raise
     here. A non-string sibling anywhere in the list can now never mask - or
     fake - a genuine severe flag, and malformed entries degrade to being
-    ignored rather than crashing the caller. A non-list `flags` argument
-    (e.g. a bare string) is unaffected by this change: iterating a string's
-    characters already returned False safely pre-#159, since no single
-    character equals a multi-character flag name.
+    ignored rather than crashing the caller.
+
+    Issue #260 review: a non-collection `flags` (an int, a bare string, a
+    dict) returns False before iteration. An int survived the `if not flags`
+    guard and raised TypeError on iteration, so one malformed meta aborted the
+    whole catalog build; a dict was iterated by its KEYS, so
+    `{"monolithic_severe": true}` faked a severe verdict.
     """
-    if not flags:
+    if not flags or not isinstance(flags, _FLAG_COLLECTION_TYPES):
         return False
     return any(f in SEVERE_QUALITY_FLAGS for f in flags if isinstance(f, str))
 
@@ -506,7 +538,12 @@ def _first_frontmatter_value(lines: list[str], key: str) -> str | None:
     return None
 
 
-def briefing_video_counts(briefings_dir: Path) -> Counter:
+#: Per-file read cap for a briefing. Front matter can carry a long `video_ids`
+#: list (a catch-up briefing lists dozens), so this sits well above a meta's.
+MAX_BRIEFING_BYTES = 1024 * 1024
+
+
+def briefing_video_counts(briefings_dir: Path, skipped: list[str] | None = None) -> Counter:
     """How many briefing files under _briefings/**/*.md list each video id.
 
     A video listed twice in one briefing counts once for that file. Missing
@@ -514,15 +551,23 @@ def briefing_video_counts(briefings_dir: Path) -> Counter:
     topic-based organization of the briefings dir doesn't silently un-see
     videos. Truthy non-string ids are coerced with `str()`, as
     `load_seen_video_ids` always has.
+
+    Each briefing is read through `read_text_best_effort`, so an unreadable,
+    oversized or non-UTF-8 file is skipped with a WARNING and appended to the
+    caller-owned ``skipped`` list (a throwaway list when omitted) instead of
+    raising out of the catalog build. A bare `read_text` caught only OSError,
+    and `UnicodeDecodeError` is a ValueError.
     """
     counts: Counter = Counter()
+    if skipped is None:
+        skipped = []
     if not briefings_dir.is_dir():
         return counts
     for md in sorted(briefings_dir.rglob("*.md")):
-        try:
-            front_matter, _ = parse_front_matter(md.read_text(encoding="utf-8"))
-        except OSError:
+        text = read_text_best_effort(md, skipped, max_bytes=MAX_BRIEFING_BYTES)
+        if text is None:
             continue
+        front_matter, _ = parse_front_matter(text)
         ids = front_matter.get("video_ids") or []
         if isinstance(ids, list):
             counts.update({str(v) for v in ids if v})

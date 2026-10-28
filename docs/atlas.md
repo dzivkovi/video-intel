@@ -48,9 +48,19 @@ What each count means:
 - `no_id`: metas that are JSON objects but carry no usable `video_id`.
 - `excluded_metas`: metas under `_`- and `.`-prefixed folders (for example `_quarantine/`), which are never walked.
 - `unthreaded`: rows that belong to no curated topic, with their share of all rows.
-- `warnings`: how many distinct warning codes the build raised for missing or malformed optional inputs. The codes (`taxonomy_missing`, `taxonomy_malformed`, `topics_missing`, `topics_malformed`, `concepts_malformed`) are in the file's `summary.warnings`; the paths are on stderr.
+- `warnings`: how many distinct warning codes the build raised for missing or malformed optional inputs. The codes (`taxonomy_missing`, `taxonomy_malformed`, `topics_missing`, `topics_malformed`, `concepts_malformed`, `excluded_unlistable`) are in the file's `summary.warnings`; the paths are on stderr.
+
+The file's `summary` also carries two listing counts that the line leaves out on a successful run: `unlistable_channels` (channel folders whose listing failed, always 0 in a written file) and `unlistable_excluded` (`_`- and `.`-prefixed folders whose listing failed, so their metas are missing from `excluded_metas`; this raises the `excluded_unlistable` warning).
 
 **Check the partition:** `metas == rows + duplicates + skipped + no_id`. In the example, 3369 + 2 + 0 + 9 = 3380. If the sum does not match, the build has a bug; open an issue with the line.
+
+**If a channel folder cannot be listed, nothing is written.** A folder the build cannot list (a permission error, or a Drive mount that drops a folder mid-run) has no metas in any count, so the partition would still balance while a whole channel is missing. The build therefore keeps the previous `atlas.json`, exits with code 2 and prints a counts-only line instead of the usual one:
+
+```text
+atlas_build: did not write atlas.json: 1 channel folder(s) could not be listed (metas=3290 rows=3279 duplicates=2 skipped=0 no_id=9 excluded_metas=4 unlistable=1)
+```
+
+The folder name is on stderr. Fix the access problem and run again.
 
 **Paste only the stdout line into a PR or an issue.** It is counts only by design. The stderr log names files, channels and paths from your corpus, so keep it local.
 
@@ -90,7 +100,7 @@ Titles, synopsis headings, deep-link labels and concept labels are untrusted tex
 
 The build only replaces an `atlas.json` whose `generator` header is exactly `atlas_build.py`. If the existing file was written by another tool, has no `generator` key, is not a JSON object, or cannot be read, the build stops before reading the corpus and prints `refusing to overwrite <path>: it is <reason>, not atlas_build.py`. Nothing is changed. Move that file aside (it may be something you want to keep), or pass `--out` to a folder no other tool writes to, then run again.
 
-The write itself goes through a temporary `atlas.json.<pid>.tmp` in the same folder and one rename, so a crashed run leaves the previous catalog intact. A leftover temp of that exact shape is removed on the next run; any other file in `_atlas/` is left alone.
+The write itself goes through a temporary `atlas.json.<pid>.tmp` in the same folder and one rename, so a crashed run leaves the previous catalog intact. A leftover temp of that exact shape is removed on a later run once it is more than an hour old; a younger one is left alone, and any other file in `_atlas/` is never touched. Do not run two builds of the same corpus at the same time: they write to the same `atlas.json`, and the last one to finish wins.
 
 ## On a Google Drive mount
 
