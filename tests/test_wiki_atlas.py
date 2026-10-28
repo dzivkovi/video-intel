@@ -22,12 +22,17 @@ def d(iso: str) -> dt.date:
     return dt.date.fromisoformat(iso)
 
 
+def _yt_id(creator: str) -> str:
+    """An eleven-character YouTube-shaped id, so citations keep their `&t=`."""
+    return f"{creator}-vid".ljust(11, "x")[:11]
+
+
 def _mention(creator: str, date: str, **kwargs: object) -> FirstMention:
     defaults: dict[str, object] = {
         "concept_id": "dom.pact",
         "artifact_id": f"{creator}-vid",
         "title": f"{creator} on pact",
-        "url": f"https://www.youtube.com/watch?v={creator}-vid",
+        "url": f"https://www.youtube.com/watch?v={_yt_id(creator)}",
         "start_seconds": 60,
         "segment_text": "the pact pattern changes everything",
         "as_mentioned": "pact pattern",
@@ -123,6 +128,18 @@ class TestNonDullChecklist:
         assert "&t=60" in page
         assert "2026-02-01" in page
         assert '"' in page  # a quoted segment, not a bare link
+
+    def test_non_youtube_shaped_id_renders_without_timestamp(self):
+        # Issue #260 KTD7: the citation goes through youtube_deep_link, so a
+        # youtube.com URL whose id is not eleven characters (a Goldcast-style
+        # recovered id) links to the video without a fabricated `&t=`.
+        data = _data()
+        odd_url = "https://www.youtube.com/watch?v=goldcast-ab12cd34"
+        mentions = (_mention("tiny", "2026-02-01", url=odd_url), *data.chains[0].mentions[1:])
+        data = dataclasses.replace(data, chains=[dataclasses.replace(data.chains[0], mentions=mentions)])
+        page = build_atlas(data, min_ranked_concepts=5)["concepts/dom-pact.md"]
+        assert f"]({odd_url})" in page
+        assert f"{odd_url}&t=" not in page
 
     def test_small_sample_dossier_carries_honesty_language(self):
         pages = build_atlas(_data(), min_ranked_concepts=5)

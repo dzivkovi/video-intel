@@ -15,6 +15,7 @@ from timestamp_utils import (
     should_reinterpret_part_as_mm_ss_zero,
     timestamp_tolerance,
     timestamped_url,
+    youtube_deep_link,
 )
 
 
@@ -158,6 +159,44 @@ class TestTimestampedUrl:
         assert timestamped_url(None, 30) == ""
 
 
+class TestYoutubeDeepLink:
+    """Issue #260 KTD7: a deep link is built only for an https YouTube host
+    with an eleven-character id; everything else gets None, never a
+    fabricated `t=` on a URL that cannot honor it."""
+
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [
+            ("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=245"),
+            ("https://youtube.com/watch?v=dQw4w9WgXcQ", "https://youtube.com/watch?v=dQw4w9WgXcQ&t=245"),
+            ("https://m.youtube.com/watch?v=dQw4w9WgXcQ", "https://m.youtube.com/watch?v=dQw4w9WgXcQ&t=245"),
+            ("https://youtu.be/dQw4w9WgXcQ", "https://youtu.be/dQw4w9WgXcQ?t=245"),
+        ],
+    )
+    def test_accepts_youtube_hosts_with_an_eleven_character_id(self, url, expected):
+        assert youtube_deep_link(url, 245) == expected
+        # Same form timestamped_url produces: one definition of the t= suffix.
+        assert youtube_deep_link(url, 245) == timestamped_url(url, 245)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://www.youtube.com/watch?v=goldcast-ab12cd34",
+            "https://www.youtube.com/watch?v=short",
+            "https://www.youtube.com/watch",
+            "https://youtu.be/",
+            "https://fathom.video/share/x",
+            "https://notyoutube.com/watch?v=dQw4w9WgXcQ",
+            "https://www.youtube.com.evil.example/watch?v=dQw4w9WgXcQ",
+            "",
+            None,
+        ],
+    )
+    def test_rejects_everything_else(self, url):
+        assert youtube_deep_link(url, 245) is None
+
+
 class TestReExportsStayReExports:
     """The two re-exports survive only INCIDENTALLY, which is the hazard.
 
@@ -270,7 +309,15 @@ class TestStandaloneScriptImportIsolation:
     # guards) would have passed the whole suite undetected.
     @pytest.mark.parametrize(
         "module",
-        ["wiki_concepts", "wiki_atlas", "lead_lag_report", "lead_lag_viz", "burst_report", "corpus_walk"],
+        [
+            "wiki_concepts",
+            "wiki_atlas",
+            "lead_lag_report",
+            "lead_lag_viz",
+            "burst_report",
+            "corpus_walk",
+            "atlas_build",
+        ],
     )
     def test_import_succeeds_with_heavy_deps_blocked(self, module):
         child_script = textwrap.dedent(f"""
@@ -288,6 +335,7 @@ class TestStandaloneScriptImportIsolation:
             print('OK')
             print('video_intel pulled:', 'video_intel' in sys.modules)
             print('intel_graph pulled:', 'intel_graph' in sys.modules)
+            print('yaml pulled:', 'yaml' in sys.modules)
             """)
         result = subprocess.run(
             [sys.executable, "-c", child_script],
@@ -302,6 +350,42 @@ class TestStandaloneScriptImportIsolation:
         assert "OK" in result.stdout
         assert "video_intel pulled: False" in result.stdout
         assert "intel_graph pulled: False" in result.stdout
+        # PyYAML is a lazy, call-time import (corpus_walk.parse_front_matter):
+        # importing any standalone script must not load it (issue #260 R1).
+        assert "yaml pulled: False" in result.stdout
+
+    def test_atlas_build_imports_under_a_strict_stdlib_only_blocker(self):
+        """Issue #260 U2: the catalog generator imports stdlib plus the
+        repo's own firebreak modules only, with every third-party top-level
+        module blocked. wiki_concepts pulls wiki_atlas, lead_lag_report and
+        lead_lag_viz transitively; all four are stdlib-only at import."""
+        child_script = textwrap.dedent("""
+            import sys, importlib.abc
+            OWN = {'atlas_build', 'corpus_walk', 'timestamp_utils', 'wiki_concepts',
+                   'wiki_atlas', 'lead_lag_report', 'lead_lag_viz'}
+            ALLOWED = set(sys.stdlib_module_names) | OWN
+
+            class Blocker(importlib.abc.MetaPathFinder):
+                def find_spec(self, name, path=None, target=None):
+                    if name.split('.')[0] not in ALLOWED:
+                        raise ImportError('blocked: ' + name)
+                    return None
+
+            sys.meta_path.insert(0, Blocker())
+            import atlas_build
+            print('OK')
+            print('yaml pulled:', 'yaml' in sys.modules)
+            """)
+        result = subprocess.run(
+            [sys.executable, "-c", child_script],
+            cwd=str(pathlib.Path(__file__).resolve().parent.parent / "scripts"),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "OK" in result.stdout
+        assert "yaml pulled: False" in result.stdout
 
     def test_corpus_walk_imports_under_a_strict_stdlib_only_blocker(self):
         """Issue #260 U1: corpus_walk is shared by the curate stack and the
