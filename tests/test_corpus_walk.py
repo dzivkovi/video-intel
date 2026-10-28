@@ -192,6 +192,55 @@ class TestReadJsonBestEffort:
         assert skipped == [str(bad)]
 
 
+class TestReadTextBestEffort:
+    def test_a_utf8_file_is_returned(self, tmp_path):
+        path = tmp_path / "a.mindmap.md"
+        path.write_bytes("## Привет\n".encode())
+        skipped: list[str] = []
+        assert cw.read_text_best_effort(path, skipped, max_bytes=1024) == "## Привет\n"
+        assert skipped == []
+
+    def test_an_absent_file_is_neither_counted_nor_logged(self, tmp_path, caplog):
+        skipped: list[str] = []
+        with caplog.at_level(logging.DEBUG, logger="video_intel.corpus_walk"):
+            assert cw.read_text_best_effort(tmp_path / "missing.md", skipped, max_bytes=1024) is None
+        assert skipped == []
+        assert [r for r in caplog.records if r.name == "video_intel.corpus_walk"] == []
+
+    def test_a_file_torn_mid_character_is_skipped_once_and_never_rewritten(self, tmp_path, caplog):
+        path = tmp_path / "torn.mindmap.md"
+        raw = "## Привет".encode()
+        cut = raw.index("П".encode()) + 1  # inside the two-byte sequence
+        path.write_bytes(raw[:cut])
+        skipped: list[str] = []
+        with caplog.at_level(logging.WARNING, logger="video_intel.corpus_walk"):
+            assert cw.read_text_best_effort(path, skipped, max_bytes=1024) is None
+        assert skipped == [str(path)]
+        warnings = _warnings(caplog)
+        assert len(warnings) == 1
+        assert str(path) in warnings[0].getMessage()
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["torn.mindmap.md"]
+        assert path.read_bytes() == raw[:cut]
+
+    def test_errors_replace_reads_a_torn_file_instead_of_skipping_it(self, tmp_path):
+        path = tmp_path / "torn.md"
+        path.write_bytes(b"ok \xd0")
+        skipped: list[str] = []
+        assert cw.read_text_best_effort(path, skipped, max_bytes=1024, errors="replace") == "ok \ufffd"
+        assert skipped == []
+
+    def test_a_file_over_the_size_cap_is_skipped(self, tmp_path, caplog):
+        path = tmp_path / "big.mindmap.md"
+        path.write_text("x" * 100, encoding="utf-8")
+        skipped: list[str] = []
+        with caplog.at_level(logging.WARNING, logger="video_intel.corpus_walk"):
+            assert cw.read_text_best_effort(path, skipped, max_bytes=50) is None
+        assert skipped == [str(path)]
+        assert len(_warnings(caplog)) == 1
+        # The cap is inclusive: exactly max_bytes reads fine.
+        assert cw.read_text_best_effort(path, [], max_bytes=100) == "x" * 100
+
+
 # ---------------------------------------------------------------------------
 # Small predicates
 # ---------------------------------------------------------------------------
@@ -249,6 +298,20 @@ class TestFrontmatterValue:
 
     def test_empty_value_returns_none(self):
         assert cw.frontmatter_value("---\ncreator:\n---\n", "creator") is None
+
+    @pytest.mark.parametrize(
+        "page",
+        [
+            PAGE,
+            "---\nconcept_id: x\n---\n",
+            "# no frontmatter\ncreator: a\n",
+            "---\ncreator: a\n",
+            "---\ncreator:\n---\n",
+        ],
+    )
+    def test_frontmatter_values_agrees_with_frontmatter_value_per_key(self, page):
+        keys = ("creator", "concept_id", "concept", "nope")
+        assert cw.frontmatter_values(page, keys) == {key: cw.frontmatter_value(page, key) for key in keys}
 
 
 class TestParseFrontMatterIsLazyAboutYaml:

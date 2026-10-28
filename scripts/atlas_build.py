@@ -53,17 +53,18 @@ from urllib.parse import urlsplit
 from wiki_concepts import mindmap_headings, parse_mindmap_timestamps
 
 from corpus_walk import (
-    _HEALTHY_TRANSCRIPT_STATUSES,
     CONCEPTS_SUFFIX,
+    HEALTHY_TRANSCRIPT_STATUSES,
     MINDMAP_SUFFIX,
     TRANSCRIPT_STATUS_TRUNCATED,
     TRANSCRIPT_SUFFIX,
     MetaRecord,
     briefing_video_counts,
-    frontmatter_value,
+    frontmatter_values,
     is_skipped_meta,
     iter_meta_records,
     read_json_best_effort,
+    read_text_best_effort,
     transcript_quality_flags_are_severe,
 )
 from timestamp_utils import timestamp_tolerance, youtube_deep_link
@@ -111,7 +112,7 @@ MAX_MINDMAP_BYTES = 4 * 1024 * 1024
 #: Bytes read from a wiki page to find its frontmatter. Frontmatter is a few
 #: lines at the top; a block longer than this has no closing `---` in view and
 #: reads as no frontmatter.
-WIKI_FRONTMATTER_BYTES = 64 * 1024
+WIKI_FRONTMATTER_BYTES = 8 * 1024
 #: At most this many deep links per row (R7).
 MAX_DEEP_LINKS = 3
 
@@ -205,7 +206,7 @@ def transcript_quality(meta: dict, siblings: dict[str, Path]) -> str:
         return "truncated"
     if status == "partial":
         return "partial"
-    if isinstance(status, str) and status in _HEALTHY_TRANSCRIPT_STATUSES:
+    if isinstance(status, str) and status in HEALTHY_TRANSCRIPT_STATUSES:
         return "complete"
     if is_skipped_meta(meta, "transcript"):
         return "skipped"
@@ -268,11 +269,13 @@ def concept_ids(path: Path | None, skipped: list[str]) -> tuple[list[str], bool]
         log.warning("  %s: `concepts` is not a list; no concept ids for this row", path)
         return [], True
     ids: list[str] = []
+    seen: set[str] = set()
     malformed = False
     for entry in entries:
         cid = entry.get("concept_id") if isinstance(entry, dict) else None
         if isinstance(cid, str) and cid:
-            if cid not in ids:
+            if cid not in seen:
+                seen.add(cid)
                 ids.append(cid)
         else:
             malformed = True
@@ -284,16 +287,7 @@ def concept_ids(path: Path | None, skipped: list[str]) -> tuple[list[str], bool]
 def _read_mindmap(path: Path | None, skipped: list[str]) -> str:
     if path is None:
         return ""
-    try:
-        with path.open("rb") as fh:
-            raw = fh.read(MAX_MINDMAP_BYTES + 1)
-        if len(raw) > MAX_MINDMAP_BYTES:
-            raise ValueError(f"larger than {MAX_MINDMAP_BYTES} bytes")
-        return raw.decode("utf-8")
-    except (ValueError, OSError) as exc:
-        log.warning("skipping mindmap %s: %s", path, exc)
-        skipped.append(str(path))
-        return ""
+    return read_text_best_effort(path, skipped, max_bytes=MAX_MINDMAP_BYTES) or ""
 
 
 # ---------------------------------------------------------------------------
@@ -360,13 +354,12 @@ def wiki_page_keys(corpus: Path, skipped: list[str]) -> tuple[set[str], set[str]
             log.warning("skipping wiki page %s: %s", page, exc)
             skipped.append(str(page))
             continue
-        creator = frontmatter_value(text, "creator")
-        if creator:
-            creators.add(creator)
+        values = frontmatter_values(text, ("creator", "concept_id", "concept"))
+        if values["creator"]:
+            creators.add(values["creator"])
         for key in ("concept_id", "concept"):
-            value = frontmatter_value(text, key)
-            if value:
-                concepts.add(value)
+            if values[key]:
+                concepts.add(values[key])
     return creators, concepts
 
 
@@ -399,6 +392,11 @@ def _parse_processed(value: object) -> dt.datetime | None:
 # ---------------------------------------------------------------------------
 
 
+def _row_sort_key(row: dict) -> tuple[str, str]:
+    """The (`published`, `video_id`) row order; the builder sorts by it and the serializer checks it."""
+    return (row.get("published") or "", row.get("video_id") or "")
+
+
 def build_rows(corpus: Path) -> BuildResult:
     """Build every catalog row, the concept lookup and the summary. Writes nothing."""
     walk = iter_meta_records(corpus)
@@ -406,7 +404,7 @@ def build_rows(corpus: Path) -> BuildResult:
     warnings: set[str] = set()
     topics = topics_by_video(corpus, skipped, warnings)
     briefing_counts = briefing_video_counts(corpus / "_briefings")
-    wiki_creators, wiki_concepts = wiki_page_keys(corpus, skipped)
+    wiki_creators, wiki_concept_ids = wiki_page_keys(corpus, skipped)
 
     rows: list[dict] = []
     processed: list[dt.datetime] = []
@@ -437,7 +435,7 @@ def build_rows(corpus: Path) -> BuildResult:
             "briefing_count": count,
             "wiki": {
                 "creator": record.channel if record.channel in wiki_creators else None,
-                "concepts": sorted(cid for cid in ids if cid in wiki_concepts),
+                "concepts": sorted(cid for cid in ids if cid in wiki_concept_ids),
             },
             "aliases": [clean_text(a) for a in record.aliases],
         }
@@ -445,7 +443,7 @@ def build_rows(corpus: Path) -> BuildResult:
         stamp = _parse_processed(meta.get("processed"))
         if stamp is not None:
             processed.append(stamp)
-    rows.sort(key=lambda r: (r["published"], r["video_id"]))
+    rows.sort(key=_row_sort_key)
 
     referenced = {cid for row in rows for cid in row["concept_ids"]}
     labels = concept_labels(corpus, referenced, skipped, warnings)
@@ -489,17 +487,13 @@ def build_header(corpus: Path, result: BuildResult, generated_at: str | None = N
     """
     if generated_at is None:
         generated_at = result.max_processed or result.max_published
-    summary = dict(result.summary)
-    for key in ("channels", "topics"):
-        if key in summary:
-            summary[key] = dict(sorted(summary[key].items()))
     return {
         "schema_version": SCHEMA_VERSION,
         "generator": GENERATOR_NAME,
         "generator_version": GENERATOR_VERSION,
         "generated_from": corpus.name,
         "generated_at": generated_at,
-        "summary": summary,
+        "summary": result.summary,
         "concepts": dict(sorted(result.concepts.items())),
         "rows": result.rows,
     }
@@ -513,10 +507,6 @@ def _nfc(value: object) -> object:
     if isinstance(value, list):
         return [_nfc(v) for v in value]
     return value
-
-
-def _row_sort_key(row: dict) -> tuple[str, str]:
-    return (row.get("published") or "", row.get("video_id") or "")
 
 
 def serialize_atlas(document: dict) -> bytes:
@@ -541,9 +531,10 @@ def check_ownership(path: Path) -> None:
     that is not a JSON object, and one without a `generator` key are all
     refused, never overwritten.
     """
-    if not path.exists():
-        return
-    data = read_json_best_effort(path, [])
+    unusable: list[str] = []
+    data = read_json_best_effort(path, unusable)
+    if data is None and not unusable:
+        return  # absent: nothing to own
     if data is None:
         reason = "unreadable or not a JSON object"
     else:
@@ -559,12 +550,16 @@ def check_ownership(path: Path) -> None:
 
 def sweep_stale_temps(out_dir: Path) -> None:
     """Remove leftover `atlas.json.<pid>.tmp` files from a crashed run; nothing else."""
-    if not out_dir.is_dir():
+    try:
+        with os.scandir(out_dir) as entries:
+            temps = sorted(
+                Path(entry.path) for entry in entries if TEMP_SUFFIX_PATTERN.fullmatch(entry.name) and entry.is_file()
+            )
+    except (FileNotFoundError, NotADirectoryError):
         return
-    for path in sorted(out_dir.iterdir()):
-        if TEMP_SUFFIX_PATTERN.fullmatch(path.name) and path.is_file():
-            log.info("removing a leftover temp from an earlier run: %s", path)
-            path.unlink()
+    for path in temps:
+        log.info("removing a leftover temp from an earlier run: %s", path)
+        path.unlink()
 
 
 def write_atlas(out_dir: Path, document: bytes) -> Path:
@@ -583,8 +578,7 @@ def write_atlas(out_dir: Path, document: bytes) -> Path:
         temp.write_bytes(document)
         os.replace(temp, target)
     finally:
-        if temp.exists():
-            temp.unlink()
+        temp.unlink(missing_ok=True)
     return target
 
 

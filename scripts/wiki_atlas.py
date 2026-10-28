@@ -45,7 +45,7 @@ from lead_lag_report import (
 )
 from lead_lag_viz import ROBUST_EXPECTED, SMALL_SAMPLE_EXPECTED
 
-from timestamp_utils import timestamped_url, youtube_deep_link
+from timestamp_utils import youtube_deep_link
 
 if TYPE_CHECKING:
     pass
@@ -83,7 +83,7 @@ def _naive_ranks(data: ReportData) -> dict[str, int]:
 def _evidence_citation(m: FirstMention) -> str:
     # One definition of "this URL takes a deep link" (issue #260 KTD7): a URL
     # that is not a YouTube URL with an eleven-character id links plainly.
-    link = youtube_deep_link(m.url, m.start_seconds) or timestamped_url(m.url, None)
+    link = youtube_deep_link(m.url, m.start_seconds) or m.url
     quote = extract_quote(m.segment_text, m.as_mentioned) if m.segment_text else "(mindmap-level mention, no segment)"
     return f'> "{quote}"\n>\n> - {m.source_id}, [{m.title}]({link}), {m.first_date.isoformat()}'
 

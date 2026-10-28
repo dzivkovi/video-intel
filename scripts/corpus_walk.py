@@ -49,6 +49,11 @@ TRANSCRIPT_SUFFIX = ".transcript.md"
 DEFAULT_MAX_JSON_BYTES = 4 * 1024 * 1024
 
 
+def _is_channel_name(name: str) -> bool:
+    """The name half of `is_channel_dir`: dot- and underscore-prefixed names are never channels."""
+    return not name.startswith(".") and not name.startswith("_")
+
+
 def is_channel_dir(path: Path) -> bool:
     """True for a directory that holds a channel's artifacts.
 
@@ -56,23 +61,22 @@ def is_channel_dir(path: Path) -> bool:
     `_headlines`, `_wiki`, `_standalone` and `.lancedb` all sit beside the
     channel folders and must never be walked as one.
     """
-    return path.is_dir() and not path.name.startswith(".") and not path.name.startswith("_")
+    return path.is_dir() and _is_channel_name(path.name)
 
 
-def read_json_best_effort(path: Path, skipped: list[str], *, max_bytes: int = DEFAULT_MAX_JSON_BYTES) -> dict | None:
-    """Read a JSON object from ``path``; None when it is absent or unusable.
+def read_text_best_effort(path: Path, skipped: list[str], *, max_bytes: int, errors: str = "strict") -> str | None:
+    """Read UTF-8 text from ``path``; None when it is absent or unusable.
 
-    An ABSENT file is normal (no `concepts.json` yet) and is neither counted
-    nor logged. A file that exists but cannot be used - unreadable, larger
-    than ``max_bytes``, not UTF-8, not JSON, or JSON whose top level is not an
-    object - is appended to the caller-owned ``skipped`` list and logged once
-    at WARNING with its path.
+    An ABSENT file is normal (no mindmap yet) and is neither counted nor
+    logged. A file that exists but cannot be used - unreadable, larger than
+    ``max_bytes``, or not UTF-8 under ``errors`` - is appended to the
+    caller-owned ``skipped`` list and logged once at WARNING with its path.
 
-    Bytes first, then decode and parse (issue #124): `read_text` would fold a
-    content problem into the call that should only fail at the I/O layer, and
-    `UnicodeDecodeError` subclasses ValueError, not OSError, so a meta torn
+    Bytes first, then decode (issue #124): `read_text` would fold a content
+    problem into the call that should only fail at the I/O layer, and
+    `UnicodeDecodeError` subclasses ValueError, not OSError, so a file torn
     mid-multibyte-character (the normal shape of a truncated write on a corpus
-    carrying Cyrillic/BCS titles) needs the `(ValueError, OSError)` catch.
+    carrying Cyrillic/BCS titles) needs the `(ValueError, OSError)` split.
 
     Never writes, never quarantines: a reader has no business moving a file
     another process may be about to repair.
@@ -87,9 +91,32 @@ def read_json_best_effort(path: Path, skipped: list[str], *, max_bytes: int = DE
     if len(raw) > max_bytes:
         return _skip(path, skipped, f"larger than {max_bytes} bytes")
     try:
-        data = json.loads(raw.decode("utf-8"))
+        return raw.decode("utf-8", errors=errors)
     except ValueError as exc:
-        return _skip(path, skipped, f"not UTF-8 JSON ({exc})")
+        return _skip(path, skipped, f"not UTF-8 ({exc})")
+
+
+def read_json_best_effort(path: Path, skipped: list[str], *, max_bytes: int = DEFAULT_MAX_JSON_BYTES) -> dict | None:
+    """Read a JSON object from ``path``; None when it is absent or unusable.
+
+    An ABSENT file is normal (no `concepts.json` yet) and is neither counted
+    nor logged. A file that exists but cannot be used - unreadable, larger
+    than ``max_bytes``, not UTF-8, not JSON, or JSON whose top level is not an
+    object - is appended to the caller-owned ``skipped`` list and logged once
+    at WARNING with its path. The read and the decode are
+    `read_text_best_effort`'s, so the issue #124 bytes-first rule lives in one
+    place.
+
+    Never writes, never quarantines: a reader has no business moving a file
+    another process may be about to repair.
+    """
+    text = read_text_best_effort(path, skipped, max_bytes=max_bytes)
+    if text is None:
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        return _skip(path, skipped, f"not JSON ({exc})")
     if not isinstance(data, dict):
         return _skip(path, skipped, f"top level is a {type(data).__name__}, not an object")
     return data
@@ -236,16 +263,20 @@ def iter_meta_records(corpus: Path) -> WalkResult:
     siblings, and a tie keeps the FIRST record in walk order; every other
     record counts as a duplicate and hangs off the winner. Reading never
     writes. A corpus that does not exist yields an empty result.
+
+    The corpus root is listed once with `os.scandir`, so each top-level
+    entry's directory check comes from the listing rather than a stat per
+    folder on the Drive mount.
     """
     result = WalkResult()
-    if not corpus.is_dir():
+    try:
+        with os.scandir(corpus) as entries:
+            folders = sorted((entry.name, Path(entry.path)) for entry in entries if entry.is_dir())
+    except (FileNotFoundError, NotADirectoryError):
         return result
-    folders = sorted(corpus.iterdir(), key=lambda p: p.name)
     by_id: dict[str, MetaRecord] = {}
-    for folder in folders:
-        if not folder.is_dir():
-            continue
-        if not is_channel_dir(folder):
+    for name, folder in folders:
+        if not _is_channel_name(name):
             result.excluded_metas += _count_excluded_metas(folder)
             continue
         try:
@@ -311,11 +342,13 @@ def iter_meta_records(corpus: Path) -> WalkResult:
 # ---------------------------------------------------------------------------
 
 # Issue #54 / review C1: transcript writers populate `transcript_status` with
-# different healthy literals depending on path: chunked merge writes "ok"
-# (scripts/video_intel.py:1542), single-call success writes "complete"
-# (:2419), salvage writes "partial" (:2449). Any non-healthy value triggers
-# the partial-source mindmap marker. Keep this set in sync with the writers.
-_HEALTHY_TRANSCRIPT_STATUSES = {"ok", "complete"}
+# different healthy literals depending on path: the chunked merge writer
+# writes "ok", the single-call success writer writes "complete", and the
+# salvage writer writes "partial". Any non-healthy value triggers the
+# partial-source mindmap marker. Keep this set in sync with the writers.
+HEALTHY_TRANSCRIPT_STATUSES = {"ok", "complete"}
+#: The name `video_intel` has always used; kept bound to the same object.
+_HEALTHY_TRANSCRIPT_STATUSES = HEALTHY_TRANSCRIPT_STATUSES
 
 #: meta.json transcript_status for a transcript salvaged from a response that
 #: hit the output cap. Distinct from the generic "partial" on purpose: a
@@ -446,17 +479,30 @@ def frontmatter_value(text: str, key: str) -> str | None:
     is never closed, the key is absent, or its value is empty. The match is
     on `key:` exactly, so `concept` never matches a `concept_id:` line.
     """
+    return _first_frontmatter_value(_frontmatter_lines(text), key)
+
+
+def frontmatter_values(text: str, keys: tuple[str, ...]) -> dict[str, str | None]:
+    """`frontmatter_value` for several keys, finding the frontmatter block once."""
+    lines = _frontmatter_lines(text)
+    return {key: _first_frontmatter_value(lines, key) for key in keys}
+
+
+def _frontmatter_lines(text: str) -> list[str]:
+    """The stripped lines of a page's frontmatter block; empty when there is none or it is never closed."""
     if not text.startswith("---"):
-        return None
+        return []
     end = text.find("\n---", 3)
     if end == -1:
-        return None
+        return []
+    return [line.strip() for line in text[3:end].splitlines()]
+
+
+def _first_frontmatter_value(lines: list[str], key: str) -> str | None:
     prefix = f"{key}:"
-    for line in text[3:end].splitlines():
-        line = line.strip()
+    for line in lines:
         if line.startswith(prefix):
-            value = line[len(prefix) :].strip()
-            return value or None
+            return line[len(prefix) :].strip() or None
     return None
 
 
