@@ -270,7 +270,7 @@ class TestStandaloneScriptImportIsolation:
     # guards) would have passed the whole suite undetected.
     @pytest.mark.parametrize(
         "module",
-        ["wiki_concepts", "wiki_atlas", "lead_lag_report", "lead_lag_viz", "burst_report"],
+        ["wiki_concepts", "wiki_atlas", "lead_lag_report", "lead_lag_viz", "burst_report", "corpus_walk"],
     )
     def test_import_succeeds_with_heavy_deps_blocked(self, module):
         child_script = textwrap.dedent(f"""
@@ -302,3 +302,60 @@ class TestStandaloneScriptImportIsolation:
         assert "OK" in result.stdout
         assert "video_intel pulled: False" in result.stdout
         assert "intel_graph pulled: False" in result.stdout
+
+    def test_corpus_walk_imports_under_a_strict_stdlib_only_blocker(self):
+        """Issue #260 U1: corpus_walk is shared by the curate stack and the
+        standalone catalog generator, so it must import with EVERY non-stdlib
+        top-level module blocked, not only the five heavy ones above."""
+        child_script = textwrap.dedent("""
+            import sys, importlib.abc
+            ALLOWED = set(sys.stdlib_module_names) | {'corpus_walk'}
+
+            class Blocker(importlib.abc.MetaPathFinder):
+                def find_spec(self, name, path=None, target=None):
+                    if name.split('.')[0] not in ALLOWED:
+                        raise ImportError('blocked: ' + name)
+                    return None
+
+            sys.meta_path.insert(0, Blocker())
+            import corpus_walk
+            print('OK')
+            print('yaml pulled:', 'yaml' in sys.modules)
+            """)
+        result = subprocess.run(
+            [sys.executable, "-c", child_script],
+            cwd=str(pathlib.Path(__file__).resolve().parent.parent / "scripts"),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "OK" in result.stdout
+        assert "yaml pulled: False" in result.stdout
+
+    def test_corpus_walk_has_no_non_stdlib_import_at_module_body_level(self):
+        """Static twin of the subprocess check: every import that runs at
+        import time must be stdlib. Function bodies are skipped on purpose,
+        so the lazy `import yaml` inside parse_front_matter is allowed."""
+        source = (pathlib.Path(__file__).resolve().parent.parent / "scripts" / "corpus_walk.py").read_text(
+            encoding="utf-8"
+        )
+        tree = ast.parse(source)
+
+        def import_time_modules(node):
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                    continue
+                if isinstance(child, ast.Import):
+                    yield from (alias.name.split(".")[0] for alias in child.names)
+                elif isinstance(child, ast.ImportFrom):
+                    yield (child.module or "").split(".")[0]
+                yield from import_time_modules(child)
+
+        module_level = set(import_time_modules(tree))
+        assert module_level, "the walk found no module-level import at all"
+        assert module_level - set(sys.stdlib_module_names) == set()
+        # Companion: the lazy yaml import exists and is only reachable in a function body.
+        every_import = {alias.name for n in ast.walk(tree) if isinstance(n, ast.Import) for alias in n.names}
+        assert "yaml" in every_import
+        assert "yaml" not in module_level

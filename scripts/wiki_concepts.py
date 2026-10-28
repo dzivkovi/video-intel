@@ -42,6 +42,7 @@ from pathlib import Path
 
 from wiki_atlas import slugify
 
+from corpus_walk import frontmatter_value
 from timestamp_utils import TIMESTAMP_TOKEN_PATTERN, parse_time_to_seconds, timestamped_url
 
 log = logging.getLogger(__name__)
@@ -430,6 +431,21 @@ def parse_mindmap_timestamps(text: str) -> list[MindmapEntry]:
     return entries
 
 
+def mindmap_headings(text: str) -> list[str]:
+    """The mindmap's `## ` branch headings, in order, verbatim after strip.
+
+    Uses the same `_HEADING_RE` match on each stripped line as
+    `parse_mindmap_timestamps`, so the two never disagree about what a heading
+    is. Unlike that parser, a heading with no bullets under it still appears.
+    """
+    headings: list[str] = []
+    for raw_line in text.splitlines():
+        h = _HEADING_RE.match(raw_line.strip())
+        if h:
+            headings.append(h.group(1).strip())
+    return headings
+
+
 def find_timestamp(entries: list[MindmapEntry], branch: str, as_mentioned: str) -> int | None:
     """Deterministic, mechanical lookup for the timestamp behind one concept
     mention: first try a subheading match on `branch`, then a heading match,
@@ -673,18 +689,9 @@ def _frontmatter_generator(text: str) -> str | None:
     block (issue #150 FIX1c). Returns None when there is no frontmatter, no
     `generator:` key, or an empty value - a foreign page that predates any
     generator stamp is treated the same as "no signal", never as "safe to
-    overwrite" or "ours"."""
-    if not text.startswith("---"):
-        return None
-    end = text.find("\n---", 3)
-    if end == -1:
-        return None
-    for line in text[3:end].splitlines():
-        line = line.strip()
-        if line.startswith("generator:"):
-            value = line.split(":", 1)[1].strip()
-            return value or None
-    return None
+    overwrite" or "ours". The scan itself is the shared
+    `corpus_walk.frontmatter_value`."""
+    return frontmatter_value(text, "generator")
 
 
 def write_pages(pages: dict[str, str], out_dir: Path) -> None:

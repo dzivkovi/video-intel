@@ -164,6 +164,20 @@ def test_collect_corpus_videos_skips_meta_without_video_id(tmp_path):
     assert collect_corpus_videos(tmp_path) == []
 
 
+def test_collect_corpus_videos_skips_a_meta_whose_top_level_is_a_list(tmp_path):
+    """A meta that parses to a JSON list used to raise AttributeError on
+    `.get` and kill `briefings --unseen` and `topics-build` (issue #260 U1).
+    It is now skipped like any other unusable meta, and the healthy one beside
+    it still comes back."""
+    from video_intel import collect_corpus_videos
+
+    ch = tmp_path / "ch"
+    _write_video(ch, "2026-06-01-good", video_id="vGOOD", published="2026-06-01")
+    (ch / "2026-06-02-list.meta.json").write_text(json.dumps([{"video_id": "vLIST"}]), encoding="utf-8")
+    got = {v["video_id"] for v in collect_corpus_videos(tmp_path)}
+    assert got == {"vGOOD"}
+
+
 # --------------------------------------------------------------------------
 # compute_catchup_window + select_unseen
 # --------------------------------------------------------------------------
