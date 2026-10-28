@@ -49,6 +49,11 @@ def embed_json(atlas: dict) -> str:
     double-escaped script state and swallow the page's real closing tag (the
     same rule as `lead_lag_viz.render_html`). JSON parses the escapes back to
     the original characters, so the page shows titles verbatim.
+
+    The three-replace chain is deliberately the same text as in `lead_lag_viz`
+    rather than an import: that script sits on the DuckDB report stack and this
+    one must stay stdlib-only. `tests/test_atlas_render.py::TestEscapeChainParity`
+    pins the two copies to each other.
     """
     text = json.dumps(atlas, ensure_ascii=False, separators=(",", ":"))
     return text.replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e")
@@ -105,6 +110,7 @@ def check_ownership(path: Path) -> None:
 def write_atomic(path: Path, text: str) -> None:
     """Write `text` through `<name>.<pid>.tmp` and one `os.replace`; the temp never survives."""
     check_ownership(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
         with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
@@ -135,7 +141,9 @@ def main(argv: list[str] | None = None) -> int:
     out = args.out or args.atlas.with_name(CATALOG_FILENAME)
     try:
         write_atomic(out, html)
-    except SystemExit as exc:
+    except (SystemExit, OSError) as exc:
+        # A refused ownership check (SystemExit) and a failed write (a read-only folder, a refused
+        # os.replace) report the same way: one stderr line, exit 2, never a traceback.
         print(f"{GENERATOR_NAME}: {exc}", file=sys.stderr)
         return EXIT_REFUSED
     elapsed = time.perf_counter() - started
