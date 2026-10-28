@@ -9,8 +9,9 @@
   (function () {
     try {
       var t = localStorage.getItem("atlas-catalog-theme");
-      if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
-    } catch (e) {}
+      // Dark by default (owner's choice); the stored value wins once the button has been used.
+      document.documentElement.setAttribute("data-theme", t === "light" ? "light" : "dark");
+    } catch (e) { document.documentElement.setAttribute("data-theme", "dark"); }
   })();
 </script>
 <style>
@@ -240,9 +241,7 @@
   var themeBtn = document.getElementById("theme-btn");
 
   function currentTheme() {
-    var t = document.documentElement.getAttribute("data-theme");
-    if (t) return t;
-    return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    return document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark";
   }
   function paintThemeButton() {
     themeBtn.textContent = currentTheme() === "dark" ? "Light theme" : "Dark theme";
