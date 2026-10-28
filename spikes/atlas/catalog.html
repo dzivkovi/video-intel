@@ -1,0 +1,927 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Corpus catalog</title>
+<link rel="icon" href="data:,">
+<script>
+  (function () {
+    try {
+      var t = localStorage.getItem("atlas-catalog-theme");
+      // Dark by default (owner's choice); the stored value wins once the button has been used.
+      document.documentElement.setAttribute("data-theme", t === "light" ? "light" : "dark");
+    } catch (e) { document.documentElement.setAttribute("data-theme", "dark"); }
+  })();
+</script>
+<style>
+  :root {
+    --ground: #F3F4F6; --surface: #FFFFFF; --ink: #1C222B; --muted: #4F5964; --faint: #77818C; --line: #D9DEE4;
+    --accent: #2F5D9E; --accent-soft: #E3EBF6; --accent-ink: #FFFFFF;
+    --amber: #7A4E00; --amber-soft: #FBEBC8; --red: #9E1F2B; --red-soft: #F8DEE1;
+    --chip: #EEF0F3;
+    --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #12161B; --surface: #1A2028; --ink: #E4E8EC; --muted: #A3ADB8; --faint: #7F8A95; --line: #2E3742;
+      --accent: #7FA7E0; --accent-soft: #1F2D42; --accent-ink: #0E1216;
+      --amber: #F0C46A; --amber-soft: #3A2E14; --red: #F08F98; --red-soft: #3D1E23;
+      --chip: #232A34;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #12161B; --surface: #1A2028; --ink: #E4E8EC; --muted: #A3ADB8; --faint: #7F8A95; --line: #2E3742;
+    --accent: #7FA7E0; --accent-soft: #1F2D42; --accent-ink: #0E1216;
+    --amber: #F0C46A; --amber-soft: #3A2E14; --red: #F08F98; --red-soft: #3D1E23;
+    --chip: #232A34;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body { background: var(--ground); color: var(--ink); font: 15px/1.45 var(--font); overflow-x: hidden; }
+  button { font: inherit; color: inherit; }
+  a { color: var(--ink); }
+  .wrap { max-width: 1280px; margin: 0 auto; padding: 0 16px; }
+
+  header.top { background: var(--surface); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 20; }
+  .top-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; padding: 12px 0 8px; }
+  .top-row h1 { margin: 0; font-size: 20px; font-weight: 650; letter-spacing: -0.01em; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-left: auto; }
+  .search { min-height: 40px; width: 300px; max-width: 100%; padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--ground); color: var(--ink); font: inherit; }
+  .search:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .btn { min-height: 40px; padding: 6px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); cursor: pointer; }
+  .btn:hover { border-color: var(--muted); }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .seg button { min-height: 40px; padding: 6px 14px; border: 0; background: var(--surface); cursor: pointer; }
+  .seg button + button { border-left: 1px solid var(--line); }
+  .seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); }
+  .active-title { margin: 0; padding: 0 0 4px; font-size: 17px; font-weight: 600; }
+  .finding { margin: 0; padding: 0 0 10px; color: var(--muted); font-size: 14px; }
+  .drawer-btn { display: none; }
+
+  .layout { display: grid; grid-template-columns: 270px minmax(0, 1fr); gap: 20px; padding-top: 16px; }
+  :root { --header-h: 122px; }
+  .rail { align-self: start; position: sticky; top: calc(var(--header-h) + 16px); max-height: calc(100vh - var(--header-h) - 32px); overflow-y: auto; padding-bottom: 24px; }
+  .rail-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+  .rail-head strong { font-size: 14px; }
+  .facet { border-top: 1px solid var(--line); padding: 6px 0; }
+  .facet summary { cursor: pointer; padding: 8px 0; font-weight: 600; font-size: 14px; list-style-position: inside; }
+  .facet summary .sub { font-weight: 400; color: var(--muted); }
+  .facet ul { list-style: none; margin: 0; padding: 0; }
+  .fv { display: flex; width: 100%; justify-content: space-between; gap: 8px; align-items: center; min-height: 32px; padding: 4px 8px; border: 0; border-radius: 6px; background: transparent; cursor: pointer; text-align: left; font-size: 14px; }
+  .fv:hover { background: var(--chip); }
+  .fv .n { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .fv[aria-pressed="true"] { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); font-weight: 600; }
+  .fv.zero { opacity: 0.45; }
+  .fv .name { overflow-wrap: anywhere; }
+  .fv.special .name { font-style: italic; }
+  .link-btn { border: 0; background: none; color: var(--muted); text-decoration: underline; cursor: pointer; padding: 6px 8px; min-height: 32px; font-size: 13px; }
+  .active-chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 4px 0 8px; }
+  .achip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 4px 2px 10px; border-radius: 999px; background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent); font-size: 13px; }
+  .achip button { border: 0; background: none; cursor: pointer; min-width: 32px; min-height: 32px; font-size: 16px; line-height: 1; }
+
+  main { min-width: 0; padding-bottom: 32px; }
+  .cards { display: grid; gap: 12px; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 0 16px; }
+  .card.has-thumb { grid-template-columns: 168px minmax(0, 1fr); }
+  .thumb { grid-row: 1 / span 6; align-self: start; width: 168px; aspect-ratio: 16 / 9; border-radius: 6px; overflow: hidden; background: var(--chip); display: block; }
+  .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .thumb.failed { display: none; }
+  .card h3 { margin: 0 0 4px; font-size: 16px; line-height: 1.35; overflow-wrap: anywhere; }
+  .meta .chan { border: 0; background: none; padding: 0; color: var(--accent); cursor: pointer; font-size: 13px; text-decoration: none; }
+  .meta .chan:hover { text-decoration: underline; }
+  .syn a { text-decoration: none; color: var(--ink); border-bottom: 1px solid var(--line); }
+  .syn a:hover { border-bottom-color: var(--accent); color: var(--accent); }
+  .syn .t { color: var(--faint); font-size: 12px; font-variant-numeric: tabular-nums; margin-left: 4px; }
+  table.toc { width: 100%; border-collapse: collapse; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; font-size: 14px; }
+  .toc th, .toc td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  .toc th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.03em; position: sticky; top: var(--header-h); background: var(--surface); z-index: 1; }
+  .toc td.d, .toc td.dur { white-space: nowrap; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .toc td.ch { white-space: nowrap; max-width: 160px; overflow: hidden; text-overflow: ellipsis; }
+  .toc td.ttl { overflow-wrap: anywhere; }
+  .toc td.ttl a { text-decoration: none; }
+  .toc td.ttl a:hover { text-decoration: underline; }
+  .toc tr:hover td { background: var(--chip); }
+  .card h3 a { text-decoration: none; }
+  .card h3 a:hover { text-decoration: underline; }
+  .meta { display: flex; flex-wrap: wrap; gap: 4px 10px; color: var(--muted); font-size: 13px; align-items: center; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; background: var(--chip); color: var(--muted); }
+  .badge.q-complete { background: var(--chip); color: var(--muted); }
+  .badge.q-partial, .badge.q-truncated { background: var(--amber-soft); color: var(--amber); }
+  .badge.q-severe { background: var(--red-soft); color: var(--red); }
+  .badge.q-skipped, .badge.q-unknown, .badge.q-none { background: transparent; color: var(--faint); box-shadow: inset 0 0 0 1px var(--line); }
+  .aliases { margin: 6px 0 0; font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+  .syn { margin: 8px 0 0; padding-left: 18px; font-size: 14px; }
+  .syn li { overflow-wrap: anywhere; }
+  .syn .hidden { display: none; }
+  .row-actions { margin-top: 2px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  .chip { min-height: 28px; padding: 3px 9px; border-radius: 6px; border: 0; background: var(--chip); color: var(--muted); font-size: 12.5px; cursor: pointer; text-align: left; overflow-wrap: anywhere; max-width: 100%; }
+  .chip:hover { box-shadow: inset 0 0 0 1px var(--muted); }
+  .chip[aria-pressed="true"] { background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent); }
+  .seen { margin-top: 8px; font-size: 13px; color: var(--muted); }
+  .more { display: flex; justify-content: center; padding: 16px 0; }
+  .empty { padding: 40px 16px; text-align: center; color: var(--muted); background: var(--surface); border: 1px dashed var(--line); border-radius: 10px; }
+
+  .grid-note { margin: 0 0 8px; color: var(--muted); font-size: 14px; }
+  .readout { min-height: 22px; margin: 0 0 8px; font-size: 14px; font-weight: 600; }
+  .matrix-wrap { overflow: auto; max-height: calc(100vh - 220px); border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+  table.matrix { border-collapse: separate; border-spacing: 0; font-size: 12px; font-variant-numeric: tabular-nums; }
+  .matrix th, .matrix td { padding: 0; text-align: center; height: 26px; min-width: 28px; border-right: 1px solid var(--surface); border-bottom: 1px solid var(--surface); }
+  .matrix thead th { position: sticky; top: 0; background: var(--surface); color: var(--muted); font-weight: 600; z-index: 2; }
+  .matrix thead tr:nth-child(2) th { top: 26px; }
+  .matrix th.ch { position: sticky; left: 0; z-index: 1; background: var(--surface); text-align: left; padding: 0 8px; white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis; font-weight: 500; color: var(--ink); border-right: 1px solid var(--line); }
+  .matrix thead th.ch { z-index: 3; }
+  .matrix td.tot, .matrix th.tot { color: var(--muted); padding: 0 6px; font-weight: 600; background: var(--surface); }
+  .matrix tfoot td { position: sticky; bottom: 0; background: var(--surface); border-top: 1px solid var(--line); color: var(--muted); font-weight: 600; }
+  .matrix tfoot th.ch { bottom: 0; z-index: 3; position: sticky; border-top: 1px solid var(--line); }
+  .matrix td.c { cursor: pointer; }
+  .matrix td.c:hover, .matrix td.c:focus { outline: 2px solid var(--ink); outline-offset: -2px; }
+  .matrix td.s0 { background: var(--ground); cursor: default; }
+  .matrix td.s1 { background: color-mix(in srgb, var(--accent) 18%, var(--surface)); }
+  .matrix td.s2 { background: color-mix(in srgb, var(--accent) 36%, var(--surface)); }
+  .matrix td.s3 { background: color-mix(in srgb, var(--accent) 55%, var(--surface)); }
+  .matrix td.s4 { background: color-mix(in srgb, var(--accent) 75%, var(--surface)); }
+  .matrix td.s5 { background: var(--accent); }
+  .yr-start { border-left: 1px solid var(--line) !important; }
+
+  footer { border-top: 1px solid var(--line); padding: 16px 0 32px; color: var(--muted); font-size: 13px; }
+  footer p { margin: 2px 0; }
+  .backdrop { display: none; }
+  .fatal { margin: 40px auto; max-width: 640px; padding: 20px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; }
+
+  @media (max-width: 760px) {
+    .top-row h1 { font-size: 18px; }
+    .controls { margin-left: 0; width: 100%; }
+    .search { flex: 1 1 100%; width: auto; }
+    .drawer-btn { display: inline-block; }
+    .layout { grid-template-columns: minmax(0, 1fr); }
+    .rail { position: fixed; top: 0; left: 0; bottom: 0; width: min(86vw, 340px); max-height: none; z-index: 40; background: var(--surface); padding: 16px; transform: translateX(-105%); transition: transform 0.18s ease; border-right: 1px solid var(--line); }
+    .rail.open { transform: none; }
+    .backdrop.open { display: block; position: fixed; inset: 0; background: rgba(0, 0, 0, 0.4); z-index: 30; }
+    .fv, .link-btn, .chip { min-height: 40px; }
+    .card.has-thumb { grid-template-columns: 112px minmax(0, 1fr); gap: 0 12px; }
+    .thumb { width: 112px; grid-row: 1 / span 2; }
+    .card.has-thumb > :not(.thumb):not(h3):not(.meta) { grid-column: 1 / -1; }
+    .toc th:nth-child(2), .toc td.ch, .toc th:nth-child(4), .toc td.dur { display: none; }
+    header.top { position: static; }
+    .achip button { min-width: 40px; min-height: 40px; }
+    .matrix th, .matrix td { min-width: 40px; height: 40px; }
+    .matrix thead tr:nth-child(2) th { top: 40px; }
+    .matrix th.ch { max-width: 130px; }
+    .active-title { font-size: 16px; }
+  }
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="wrap">
+    <div class="top-row">
+      <h1>Corpus catalog</h1>
+      <div class="controls">
+        <input id="q" class="search" type="search" placeholder="Search titles, headings, concepts, channels" aria-label="Search the catalog" autocomplete="off">
+        <button id="drawer-btn" class="btn drawer-btn" type="button" aria-controls="rail" aria-expanded="false">Filters</button>
+        <div class="seg" role="group" aria-label="View">
+          <button id="view-list" type="button" aria-pressed="true">Cards</button>
+          <button id="view-compact" type="button" aria-pressed="false">Compact</button>
+          <button id="view-grid" type="button" aria-pressed="false">Grid</button>
+        </div>
+        <button id="thumb-btn" class="btn" type="button" aria-pressed="true">Thumbnails</button>
+        <button id="theme-btn" class="btn" type="button">Dark theme</button>
+      </div>
+    </div>
+    <p id="active-title" class="active-title" aria-live="polite"></p>
+    <p id="finding" class="finding"></p>
+  </div>
+</header>
+
+<div class="wrap layout">
+  <aside id="rail" class="rail" aria-label="Filters">
+    <div class="rail-head">
+      <strong>Filters</strong>
+      <button id="clear-all" class="link-btn" type="button">Clear all</button>
+    </div>
+    <div id="facets"></div>
+  </aside>
+  <div id="backdrop" class="backdrop"></div>
+  <main id="main">
+    <section id="list-view">
+      <div id="cards" class="cards"></div>
+      <div class="more"><button id="more-btn" class="btn" type="button">Show more</button></div>
+    </section>
+    <section id="compact-view" hidden>
+      <table id="toc" class="toc"></table>
+      <div class="more"><button id="more-toc-btn" class="btn" type="button">Show more</button></div>
+    </section>
+    <section id="grid-view" hidden>
+      <p id="grid-note" class="grid-note"></p>
+      <p id="readout" class="readout" aria-live="polite"></p>
+      <div class="matrix-wrap"><table id="matrix" class="matrix"></table></div>
+    </section>
+  </main>
+</div>
+
+<footer>
+  <div class="wrap">
+    <p id="foot-meta"></p>
+    <p>Private. Complete by design. Titles and headings are untrusted text, escaped on render. Thumbnails are the one thing fetched from the network (YouTube's image host, no referrer); turn them off with the button above.</p>
+  </div>
+</footer>
+
+<script type="application/json" id="atlas-data">__ATLAS_DATA__</script>
+<script>
+(function () {
+  "use strict";
+
+  // ---------- theme ----------
+  var THEME_KEY = "atlas-catalog-theme";
+  var themeBtn = document.getElementById("theme-btn");
+
+  function currentTheme() {
+    return document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark";
+  }
+  function paintThemeButton() {
+    themeBtn.textContent = currentTheme() === "dark" ? "Light theme" : "Dark theme";
+  }
+  themeBtn.addEventListener("click", function () {
+    var next = currentTheme() === "dark" ? "light" : "dark";
+    document.documentElement.setAttribute("data-theme", next);
+    try { localStorage.setItem(THEME_KEY, next); } catch (e) {}
+    paintThemeButton();
+  });
+  paintThemeButton();
+
+  var THUMB_KEY = "atlas-catalog-thumbs";
+  var THUMB_HOST = "https://i.ytimg.com/vi/";
+  var thumbs = true;
+  try { thumbs = localStorage.getItem(THUMB_KEY) !== "off"; } catch (e) {}
+  var thumbBtn = document.getElementById("thumb-btn");
+  function paintThumbButton() { thumbBtn.setAttribute("aria-pressed", thumbs ? "true" : "false"); thumbBtn.textContent = thumbs ? "Thumbnails on" : "Thumbnails off"; }
+  thumbBtn.addEventListener("click", function () {
+    thumbs = !thumbs;
+    try { localStorage.setItem(THUMB_KEY, thumbs ? "on" : "off"); } catch (e) {}
+    paintThumbButton();
+    render();
+  });
+  paintThumbButton();
+
+  var headerEl = document.querySelector("header.top");
+  function syncHeaderHeight() { document.documentElement.style.setProperty("--header-h", Math.ceil(headerEl.getBoundingClientRect().height) + "px"); }
+  if (window.ResizeObserver) new ResizeObserver(syncHeaderHeight).observe(headerEl);
+  window.addEventListener("resize", syncHeaderHeight);
+  syncHeaderHeight();
+
+  // ---------- helpers ----------
+  // Every corpus value goes through textContent or setAttribute; nothing from the data
+  // ever reaches innerHTML.
+  function el(tag, attrs, text) {
+    var e = document.createElement(tag);
+    if (attrs) {
+      for (var k in attrs) {
+        if (attrs[k] !== null && attrs[k] !== undefined && attrs[k] !== false) e.setAttribute(k, attrs[k]);
+      }
+    }
+    if (text !== null && text !== undefined) e.textContent = String(text);
+    return e;
+  }
+  function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+  function fmt(n) { return Number(n).toLocaleString("en-US"); }
+  function pct(a, b) { return b ? Math.round((100 * a) / b) + "%" : "0%"; }
+  function safeUrl(u) { return typeof u === "string" && /^https:\/\//i.test(u) ? u : null; }
+  // The thumbnail id comes from the stored watch URL itself, never from the row's id alone.
+  function thumbUrl(r) {
+    var u = safeUrl(r.url);
+    if (!u) return null;
+    var m = u.match(/^https:\/\/(?:www\.|m\.)?youtube\.com\/watch\?(?:[^#]*&)?v=([A-Za-z0-9_-]{11})(?:[&#]|$)/) || u.match(/^https:\/\/youtu\.be\/([A-Za-z0-9_-]{11})(?:[?#]|$)/);
+    return m ? THUMB_HOST + m[1] + "/mqdefault.jpg" : null;
+  }
+  function fmtDur(s) {
+    if (s === null || s === undefined || s < 0) return "";
+    s = Math.floor(s);
+    var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+    var ss = (sec < 10 ? "0" : "") + sec;
+    if (h > 0) return h + ":" + (m < 10 ? "0" : "") + m + ":" + ss;
+    return m + ":" + ss;
+  }
+  function tokens(s) {
+    return String(s || "").toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  }
+  var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  function monthLabel(ym) {
+    if (!ym) return "No date";
+    return MONTHS[parseInt(ym.slice(5, 7), 10) - 1] + " " + ym.slice(0, 4);
+  }
+  function showFatal(msg) {
+    var main = document.getElementById("main");
+    clear(main);
+    main.appendChild(el("div", { class: "fatal" }, msg));
+  }
+
+  // ---------- load ----------
+  var raw = document.getElementById("atlas-data").textContent.trim();
+  if (!raw || raw === "__ATLAS_" + "DATA__") { showFatal("No catalog data is embedded. Build this page with render_catalog.py."); return; }
+  var atlas;
+  try { atlas = JSON.parse(raw); } catch (e) { showFatal("The embedded catalog data could not be parsed."); return; }
+
+  var rows = Array.isArray(atlas.rows) ? atlas.rows : [];
+  var N = rows.length;
+  var conceptLabels = atlas.concepts || {};
+  var summary = atlas.summary || {};
+  var PAGE = 50, TOC_PAGE = 200;
+  var QUALITY = ["complete", "partial", "truncated", "severe", "skipped", "unknown", "none"];
+  var UNTHREADED = "_unthreaded";
+
+  // ---------- facet dimensions, built once ----------
+  // kind: "one" = single value per row; "any" = multi-valued, OR within the facet;
+  // "all" = multi-valued, every selected value required (concept chips narrow).
+  function makeDim(key, label, kind, display) {
+    return { key: key, label: label, kind: kind, display: display || function (v) { return v; }, values: [], index: new Map(), codes: kind === "one" ? new Int32Array(N) : new Array(N), sel: new Set(), expanded: false, open: true };
+  }
+  function codeOf(dim, v) {
+    var c = dim.index.get(v);
+    if (c === undefined) { c = dim.values.length; dim.values.push(v); dim.index.set(v, c); }
+    return c;
+  }
+  function yesNo(v) { return v === "yes" ? "Yes" : "No"; }
+
+  var D = {
+    channel: makeDim("ch", "Channel", "one"),
+    topic: makeDim("tp", "Topic", "any", function (v) { return v === UNTHREADED ? "Unthreaded" : v; }),
+    year: makeDim("yr", "Year", "one", function (v) { return v || "No date"; }),
+    month: makeDim("mo", "Month", "one", monthLabel),
+    quality: makeDim("ql", "Transcript quality", "one"),
+    briefing: makeDim("br", "Already in a briefing", "one", yesNo),
+    wiki: makeDim("wk", "Has wiki page", "one", yesNo),
+    concept: makeDim("cn", "Concept", "all", function (v) { return conceptLabels[v] || v; })
+  };
+  var DIMS = [D.channel, D.topic, D.year, D.month, D.quality, D.briefing, D.wiki, D.concept];
+  var RAIL_DIMS = [D.channel, D.topic, D.year, D.month, D.quality, D.briefing, D.wiki];
+
+  QUALITY.forEach(function (q) { codeOf(D.quality, q); });
+  ["yes", "no"].forEach(function (v) { codeOf(D.briefing, v); codeOf(D.wiki, v); });
+  Object.keys(summary.topics || {}).sort().forEach(function (t) { codeOf(D.topic, t); });
+  var unthreadedCode = codeOf(D.topic, UNTHREADED);
+
+  var titleText = new Array(N), otherText = new Array(N), titleLower = new Array(N);
+  for (var i = 0; i < N; i++) {
+    var r = rows[i];
+    var pub = r.published || "";
+    D.channel.codes[i] = codeOf(D.channel, r.channel || "");
+    D.year.codes[i] = codeOf(D.year, pub.slice(0, 4));
+    D.month.codes[i] = codeOf(D.month, pub.slice(0, 7));
+    D.quality.codes[i] = codeOf(D.quality, r.transcript_quality || "unknown");
+    D.briefing.codes[i] = codeOf(D.briefing, r.in_briefings ? "yes" : "no");
+    var w = r.wiki || {};
+    D.wiki.codes[i] = codeOf(D.wiki, w.creator || (w.concepts && w.concepts.length) ? "yes" : "no");
+    var tps = r.topics || [];
+    D.topic.codes[i] = tps.length ? tps.map(function (t) { return codeOf(D.topic, t); }) : [unthreadedCode];
+    var seen = new Set(), cc = [];
+    (r.concept_ids || []).forEach(function (id) { var c = codeOf(D.concept, id); if (!seen.has(c)) { seen.add(c); cc.push(c); } });
+    D.concept.codes[i] = cc;
+
+    // Search haystacks: " tok tok " so a prefix match is indexOf(" " + queryToken).
+    var t = [r.title].concat(r.aliases || []).join(" ");
+    titleLower[i] = String(r.title || "").toLowerCase();
+    titleText[i] = " " + tokens(t).join(" ") + " ";
+    var other = [r.channel].concat(r.synopsis || [], (r.concept_ids || []).map(function (id) { return conceptLabels[id] || id; }));
+    otherText[i] = " " + tokens(other.join(" ")).join(" ") + " ";
+  }
+
+  // ---------- state ----------
+  var state = { q: "", view: "list", n: PAGE, allMonths: false };
+  var GRID_MONTHS = 24;
+
+  function serialize() {
+    var p = new URLSearchParams();
+    if (state.q) p.set("q", state.q);
+    DIMS.forEach(function (d) {
+      Array.from(d.sel).sort(function (a, b) { return a - b; }).forEach(function (c) { p.append(d.key, d.values[c]); });
+    });
+    if (state.view !== "list") p.set("v", state.view);
+    if (state.allMonths) p.set("gm", "all");
+    if (state.n !== (state.view === "compact" ? TOC_PAGE : PAGE)) p.set("n", String(state.n));
+    return p.toString();
+  }
+  function parse(hash) {
+    var p = new URLSearchParams(hash.replace(/^#/, ""));
+    state.q = p.get("q") || "";
+    state.view = p.get("v") === "grid" ? "grid" : p.get("v") === "compact" ? "compact" : "list";
+    state.allMonths = p.get("gm") === "all";
+    var step = state.view === "compact" ? TOC_PAGE : PAGE;
+    var n = parseInt(p.get("n") || "", 10);
+    state.n = n > 0 ? Math.max(step, Math.ceil(n / step) * step) : step;
+    DIMS.forEach(function (d) {
+      d.sel.clear();
+      p.getAll(d.key).forEach(function (v) { var c = d.index.get(v); if (c !== undefined) d.sel.add(c); });
+    });
+  }
+  function writeHash(push) {
+    var h = "#" + serialize();
+    if (h === location.hash || (h === "#" && !location.hash)) return;
+    try {
+      if (push) history.pushState(null, "", h); else history.replaceState(null, "", h);
+    } catch (e) {
+      location.hash = h;
+    }
+  }
+  function commit(push) { writeHash(push); render(); }
+
+  // ---------- filtering ----------
+  function searchScores(q) {
+    var qt = tokens(q);
+    if (!qt.length) return null;
+    var phrase = q.trim().toLowerCase();
+    var scores = new Float64Array(N);
+    for (var i = 0; i < N; i++) {
+      var s = 0, ok = true;
+      for (var k = 0; k < qt.length; k++) {
+        var needle = " " + qt[k];
+        if (titleText[i].indexOf(needle) >= 0) s += 10;
+        else if (otherText[i].indexOf(needle) >= 0) s += 1;
+        else { ok = false; break; }
+      }
+      if (ok) scores[i] = s + (qt.length > 1 && titleLower[i].indexOf(phrase) >= 0 ? 5 : 0);
+    }
+    return scores;
+  }
+  function passes(d, i) {
+    if (!d.sel.size) return true;
+    if (d.kind === "one") return d.sel.has(d.codes[i]);
+    var rc = d.codes[i], hit = 0;
+    for (var k = 0; k < rc.length; k++) {
+      if (d.sel.has(rc[k])) { if (d.kind === "any") return true; hit++; }
+    }
+    return d.kind === "all" && hit === d.sel.size;
+  }
+  function addCounts(d, counts, i) {
+    if (d.kind === "one") { counts[d.codes[i]]++; return; }
+    var rc = d.codes[i];
+    for (var k = 0; k < rc.length; k++) counts[rc[k]]++;
+  }
+
+  // Cross-filter counts: a facet's counts use every filter except its own, so a row that
+  // fails exactly one facet still counts toward that facet's values.
+  function compute() {
+    var scores = state.q ? searchScores(state.q) : null;
+    var counts = DIMS.map(function (d) { return new Int32Array(d.values.length); });
+    var matched = [];
+    for (var i = 0; i < N; i++) {
+      if (scores && scores[i] === 0) continue;
+      var fails = 0, failDim = -1;
+      for (var d = 0; d < DIMS.length && fails < 2; d++) {
+        if (!passes(DIMS[d], i)) { fails++; failDim = d; }
+      }
+      if (fails === 0) {
+        matched.push(i);
+        for (var e = 0; e < DIMS.length; e++) addCounts(DIMS[e], counts[e], i);
+      } else if (fails === 1) {
+        addCounts(DIMS[failDim], counts[failDim], i);
+      }
+    }
+    matched.sort(function (a, b) {
+      if (scores) { var ds = scores[b] - scores[a]; if (ds) return ds; }
+      var pa = rows[a].published || "", pb = rows[b].published || "";
+      if (pa !== pb) { if (!pa) return 1; if (!pb) return -1; return pa < pb ? 1 : -1; }
+      return rows[a].video_id < rows[b].video_id ? -1 : 1;
+    });
+    return { matched: matched, counts: counts };
+  }
+
+  // ---------- header ----------
+  function selLabels(d) {
+    return Array.from(d.sel).map(function (c) { return d.display(d.values[c]); });
+  }
+  function joinOr(list, singular, plural) {
+    if (!list.length) return null;
+    if (list.length > 3) return list.length + " " + plural;
+    return singular + " " + list.join(" or ");
+  }
+  function renderTitle(res) {
+    var parts = [];
+    if (state.q) parts.push("matching “" + state.q.trim() + "”");
+    var y = selLabels(D.year); if (y.length) parts.push(y.join(" or "));
+    var m = selLabels(D.month); if (m.length) parts.push(m.length > 3 ? m.length + " months" : m.join(" or "));
+    [[D.channel, "channel", "channels"], [D.topic, "topic", "topics"], [D.quality, "quality", "quality states"]].forEach(function (x) {
+      var s = joinOr(selLabels(x[0]), x[1], x[2]); if (s) parts.push(s);
+    });
+    if (D.briefing.sel.size === 1) parts.push(D.briefing.sel.has(D.briefing.index.get("yes")) ? "already in a briefing" : "not yet in a briefing");
+    if (D.wiki.sel.size === 1) parts.push(D.wiki.sel.has(D.wiki.index.get("yes")) ? "with a wiki page" : "without a wiki page");
+    var c = selLabels(D.concept); if (c.length) parts.push((c.length > 1 ? "concepts " : "concept ") + c.join(" and "));
+    var n = res.matched.length;
+    var title = fmt(n) + " of " + fmt(N) + " videos" + (parts.length ? ", " + parts.join(", ") : "");
+    document.getElementById("active-title").textContent = title;
+    document.title = "Corpus catalog: " + fmt(n) + " of " + fmt(N);
+
+    var inBrief = 0, unthreaded = 0, issues = 0;
+    res.matched.forEach(function (i) {
+      var r = rows[i];
+      if (r.in_briefings) inBrief++;
+      if (!r.topics || !r.topics.length) unthreaded++;
+      var q = r.transcript_quality;
+      if (q === "partial" || q === "truncated" || q === "severe") issues++;
+    });
+    document.getElementById("finding").textContent = n
+      ? fmt(inBrief) + " of " + fmt(n) + " (" + pct(inBrief, n) + ") already in a briefing; " + fmt(unthreaded) + " of " + fmt(n) + " (" + pct(unthreaded, n) + ") in no topic; " + fmt(issues) + " of " + fmt(n) + " with a partial, truncated or severe transcript."
+      : (tokens(state.q).length > 1 ? "Nothing matches. Every search word must match, so try fewer words, or remove a filter." : "Nothing matches. Remove a filter or change the search.");
+  }
+
+  // ---------- rail ----------
+  var TOP = { ch: 15, tp: 15, mo: 12 };
+  function orderedCodes(d, counts) {
+    var codes = d.values.map(function (_, c) { return c; });
+    if (d === D.year || d === D.month) {
+      codes.sort(function (a, b) { var va = d.values[a], vb = d.values[b]; if (!va) return 1; if (!vb) return -1; return va < vb ? 1 : -1; });
+    } else if (d === D.channel || d === D.topic) {
+      codes.sort(function (a, b) {
+        if (d === D.topic) { if (a === unthreadedCode) return 1; if (b === unthreadedCode) return -1; }
+        return counts[b] - counts[a] || (d.values[a] < d.values[b] ? -1 : 1);
+      });
+    }
+    return codes;
+  }
+  function renderRail(res) {
+    var host = document.getElementById("facets");
+    clear(host);
+    if (D.concept.sel.size) {
+      var sec = el("div", { class: "facet" });
+      sec.appendChild(el("div", { class: "rail-head" })).appendChild(el("strong", null, "Concepts (all required)"));
+      var chips = sec.appendChild(el("div", { class: "active-chips" }));
+      D.concept.sel.forEach(function (c) {
+        var chip = chips.appendChild(el("span", { class: "achip" }, D.concept.display(D.concept.values[c])));
+        chip.appendChild(el("button", { type: "button", "data-remove-cn": c, "aria-label": "Remove concept filter " + D.concept.display(D.concept.values[c]) }, "×"));
+      });
+      host.appendChild(sec);
+    }
+    RAIL_DIMS.forEach(function (d) {
+      var counts = res.counts[DIMS.indexOf(d)];
+      var codes = orderedCodes(d, counts);
+      var nonZero = 0;
+      codes.forEach(function (c) { if (counts[c] > 0) nonZero++; });
+      var det = el("details", { class: "facet", "data-dim": d.key, open: d.open ? "" : null });
+      var sum = det.appendChild(el("summary", null, d.label + " "));
+      var sub = fmt(nonZero) + " of " + fmt(codes.length) + " with matches";
+      if (d.sel.size) sub += ", " + d.sel.size + " selected";
+      sum.appendChild(el("span", { class: "sub" }, sub));
+      var limit = TOP[d.key];
+      var ul = det.appendChild(el("ul"));
+      var shown = 0;
+      codes.forEach(function (c, idx) {
+        if (limit && !d.expanded && idx >= limit && !d.sel.has(c)) return;
+        shown++;
+        var cls = "fv" + (counts[c] === 0 && !d.sel.has(c) ? " zero" : "") + (d === D.topic && c === unthreadedCode ? " special" : "");
+        var b = el("button", { type: "button", class: cls, "data-dim": d.key, "data-code": c, "aria-pressed": d.sel.has(c) ? "true" : "false" });
+        b.appendChild(el("span", { class: "name" }, d.display(d.values[c])));
+        b.appendChild(el("span", { class: "n" }, fmt(counts[c])));
+        ul.appendChild(el("li")).appendChild(b);
+      });
+      if (limit && codes.length > limit) {
+        det.appendChild(el("button", { type: "button", class: "link-btn", "data-expand": d.key }, d.expanded ? "Show top " + limit : "Show all " + fmt(codes.length)));
+      }
+      host.appendChild(det);
+    });
+    var active = DIMS.reduce(function (a, d) { return a + d.sel.size; }, 0);
+    document.getElementById("drawer-btn").textContent = active ? "Filters (" + active + ")" : "Filters";
+  }
+  function dimByKey(k) { for (var i = 0; i < DIMS.length; i++) if (DIMS[i].key === k) return DIMS[i]; return null; }
+
+  // ---------- list ----------
+  // "complete" is the normal state and stays silent; only the exceptions get a badge.
+  function qualityBadge(q) { return q === "complete" ? null : el("span", { class: "badge q-" + q, title: "Transcript quality" }, q); }
+  function appendBadge(host, q) { var b = qualityBadge(q); if (b) host.appendChild(b); }
+  function renderCard(i) {
+    var r = rows[i];
+    var card = el("article", { class: "card" });
+    var u = safeUrl(r.url);
+    var tu = thumbs ? thumbUrl(r) : null;
+    if (tu) {
+      card.classList.add("has-thumb");
+      var th = card.appendChild(el(u ? "a" : "div", { class: "thumb", href: u, target: u ? "_blank" : null, rel: u ? "noopener noreferrer" : null, tabindex: u ? "-1" : null, "aria-hidden": "true" }));
+      var img = th.appendChild(el("img", { src: tu, alt: "", loading: "lazy", decoding: "async", referrerpolicy: "no-referrer", width: "320", height: "180" }));
+      img.addEventListener("error", function () { th.classList.add("failed"); card.classList.remove("has-thumb"); });
+    }
+    var h = card.appendChild(el("h3"));
+    if (u) h.appendChild(el("a", { href: u, target: "_blank", rel: "noopener noreferrer" }, r.title || r.video_id));
+    else h.textContent = r.title || r.video_id;
+
+    var meta = card.appendChild(el("div", { class: "meta" }));
+    meta.appendChild(el("button", { type: "button", class: "chan", "data-ch": D.channel.codes[i], title: "Only this channel" }, r.channel));
+    meta.appendChild(el("span", null, r.published || "no date"));
+    var dur = fmtDur(r.duration_seconds);
+    if (dur) meta.appendChild(el("span", null, dur));
+    appendBadge(meta, r.transcript_quality || "unknown");
+
+    if (r.aliases && r.aliases.length) card.appendChild(el("p", { class: "aliases" }, "also titled: " + r.aliases.join("; ")));
+
+    // Headings double as the deep links: a heading that has a timestamp in the mindmap
+    // is rendered as the link itself, so there is no second row repeating the same text.
+    var syn = r.synopsis || [];
+    var byLabel = new Map();
+    (r.deep_links || []).forEach(function (dl) { if (safeUrl(dl.url) && !byLabel.has(dl.label)) byLabel.set(dl.label, dl); });
+    if (syn.length) {
+      var ol = card.appendChild(el("ul", { class: "syn" }));
+      syn.forEach(function (sTxt, k) {
+        var li = ol.appendChild(el("li", k >= 3 ? { class: "hidden" } : null));
+        var dl = byLabel.get(sTxt);
+        if (dl) {
+          li.appendChild(el("a", { href: dl.url, target: "_blank", rel: "noopener noreferrer", title: "Open at " + fmtDur(dl.seconds) }, sTxt));
+          li.appendChild(el("span", { class: "t" }, fmtDur(dl.seconds)));
+        } else {
+          li.textContent = sTxt;
+        }
+      });
+      if (syn.length > 3) {
+        card.appendChild(el("div", { class: "row-actions" })).appendChild(el("button", { type: "button", class: "link-btn", "data-syn": "1", "aria-expanded": "false" }, "more (" + (syn.length - 3) + ")"));
+      }
+    }
+
+    var cc = D.concept.codes[i];
+    if (cc.length) {
+      var chips = card.appendChild(el("div", { class: "chips", "data-row": i }));
+      fillChips(chips, cc, false);
+    }
+
+    var seen = [];
+    if (r.briefing_count > 0) seen.push("in " + r.briefing_count + (r.briefing_count === 1 ? " briefing" : " briefings"));
+    var w = r.wiki || {};
+    if (w.creator) seen.push("creator dossier");
+    if (w.concepts && w.concepts.length) seen.push(w.concepts.length + (w.concepts.length === 1 ? " concept page" : " concept pages"));
+    if (seen.length) card.appendChild(el("div", { class: "seen" }, "Already seen: " + seen.join(", ")));
+    return card;
+  }
+  function fillChips(host, cc, all) {
+    clear(host);
+    var max = all ? cc.length : Math.min(6, cc.length);
+    for (var k = 0; k < max; k++) {
+      var c = cc[k];
+      host.appendChild(el("button", { type: "button", class: "chip", "data-cn": c, "aria-pressed": D.concept.sel.has(c) ? "true" : "false", title: "Filter by this concept" }, D.concept.display(D.concept.values[c])));
+    }
+    if (cc.length > max) host.appendChild(el("button", { type: "button", class: "link-btn", "data-allchips": "1" }, "+" + (cc.length - max)));
+  }
+  function renderList(res) {
+    var host = document.getElementById("cards");
+    clear(host);
+    var m = res.matched;
+    if (!m.length) { host.appendChild(el("div", { class: "empty" }, "No videos match this view.")); }
+    var end = Math.min(state.n, m.length);
+    var frag = document.createDocumentFragment();
+    for (var k = 0; k < end; k++) frag.appendChild(renderCard(m[k]));
+    host.appendChild(frag);
+    var more = document.getElementById("more-btn");
+    more.hidden = end >= m.length;
+    more.textContent = "Show more (" + fmt(end) + " of " + fmt(m.length) + " shown)";
+  }
+
+  // ---------- compact ----------
+  function renderCompact(res) {
+    var table = document.getElementById("toc");
+    clear(table);
+    var m = res.matched;
+    var end = Math.min(state.n, m.length);
+    var thead = table.appendChild(el("thead"));
+    var hr = thead.appendChild(el("tr"));
+    ["Date", "Channel", "Title", "Length", "Transcript"].forEach(function (t) { hr.appendChild(el("th", { scope: "col" }, t)); });
+    var tbody = table.appendChild(el("tbody"));
+    var frag = document.createDocumentFragment();
+    for (var k = 0; k < end; k++) {
+      var r = rows[m[k]];
+      var tr = el("tr");
+      tr.appendChild(el("td", { class: "d" }, r.published || "no date"));
+      tr.appendChild(el("td", { class: "ch", title: r.channel }, r.channel));
+      var td = tr.appendChild(el("td", { class: "ttl" }));
+      var u = safeUrl(r.url);
+      if (u) td.appendChild(el("a", { href: u, target: "_blank", rel: "noopener noreferrer" }, r.title || r.video_id));
+      else td.textContent = r.title || r.video_id;
+      tr.appendChild(el("td", { class: "dur" }, fmtDur(r.duration_seconds)));
+      appendBadge(tr.appendChild(el("td")), r.transcript_quality || "unknown");
+      frag.appendChild(tr);
+    }
+    tbody.appendChild(frag);
+    if (!m.length) tbody.appendChild(el("tr")).appendChild(el("td", { colspan: "5", class: "empty" }, "No videos match this view."));
+    var more = document.getElementById("more-toc-btn");
+    more.hidden = end >= m.length;
+    more.textContent = "Show more (" + fmt(end) + " of " + fmt(m.length) + " shown)";
+  }
+
+  // ---------- grid ----------
+  function monthSeq(lo, hi) {
+    var out = [], y = parseInt(lo.slice(0, 4), 10), mo = parseInt(lo.slice(5, 7), 10);
+    var hy = parseInt(hi.slice(0, 4), 10), hm = parseInt(hi.slice(5, 7), 10);
+    while (y < hy || (y === hy && mo <= hm)) {
+      out.push(y + "-" + (mo < 10 ? "0" : "") + mo);
+      mo++; if (mo > 12) { mo = 1; y++; }
+    }
+    return out;
+  }
+  function renderGrid(res) {
+    var table = document.getElementById("matrix");
+    clear(table);
+    var dated = res.matched.filter(function (i) { return /^\d{4}-\d{2}/.test(rows[i].published || ""); });
+    var undated = res.matched.length - dated.length;
+    var note = document.getElementById("grid-note");
+    document.getElementById("readout").textContent = "";
+    if (!dated.length) { note.textContent = "No dated videos in this view."; return; }
+    var lo = "9999-99", hi = "0000-00";
+    dated.forEach(function (i) { var m = rows[i].published.slice(0, 7); if (m < lo) lo = m; if (m > hi) hi = m; });
+    var allMonths = monthSeq(lo, hi);
+    var months = allMonths;
+    if (!state.allMonths && allMonths.length > GRID_MONTHS) {
+      months = allMonths.slice(allMonths.length - GRID_MONTHS);
+      dated = dated.filter(function (i) { return rows[i].published.slice(0, 7) >= months[0]; });
+    }
+    var col = new Map();
+    months.forEach(function (m, k) { col.set(m, k); });
+    var byCh = new Map();
+    dated.forEach(function (i) {
+      var ch = D.channel.codes[i];
+      var arr = byCh.get(ch);
+      if (!arr) { arr = new Int32Array(months.length); byCh.set(ch, arr); }
+      arr[col.get(rows[i].published.slice(0, 7))]++;
+    });
+    var chans = Array.from(byCh.keys()).map(function (c) {
+      var a = byCh.get(c), t = 0; for (var k = 0; k < a.length; k++) t += a[k];
+      return { code: c, counts: a, total: t };
+    }).sort(function (a, b) { return b.total - a.total || (D.channel.values[a.code] < D.channel.values[b.code] ? -1 : 1); });
+    var max = 0, colTot = new Int32Array(months.length);
+    chans.forEach(function (c) { for (var k = 0; k < months.length; k++) { colTot[k] += c.counts[k]; if (c.counts[k] > max) max = c.counts[k]; } });
+
+    clear(note);
+    note.appendChild(el("span", null, fmt(chans.length) + " channels by " + fmt(months.length) + " months, " + fmt(dated.length) + " of " + fmt(res.matched.length) + " videos in this view" + (undated ? " (" + fmt(undated) + " without a published date are left out)" : "") + ". Darker means more videos; the darkest cell holds " + fmt(max) + ". Select a cell to list those videos. "));
+    if (allMonths.length > GRID_MONTHS) {
+      note.appendChild(el("button", { type: "button", class: "link-btn", id: "months-btn" }, state.allMonths ? "Show the last " + GRID_MONTHS + " months" : "Show all " + fmt(allMonths.length) + " months"));
+    }
+
+    var thead = table.appendChild(el("thead"));
+    var yrRow = thead.appendChild(el("tr"));
+    yrRow.appendChild(el("th", { class: "ch", rowspan: "2", scope: "col" }, "Channel"));
+    var k = 0;
+    while (k < months.length) {
+      var y = months[k].slice(0, 4), span = 0;
+      while (k + span < months.length && months[k + span].slice(0, 4) === y) span++;
+      yrRow.appendChild(el("th", { colspan: String(span), class: "yr-start", scope: "colgroup" }, y));
+      k += span;
+    }
+    yrRow.appendChild(el("th", { class: "tot", rowspan: "2", scope: "col" }, "Total"));
+    var moRow = thead.appendChild(el("tr"));
+    months.forEach(function (m) {
+      moRow.appendChild(el("th", { scope: "col", title: monthLabel(m), class: m.slice(5) === "01" || m === months[0] ? "yr-start" : null }, m.slice(5)));
+    });
+
+    var tbody = table.appendChild(el("tbody"));
+    var frag = document.createDocumentFragment();
+    chans.forEach(function (c) {
+      var tr = el("tr");
+      var name = D.channel.values[c.code];
+      tr.appendChild(el("th", { class: "ch", scope: "row", title: name }, name));
+      for (var j = 0; j < months.length; j++) {
+        var n = c.counts[j];
+        var cls = "c " + (n ? "s" + Math.max(1, Math.ceil(Math.sqrt(n / max) * 5)) : "s0") + (months[j].slice(5) === "01" ? " yr-start" : "");
+        var label = name + ", " + monthLabel(months[j]) + ": " + n + " of " + c.total;
+        var td = el("td", { class: cls, title: label, "aria-label": label, tabindex: n ? "0" : null, "data-ch": c.code, "data-mo": months[j], "data-n": n });
+        tr.appendChild(td);
+      }
+      tr.appendChild(el("td", { class: "tot" }, fmt(c.total)));
+      frag.appendChild(tr);
+    });
+    tbody.appendChild(frag);
+    var tfoot = table.appendChild(el("tfoot"));
+    var fr = tfoot.appendChild(el("tr"));
+    fr.appendChild(el("th", { class: "ch", scope: "row" }, "Total"));
+    for (var j = 0; j < months.length; j++) fr.appendChild(el("td", { title: monthLabel(months[j]) + ": " + colTot[j] + " of " + dated.length }, colTot[j] ? String(colTot[j]) : ""));
+    fr.appendChild(el("td", { class: "tot" }, fmt(dated.length)));
+    var wrapEl = table.parentNode;
+    wrapEl.scrollLeft = wrapEl.scrollWidth;
+  }
+
+  // ---------- render ----------
+  function render() {
+    var res = compute();
+    var q = document.getElementById("q");
+    if (document.activeElement !== q && q.value !== state.q) q.value = state.q;
+    renderTitle(res);
+    renderRail(res);
+    var v = state.view;
+    document.getElementById("view-list").setAttribute("aria-pressed", v === "list" ? "true" : "false");
+    document.getElementById("view-compact").setAttribute("aria-pressed", v === "compact" ? "true" : "false");
+    document.getElementById("view-grid").setAttribute("aria-pressed", v === "grid" ? "true" : "false");
+    document.getElementById("list-view").hidden = v !== "list";
+    document.getElementById("compact-view").hidden = v !== "compact";
+    document.getElementById("grid-view").hidden = v !== "grid";
+    if (v === "grid") renderGrid(res); else if (v === "compact") renderCompact(res); else renderList(res);
+  }
+
+  // ---------- events ----------
+  var debounce = null;
+  document.getElementById("q").addEventListener("input", function (ev) {
+    var v = ev.target.value;
+    clearTimeout(debounce);
+    debounce = setTimeout(function () { state.q = v; state.n = PAGE; commit(false); }, 160);
+  });
+  function setView(v) { if (state.view === v) return; state.view = v; state.n = v === "compact" ? TOC_PAGE : PAGE; commit(true); }
+  document.getElementById("view-list").addEventListener("click", function () { setView("list"); });
+  document.getElementById("view-compact").addEventListener("click", function () { setView("compact"); });
+  document.getElementById("view-grid").addEventListener("click", function () { setView("grid"); });
+  document.getElementById("more-btn").addEventListener("click", function () { state.n += PAGE; writeHash(false); renderList(compute()); });
+  document.getElementById("more-toc-btn").addEventListener("click", function () { state.n += TOC_PAGE; writeHash(false); renderCompact(compute()); });
+  document.getElementById("clear-all").addEventListener("click", function () {
+    DIMS.forEach(function (d) { d.sel.clear(); });
+    state.q = ""; state.n = PAGE; document.getElementById("q").value = "";
+    commit(true);
+  });
+
+  var rail = document.getElementById("rail"), backdrop = document.getElementById("backdrop"), drawerBtn = document.getElementById("drawer-btn");
+  function setDrawer(open) {
+    rail.classList.toggle("open", open);
+    backdrop.classList.toggle("open", open);
+    drawerBtn.setAttribute("aria-expanded", open ? "true" : "false");
+  }
+  drawerBtn.addEventListener("click", function () { setDrawer(!rail.classList.contains("open")); });
+  backdrop.addEventListener("click", function () { setDrawer(false); });
+  document.addEventListener("keydown", function (ev) { if (ev.key === "Escape") setDrawer(false); });
+
+  rail.addEventListener("toggle", function (ev) {
+    var d = dimByKey(ev.target.getAttribute && ev.target.getAttribute("data-dim"));
+    if (d) d.open = ev.target.open;
+  }, true);
+  rail.addEventListener("click", function (ev) {
+    var b = ev.target.closest("button");
+    if (!b) return;
+    if (b.hasAttribute("data-expand")) { var de = dimByKey(b.getAttribute("data-expand")); de.expanded = !de.expanded; render(); return; }
+    if (b.hasAttribute("data-remove-cn")) { D.concept.sel.delete(parseInt(b.getAttribute("data-remove-cn"), 10)); state.n = PAGE; commit(true); return; }
+    var d = dimByKey(b.getAttribute("data-dim"));
+    if (!d) return;
+    var c = parseInt(b.getAttribute("data-code"), 10);
+    if (d.sel.has(c)) d.sel.delete(c); else d.sel.add(c);
+    state.n = PAGE;
+    commit(true);
+  });
+
+  document.getElementById("cards").addEventListener("click", function (ev) {
+    var b = ev.target.closest("button");
+    if (!b) return;
+    if (b.hasAttribute("data-ch")) {
+      D.channel.sel = new Set([parseInt(b.getAttribute("data-ch"), 10)]);
+      state.n = PAGE; commit(true); window.scrollTo(0, 0);
+      return;
+    }
+    if (b.hasAttribute("data-cn")) {
+      var c = parseInt(b.getAttribute("data-cn"), 10);
+      if (!D.concept.sel.has(c)) { D.concept.sel.add(c); state.n = PAGE; commit(true); window.scrollTo(0, 0); }
+      return;
+    }
+    if (b.hasAttribute("data-allchips")) {
+      var host = b.parentNode;
+      fillChips(host, D.concept.codes[parseInt(host.getAttribute("data-row"), 10)], true);
+      return;
+    }
+    if (b.hasAttribute("data-syn")) {
+      var list = b.closest(".card").querySelector(".syn");
+      var open = b.getAttribute("aria-expanded") !== "true";
+      Array.prototype.forEach.call(list.children, function (li, k) { if (k >= 3) li.classList.toggle("hidden", !open); });
+      b.setAttribute("aria-expanded", open ? "true" : "false");
+      b.textContent = open ? "less" : "more (" + (list.children.length - 3) + ")";
+    }
+  });
+
+  var matrix = document.getElementById("matrix");
+  function pickCell(td) {
+    if (!td || !td.classList.contains("c") || td.getAttribute("data-n") === "0") return;
+    var mc = D.month.index.get(td.getAttribute("data-mo"));
+    if (mc === undefined) return;
+    D.channel.sel = new Set([parseInt(td.getAttribute("data-ch"), 10)]);
+    D.month.sel = new Set([mc]);
+    state.view = "list"; state.n = PAGE;
+    commit(true);
+    window.scrollTo(0, 0);
+  }
+  matrix.addEventListener("click", function (ev) { pickCell(ev.target.closest("td")); });
+  document.getElementById("grid-note").addEventListener("click", function (ev) {
+    if (ev.target.id === "months-btn") { state.allMonths = !state.allMonths; commit(true); }
+  });
+  matrix.addEventListener("keydown", function (ev) { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); pickCell(ev.target.closest("td")); } });
+  function readout(ev) {
+    var td = ev.target.closest && ev.target.closest("td.c");
+    if (td) document.getElementById("readout").textContent = td.getAttribute("aria-label");
+  }
+  matrix.addEventListener("mouseover", readout);
+  matrix.addEventListener("focusin", readout);
+
+  function fromLocation() {
+    var before = serialize();
+    parse(location.hash);
+    if (serialize() !== before || !rendered) { rendered = true; render(); }
+  }
+  var rendered = false;
+  window.addEventListener("popstate", fromLocation);
+  window.addEventListener("hashchange", fromLocation);
+
+  var g = atlas.generated_at || "unknown";
+  document.getElementById("foot-meta").textContent = "Generated " + g + " from " + (atlas.generated_from || "unknown") + ", " + fmt(N) + " rows, " + fmt(Object.keys(conceptLabels).length) + " concept labels.";
+
+  fromLocation();
+})();
+</script>
+</body>
+</html>

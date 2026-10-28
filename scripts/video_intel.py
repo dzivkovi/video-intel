@@ -45,6 +45,31 @@ from youtube_captions import (
     fetch_english_captions,
 )
 
+# Reader primitives moved to the stdlib-only corpus_walk module (issue #260)
+# and re-exported here, so every existing caller and test still resolves them
+# from video_intel. One definition each; never re-define one locally.
+from corpus_walk import (  # noqa: F401 - re-exports
+    _HEALTHY_TRANSCRIPT_STATUSES,
+    CONCEPTS_SUFFIX,
+    META_SUFFIX,
+    MINDMAP_SUFFIX,
+    QUALITY_FLAG_BACKWARD_JUMP_SEVERE,
+    QUALITY_FLAG_BLIND_GAP_SEVERE,
+    QUALITY_FLAG_CHUNK_WINDOW_MISMATCH_SEVERE,
+    QUALITY_FLAG_MONOLITHIC_SEVERE,
+    TRANSCRIPT_STATUS_TRUNCATED,
+    TRANSCRIPT_SUFFIX,
+    briefing_video_counts,
+    is_channel_dir,
+    is_skipped_meta,
+    iter_meta_records,
+    load_seen_video_ids,
+    parse_front_matter,
+    read_json_best_effort,
+    transcript_quality_flags_are_severe,
+    usable_video_id,
+)
+from corpus_walk import SEVERE_QUALITY_FLAGS as _SEVERE_QUALITY_FLAGS  # noqa: F401
 from gemini_common import (
     MAX_RETRIES_TRANSPORT,
     build_permissive_safety_settings,
@@ -1236,12 +1261,6 @@ def expand_query_via_taxonomy(
 
 _VALID_MINDMAP_SOURCE_VALUES = {"auto", "video", "transcript", "none"}
 
-# Issue #54 / review C1: transcript writers populate `transcript_status` with
-# different healthy literals depending on path: chunked merge writes "ok"
-# (scripts/video_intel.py:1542), single-call success writes "complete"
-# (:2419), salvage writes "partial" (:2449). Any non-healthy value triggers
-# the partial-source mindmap marker. Keep this set in sync with the writers.
-_HEALTHY_TRANSCRIPT_STATUSES = {"ok", "complete"}
 
 # Issue #60: how the transcript step sources its text.
 _VALID_TRANSCRIPT_SOURCE_VALUES = {"gemini", "yt-captions", "auto"}
@@ -2904,12 +2923,6 @@ CAPTIONS_OVER_DURATION_DEFAULT = None
 #: of headroom, so the threshold is nowhere near the healthy range.
 OUTPUT_CAP_RATIO = 0.98
 
-#: meta.json transcript_status for a transcript salvaged from a response that
-#: hit the output cap. Distinct from the generic "partial" on purpose: a
-#: salvage-from-malformed-JSON and a salvage-from-output-truncation were
-#: indistinguishable in meta.json, so there was no way to sweep the corpus for
-#: the videos that a chunked re-run would actually fix (issue #128).
-TRANSCRIPT_STATUS_TRUNCATED = "truncated_output"
 
 #: Status-string PREFIX `_run_chunked_transcript_url` returns when at least one
 #: chunk was LOST (wall-clock timeout, parse failure, or a confabulation
@@ -4614,28 +4627,6 @@ def record_alt_title_if_rotated(
 SKIP_MODES_VALID = ("mindmap", "transcript", "concepts")
 
 
-def is_skipped_meta(meta: dict, mode: str | None = None) -> bool:
-    """Decide whether a video should be skipped for a given processing mode.
-
-    Resolution order (issue #42):
-      1. If meta has a `skip_modes` list, check membership against `mode`.
-         skip_modes wins outright; legacy `skip` is ignored when both exist.
-      2. Else if `skip == True` (legacy boolean), treat as full-skip
-         (every mode is skipped).
-      3. Else False.
-
-    Passing mode=None preserves the pre-issue-42 "any skip" semantics so
-    existing call sites that do not care about a specific mode (e.g. dry-run
-    listing, dedupe candidates) keep behaving the same.
-    """
-    skip_modes = meta.get("skip_modes")
-    if isinstance(skip_modes, list):
-        if mode is None:
-            return len(skip_modes) > 0
-        return mode in skip_modes
-    return meta.get("skip") is True
-
-
 def is_skipped(output_dir, channel_name, video, mode: str | None = None) -> bool:
     """Disk-backed wrapper: read meta.json then delegate to is_skipped_meta.
 
@@ -4829,9 +4820,6 @@ BACKWARD_JUMP_MILD_SECONDS = 60
 #: ~20 minutes (1200s) mid-call, well past this floor.
 BACKWARD_JUMP_SEVERE_SECONDS = 600
 
-QUALITY_FLAG_MONOLITHIC_SEVERE = "monolithic_severe"
-QUALITY_FLAG_BLIND_GAP_SEVERE = "blind_gap_severe"
-QUALITY_FLAG_BACKWARD_JUMP_SEVERE = "backward_jump_severe"
 QUALITY_FLAG_DENSITY_MILD = "density_mild"
 QUALITY_FLAG_BACKWARD_JUMP_MILD = "backward_jump_mild"
 QUALITY_FLAG_TRAILING_GAP_MILD = "trailing_gap_mild"
@@ -4861,8 +4849,8 @@ TIMESTAMP_OVERRUN_OUTLIER_JUMP_SECONDS = 600
 #: chunk's stamps are out of window); MILD means a stray stamp beyond slack
 #: without a majority. Two distinct flag names (not one shared string) so
 #: transcript_quality_flags_are_severe's frozenset-membership test can tell
-#: them apart, exactly like every other severe/mild pair in this file.
-QUALITY_FLAG_CHUNK_WINDOW_MISMATCH_SEVERE = "chunk_window_mismatch_severe"
+#: them apart, exactly like every other severe/mild pair in this file. The
+#: severe name lives in corpus_walk with the rest of the severe set.
 QUALITY_FLAG_CHUNK_WINDOW_MISMATCH_MILD = "chunk_window_mismatch_mild"
 
 #: Issue #158 severity thresholds: a chunk's out-of-window fraction has to
@@ -4888,20 +4876,6 @@ CHUNK_WINDOW_MISMATCH_SEVERE_MIN_ENTRIES = 4
 #: majority-but-not-unanimous path - this constant governs ONLY the
 #: unanimous shortcut.
 CHUNK_WINDOW_MISMATCH_UNANIMOUS_MIN_ENTRIES = 2
-
-#: Flags that change transcript_status to "partial", count as a pipeline gap
-#: (exit EXIT_PARTIAL), and make resolve_mindmap_source's "auto" branch treat
-#: the transcript as unavailable. Membership-tested against a PERSISTED
-#: transcript_quality_flags list, not recomputed - see
-#: transcript_quality_flags_are_severe().
-_SEVERE_QUALITY_FLAGS = frozenset(
-    {
-        QUALITY_FLAG_MONOLITHIC_SEVERE,
-        QUALITY_FLAG_BLIND_GAP_SEVERE,
-        QUALITY_FLAG_BACKWARD_JUMP_SEVERE,
-        QUALITY_FLAG_CHUNK_WINDOW_MISMATCH_SEVERE,
-    }
-)
 
 
 def _classify_chunk_window_violations(per_chunk_counts: list[dict]) -> dict:
@@ -4957,41 +4931,6 @@ def _classify_chunk_window_violations(per_chunk_counts: list[dict]) -> dict:
         elif QUALITY_FLAG_CHUNK_WINDOW_MISMATCH_MILD not in mild:
             mild.append(QUALITY_FLAG_CHUNK_WINDOW_MISMATCH_MILD)
     return {"severe": severe, "mild": mild, "total_violations": total_violations}
-
-
-def transcript_quality_flags_are_severe(flags: list | None) -> bool:
-    """Whether a PERSISTED transcript_quality_flags list contains a severe flag.
-
-    The single place every consumer (the writers computing transcript_status,
-    resolve_mindmap_source's containment check, the process orchestrators'
-    exit-code gate, dedupe's canonical selection) re-derives severity from
-    what actually landed in meta.json, rather than each hand-rolling its own
-    membership test against _SEVERE_QUALITY_FLAGS. A missing or empty list is
-    not severe.
-
-    Issue #159 dual-review: the membership test filters to string entries
-    (`if isinstance(f, str)`) BEFORE evaluating `f in _SEVERE_QUALITY_FLAGS`,
-    for two reasons, not one. First, order-independence - `any()` short-
-    circuits on the first entry that satisfies the expression, so without
-    the filter a malformed list like `[{"x": 1}, "monolithic_severe"]` used
-    to raise TypeError on the unhashable dict *before* `any()` ever reached
-    the genuine severe string a few entries later, while the reordered list
-    `["monolithic_severe", {"x": 1}]` returned True correctly - the verdict
-    depended on where the bad entry happened to sit, in either direction.
-    Second, safety - a non-string entry (dict, list, custom object) can be
-    unhashable, and `in` on a frozenset requires hashing its left operand;
-    filtering by `isinstance(f, str)` first means the `in` test only ever
-    runs on a value that is guaranteed hashable, so no entry shape can raise
-    here. A non-string sibling anywhere in the list can now never mask - or
-    fake - a genuine severe flag, and malformed entries degrade to being
-    ignored rather than crashing the caller. A non-list `flags` argument
-    (e.g. a bare string) is unaffected by this change: iterating a string's
-    characters already returned False safely pre-#159, since no single
-    character equals a multi-character flag name.
-    """
-    if not flags:
-        return False
-    return any(f in _SEVERE_QUALITY_FLAGS for f in flags if isinstance(f, str))
 
 
 def _transcript_quality_severe_from_meta(meta_path: Path) -> bool:
@@ -6635,16 +6574,6 @@ def _transcript_identity_fields(video: dict, channel_dir: Path | None, *, channe
     # previously-good field to None/"" - e.g. local-file flows where video["url"]
     # may be empty (ce-data-integrity review, #66). channel is always truthy.
     return {k: v for k, v in fields.items() if v}
-
-
-def usable_video_id(value: Any) -> bool:
-    """True when ``value`` can serve as the join key between corpus artifacts.
-
-    A YouTube video id is always a string; anything else on disk is malformed
-    data, and coercing it with ``str()`` would silently merge a hypothetical
-    ``123`` and ``"123"`` into one identity. Callers skip-with-WARNING instead.
-    """
-    return isinstance(value, str) and bool(value.strip())
 
 
 def _identity_from_mindmap_header(mindmap_path: Path) -> dict | None:
@@ -13019,144 +12948,51 @@ _YOUTUBE_HOSTS = frozenset({"youtube.com", "m.youtube.com", "youtu.be", "www.you
 _MINDMAP_TIMESTAMP_RE = re.compile(r"\((\d{1,3}):(\d{2})(?::(\d{2}))?\)")
 
 
-def parse_front_matter(text: str) -> tuple[dict, str]:
-    """Split a markdown doc into (front_matter_dict, body).
-
-    Front matter is a leading YAML block delimited by '---' lines. Returns
-    ({}, text) when no well-formed front matter is present and never raises on
-    malformed YAML - a hand-edited briefing must not crash the catch-up scan.
-    """
-    if not text.startswith("---"):
-        return {}, text
-    lines = text.splitlines()
-    closing = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
-    if closing is None:
-        return {}, text
-    try:
-        data = yaml.safe_load("\n".join(lines[1:closing])) or {}
-    except yaml.YAMLError:
-        return {}, text
-    if not isinstance(data, dict):
-        return {}, text
-    return data, "\n".join(lines[closing + 1 :])
-
-
-def load_seen_video_ids(briefings_dir: Path) -> set[str]:
-    """Union of `video_ids` across every _briefings/**/*.md front matter.
-
-    This is the strict set-difference basis for "unseen": a video that has
-    appeared in ANY briefing is considered surfaced. Missing dir -> empty set.
-    Recurses into subfolders (e.g. _briefings/sales/) so topic-based
-    organization of the briefings dir doesn't silently un-see videos.
-    """
-    seen: set[str] = set()
-    if not briefings_dir.is_dir():
-        return seen
-    for md in sorted(briefings_dir.rglob("*.md")):
-        try:
-            front_matter, _ = parse_front_matter(md.read_text(encoding="utf-8"))
-        except OSError:
-            continue
-        ids = front_matter.get("video_ids") or []
-        if isinstance(ids, list):
-            seen.update(str(v) for v in ids if v)
-    return seen
-
-
-def _artifact_count(record: dict) -> int:
-    """How many of a video's optional artifacts (mindmap, concepts) are present."""
-    return sum(1 for key in ("mindmap_path", "concepts_path") if record.get(key))
-
-
 def collect_corpus_videos(output_dir: Path) -> list[dict]:
     """One record per unique video_id that has a meta.json, across all channel dirs.
 
-    Skips dot-dirs and underscore-dirs (e.g. _briefings) so human-note folders
-    are never mistaken for channels. Each record carries the catch-up fields
-    plus paths to the mindmap/concepts siblings (None when absent). When a
-    video_id has duplicate metas (title-rotation, pre-dedupe), the most complete
-    record wins so a video is never surfaced twice in one briefing.
+    A projection over `corpus_walk.iter_meta_records` (issue #260), so
+    briefings, topics-build and the catalog share one identity rule, one
+    sibling lookup and one duplicate tie-break instead of three walkers that
+    could drift. That walker skips dot-dirs and underscore-dirs (e.g.
+    _briefings) so human-note folders are never mistaken for channels, reads
+    each meta through the shared best-effort reader, and skips a meta whose
+    `video_id` is not a string with a WARNING naming the file. When a video_id
+    has duplicate metas (title-rotation, pre-dedupe), the most complete record
+    wins so a video is never surfaced twice in one briefing. Each record
+    carries the catch-up fields plus paths to the mindmap/concepts siblings
+    (None when absent).
     """
-    by_id: dict[str, dict] = {}
-    if not output_dir.is_dir():
-        return []
-    channel_dirs = [
-        d for d in output_dir.iterdir() if d.is_dir() and not d.name.startswith(".") and not d.name.startswith("_")
-    ]
-    for channel_dir in sorted(channel_dirs):
-        for meta_path in sorted(channel_dir.glob("*.meta.json")):
-            try:
-                # Bytes first, then decode+parse (issue #124). `read_text` folds
-                # a CONTENT problem into the call that should only be able to
-                # fail at the I/O layer, and `UnicodeDecodeError` subclasses
-                # ValueError, not OSError - so a meta torn mid-multibyte-character
-                # (the normal shape of a truncated write on a corpus carrying
-                # Cyrillic/BCS titles) escaped the narrower handler and killed
-                # every caller of this walker, `topics-build` included.
-                meta = json.loads(meta_path.read_bytes().decode("utf-8"))
-            except (ValueError, OSError):
-                continue
-            video_id = meta.get("video_id")
-            if not video_id:
-                continue
-            if not usable_video_id(video_id):
-                # A non-string id is malformed data, and it poisons every
-                # `sorted()` downstream that mixes it with real ids (Python
-                # refuses to order an int against a str), so one bad meta used
-                # to abort a whole `topics-build`. Skip it, name the file, and
-                # do NOT coerce: `str(123)` would merge it with a real "123".
-                log.warning(
-                    "  %s: `video_id` is a %s, not a string; skipping this meta",
-                    meta_path.name,
-                    type(video_id).__name__,
-                )
-                continue
-            channel = meta.get("channel") or channel_dir.name
-            if not isinstance(channel, str):
-                # `channels` is sorted and rolled up per topic, so a non-string
-                # here breaks the same ordering. The folder the meta actually
-                # lives in is the accurate fallback, not an invented label.
-                log.warning(
-                    "  %s: `channel` is a %s, not a string; using the folder name %s",
-                    meta_path.name,
-                    type(channel).__name__,
-                    channel_dir.name,
-                )
-                channel = channel_dir.name
-            prefix = meta_path.name[: -len(".meta.json")]
-            mindmap_path = channel_dir / f"{prefix}.mindmap.md"
-            concepts_path = channel_dir / f"{prefix}.concepts.json"
-            record = {
-                "video_id": video_id,
-                "title": meta.get("title", prefix),
+    videos: list[dict] = []
+    for rec in iter_meta_records(output_dir).records:
+        meta = rec.meta
+        # Issue #146: the topic layer joins through this same video_id
+        # identity (contract C9), so the meta-asserted topics ride along on the
+        # record instead of forcing a second walk of every meta.json under a
+        # different - and driftable - join rule. Topics are UNIONed across
+        # duplicate metas rather than inherited from the completeness winner:
+        # an operator can stamp --topic before a title rotation, leaving the
+        # tag on the meta that later loses the tie-break.
+        topics = normalize_meta_topics(meta.get("topics"), label=f"{rec.prefix}{META_SUFFIX}")
+        if rec.losers:
+            union = set(topics)
+            for loser in rec.losers:
+                union |= set(normalize_meta_topics(loser.meta.get("topics"), label=f"{loser.prefix}{META_SUFFIX}"))
+            topics = sorted(union)
+        videos.append(
+            {
+                "video_id": rec.video_id,
+                "title": meta.get("title", rec.prefix),
                 "published": meta.get("published", ""),
-                "channel": channel,
-                "url": meta.get("video_url") or f"https://www.youtube.com/watch?v={video_id}",
-                "mindmap_path": mindmap_path if mindmap_path.exists() else None,
-                "concepts_path": concepts_path if concepts_path.exists() else None,
+                "channel": rec.channel,
+                "url": meta.get("video_url") or f"https://www.youtube.com/watch?v={rec.video_id}",
+                "mindmap_path": rec.siblings.get(MINDMAP_SUFFIX),
+                "concepts_path": rec.siblings.get(CONCEPTS_SUFFIX),
                 "processed": meta.get("processed", ""),
-                # Issue #146: the topic layer joins through this same video_id
-                # identity (contract C9), so the meta-asserted topics ride along
-                # on the record instead of forcing a second walk of every
-                # meta.json under a different - and driftable - join rule.
-                "topics": normalize_meta_topics(meta.get("topics"), label=meta_path.name),
+                "topics": topics,
             }
-            # Dedupe by video_id - title-rotation can leave >1 meta per id, and a
-            # set-difference against prior briefings won't catch a same-corpus dup.
-            # Keep the most complete record so ranking has concepts to work with.
-            existing = by_id.get(video_id)
-            if existing is None or _artifact_count(record) > _artifact_count(existing):
-                if existing is not None:
-                    # Topics are UNIONed across duplicate metas rather than
-                    # inherited from the completeness winner. An operator can
-                    # stamp --topic before a title rotation, leaving the tag on
-                    # the meta that later loses the tie-break; taking only the
-                    # winner's list would silently delete that membership.
-                    record["topics"] = sorted(set(record["topics"]) | set(existing["topics"]))
-                by_id[video_id] = record
-            elif record["topics"]:
-                existing["topics"] = sorted(set(existing["topics"]) | set(record["topics"]))
-    return list(by_id.values())
+        )
+    return videos
 
 
 def _parse_iso_date(value: str):

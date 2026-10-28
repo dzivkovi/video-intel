@@ -718,6 +718,8 @@ Retrieval finds a passage; this layer files what you learn back into the corpus 
 
 See **[docs/wiki-layer.md](docs/wiki-layer.md)** for full usage, the safety rules around overwriting pages, and troubleshooting.
 
+To see everything in the corpus as one machine-readable file (one row per video with facets, headings, deep links and already-seen signals; read-only, no Gemini), run `python scripts/atlas_build.py --corpus <output_dir>` and read **[docs/atlas.md](docs/atlas.md)**. It writes a private catalog to `_atlas/atlas.json`, separate from the wiki pages.
+
 ## The intelligence layer (optional)
 
 Beyond search, the repo can build a small **DuckDB analytics store** from your corpus and ask it questions a search box cannot: who covered an idea first, what is suddenly spiking, which creators genuinely cluster. The statistics are done carefully - real null models, significance testing, and a plain caveat on every number - and the guide below explains all of it without assuming a stats background. It is entirely optional; the scan/transcript/search pipeline above never touches it.

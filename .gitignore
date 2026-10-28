@@ -87,3 +87,9 @@ gate1_*_out/
 examples/*.docx
 # Timestamped backups of the private config, made before a config edit
 config.yaml.backup-*
+
+# Corpus catalog output (scripts/atlas_build.py): derived and private, like
+# config.yaml. A real-data screenshot or a zipped copy is private too.
+_atlas/
+spikes/atlas/screenshots/
+*.zip

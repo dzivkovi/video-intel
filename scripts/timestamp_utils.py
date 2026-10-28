@@ -27,7 +27,10 @@ group before assuming an argument shape:
   here from `video_intel.py`, which re-exports it.
 * **Link construction** - `timestamped_url`, which appends a `t=<seconds>`
   deep link to a video URL. Moved here from `intel_graph.py`, which
-  re-exports it.
+  re-exports it. `youtube_deep_link` is the guarded form (issue #260 KTD7):
+  it returns a deep link only for an `https` YouTube URL carrying an
+  eleven-character video id, else None, so a caller never puts `t=` on a URL
+  that cannot honor it.
 * **Token shape** - `TIMESTAMP_TOKEN_PATTERN`, the one regex source for what a
   rendered timestamp token looks like: an UNBOUNDED minute-or-hour field, then
   `:SS`, then an optional second `:SS`. Unbounded because the captions renderer
@@ -44,6 +47,7 @@ seam safe.
 """
 
 import re
+from urllib.parse import parse_qs, urlsplit
 
 # The one definition of a rendered timestamp token's shape (issue #195). See
 # the module docstring's "Token shape" entry for why the first field is \d+.
@@ -152,3 +156,56 @@ def timestamped_url(url: str | None, seconds: int | None) -> str:
         return url
     sep = "&" if "?" in url else "?"
     return f"{url}{sep}t={seconds}"
+
+
+#: Hosts whose watch URLs honor a `t=` deep link. Deliberately narrower than
+#: `video_intel._YOUTUBE_HOSTS`, which is a channel-shape check, not a
+#: "this URL plays a video at second N" check.
+YOUTUBE_DEEP_LINK_HOSTS = frozenset({"www.youtube.com", "youtube.com", "m.youtube.com", "youtu.be"})
+
+_YOUTUBE_VIDEO_ID_RE = re.compile(r"[A-Za-z0-9_-]{11}")
+
+#: Path forms on a youtube.com host whose second segment is the video id AND
+#: whose player honors `t=`: only `/live/<id>` today. `/embed/<id>` reads
+#: `start=` and ignores `t=`, and Shorts do not reliably seek either, so a
+#: `t=` on those would be a timestamp that never jumps, the fabricated-link
+#: class the catalog forbids. Any other path (a `/channel/...` page, say)
+#: carries no video id and gets no deep link.
+_YOUTUBE_ID_PATH_KEYWORDS = frozenset({"live"})
+
+
+def is_youtube_deep_linkable(url: str | None) -> bool:
+    """Whether `url` is a playable YouTube URL that can carry a `t=` deep link.
+
+    Playable means: scheme `https`, host in `YOUTUBE_DEEP_LINK_HOSTS`, and a
+    video id of exactly eleven `[A-Za-z0-9_-]` characters, taken from the `v`
+    query parameter, the first path segment on `youtu.be`, or the segment
+    after `/live/`. A recovered non-YouTube id filed
+    under a youtube.com URL (a Goldcast-style `goldcast-ab12cd34`) fails the
+    id check, so no `t=` is fabricated for it. The one definition of the rule:
+    `youtube_deep_link` and the catalog's link gate both ask it.
+    """
+    if not isinstance(url, str) or not url:
+        return False
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+    except ValueError:
+        return False
+    if parts.scheme != "https" or host not in YOUTUBE_DEEP_LINK_HOSTS:
+        return False
+    segments = parts.path.lstrip("/").split("/")
+    if host == "youtu.be":
+        video_id = segments[0]
+    elif segments[0] in _YOUTUBE_ID_PATH_KEYWORDS and len(segments) > 1:
+        video_id = segments[1]
+    else:
+        video_id = parse_qs(parts.query).get("v", [""])[0]
+    return bool(_YOUTUBE_VIDEO_ID_RE.fullmatch(video_id))
+
+
+def youtube_deep_link(url: str | None, seconds: int | None) -> str | None:
+    """`timestamped_url(url, seconds)` when `is_youtube_deep_linkable(url)`, else None."""
+    if not is_youtube_deep_linkable(url):
+        return None
+    return timestamped_url(url, seconds)

@@ -43,6 +43,7 @@ from wiki_concepts import (
     collect_corpus_videos,
     find_timestamp,
     mention_link,
+    mindmap_headings,
     parse_mindmap_timestamps,
     reset_skip_tracking,
     select_stable_concepts,
@@ -298,6 +299,15 @@ class TestMindmapTimestampParsing:
     def test_find_timestamp_returns_none_when_nothing_matches(self):
         entries = parse_mindmap_timestamps(MINDMAP_A)
         assert find_timestamp(entries, branch="Nope", as_mentioned="also nope") is None
+
+    def test_mindmap_headings_agree_with_the_timestamp_parser(self):
+        assert mindmap_headings(MINDMAP_A) == ["Shared Topic", "Other Topic"]
+        assert set(mindmap_headings(MINDMAP_A)) == {e.heading for e in parse_mindmap_timestamps(MINDMAP_A)}
+
+    def test_a_heading_with_no_bullets_appears_in_mindmap_headings_only(self):
+        text = MINDMAP_A + "\n## Empty Branch\n\n* **Nothing under it**\n"
+        assert "Empty Branch" in mindmap_headings(text)
+        assert "Empty Branch" not in {e.heading for e in parse_mindmap_timestamps(text)}
 
     def test_minutes_past_99_anchor_at_the_real_time_not_a_substring(self):
         """Issue #195, same class as chunk_transcript's boundary fix.

@@ -35,7 +35,8 @@ description: >
   wiki", "browse my creator atlas", "open the Obsidian wiki", "who talked
   about [X] first, who followed", "who's ahead of the curve on [topic]",
   "what's trending across my channels", "what's spiking this month",
-  "who has validated ties across my creators".
+  "who has validated ties across my creators", "build the video catalog",
+  "refresh the corpus catalog", "what is in my corpus as one file".
   Requires GEMINI_API_KEY, YOUTUBE_API_KEY, and
   `channels:` configured in config.yaml - this skill must run from the
   plugin repo checkout, not a globally-installed cache. Calls Gemini as
@@ -201,6 +202,7 @@ table is the canonical mapping — read it before picking a command.
 | "who has validated ties", "who clusters with whom", "which creators overlap more than chance", "the real creator network" | `python scripts/sdsm_network.py` | **Intelligence layer (optional).** SDSM-validated creator network: creator pairs sharing more concepts than a degree- AND popularity-preserving null expects. Prunes the naive-overlap noise (a topically homogeneous corpus makes almost every pair "overlap"). Same store requirement (`intel_graph.py load`). Undirected co-adoption ties, not influence - "who leads whom" is the lead-lag report. No Gemini. |
 | "open my video wiki", "show me the atlas", "let me look at what's already there" | `python scripts/register_obsidian_vault.py "<output_dir>/_wiki" --open --launch` | Opens an **already-built** wiki (Obsidian must be closed). If `_wiki/` doesn't exist yet, fall through to the build row below instead. |
 | "build the creator atlas", "make the wiki", "let me browse the findings", "generate the Obsidian wiki" | `python scripts/wiki_atlas.py --wiki-dir <output_dir>/_wiki` | **Intelligence layer (optional).** Writes a browsable wiki of the lead-lag findings. To open it in Obsidian when the GUI won't add the vault: `python scripts/register_obsidian_vault.py "<output_dir>/_wiki" --open --launch` (Obsidian must be closed). Same store requirement. No Gemini. |
+| "build the video catalog", "refresh the corpus catalog", "what is in my corpus as one file" | `python scripts/atlas_build.py --corpus <output_dir>` | Writes `<output_dir>/_atlas/atlas.json`: one row per video with facets, a headings-only synopsis, timestamped deep links and already-seen signals (briefing membership, wiki pages). Complete by design: every video is a row, so treat the file as private. Reads the corpus, writes only `_atlas/atlas.json`, no Gemini. Prints one counts-only summary line; see `docs/atlas.md` for how to read it. A different tool from the creator wiki that `wiki_atlas.py` builds. |
 | "find videos about X", "search for Y", "nugget brief on Z", "corpus status", "verify quote", "fact-check claim against [creator]" | — | **Wrong skill.** These are read-only queries; use the **video-intel-search** skill. |
 
 ### Channel name resolution

@@ -37,6 +37,7 @@ LIVING_DOCS = [
     "docs/troubleshooting.md",
     "docs/reading-layer.md",
     "docs/cost-model.md",
+    "docs/atlas.md",
     "skills/video-intel/SKILL.md",
     "skills/video-intel-search/SKILL.md",
     "skills/translate-bcs/SKILL.md",

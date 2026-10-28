@@ -9,12 +9,14 @@ import textwrap
 import pytest
 
 from timestamp_utils import (
+    is_youtube_deep_linkable,
     normalize_mm_ss_zero_timestamp,
     normalize_timestamp,
     parse_time_to_seconds,
     should_reinterpret_part_as_mm_ss_zero,
     timestamp_tolerance,
     timestamped_url,
+    youtube_deep_link,
 )
 
 
@@ -158,6 +160,85 @@ class TestTimestampedUrl:
         assert timestamped_url(None, 30) == ""
 
 
+class TestYoutubeDeepLink:
+    """Issue #260 KTD7: a deep link is built only for an https YouTube host
+    with an eleven-character id; everything else gets None, never a
+    fabricated `t=` on a URL that cannot honor it."""
+
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [
+            ("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=245"),
+            ("https://youtube.com/watch?v=dQw4w9WgXcQ", "https://youtube.com/watch?v=dQw4w9WgXcQ&t=245"),
+            ("https://m.youtube.com/watch?v=dQw4w9WgXcQ", "https://m.youtube.com/watch?v=dQw4w9WgXcQ&t=245"),
+            ("https://youtu.be/dQw4w9WgXcQ", "https://youtu.be/dQw4w9WgXcQ?t=245"),
+        ],
+    )
+    def test_accepts_youtube_hosts_with_an_eleven_character_id(self, url, expected):
+        assert youtube_deep_link(url, 245) == expected
+        # Same form timestamped_url produces: one definition of the t= suffix.
+        assert youtube_deep_link(url, 245) == timestamped_url(url, 245)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://www.youtube.com/watch?v=goldcast-ab12cd34",
+            "https://www.youtube.com/watch?v=short",
+            "https://www.youtube.com/watch",
+            "https://youtu.be/",
+            "https://fathom.video/share/x",
+            "https://notyoutube.com/watch?v=dQw4w9WgXcQ",
+            "https://www.youtube.com.evil.example/watch?v=dQw4w9WgXcQ",
+            "",
+            None,
+        ],
+    )
+    def test_rejects_everything_else(self, url):
+        assert youtube_deep_link(url, 245) is None
+        assert is_youtube_deep_linkable(url) is False
+
+    @pytest.mark.parametrize("keyword", ["live"])
+    def test_accepts_the_live_path_form(self, keyword):
+        url = f"https://www.youtube.com/{keyword}/dQw4w9WgXcQ"
+        assert youtube_deep_link(url, 245) == f"{url}?t=245"
+        assert is_youtube_deep_linkable(url) is True
+        with_query = f"https://www.youtube.com/{keyword}/dQw4w9WgXcQ?feature=share"
+        assert youtube_deep_link(with_query, 245) == f"{with_query}&t=245"
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://www.youtube.com/channel/UCabcdefghijklmnopqrstuv",
+            "https://www.youtube.com/channel/dQw4w9WgXcQ",
+            "https://www.youtube.com/live/goldcast-ab12cd34",
+            "https://www.youtube.com/live/short",
+            "https://www.youtube.com/live/",
+            # /embed/ reads start= and ignores t=; Shorts do not seek reliably.
+            # A t= there is a link that never jumps, so neither form qualifies.
+            "https://www.youtube.com/embed/dQw4w9WgXcQ",
+            "https://www.youtube.com/shorts/dQw4w9WgXcQ",
+            "https://www.youtube.com/xlive/dQw4w9WgXcQ",
+            "http://www.youtube.com/live/dQw4w9WgXcQ",
+            "https://fathom.video/live/dQw4w9WgXcQ",
+        ],
+    )
+    def test_rejects_other_paths_and_bad_ids_on_the_path_forms(self, url):
+        assert youtube_deep_link(url, 245) is None
+        assert is_youtube_deep_linkable(url) is False
+
+    def test_the_predicate_agrees_with_the_link_builder(self):
+        # One rule: `youtube_deep_link` returns a link exactly when the predicate is True.
+        for url in (
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://youtu.be/dQw4w9WgXcQ",
+            "https://www.youtube.com/live/dQw4w9WgXcQ",
+            "https://www.youtube.com/watch?v=goldcast-ab12cd34",
+            "https://fathom.video/share/x",
+        ):
+            assert (youtube_deep_link(url, 1) is not None) is is_youtube_deep_linkable(url), url
+
+
 class TestReExportsStayReExports:
     """The two re-exports survive only INCIDENTALLY, which is the hazard.
 
@@ -270,7 +351,15 @@ class TestStandaloneScriptImportIsolation:
     # guards) would have passed the whole suite undetected.
     @pytest.mark.parametrize(
         "module",
-        ["wiki_concepts", "wiki_atlas", "lead_lag_report", "lead_lag_viz", "burst_report"],
+        [
+            "wiki_concepts",
+            "wiki_atlas",
+            "lead_lag_report",
+            "lead_lag_viz",
+            "burst_report",
+            "corpus_walk",
+            "atlas_build",
+        ],
     )
     def test_import_succeeds_with_heavy_deps_blocked(self, module):
         child_script = textwrap.dedent(f"""
@@ -288,6 +377,7 @@ class TestStandaloneScriptImportIsolation:
             print('OK')
             print('video_intel pulled:', 'video_intel' in sys.modules)
             print('intel_graph pulled:', 'intel_graph' in sys.modules)
+            print('yaml pulled:', 'yaml' in sys.modules)
             """)
         result = subprocess.run(
             [sys.executable, "-c", child_script],
@@ -302,3 +392,96 @@ class TestStandaloneScriptImportIsolation:
         assert "OK" in result.stdout
         assert "video_intel pulled: False" in result.stdout
         assert "intel_graph pulled: False" in result.stdout
+        # PyYAML is a lazy, call-time import (corpus_walk.parse_front_matter):
+        # importing any standalone script must not load it (issue #260 R1).
+        assert "yaml pulled: False" in result.stdout
+
+    def test_atlas_build_imports_under_a_strict_stdlib_only_blocker(self):
+        """Issue #260 U2: the catalog generator imports stdlib plus the
+        repo's own firebreak modules only, with every third-party top-level
+        module blocked. wiki_concepts pulls wiki_atlas, lead_lag_report and
+        lead_lag_viz transitively; all four are stdlib-only at import."""
+        child_script = textwrap.dedent("""
+            import sys, importlib.abc
+            OWN = {'atlas_build', 'corpus_walk', 'timestamp_utils', 'wiki_concepts',
+                   'wiki_atlas', 'lead_lag_report', 'lead_lag_viz'}
+            ALLOWED = set(sys.stdlib_module_names) | OWN
+
+            class Blocker(importlib.abc.MetaPathFinder):
+                def find_spec(self, name, path=None, target=None):
+                    if name.split('.')[0] not in ALLOWED:
+                        raise ImportError('blocked: ' + name)
+                    return None
+
+            sys.meta_path.insert(0, Blocker())
+            import atlas_build
+            print('OK')
+            print('yaml pulled:', 'yaml' in sys.modules)
+            """)
+        result = subprocess.run(
+            [sys.executable, "-c", child_script],
+            cwd=str(pathlib.Path(__file__).resolve().parent.parent / "scripts"),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "OK" in result.stdout
+        assert "yaml pulled: False" in result.stdout
+
+    def test_corpus_walk_imports_under_a_strict_stdlib_only_blocker(self):
+        """Issue #260 U1: corpus_walk is shared by the curate stack and the
+        standalone catalog generator, so it must import with EVERY non-stdlib
+        top-level module blocked, not only the five heavy ones above."""
+        child_script = textwrap.dedent("""
+            import sys, importlib.abc
+            ALLOWED = set(sys.stdlib_module_names) | {'corpus_walk'}
+
+            class Blocker(importlib.abc.MetaPathFinder):
+                def find_spec(self, name, path=None, target=None):
+                    if name.split('.')[0] not in ALLOWED:
+                        raise ImportError('blocked: ' + name)
+                    return None
+
+            sys.meta_path.insert(0, Blocker())
+            import corpus_walk
+            print('OK')
+            print('yaml pulled:', 'yaml' in sys.modules)
+            """)
+        result = subprocess.run(
+            [sys.executable, "-c", child_script],
+            cwd=str(pathlib.Path(__file__).resolve().parent.parent / "scripts"),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "OK" in result.stdout
+        assert "yaml pulled: False" in result.stdout
+
+    def test_corpus_walk_has_no_non_stdlib_import_at_module_body_level(self):
+        """Static twin of the subprocess check: every import that runs at
+        import time must be stdlib. Function bodies are skipped on purpose,
+        so the lazy `import yaml` inside parse_front_matter is allowed."""
+        source = (pathlib.Path(__file__).resolve().parent.parent / "scripts" / "corpus_walk.py").read_text(
+            encoding="utf-8"
+        )
+        tree = ast.parse(source)
+
+        def import_time_modules(node):
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                    continue
+                if isinstance(child, ast.Import):
+                    yield from (alias.name.split(".")[0] for alias in child.names)
+                elif isinstance(child, ast.ImportFrom):
+                    yield (child.module or "").split(".")[0]
+                yield from import_time_modules(child)
+
+        module_level = set(import_time_modules(tree))
+        assert module_level, "the walk found no module-level import at all"
+        assert module_level - set(sys.stdlib_module_names) == set()
+        # Companion: the lazy yaml import exists and is only reachable in a function body.
+        every_import = {alias.name for n in ast.walk(tree) if isinstance(n, ast.Import) for alias in n.names}
+        assert "yaml" in every_import
+        assert "yaml" not in module_level

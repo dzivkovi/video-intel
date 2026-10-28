@@ -4,7 +4,9 @@ paths:
   - scripts/video_intel.py
   - scripts/gemini_common.py
   - scripts/youtube_captions.py
+  - scripts/corpus_walk.py
   - prompts/transcript.md
+  - tests/test_corpus_walk.py
   - tests/usage_shapes.py
   - tests/test_captions_failover.py
   - tests/test_chunked_confab_guard.py
