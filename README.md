@@ -193,6 +193,8 @@ Three views over one filtered set. **Cards** show the thumbnail, the mind-map's 
 
 The design borrows from the "storytelling with data" school: one colour carries data and grey carries structure; warning colours appear only on transcripts with a problem; the finding under the title is a sentence with its denominators, not a chart; rows are sorted by size so the eye reads top-down. There is no node-link graph on purpose. A corpus like this has no edges that help you find a video (concept co-occurrence just puts popular topics in the middle), while the axes the grid uses, who and when, are ones you can act on.
 
+The page turned out to be a data-quality check as much as a browsing tool. Facet counts are a free audit: the first time the catalog was opened over a corpus that had been queried for seven months, it showed 158 transcripts that had never been quality-checked, 564 with no recorded source, 934 videos with no stored length, and a month-by-month grid whose one early cell exposed a channel pulled in years before the rest. None of that was visible through search or the CLI, because a query returns the rows that match and a count shows the rows that are missing. Expect the first open of your own catalog to produce a short list of repairs; that is the page doing its job.
+
 **Try it:** [the live demo](https://dzivkovi.github.io/video-intel/) is a real public subset, 1,646 videos from twelve public channels over twelve months, built by the same commands you would run on your own corpus. The same file is [examples/catalog/catalog.html](examples/catalog/catalog.html), next to the policy that produced it; it needs no server and fetches nothing but YouTube thumbnails, which a button turns off.
 
 ```bash
