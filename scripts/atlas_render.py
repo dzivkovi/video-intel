@@ -29,6 +29,10 @@ from pathlib import Path
 
 GENERATOR_NAME = "atlas_render.py"
 ATLAS_GENERATOR_NAME = "atlas_build.py"
+#: The two documents this renderer accepts: the private catalog and the policy-filtered
+#: public subset `atlas_export.py` derives from it. Nothing else, so a stray JSON file
+#: with a rows list never becomes a page.
+ATLAS_GENERATORS = frozenset({ATLAS_GENERATOR_NAME, "atlas_export.py"})
 ATLAS_SCHEMA_VERSION = 1
 CATALOG_FILENAME = "catalog.html"
 TEMPLATE_PATH = Path(__file__).resolve().with_name("atlas_catalog_template.html")
@@ -72,10 +76,10 @@ def render(atlas: dict, template: str) -> str:
 
 
 def load_atlas(path: Path) -> dict:
-    """Parse `path` and require it to be an atlas.json written by atlas_build.py."""
+    """Parse `path` and require it to be an atlas.json from a generator in `ATLAS_GENERATORS`."""
     atlas = json.loads(path.read_bytes().decode("utf-8"))
-    if not isinstance(atlas, dict) or atlas.get("generator") != ATLAS_GENERATOR_NAME:
-        raise ValueError(f"{path} is not an atlas.json written by {ATLAS_GENERATOR_NAME}")
+    if not isinstance(atlas, dict) or atlas.get("generator") not in ATLAS_GENERATORS:
+        raise ValueError(f"{path} is not an atlas.json written by {' or '.join(sorted(ATLAS_GENERATORS))}")
     if atlas.get("schema_version") != ATLAS_SCHEMA_VERSION:
         raise ValueError(f"{path} has schema_version {atlas.get('schema_version')!r}, expected {ATLAS_SCHEMA_VERSION}")
     if not isinstance(atlas.get("rows"), list):
@@ -122,7 +126,9 @@ def write_atomic(path: Path, text: str) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Render _atlas/atlas.json into one self-contained catalog.html.")
-    parser.add_argument("--atlas", required=True, type=Path, help="Path to atlas.json written by atlas_build.py.")
+    parser.add_argument(
+        "--atlas", required=True, type=Path, help="Path to atlas.json written by atlas_build.py or atlas_export.py."
+    )
     parser.add_argument("--out", type=Path, help=f"Output HTML file. Default: {CATALOG_FILENAME} next to the atlas.")
     parser.add_argument("--template", type=Path, default=TEMPLATE_PATH, help=argparse.SUPPRESS)
     return parser

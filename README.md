@@ -179,6 +179,28 @@ Three consequences worth knowing before you configure a channel: the expensive s
 > "Read the mind maps in ~/video-intel/natebjones/ from this week and tell me
 > which videos are worth watching for agentic AI patterns."
 
+## The catalog: your whole library on one page
+
+Once a few hundred videos have flowed through, the question changes from "what did this video say" to "do I already have something on this". The catalog answers it without the CLI: one self-contained HTML page that lists everything in the corpus, with the facets that let you narrow 3,000 videos to the three you meant in two clicks.
+
+![Cards view: thumbnail, mind-map headings that double as timestamped links, concept chips](docs/images/catalog-cards.png)
+
+Three views over one filtered set. **Cards** show the thumbnail, the mind-map's branch headings (each one a link that opens the video at that second) and the concepts the video touches. **Compact** is a dated table of contents. **Grid** is channel by month, darker where more videos landed; click a cell to list exactly those.
+
+![Grid view: channel by month, darker means more videos](docs/images/catalog-grid.png)
+
+The design borrows from the "storytelling with data" school: one colour carries data and grey carries structure; warning colours appear only on transcripts with a problem; the finding under the title is a sentence with its denominators, not a chart; rows are sorted by size so the eye reads top-down. There is no node-link graph on purpose. A corpus like this has no edges that help you find a video (concept co-occurrence just puts popular topics in the middle), while the axes the grid uses, who and when, are ones you can act on.
+
+**Try it:** [examples/catalog/catalog.html](examples/catalog/catalog.html) is a real public subset, 1,646 videos from twelve public channels over twelve months, built by the same commands you would run on your own corpus. Download the file and open it; it needs no server and fetches nothing but YouTube thumbnails, which a button turns off. The policy that produced it sits next to it.
+
+```bash
+python scripts/atlas_build.py --corpus <output_dir>                          # the private catalog: every video, one JSON file
+python scripts/atlas_render.py --atlas <output_dir>/_atlas/atlas.json        # the private page, next to it
+python scripts/atlas_export.py --atlas <output_dir>/_atlas/atlas.json --policy <output_dir>/_atlas/export-policy.yaml --deny-terms <your private term list>   # a shareable subset
+```
+
+The private page is complete by design, so it stays on your machine. A shared copy is a separate export behind a policy you write (which channels, from which date), limited to videos the YouTube API reports as public (unlisted ones never leave), projected onto public fields only (no topic tags, briefing membership or wiki keys), and, when you pass your private term list, scanned against it before a byte is written. Details in [docs/atlas.md](docs/atlas.md).
+
 ## Design principles
 
 - **Gemini watches, Claude thinks.** Gemini sees frames at 1 FPS, reads on-screen text and hears audio in one pass. Claude never calls Gemini during triage: it reads the files Gemini produced. Best tool for each job, not competing models.
@@ -237,6 +259,7 @@ The corpus has grown past YouTube. The reading layer that turns transcripts into
 | --- | --- |
 | install it, or use it from another agent platform | [INSTALLATION.md](INSTALLATION.md) |
 | understand how a search hit is ranked | [docs/search-internals.md](docs/search-internals.md) |
+| see the whole corpus on one page, or share a subset of it | [docs/atlas.md](docs/atlas.md) |
 | organize the corpus into the threads you are following | [docs/topics-layer.md](docs/topics-layer.md) |
 | understand why every briefing, digest and distillation has the same shape, and bring your own templates | [docs/reading-layer.md](docs/reading-layer.md) |
 | make what you learn compound instead of re-paying for it | [docs/wiki-layer.md](docs/wiki-layer.md) |
@@ -718,7 +741,7 @@ Retrieval finds a passage; this layer files what you learn back into the corpus 
 
 See **[docs/wiki-layer.md](docs/wiki-layer.md)** for full usage, the safety rules around overwriting pages, and troubleshooting.
 
-To see everything in the corpus as one machine-readable file (one row per video with facets, headings, deep links and already-seen signals; read-only, no Gemini), run `python scripts/atlas_build.py --corpus <output_dir>` and read **[docs/atlas.md](docs/atlas.md)**. It writes a private catalog to `_atlas/atlas.json`, separate from the wiki pages.
+To see everything in the corpus as one machine-readable file (one row per video with facets, headings, deep links and already-seen signals; read-only, no Gemini), run `python scripts/atlas_build.py --corpus <output_dir>` and read **[docs/atlas.md](docs/atlas.md)**. It writes a private catalog to `_atlas/atlas.json`, separate from the wiki pages; the page built from it is described in [The catalog](#the-catalog-your-whole-library-on-one-page) above.
 
 ## The intelligence layer (optional)
 

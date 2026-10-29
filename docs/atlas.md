@@ -51,6 +51,35 @@ Rebuild the page after every atlas rebuild. It refuses to overwrite a `catalog.h
 
 The page follows the plain rules of good data display: one accent colour for data and grey for everything else, warning colours only on transcript problems, the finding stated as a sentence with its denominators under the title, and rows ordered by size so the eye reads top-down (the "storytelling with data" school).
 
+## Share a subset
+
+The private page is complete by design, so it never leaves the machine. To show the catalog to someone else, export a subset behind a policy:
+
+```bash
+python scripts/atlas_export.py --atlas <output_dir>/_atlas/atlas.json --policy <output_dir>/_atlas/export-policy.yaml --deny-terms <your-private-term-list>
+```
+
+The policy is a small YAML file with three keys, all default deny:
+
+```yaml
+channels:            # required: only these channel folders leave the machine
+  - somechannel
+  - otherchannel
+since: 2025-10-28    # optional: only videos published on or after this date
+exclude_video_ids:   # optional: single videos to leave out
+  - dQw4w9WgXcQ
+```
+
+The export keeps a row only when its channel is listed, its date is on or after `since`, its URL is the canonical public YouTube watch URL of its own id (so other platforms never qualify), and the YouTube Data API reports the video as `public`. That last check is what keeps unlisted videos out: a canonical URL proves nothing about visibility, and publishing an unlisted link is a disclosure the creator did not make. It needs `YOUTUBE_API_KEY` in the environment (one quota unit per 50 videos); without the key the export refuses, and `--no-verify-public` is the explicit way to accept the risk. A local ingest filed under a real-looking id is caught by the same check, since the API does not return it. A policy channel that ends up with no exportable video is a refusal too, so a typo in the allowlist cannot export silently.
+
+Each kept row is projected onto an explicit public field list: id, title, channel, date, length, URL, transcript quality and flag count, headings, deep links and concept ids. Topics, briefing membership, wiki keys, alternate titles and the folders a duplicate lived in are not fields of the public row at all. The concept labels and channel counts are rebuilt from the kept rows, so nothing the subset does not reference rides along in a side table. An unknown policy key, a duplicate key, a non-string key, a malformed date or an empty channel list is a refusal, never a default; `exclude_video_ids: []` is fine.
+
+`--deny-terms` is required and takes a file with one term per line (comments are skipped; lines under five characters are ignored and counted on stderr; an empty file is the explicit way to say you have none). The export aborts before any write when a term appears anywhere in the serialized subset, comparing after Unicode normalization and case folding, so an accented or differently cased spelling still matches; use your private term list. A public creator's title can trip it legitimately, as a video title naming a company did on the first real export; the remedy is `exclude_video_ids`, decided by you. Note that an excluded id in a committed policy is itself public: anyone can resolve it to the video.
+
+The bundle lands in `<output_dir>/_atlas-export/` by default (`--out` to choose): `atlas.json` (the subset, `generator: atlas_export.py`, with an `export` header recording the policy fingerprint, the channel list and the date floor, never the private corpus size) and `catalog.html` rendered from it by the same renderer. Exporting into the private `_atlas/` folder is refused, an `atlas.json` or `catalog.html` another tool wrote in the output folder is refused and left untouched, and a failed render removes only what the run wrote. The subset and its page are byte-stable for the same atlas and policy.
+
+The repo ships one such bundle as the demo: [examples/catalog/](../examples/catalog/) holds the exported `atlas.json`, the `catalog.html` built from it and the policy that produced them. `tests/test_catalog_demo.py` keeps the three in step: every row obeys the committed policy and the public field list, the page re-renders byte-identical from the JSON, and no private term appears in any committed byte.
+
 ## Read the summary line
 
 A successful build prints exactly one line on stdout. A healthy run on the full corpus looks like this:
