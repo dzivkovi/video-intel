@@ -38,7 +38,8 @@ description: >
   "who has validated ties across my creators", "build the video catalog",
   "refresh the corpus catalog", "what is in my corpus as one file",
   "render the catalog page", "open my catalog in the browser", "show me
-  my corpus as a page".
+  my corpus as a page", "export a public catalog", "make a shareable
+  subset of the catalog".
   Requires GEMINI_API_KEY, YOUTUBE_API_KEY, and
   `channels:` configured in config.yaml - this skill must run from the
   plugin repo checkout, not a globally-installed cache. Calls Gemini as
@@ -206,6 +207,7 @@ table is the canonical mapping — read it before picking a command.
 | "build the creator atlas", "make the wiki", "let me browse the findings", "generate the Obsidian wiki" | `python scripts/wiki_atlas.py --wiki-dir <output_dir>/_wiki` | **Intelligence layer (optional).** Writes a browsable wiki of the lead-lag findings. To open it in Obsidian when the GUI won't add the vault: `python scripts/register_obsidian_vault.py "<output_dir>/_wiki" --open --launch` (Obsidian must be closed). Same store requirement. No Gemini. |
 | "build the video catalog", "refresh the corpus catalog", "what is in my corpus as one file" | `python scripts/atlas_build.py --corpus <output_dir>` | Writes `<output_dir>/_atlas/atlas.json`: one row per video with facets, a headings-only synopsis, timestamped deep links and already-seen signals (briefing membership, wiki pages). Complete by design: every video is a row, so treat the file as private. Reads the corpus, writes only `_atlas/atlas.json`, no Gemini. Prints one counts-only summary line; see `docs/atlas.md` for how to read it. A different tool from the creator wiki that `wiki_atlas.py` builds. |
 | "render the catalog page", "open my catalog in the browser", "show me my corpus as a page" | `python scripts/atlas_render.py --atlas <output_dir>/_atlas/atlas.json` | Turns the catalog into one self-contained `<output_dir>/_atlas/catalog.html` (Cards with thumbnails and timestamped headings, Compact table of contents, Grid of channel by month; filters, search, light and dark). Opens from disk by double-click; nothing is fetched except YouTube thumbnails, which a button turns off. Run the build row first when `atlas.json` is missing or stale; when unsure, run both, they are free (no Gemini). Pass `--out <file>` for a different location; an existing `catalog.html` this script did not write is refused, never overwritten. The page is private like the atlas. Not the Obsidian wiki: for that, see the open-wiki row above. |
+| "export a public catalog", "make a shareable subset of the catalog", "build the demo page" | `python scripts/atlas_export.py --atlas <output_dir>/_atlas/atlas.json --policy <output_dir>/_atlas/export-policy.yaml --deny-terms <private term list>` | Writes `<output_dir>/_atlas-export/atlas.json` and `catalog.html`: only the channels the policy lists, only videos on or after its `since` date, only public YouTube watch URLs, only the public row fields (no topics, briefing membership, wiki keys or aliases). Aborts before any write when a deny term appears in the subset. Refuses to write into `_atlas/` itself. Ask the user for the policy file when none exists; never invent a channel list. See `docs/atlas.md`, "Share a subset". |
 | "find videos about X", "search for Y", "nugget brief on Z", "corpus status", "verify quote", "fact-check claim against [creator]" | — | **Wrong skill.** These are read-only queries; use the **video-intel-search** skill. |
 
 ### Channel name resolution

@@ -360,6 +360,7 @@ class TestStandaloneScriptImportIsolation:
             "corpus_walk",
             "atlas_build",
             "atlas_render",
+            "atlas_export",
         ],
     )
     def test_import_succeeds_with_heavy_deps_blocked(self, module):

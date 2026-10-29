@@ -360,7 +360,10 @@
     concept: makeDim("cn", "Concept", "all", labelOf)
   };
   var DIMS = [D.channel, D.topic, D.year, D.month, D.quality, D.briefing, D.wiki, D.concept];
-  var RAIL_DIMS = [D.channel, D.topic, D.year, D.month, D.quality, D.briefing, D.wiki];
+  var hasTopics = rows.some(function (r) { return r.topics && r.topics.length; });
+  var hasBriefings = rows.some(function (r) { return r.in_briefings; });
+  var hasWiki = rows.some(function (r) { var w = r.wiki || {}; return w.creator || (w.concepts && w.concepts.length); });
+  var RAIL_DIMS = [D.channel].concat(hasTopics ? [D.topic] : [], [D.year, D.month, D.quality], hasBriefings ? [D.briefing] : [], hasWiki ? [D.wiki] : []);
 
   QUALITY.forEach(function (q) { codeOf(D.quality, q); });
   ["yes", "no"].forEach(function (v) { codeOf(D.briefing, v); codeOf(D.wiki, v); });
@@ -527,8 +530,12 @@
       var q = r.transcript_quality;
       if (q === "partial" || q === "truncated" || q === "severe") issues++;
     });
+    var facts = [];
+    if (hasBriefings) facts.push(fmt(inBrief) + " of " + fmt(n) + " (" + pct(inBrief, n) + ") already in a briefing");
+    if (hasTopics) facts.push(fmt(unthreaded) + " of " + fmt(n) + " (" + pct(unthreaded, n) + ") in no topic");
+    facts.push(fmt(issues) + " of " + fmt(n) + " with a partial, truncated or severe transcript");
     document.getElementById("finding").textContent = n
-      ? fmt(inBrief) + " of " + fmt(n) + " (" + pct(inBrief, n) + ") already in a briefing; " + fmt(unthreaded) + " of " + fmt(n) + " (" + pct(unthreaded, n) + ") in no topic; " + fmt(issues) + " of " + fmt(n) + " with a partial, truncated or severe transcript."
+      ? facts.join("; ") + "."
       : (tokens(state.q).length > 1 ? "Nothing matches. Every search word must match, so try fewer words, or remove a filter." : "Nothing matches. Remove a filter or change the search.");
   }
 
@@ -927,7 +934,12 @@
   window.addEventListener("hashchange", fromLocation);
 
   var g = atlas.generated_at || "unknown";
-  document.getElementById("foot-meta").textContent = "Generated " + g + " from " + (atlas.generated_from || "unknown") + ", " + fmt(N) + " rows, " + fmt(Object.keys(conceptLabels).length) + " concept labels.";
+  var footText = "Generated " + g + " from " + (atlas.generated_from || "unknown") + ", " + fmt(N) + " rows, " + fmt(Object.keys(conceptLabels).length) + " concept labels.";
+  var ex = atlas.export;
+  if (ex && typeof ex === "object") {
+    footText += " Public subset: " + fmt((ex.channels || []).length) + " channels" + (ex.since ? " since " + ex.since : "") + ", " + fmt(N) + " of " + fmt(ex.source_rows || 0) + " videos.";
+  }
+  document.getElementById("foot-meta").textContent = footText;
 
   fromLocation();
 })();

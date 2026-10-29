@@ -1,0 +1,22 @@
+# Export policy for the public catalog subset (scripts/atlas_export.py).
+# Default deny: only the channels listed here leave the machine, only videos
+# published on or after `since`, only canonical public YouTube watch URLs, and
+# only the public row fields (no topics, briefing membership, wiki keys or aliases).
+# Chosen 2026-10-28: the twelve most active channels of the last twelve months.
+channels:
+  - aidotengineer
+  - natebjones
+  - chase_h_ai
+  - engineerprompt
+  - ycombinator
+  - thenextnewthingai
+  - everyinc
+  - mark_kashef
+  - twist
+  - colemedin
+  - samwitteveenai
+  - gregisenberg
+since: 2025-10-28
+# Excluded by hand after the deny-term scan: a public title that names a guarded term.
+exclude_video_ids:
+  - XGvDbeoSN3E

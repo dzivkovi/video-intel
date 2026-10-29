@@ -118,10 +118,18 @@ def test_a_facet_click_in_compact_keeps_the_compact_page_size(page):
     page.click("#view-compact")
     page.wait_for_selector("#toc tbody tr")
     assert page.evaluate("document.querySelectorAll('#toc tbody tr').length") == ROWS
-    page.click("#facets button.fv[data-dim='br']:has-text('No')")  # "Already in a briefing: No" keeps every row
+    page.click("#facets button.fv[data-dim='ql']:has-text('complete')")  # every fixture row is complete
     page.wait_for_timeout(100)
     assert page.evaluate("document.querySelectorAll('#toc tbody tr').length") == ROWS
     assert "n=" not in page.evaluate("location.hash")
+
+
+def test_facets_no_row_can_answer_are_hidden_and_the_finding_says_only_what_it_can(page):
+    """No fixture row is in a briefing or has a wiki key, so those facets and clauses are absent."""
+    dims = page.eval_on_selector_all("#facets details.facet", "els => els.map(e => e.getAttribute('data-dim'))")
+    assert "tp" in dims and "br" not in dims and "wk" not in dims
+    finding = page.text_content("#finding")
+    assert "briefing" not in finding and "in no topic" in finding and "transcript" in finding
 
 
 def test_the_hash_restores_a_view_and_a_pending_debounce_cannot_undo_it(page, page_url):
