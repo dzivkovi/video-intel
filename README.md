@@ -5,7 +5,9 @@
 
 Point it at the YouTube channels you follow. It watches the videos for you - frames, on-screen text and audio together - and writes back a mind map, a transcript that records what was *shown* as well as what was said, and, if you want it, a search index that answers a question with timestamped links to the moments that match. You read the mind maps, decide what deserves 30 minutes, and ask questions across everything you have indexed.
 
-It is a Claude Code plugin: you say "scan my channels" or "what did anyone say about prompt caching", and Claude runs the tool. In daily use since March 2026 on a corpus of 2,400+ videos across 75 channels.
+It is a Claude Code plugin: you say "scan my channels" or "what did anyone say about prompt caching", and Claude runs the tool. In daily use since March 2026 on a corpus of 3,300+ videos across 100+ channels.
+
+**[Launch the interactive catalog](https://dzivkovi.github.io/video-intel/)**: 1,646 real videos from twelve public channels, browsable in your browser, no install.
 
 ## What a Fused Transcript Looks Like
 
@@ -181,7 +183,7 @@ Three consequences worth knowing before you configure a channel: the expensive s
 
 ## The catalog: your whole library on one page
 
-Once a few hundred videos have flowed through, the question changes from "what did this video say" to "do I already have something on this". The catalog answers it without the CLI: one self-contained HTML page that lists everything in the corpus, with the facets that let you narrow 3,000 videos to the three you meant in two clicks.
+Scanning and search answer questions you already know to ask. The catalog is the other way in: you browse. Once a few hundred videos have flowed through, the question changes from "what did this video say" to "do I already have something on this", and the answer is one page with no chat in the loop: every video you have, filters that narrow 3,000 to the three you meant in two clicks, and a link that opens each video at the second a topic starts.
 
 ![Cards view: thumbnail, mind-map headings that double as timestamped links, concept chips](docs/images/catalog-cards.png)
 
@@ -191,7 +193,7 @@ Three views over one filtered set. **Cards** show the thumbnail, the mind-map's 
 
 The design borrows from the "storytelling with data" school: one colour carries data and grey carries structure; warning colours appear only on transcripts with a problem; the finding under the title is a sentence with its denominators, not a chart; rows are sorted by size so the eye reads top-down. There is no node-link graph on purpose. A corpus like this has no edges that help you find a video (concept co-occurrence just puts popular topics in the middle), while the axes the grid uses, who and when, are ones you can act on.
 
-**Try it:** [examples/catalog/catalog.html](examples/catalog/catalog.html) is a real public subset, 1,646 videos from twelve public channels over twelve months, built by the same commands you would run on your own corpus. Download the file and open it; it needs no server and fetches nothing but YouTube thumbnails, which a button turns off. The policy that produced it sits next to it.
+**Try it:** [the live demo](https://dzivkovi.github.io/video-intel/) is a real public subset, 1,646 videos from twelve public channels over twelve months, built by the same commands you would run on your own corpus. The same file is [examples/catalog/catalog.html](examples/catalog/catalog.html), next to the policy that produced it; it needs no server and fetches nothing but YouTube thumbnails, which a button turns off.
 
 ```bash
 python scripts/atlas_build.py --corpus <output_dir>                          # the private catalog: every video, one JSON file
