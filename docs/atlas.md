@@ -45,7 +45,7 @@ What the page gives you:
 - **Cards**: thumbnail, title, channel (click it to filter), date, length; the mind map's branch headings double as the deep links, with the second they jump to; six concept chips (a chip narrows the set); an "Already seen" line when the video is in a briefing or has a wiki page.
 - **Compact**: a dated table of contents, newest first, 200 rows a page.
 - **Grid**: channel by month, last 24 months by default with a link to all months; darker means more videos; a cell lists exactly those videos.
-- A filter rail (channel, topic, year, month, transcript quality, briefing and wiki membership) whose counts update against every other filter; search where every word must match somewhere in title, headings, concepts or channel, with title hits first; a URL hash that carries the whole view, so a bookmark reopens it; a dark theme by default and a light one behind the button.
+- A filter rail (channel, topic, concept with a filter box, year, month, transcript quality, briefing and wiki membership) whose counts update against every other filter; search where every word must match somewhere in title, headings, concepts or channel, with title hits first; a URL hash that carries the whole view, so a bookmark reopens it; a dark theme by default and a light one behind the button.
 
 Rebuild the page after every atlas rebuild. It refuses to overwrite a `catalog.html` it did not write itself (no `atlas_render.py` generator marker in the file), the same rule the atlas build applies to `atlas.json`.
 
