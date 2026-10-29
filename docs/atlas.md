@@ -72,7 +72,7 @@ exclude_video_ids:   # optional: single videos to leave out
 
 The export keeps a row only when its channel is listed, its date is on or after `since`, its URL is the canonical public YouTube watch URL of its own id (so other platforms never qualify), and the YouTube Data API reports the video as `public`. That last check is what keeps unlisted videos out: a canonical URL proves nothing about visibility, and publishing an unlisted link is a disclosure the creator did not make. It needs `YOUTUBE_API_KEY` in the environment (one quota unit per 50 videos); without the key the export refuses, and `--no-verify-public` is the explicit way to accept the risk. A local ingest filed under a real-looking id is caught by the same check, since the API does not return it. A policy channel that ends up with no exportable video is a refusal too, so a typo in the allowlist cannot export silently.
 
-Each kept row is projected onto an explicit public field list: id, title, channel, date, length, URL, transcript quality and flag count, headings, deep links and concept ids. Topics, briefing membership, wiki keys, alternate titles and the folders a duplicate lived in are not fields of the public row at all. The concept labels and channel counts are rebuilt from the kept rows, so nothing the subset does not reference rides along in a side table. An unknown policy key, a duplicate key, a non-string key, a malformed date or an empty channel list is a refusal, never a default; `exclude_video_ids: []` is fine.
+Each kept row is projected onto an explicit public field list: id, title, channel, date, length, URL, transcript quality, flag count and transcript source, headings, deep links and concept ids. Topics, briefing membership, wiki keys, alternate titles and the folders a duplicate lived in are not fields of the public row at all. The concept labels and channel counts are rebuilt from the kept rows, so nothing the subset does not reference rides along in a side table. An unknown policy key, a duplicate key, a non-string key, a malformed date or an empty channel list is a refusal, never a default; `exclude_video_ids: []` is fine.
 
 `--deny-terms` is required and takes a file with one term per line (comments are skipped; lines under five characters are ignored and counted on stderr; an empty file is the explicit way to say you have none). The export aborts before any write when a term appears anywhere in the serialized subset, comparing after Unicode normalization and case folding, so an accented or differently cased spelling still matches; use your private term list. A public creator's title can trip it legitimately, as a video title naming a company did on the first real export; the remedy is `exclude_video_ids`, decided by you. Note that an excluded id in a committed policy is itself public: anyone can resolve it to the video.
 
@@ -117,7 +117,7 @@ The folder name is on stderr. Fix the access problem and run again.
 
 The full contract is [`schemas/atlas.schema.json`](../schemas/atlas.schema.json). The file's top-level keys are, in order: `schema_version`, `generator`, `generator_version`, `generated_from` (the corpus folder name, never a path), `generated_at`, `summary`, `concepts` (concept id to label, only for ids some row references) and `rows` (sorted by `published`, then `video_id`).
 
-Each row has these seventeen keys, in this order:
+Each row has these eighteen keys, in this order:
 
 1. `video_id`
 2. `title`
@@ -128,14 +128,15 @@ Each row has these seventeen keys, in this order:
 7. `url` (the stored `https` link, or `null`; never built from an id)
 8. `transcript_quality` (`severe`, `truncated`, `partial`, `complete`, `skipped`, `unknown` or `none`)
 9. `transcript_flag_count`
-10. `synopsis` (the mindmap's branch headings)
-11. `deep_links` (up to three `{label, seconds, url}`, only for YouTube URLs with an eleven-character id)
-12. `concept_ids`
-13. `topics` (from `topics.json`)
-14. `in_briefings`
-15. `briefing_count`
-16. `wiki` (`{"creator": <channel or null>, "concepts": [<concept ids>]}`: page keys read from the wiki pages' own front matter, so a renderer maps them to files)
-17. `aliases` (titles of the losing duplicate records)
+10. `transcript_source` (the stored `transcript_source` from meta.json, such as `gemini` or `youtube_captions`, or `null` when none is recorded)
+11. `synopsis` (the mindmap's branch headings)
+12. `deep_links` (up to three `{label, seconds, url}`, only for YouTube URLs with an eleven-character id)
+13. `concept_ids`
+14. `topics` (from `topics.json`)
+15. `in_briefings`
+16. `briefing_count`
+17. `wiki` (`{"creator": <channel or null>, "concepts": [<concept ids>]}`: page keys read from the wiki pages' own front matter, so a renderer maps them to files)
+18. `aliases` (titles of the losing duplicate records)
 
 ## Plain text for renderers
 

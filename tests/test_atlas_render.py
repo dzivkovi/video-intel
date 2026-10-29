@@ -132,6 +132,14 @@ class TestVocabulary:
         schema_values = set(schema["$defs"]["row"]["properties"]["transcript_quality"]["enum"])
         assert template_values == schema_values
 
+    def test_template_source_labels_cover_the_known_values(self):
+        """Drift tripwire: the sourceLabel map must keep a word for each value the page relies on."""
+        page = ar.TEMPLATE_PATH.read_text(encoding="utf-8")
+        m = re.search(r"var SOURCE_LABELS = \{([^}]*)\};", page)
+        assert m, "SOURCE_LABELS map not found in the template"
+        keys = set(re.findall(r'"?([a-z_-]+)"?\s*:', m.group(1)))
+        assert {"gemini", "youtube_captions", "none", "unrecorded"} <= keys
+
 
 class TestEscapeChainParity:
     def test_embed_json_uses_the_same_chain_as_lead_lag_viz(self):

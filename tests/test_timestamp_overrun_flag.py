@@ -337,11 +337,12 @@ class TestChunkedWriterPersistsTheFlag:
 class TestEveryWholeVideoWriterPersistsTheCount:
     def test_literal_count(self):
         src = Path(vi.__file__).read_text(encoding="utf-8")
-        # 4 writers: single-shot full-parse + salvage (process_transcript),
-        # _run_chunked_transcript_url, _try_captions_transcript; plus one entry
-        # in TRANSCRIPT_ARTIFACT_FIELDS. A new writer that forgets the field
-        # leaves this count short.
-        assert src.count('"transcript_timestamp_overrun_entries"') == 5
+        # 5 writers: single-shot full-parse + salvage (process_transcript),
+        # _run_chunked_transcript_url, _try_captions_transcript, and
+        # assess_transcript_markdown (the assess-transcripts backfill); plus one
+        # entry in TRANSCRIPT_ARTIFACT_FIELDS. A new writer that forgets the
+        # field leaves this count short.
+        assert src.count('"transcript_timestamp_overrun_entries"') == 6
 
 
 class TestSalvageWriterPersistsTheFlag:

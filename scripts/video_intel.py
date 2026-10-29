@@ -12,6 +12,7 @@ Prerequisites:
 """
 
 import argparse
+import csv
 import functools
 import itertools
 import json
@@ -580,6 +581,9 @@ CONFIG_BACKUP_COMMANDS = frozenset(
         "topics-build",
         "index",
         "repair-metas",
+        # Issue #269: writes quality fields into corpus metas. Needs no
+        # `channels:`, like repair-metas.
+        "assess-transcripts",
         "backfill-descriptions",
         "dedupe",
         "prune-shorts",
@@ -10602,6 +10606,46 @@ def require_voyageai():
 ENTRY_TIMESTAMP_PATTERN = TIMESTAMP_TOKEN_PATTERN
 
 
+def dialogue_entries_from_transcript_markdown(text: str) -> list[dict]:
+    """Dialogue entries of a rendered ``.transcript.md``, in FILE order.
+
+    One ``{"start": "<stamp>", "text": "<rest of line>"}`` per line that opens
+    with a bracketed stamp matched by ``ENTRY_TIMESTAMP_PATTERN`` - the same
+    shape ``chunk_transcript`` treats as an entry boundary, so the two readers
+    of the rendered markdown cannot disagree about what a dialogue line is
+    (issue #195). Both renderers' lines qualify: captions
+    (``[00:02] "Hello"``) and Gemini (``[00:05] Dan Shipper (Host): "text"``).
+
+    Excluded: SCREEN lines (on-screen content is not dialogue, and the assessor
+    is never handed it) and every line of the header, which is everything up
+    to the first ``---`` line after the ``# Transcript:`` title. A file whose
+    title is never followed by ``---`` is all header and yields no entries.
+
+    File order is kept on purpose: ``assess_transcript_artifact`` reads
+    backward jumps in the order given.
+    """
+    entry_line = re.compile(rf"^\[({ENTRY_TIMESTAMP_PATTERN})\][ \t]*(.*)$")
+    lines = text.splitlines()
+    body_start = 0
+    for i, line in enumerate(lines):
+        if line.startswith("# Transcript:"):
+            for j in range(i + 1, len(lines)):
+                if lines[j].strip() == "---":
+                    body_start = j + 1
+                    break
+            else:
+                return []
+            break
+    entries = []
+    for line in lines[body_start:]:
+        if line.strip().startswith("SCREEN ["):
+            continue
+        match = entry_line.match(line)
+        if match:
+            entries.append({"start": match.group(1), "text": match.group(2)})
+    return entries
+
+
 def _parse_timestamp_seconds(ts: str) -> int:
     """Convert 'MM:SS' or 'HH:MM:SS' to seconds."""
     parts = ts.split(":")
@@ -12892,6 +12936,228 @@ def cmd_repair_metas(args, config):
     )
     if not args.apply and (repaired or orphans):
         log.info("Re-run with --apply to write. After applying, run 'taxonomy-build' and 'index --force'.")
+
+
+ASSESS_TRANSCRIPTS_MANIFEST = "manifest.csv"
+
+
+def _assessable_duration(meta: dict) -> int | None:
+    """``duration_seconds`` when it is a positive number, else None (unknown).
+
+    ``bool`` is rejected first because ``isinstance(True, int)`` holds and
+    ``int(True) == 1`` would assess a whole transcript against a one-second
+    video. Unknown duration makes the assessor skip gap and density rather
+    than guess, which is the designed fail-safe.
+    """
+    raw = meta.get("duration_seconds")
+    if isinstance(raw, bool) or not isinstance(raw, int | float):
+        return None
+    try:
+        value = int(raw)
+    except (OverflowError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def assess_transcript_markdown(text: str, duration_seconds: int | None, *, captions: bool) -> tuple[dict, list[str]]:
+    """Assess a transcript on disk: (the six persisted quality fields, sorted flags).
+
+    The fields are exactly the ones the transcript writers persist, computed by
+    the one assessor from the entries ``dialogue_entries_from_transcript_markdown``
+    reads. A captions transcript gets the captions writer's leading-gap
+    demotion (issue #182 invariant 7): silence before the first cue is a
+    pre-show, not lost content.
+    """
+    metrics = assess_transcript_artifact(dialogue_entries_from_transcript_markdown(text), duration_seconds)
+    if captions:
+        severe, mild = _demote_captions_leading_gap(metrics)
+    else:
+        severe, mild = metrics["severe"], metrics["mild"]
+    flags = sorted(set(severe) | set(mild))
+    fields = {
+        "transcript_quality_flags": flags,
+        "transcript_max_blind_gap_seconds": metrics["max_blind_gap_seconds"],
+        "transcript_blind_gap_at_seconds": metrics["blind_gap_at_seconds"],
+        "transcript_last_dialogue_fraction": metrics["last_dialogue_fraction"],
+        "transcript_dialogue_entries": metrics["dialogue_entries"],
+        "transcript_timestamp_overrun_entries": metrics["timestamp_overrun_entries"],
+    }
+    return fields, flags
+
+
+def _write_meta_atomic(meta_path: Path, meta: dict) -> None:
+    """``json.dumps(meta, indent=2)`` to ``<meta>.<pid>.tmp``, then ``os.replace``."""
+    tmp = meta_path.with_name(f"{meta_path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        os.replace(tmp, meta_path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _backup_meta_verified(backup_dir: Path, channel: str, meta_path: Path, raw_bytes: bytes) -> bool:
+    """Copy the meta's original bytes aside and prove the copy is identical.
+
+    The bytes are the ones the caller already read and parsed, so the backup
+    holds exactly the content the new fields were computed against. An
+    existing backup is never overwritten: if it holds different bytes it is an
+    older original, and the run stops rather than lose it.
+    """
+    dest = backup_dir / channel / meta_path.name
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        if dest.read_bytes() == raw_bytes:
+            return True
+        log.error("  %s: a different backup already exists; refusing to overwrite it. Use a new --backup-dir.", dest)
+        return False
+    dest.write_bytes(raw_bytes)
+    if dest.read_bytes() != raw_bytes:
+        log.error("  %s: backup copy does not match the original bytes.", dest)
+        return False
+    return True
+
+
+def _append_assess_manifest_row(backup_dir: Path, row: list[str]) -> None:
+    manifest = backup_dir / ASSESS_TRANSCRIPTS_MANIFEST
+    new = not manifest.exists()
+    with manifest.open("a", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh)
+        if new:
+            writer.writerow(["channel", "meta_file", "video_id", "flags", "transcript_status"])
+        writer.writerow(row)
+
+
+def cmd_assess_transcripts(args, config):
+    """Run the issue #157 quality assessor over transcripts never assessed.
+
+    Reads ``.transcript.md`` files already on disk; never calls Gemini.
+    Candidates are ``<output_dir>/<channel>/<prefix>.meta.json`` files
+    (``_``/``.`` folders skipped) that parse to a non-empty object, have a
+    literal ``<prefix>.transcript.md`` sibling, carry a string
+    ``transcript_status`` not starting with ``error``, and - unless
+    ``--force`` - have no ``transcript_quality_flags`` key at all.
+
+    Writes exactly the six quality fields the transcript writers persist, plus
+    ``transcript_status: partial`` when a severe flag lands on a healthy
+    status (#157 invariant 6). No other key is touched, so this deliberately
+    does NOT go through ``update_meta`` (which clears ``last_error`` and marks
+    a mode complete). It never creates a meta and never re-identifies one.
+
+    Dry run by default. ``--apply`` (with the parser-enforced
+    ``--backup-dir``) copies each meta it is about to change to
+    ``<backup-dir>/<channel>/``, verifies the copy byte for byte, records it in
+    ``manifest.csv``, and only then replaces the original. A failed
+    verification stops the run, non-zero, before that meta is touched.
+    """
+    output_dir = resolve_output_dir(config)
+    only = getattr(args, "channel", None)
+    force = bool(getattr(args, "force", False))
+    apply = bool(getattr(args, "apply", False))
+    backup_dir = Path(args.backup_dir).expanduser() if apply else None
+
+    counts = dict.fromkeys(
+        ("candidates", "clean", "mild", "severe", "demoted", "status_set", "skipped_unparseable", "skipped_no_entries"),
+        0,
+    )
+    changed = 0
+    for meta_path in sorted(output_dir.glob("*/*.meta.json")):
+        channel = meta_path.parent.name
+        if channel.startswith((".", "_")):
+            continue
+        if only and channel != only:
+            continue
+        prefix = meta_path.name[: -len(".meta.json")]
+        transcript_path = meta_path.parent / f"{prefix}.transcript.md"
+        if not transcript_path.exists():
+            continue
+        # Bytes first (they are also what a backup must hold), then decode +
+        # parse, catching ValueError so a torn multibyte write lands here too
+        # (issue #124). An OSError propagates: a read that never happened is
+        # not evidence about the file. Unusable content is skipped, NOT
+        # quarantined: this command never rewrites an unparseable meta, and a
+        # dry run must leave the corpus exactly as it found it.
+        raw_bytes = meta_path.read_bytes()
+        try:
+            meta = json.loads(raw_bytes.decode("utf-8"))
+        except ValueError:
+            meta = None
+        if not isinstance(meta, dict) or not meta:
+            counts["skipped_unparseable"] += 1
+            log.warning(
+                "  %s/%s: meta.json unusable or empty; skipped (this command never creates a meta)", channel, prefix
+            )
+            continue
+        status = meta.get("transcript_status")
+        # A missing status is the oldest writer's shape (a transcript on disk, no
+        # record of it): it is assessable, and the inspection gives it its first
+        # status. Anything that is a string but not healthy or absent is left alone.
+        if status is not None and (not isinstance(status, str) or status.startswith("error")):
+            continue
+        if not force and "transcript_quality_flags" in meta:
+            continue
+        try:
+            text = transcript_path.read_text(encoding="utf-8")
+        except (OSError, ValueError) as exc:
+            counts["skipped_no_entries"] += 1
+            log.warning("  %s/%s: transcript unreadable (%s); skipped", channel, prefix, exc)
+            continue
+        if not dialogue_entries_from_transcript_markdown(text):
+            # An empty entry list would read as a collapse; it is a parse
+            # question, not evidence about the transcript.
+            counts["skipped_no_entries"] += 1
+            log.warning("  %s/%s: no dialogue entries parsed; skipped", channel, prefix)
+            continue
+
+        fields, flags = assess_transcript_markdown(
+            text,
+            _assessable_duration(meta),
+            captions=meta.get("transcript_source") == TRANSCRIPT_SOURCE_CAPTIONS,
+        )
+        severe = transcript_quality_flags_are_severe(flags)
+        verdict = "severe" if severe else ("mild" if flags else "clean")
+        counts["candidates"] += 1
+        counts[verdict] += 1
+        new_meta = dict(meta)
+        new_meta.update(fields)
+        if status is None:
+            # First status this transcript ever had: what the inspection found.
+            new_meta["transcript_status"] = "partial" if severe else "complete"
+            counts["demoted" if severe else "status_set"] += 1
+        elif severe and status in _HEALTHY_TRANSCRIPT_STATUSES:
+            new_meta["transcript_status"] = "partial"
+            counts["demoted"] += 1
+        log.info("  %s/%s: %s, %s", channel, prefix, ", ".join(flags) or "clean", verdict)
+
+        if not apply or new_meta == meta:
+            continue
+        if not _backup_meta_verified(backup_dir, channel, meta_path, raw_bytes):
+            log.error(
+                "assess-transcripts: stopped before writing %s/%s; %d meta(s) written so far.", channel, prefix, changed
+            )
+            sys.exit(1)
+        _append_assess_manifest_row(
+            backup_dir,
+            [channel, meta_path.name, str(meta.get("video_id") or ""), ";".join(flags), new_meta["transcript_status"]],
+        )
+        _write_meta_atomic(meta_path, new_meta)
+        changed += 1
+
+    tail = f"applied, backups in {backup_dir}" if apply else "dry run"
+    log.info(
+        "assess-transcripts: candidates=%d clean=%d mild=%d severe=%d demoted=%d status_set=%d "
+        "skipped_unparseable=%d skipped_no_entries=%d (%s)",
+        counts["candidates"],
+        counts["clean"],
+        counts["mild"],
+        counts["severe"],
+        counts["demoted"],
+        counts["status_set"],
+        counts["skipped_unparseable"],
+        counts["skipped_no_entries"],
+        tail,
+    )
+    return counts
 
 
 # ---------------------------------------------------------------------------
@@ -15494,6 +15760,27 @@ Examples:
         help="Write the backfilled fields. Default is dry-run (report only).",
     )
 
+    # assess-transcripts command (issue #269)
+    assess_parser = subparsers.add_parser(
+        "assess-transcripts",
+        help="Run the transcript quality assessor over transcripts on disk that were never assessed. Reads files only; no Gemini call.",
+    )
+    assess_parser.add_argument("--channel", help="Restrict to this channel (default: all channels).")
+    assess_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-assess every transcript, not only the ones with no quality flags recorded.",
+    )
+    assess_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write the quality fields. Default is dry-run (report only). Requires --backup-dir.",
+    )
+    assess_parser.add_argument(
+        "--backup-dir",
+        help="Folder that receives a verified copy of every meta.json before it changes, plus manifest.csv. Required with --apply.",
+    )
+
     # backfill-descriptions command (issue #224)
     backfill_parser = subparsers.add_parser(
         "backfill-descriptions",
@@ -15609,6 +15896,8 @@ Examples:
     )
 
     args = parser.parse_args()
+    if args.command == "assess-transcripts" and args.apply and not args.backup_dir:
+        parser.error("assess-transcripts --apply requires --backup-dir PATH (a verified copy of every meta it changes)")
     logging.basicConfig(
         level=logging.WARNING,
         format="%(asctime)s %(levelname)-7s %(message)s",
@@ -15682,6 +15971,8 @@ Examples:
             cmd_backfill_descriptions(args, config)
         elif args.command == "repair-metas":
             cmd_repair_metas(args, config)
+        elif args.command == "assess-transcripts":
+            cmd_assess_transcripts(args, config)
         elif args.command == "dedupe":
             cmd_dedupe(args, config)
         elif args.command == "prune-shorts":

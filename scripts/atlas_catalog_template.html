@@ -115,6 +115,7 @@
   .badge.q-complete { background: var(--chip); color: var(--muted); }
   .badge.q-partial, .badge.q-truncated { background: var(--amber-soft); color: var(--amber); }
   .badge.q-severe { background: var(--red-soft); color: var(--red); }
+  .badge.q-captions { background: transparent; color: var(--muted); box-shadow: inset 0 0 0 1px var(--line); }
   .badge.q-skipped, .badge.q-unknown, .badge.q-none { background: transparent; color: var(--faint); box-shadow: inset 0 0 0 1px var(--line); }
   .aliases { margin: 6px 0 0; font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
   .syn { margin: 8px 0 0; padding-left: 18px; font-size: 14px; }
@@ -353,6 +354,15 @@
   // Display words for the transcript_quality values; the values themselves never change.
   var QUALITY_LABELS = { none: "no transcript", unknown: "not assessed" };
   function qualityLabel(q) { return QUALITY_LABELS[q] || q; }
+  // Display words for the transcript_source values; an unlisted value shows as written.
+  var SOURCE_LABELS = { gemini: "Gemini multimodal", youtube_captions: "YouTube captions", "youtube-auto-captions": "YouTube captions", none: "no transcript", unrecorded: "not recorded" };
+  function sourceLabel(v) { return Object.prototype.hasOwnProperty.call(SOURCE_LABELS, v) ? SOURCE_LABELS[v] : v; }
+  // The one definition of a row's source value, shared by the facet and the captions badge.
+  function rowSource(r) {
+    if (typeof r.transcript_source === "string" && r.transcript_source) return r.transcript_source;
+    return r.transcript_quality === "none" || r.transcript_quality === "skipped" ? "none" : "unrecorded";
+  }
+  function isCaptions(v) { return v === "youtube_captions" || v === "youtube-auto-captions"; }
 
   var D = {
     channel: makeDim("ch", "Channel", "one"),
@@ -360,17 +370,19 @@
     year: makeDim("yr", "Year", "one", function (v) { return v || "No date"; }),
     month: makeDim("mo", "Month", "one", monthLabel),
     quality: makeDim("ql", "Transcript quality", "one", qualityLabel),
+    source: makeDim("ts", "Transcript source", "one", sourceLabel),
     briefing: makeDim("br", "Already in a briefing", "one", yesNo),
     wiki: makeDim("wk", "Has wiki page", "one", yesNo),
     concept: makeDim("cn", "Concept (all required)", "all", labelOf)
   };
-  var DIMS = [D.channel, D.topic, D.year, D.month, D.quality, D.briefing, D.wiki, D.concept];
+  var DIMS = [D.channel, D.topic, D.year, D.month, D.quality, D.source, D.briefing, D.wiki, D.concept];
   var hasTopics = rows.some(function (r) { return r.topics && r.topics.length; });
   var hasBriefings = rows.some(function (r) { return r.in_briefings; });
   var hasWiki = rows.some(function (r) { var w = r.wiki || {}; return w.creator || (w.concepts && w.concepts.length); });
-  var RAIL_DIMS = [D.channel].concat(hasTopics ? [D.topic] : [], [D.concept, D.year, D.month, D.quality], hasBriefings ? [D.briefing] : [], hasWiki ? [D.wiki] : []);
+  var hasSource = rows.some(function (r) { return typeof r.transcript_source === "string" && r.transcript_source; });
+  var RAIL_DIMS = [D.channel].concat(hasTopics ? [D.topic] : [], [D.concept, D.year, D.month, D.quality], hasSource ? [D.source] : [], hasBriefings ? [D.briefing] : [], hasWiki ? [D.wiki] : []);
   // Facets whose zero-count values are noise rather than a choice: hidden unless selected.
-  var HIDE_ZERO = [D.concept, D.quality];
+  var HIDE_ZERO = [D.concept, D.quality, D.source];
   var FILTERABLE = [D.concept];
 
   QUALITY.forEach(function (q) { codeOf(D.quality, q); });
@@ -386,6 +398,7 @@
     D.year.codes[i] = codeOf(D.year, pub.slice(0, 4));
     D.month.codes[i] = codeOf(D.month, pub.slice(0, 7));
     D.quality.codes[i] = codeOf(D.quality, r.transcript_quality || "unknown");
+    D.source.codes[i] = codeOf(D.source, rowSource(r));
     D.briefing.codes[i] = codeOf(D.briefing, r.in_briefings ? "yes" : "no");
     var w = r.wiki || {};
     D.wiki.codes[i] = codeOf(D.wiki, w.creator || (w.concepts && w.concepts.length) ? "yes" : "no");
@@ -556,7 +569,7 @@
     var codes = d.values.map(function (_, c) { return c; });
     if (d === D.year || d === D.month) {
       codes.sort(function (a, b) { var va = d.values[a], vb = d.values[b]; if (!va) return 1; if (!vb) return -1; return va < vb ? 1 : -1; });
-    } else if (d === D.channel || d === D.topic || d === D.concept) {
+    } else if (d === D.channel || d === D.topic || d === D.concept || d === D.source) {
       codes.sort(function (a, b) {
         if (d === D.topic) { if (a === unthreadedCode) return 1; if (b === unthreadedCode) return -1; }
         return counts[b] - counts[a] || (d.values[a] < d.values[b] ? -1 : 1);
@@ -614,6 +627,10 @@
   // "complete" is the normal state and stays silent; only the exceptions get a badge.
   function qualityBadge(q) { return q === "complete" ? null : el("span", { class: "badge q-" + q, title: "Transcript quality" }, qualityLabel(q)); }
   function appendBadge(host, q) { var b = qualityBadge(q); if (b) host.appendChild(b); }
+  // Gemini is the normal source and stays silent, like "complete"; captions get a badge.
+  function appendSourceBadge(host, r) {
+    if (isCaptions(rowSource(r))) host.appendChild(el("span", { class: "badge q-captions", title: "Transcript source: " + sourceLabel(rowSource(r)) }, "captions"));
+  }
   function renderCard(i) {
     var r = rows[i];
     var card = el("article", { class: "card" });
@@ -635,6 +652,7 @@
     var dur = fmtDur(r.duration_seconds);
     if (dur) meta.appendChild(el("span", null, dur));
     appendBadge(meta, r.transcript_quality || "unknown");
+    appendSourceBadge(meta, r);
 
     if (r.aliases && r.aliases.length) card.appendChild(el("p", { class: "aliases" }, "also titled: " + r.aliases.join("; ")));
 
@@ -720,7 +738,9 @@
       if (u) td.appendChild(el("a", { href: u, target: "_blank", rel: "noopener noreferrer" }, r.title || r.video_id));
       else td.textContent = r.title || r.video_id;
       tr.appendChild(el("td", { class: "dur" }, fmtDur(r.duration_seconds)));
-      appendBadge(tr.appendChild(el("td")), r.transcript_quality || "unknown");
+      var tq = tr.appendChild(el("td"));
+      appendBadge(tq, r.transcript_quality || "unknown");
+      appendSourceBadge(tq, r);
       frag.appendChild(tr);
     }
     tbody.appendChild(frag);

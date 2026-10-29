@@ -57,6 +57,7 @@ CANARIES = [
     "777777",
     "7777",
     "9998",
+    "CANARY_source_private",
 ]
 
 
@@ -71,6 +72,7 @@ def row(vid, title, channel, published, url=None, **over):
         "url": url if url is not None else f"https://www.youtube.com/watch?v={vid}",
         "transcript_quality": "complete",
         "transcript_flag_count": 0,
+        "transcript_source": "gemini",
         "synopsis": ["Heading one", "Heading two"],
         "deep_links": [
             {"label": "Heading one", "seconds": 5, "url": f"https://www.youtube.com/watch?v={vid}&t=5"},
@@ -120,6 +122,7 @@ def private_atlas() -> dict:
                 duration_seconds=777777,
                 transcript_quality="severe",
                 transcript_flag_count=9998,
+                transcript_source="CANARY_source_private",
                 synopsis=["CANARY_heading_private"],
                 deep_links=[
                     {
@@ -206,6 +209,7 @@ class TestCanaries:
         (r,) = subset["rows"]
         assert tuple(r) == ax.PUBLIC_ROW_KEYS
         assert r["video_id"] == PUBLIC_ID and r["title"] == "A public video & <b>title</b>"
+        assert r["transcript_source"] == "gemini"
         assert [dl["seconds"] for dl in r["deep_links"]] == [5]
         assert subset["concepts"] == {"c.public": "Public concept"}
         assert subset["summary"] == {"channels": {PUBLIC_CH: 1}, "topics": {}, "unthreaded": 0, "rows": 1}
@@ -381,7 +385,7 @@ class TestPolicy:
         ],
     )
     def test_a_policy_that_cannot_be_trusted_is_refused_and_nothing_is_written(self, corpus, capsys, text, message):
-        root, atlas, policy = corpus
+        root, _atlas, policy = corpus
         policy.write_text(text, encoding="utf-8")
         assert run(corpus) == ax.EXIT_REFUSED
         assert message in capsys.readouterr().err
