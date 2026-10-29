@@ -64,6 +64,7 @@ PUBLIC_ROW_KEYS = (
     "url",
     "transcript_quality",
     "transcript_flag_count",
+    "transcript_source",
     "synopsis",
     "deep_links",
     "concept_ids",

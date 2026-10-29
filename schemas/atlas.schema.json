@@ -109,6 +109,7 @@
         "url",
         "transcript_quality",
         "transcript_flag_count",
+        "transcript_source",
         "synopsis",
         "deep_links",
         "concept_ids",
@@ -139,6 +140,7 @@
           "enum": ["severe", "truncated", "partial", "complete", "skipped", "unknown", "none"]
         },
         "transcript_flag_count": {"$ref": "#/$defs/count"},
+        "transcript_source": {"type": ["string", "null"]},
         "synopsis": {
           "type": "array",
           "description": "The mindmap branch headings in order.",

@@ -1,7 +1,7 @@
 """Tests for scripts/atlas_build.py, the data layer (issue #260, unit U2).
 
 Contract under test:
-- `build_rows` returns one row per walker record with the seventeen R11 keys
+- `build_rows` returns one row per walker record with the eighteen R11 keys
   in schema order, built by explicit projection: free-text meta fields never
   reach a row;
 - the synopsis is the mindmap's `##` headings only, and the generator never
@@ -38,6 +38,7 @@ ROW_KEYS = [
     "url",
     "transcript_quality",
     "transcript_flag_count",
+    "transcript_source",
     "synopsis",
     "deep_links",
     "concept_ids",
@@ -113,7 +114,7 @@ def _happy_corpus(root: pathlib.Path) -> pathlib.Path:
         mindmap=f"# Root\n\n## Branch One\n\n* **Sub**\n  - first point {SENTINEL} (1:05)\n\n## Branch Two\n  - x (2:00)\n",
         concepts=_concepts("dom.pact", "dom.loop", as_mentioned=SENTINEL),
         transcript=f"[00:00] {SENTINEL}\n",
-        extra={"transcript_status": "complete", "duration_seconds": 600},
+        extra={"transcript_status": "complete", "duration_seconds": 600, "transcript_source": "gemini"},
     )
     _video(
         corpus,
@@ -159,7 +160,7 @@ def _row(result, video_id):
 
 
 class TestHappyPath:
-    def test_rows_have_the_seventeen_keys_in_order(self, tmp_path):
+    def test_rows_have_the_eighteen_keys_in_order(self, tmp_path):
         result = ab.build_rows(_happy_corpus(tmp_path))
         assert len(result.rows) == 4
         for row in result.rows:
@@ -262,6 +263,8 @@ class TestSynopsisAndTranscript:
         assert not [p for p in touched if p.endswith(".transcript.md")]
         # Presence is still known from the listing.
         assert _row(result, "aaaaaaaaaa1")["transcript_quality"] == "complete"
+        # The source comes from meta.json alone, with the transcript still unopened.
+        assert _row(result, "aaaaaaaaaa1")["transcript_source"] == "gemini"
 
 
 class TestReadingNeverWrites:
@@ -420,6 +423,26 @@ class TestTranscriptQuality:
         result = ab.build_rows(corpus)
         assert _row(result, "a")["transcript_flag_count"] == 2
         assert _row(result, "b")["transcript_flag_count"] == 0
+
+    def test_transcript_source_is_carried_verbatim(self, tmp_path):
+        corpus = tmp_path / "c"
+        _video(corpus, "chanA", "2026-01-01-a", "a", extra={"transcript_source": "youtube_captions"})
+        _video(corpus, "chanA", "2026-01-01-b", "b", extra={"transcript_source": "gemini"})
+        result = ab.build_rows(corpus)
+        assert _row(result, "a")["transcript_source"] == "youtube_captions"
+        assert _row(result, "b")["transcript_source"] == "gemini"
+
+    def test_missing_empty_or_non_string_source_is_null(self, tmp_path):
+        corpus = tmp_path / "c"
+        _video(corpus, "chanA", "2026-01-01-a", "a")
+        _video(corpus, "chanA", "2026-01-01-b", "b", extra={"transcript_source": ""})
+        _video(corpus, "chanA", "2026-01-01-c", "c", extra={"transcript_source": 7})
+        _video(corpus, "chanA", "2026-01-01-d", "d", extra={"transcript_source": ["gemini"]})
+        result = ab.build_rows(corpus)
+        for vid in ("a", "b", "c", "d"):
+            row = _row(result, vid)
+            assert "transcript_source" in row, vid
+            assert row["transcript_source"] is None, vid
 
 
 class TestWikiBriefingsAndPaths:

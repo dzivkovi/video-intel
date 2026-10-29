@@ -96,6 +96,7 @@ ROW_KEYS = (
     "url",
     "transcript_quality",
     "transcript_flag_count",
+    "transcript_source",
     "synopsis",
     "deep_links",
     "concept_ids",
@@ -228,6 +229,12 @@ def transcript_flag_count(meta: dict) -> int:
     if not isinstance(flags, list):
         return 0
     return sum(1 for f in flags if isinstance(f, str))
+
+
+def transcript_source(meta: dict) -> str | None:
+    """The writer's stored `transcript_source`, read from meta.json only (never the transcript)."""
+    source = meta.get("transcript_source")
+    return source if isinstance(source, str) and source else None
 
 
 def deep_links(mindmap_text: str, url: str | None, duration: int | None) -> list[dict]:
@@ -441,6 +448,7 @@ def build_rows(corpus: Path) -> BuildResult:
             "url": url,
             "transcript_quality": transcript_quality(meta, record.siblings),
             "transcript_flag_count": transcript_flag_count(meta),
+            "transcript_source": transcript_source(meta),
             "synopsis": [h for h in (clean_text(h) for h in mindmap_headings(mindmap)) if h],
             "deep_links": deep_links(mindmap, url, duration),
             "concept_ids": ids,

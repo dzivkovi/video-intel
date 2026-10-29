@@ -39,6 +39,7 @@ def smoke_atlas() -> dict:
                 "url": f"https://www.youtube.com/watch?v={vid}",
                 "transcript_quality": {1: "unknown", 2: "none"}.get(i, "complete"),
                 "transcript_flag_count": 0,
+                "transcript_source": "youtube_captions" if i == 3 else ("gemini" if i not in (1, 2) else None),
                 "synopsis": ["Same label", "Same label", "Other"],
                 "deep_links": [
                     {"label": "Same label", "seconds": 10, "url": f"https://www.youtube.com/watch?v={vid}&t=10"},
@@ -167,5 +168,79 @@ def test_the_concept_filter_box_narrows_the_facet_and_keeps_focus(page):
 def test_quality_facet_uses_plain_labels_and_hides_zero_counts(page):
     names = page.eval_on_selector_all("#facets button.fv[data-dim='ql'] .name", "els => els.map(e => e.textContent)")
     assert names == ["complete", "not assessed", "no transcript"]
-    badges = page.eval_on_selector_all("#cards .badge", "els => els.map(e => e.textContent)")
+    badges = page.eval_on_selector_all("#cards .badge:not(.q-captions)", "els => els.map(e => e.textContent)")
     assert set(badges) <= {"not assessed", "no transcript"}
+
+
+SOURCE_LABELS = {
+    "gemini": "Gemini multimodal",
+    "youtube_captions": "YouTube captions",
+    "none": "no transcript",
+    "unrecorded": "not recorded",
+}
+
+
+def _fixture_source(row: dict) -> str:
+    """The page's rowSource rule, restated over the fixture to derive the expected facet."""
+    if isinstance(row["transcript_source"], str) and row["transcript_source"]:
+        return row["transcript_source"]
+    return "none" if row["transcript_quality"] in ("none", "skipped") else "unrecorded"
+
+
+def test_the_source_facet_lists_plain_labels_in_count_order(page):
+    counts: dict[str, int] = {}
+    for row in smoke_atlas()["rows"]:
+        counts[_fixture_source(row)] = counts.get(_fixture_source(row), 0) + 1
+    # Count descending, then the raw value ascending: the rail's channel/concept order.
+    expected = [SOURCE_LABELS[v] for v in sorted(counts, key=lambda v: (-counts[v], v))]
+    assert sorted(expected) == sorted(["Gemini multimodal", "YouTube captions", "no transcript", "not recorded"])
+    label = page.text_content("#facets details.facet[data-dim='ts'] summary")
+    assert label.startswith("Transcript source")
+    names = page.eval_on_selector_all("#facets button.fv[data-dim='ts'] .name", "els => els.map(e => e.textContent)")
+    assert names == expected
+
+
+def test_clicking_youtube_captions_narrows_to_one_and_writes_the_hash(page):
+    page.click("#facets button.fv[data-dim='ts']:has-text('YouTube captions')")
+    page.wait_for_timeout(100)
+    assert page.text_content("#active-title").startswith(f"1 of {ROWS} videos")
+    assert page.evaluate("new URLSearchParams(location.hash.slice(1)).getAll('ts')") == ["youtube_captions"]
+
+
+def test_the_captions_badge_marks_exactly_one_card(page, page_url):
+    page.goto(page_url + "#n=100")  # every fixture row on one Cards page
+    page.wait_for_selector("#cards .card")
+    assert page.evaluate("document.querySelectorAll('#cards .card').length") == ROWS
+    titles = page.eval_on_selector_all(
+        "#cards .card",
+        "els => els.filter(e => e.querySelector('.badge.q-captions')).map(e => e.querySelector('h3').textContent)",
+    )
+    assert titles == ["Video number 3"]
+    assert page.text_content("#cards .card .badge.q-captions") == "captions"
+    page.click("#view-compact")
+    page.wait_for_selector("#toc tbody tr")
+    assert page.evaluate("document.querySelectorAll('#toc tbody .badge.q-captions').length") == 1
+
+
+def test_an_atlas_without_the_source_field_shows_no_source_facet(browser, tmp_path):
+    atlas = smoke_atlas()
+    atlas["rows"] = atlas["rows"][:5]
+    for row in atlas["rows"]:
+        del row["transcript_source"]
+    atlas_path = tmp_path / "atlas.json"
+    atlas_path.write_text(json.dumps(atlas), encoding="utf-8")
+    assert ar.main(["--atlas", str(atlas_path)]) == 0
+    pg = browser.new_page(viewport={"width": 1280, "height": 900})
+    errors: list[str] = []
+    pg.on("pageerror", lambda e: errors.append(str(e)))
+    try:
+        pg.goto((tmp_path / "catalog.html").resolve().as_uri() + "#ts=unrecorded")
+        pg.wait_for_selector("#active-title:not(:empty)", timeout=15000)
+        dims = pg.eval_on_selector_all("#facets details.facet", "els => els.map(e => e.getAttribute('data-dim'))")
+        assert "ql" in dims and "ts" not in dims
+        # A hash naming the hidden facet selects nothing, so all five rows stay in view.
+        assert pg.text_content("#active-title").startswith("5 of 5 videos")
+        assert pg.evaluate("document.querySelectorAll('.badge.q-captions').length") == 0
+        assert errors == [], errors
+    finally:
+        pg.close()
