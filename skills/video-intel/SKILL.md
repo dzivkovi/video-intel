@@ -8,7 +8,10 @@ description: >
   "what's new in channels I don't follow", "show me the digest"); transcribe a video (URL or
   local MP4); run the full mindmap+transcript+concepts pipeline on a local
   video; extract and normalize concepts into the taxonomy; rebuild the
-  LanceDB hybrid-search index from existing transcripts; clean up
+  LanceDB hybrid-search index from existing transcripts; see the whole
+  corpus as one visual catalog page (cards with thumbnails and timestamped
+  headings, a dated table of contents, a channel-by-month grid) and export
+  a shareable public subset of it behind a policy; clean up
   title-rotation duplicates; prune YouTube Shorts that polluted the corpus;
   manage channel configuration. Trigger phrases:
   "scan channel", "scan all channels", "what's new from [creator]" (with
@@ -38,7 +41,8 @@ description: >
   "who has validated ties across my creators", "build the video catalog",
   "refresh the corpus catalog", "what is in my corpus as one file",
   "render the catalog page", "open my catalog in the browser", "show me
-  my corpus as a page".
+  my corpus as a page", "export a public catalog", "make a shareable
+  subset of the catalog", "make the public demo catalog".
   Requires GEMINI_API_KEY, YOUTUBE_API_KEY, and
   `channels:` configured in config.yaml - this skill must run from the
   plugin repo checkout, not a globally-installed cache. Calls Gemini as
@@ -206,6 +210,7 @@ table is the canonical mapping — read it before picking a command.
 | "build the creator atlas", "make the wiki", "let me browse the findings", "generate the Obsidian wiki" | `python scripts/wiki_atlas.py --wiki-dir <output_dir>/_wiki` | **Intelligence layer (optional).** Writes a browsable wiki of the lead-lag findings. To open it in Obsidian when the GUI won't add the vault: `python scripts/register_obsidian_vault.py "<output_dir>/_wiki" --open --launch` (Obsidian must be closed). Same store requirement. No Gemini. |
 | "build the video catalog", "refresh the corpus catalog", "what is in my corpus as one file" | `python scripts/atlas_build.py --corpus <output_dir>` | Writes `<output_dir>/_atlas/atlas.json`: one row per video with facets, a headings-only synopsis, timestamped deep links and already-seen signals (briefing membership, wiki pages). Complete by design: every video is a row, so treat the file as private. Reads the corpus, writes only `_atlas/atlas.json`, no Gemini. Prints one counts-only summary line; see `docs/atlas.md` for how to read it. A different tool from the creator wiki that `wiki_atlas.py` builds. |
 | "render the catalog page", "open my catalog in the browser", "show me my corpus as a page" | `python scripts/atlas_render.py --atlas <output_dir>/_atlas/atlas.json` | Turns the catalog into one self-contained `<output_dir>/_atlas/catalog.html` (Cards with thumbnails and timestamped headings, Compact table of contents, Grid of channel by month; filters, search, light and dark). Opens from disk by double-click; nothing is fetched except YouTube thumbnails, which a button turns off. Run the build row first when `atlas.json` is missing or stale; when unsure, run both, they are free (no Gemini). Pass `--out <file>` for a different location; an existing `catalog.html` this script did not write is refused, never overwritten. The page is private like the atlas. Not the Obsidian wiki: for that, see the open-wiki row above. |
+| "export a public catalog", "make a shareable subset of the catalog", "make the public demo catalog" | `python scripts/atlas_export.py --atlas <output_dir>/_atlas/atlas.json --policy <output_dir>/_atlas/export-policy.yaml --deny-terms <private term list>` | Writes `<output_dir>/_atlas-export/atlas.json` and `catalog.html` (pass `--out` for another folder; `_atlas/` itself is refused): only the channels the policy lists, only videos on or after its `since` date, only canonical YouTube watch URLs the YouTube API confirms are public (needs `YOUTUBE_API_KEY`; unlisted videos are dropped and named), only the public row fields (no topics, briefing membership, wiki keys or aliases). Run the build row first when `atlas.json` is missing. The policy is YAML with `channels` (required list), `since` (optional `YYYY-MM-DD`) and `exclude_video_ids` (optional); unknown or duplicate keys are refused. **The channel list and the deny-term file come from the user: ask for both, never invent a channel list, never run without the term file.** On a deny-term hit nothing is written; report the matched video to the user and let them choose between `exclude_video_ids` and a demo copy of the term list. Do not edit the term list, the policy or retry on your own. Hand the bundle to the user; do not commit or push it. See `docs/atlas.md`, "Share a subset". |
 | "find videos about X", "search for Y", "nugget brief on Z", "corpus status", "verify quote", "fact-check claim against [creator]" | — | **Wrong skill.** These are read-only queries; use the **video-intel-search** skill. |
 
 ### Channel name resolution
