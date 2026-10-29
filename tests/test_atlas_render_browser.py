@@ -37,14 +37,14 @@ def smoke_atlas() -> dict:
                 "published": "2026-12-31" if i == 0 else f"2026-{(i % 12) + 1:02d}-15",
                 "duration_seconds": 600 + i,
                 "url": f"https://www.youtube.com/watch?v={vid}",
-                "transcript_quality": "complete",
+                "transcript_quality": {1: "unknown", 2: "none"}.get(i, "complete"),
                 "transcript_flag_count": 0,
                 "synopsis": ["Same label", "Same label", "Other"],
                 "deep_links": [
                     {"label": "Same label", "seconds": 10, "url": f"https://www.youtube.com/watch?v={vid}&t=10"},
                     {"label": "Same label", "seconds": 20, "url": f"https://www.youtube.com/watch?v={vid}&t=20"},
                 ],
-                "concept_ids": ["dom.c1"],
+                "concept_ids": ["dom.c1", "dom.c2"] if i % 2 == 0 else ["dom.c1"],
                 "topics": ["sales"] if i % 3 == 0 else [],
                 "in_briefings": False,
                 "briefing_count": 0,
@@ -64,7 +64,7 @@ def smoke_atlas() -> dict:
             "topics": {"sales": ROWS // 3},
             "unthreaded": 0,
         },
-        "concepts": {"dom.c1": "Concept one"},
+        "concepts": {"dom.c1": "Concept one", "dom.c2": "Concept two"},
         "rows": rows,
     }
 
@@ -118,10 +118,10 @@ def test_a_facet_click_in_compact_keeps_the_compact_page_size(page):
     page.click("#view-compact")
     page.wait_for_selector("#toc tbody tr")
     assert page.evaluate("document.querySelectorAll('#toc tbody tr').length") == ROWS
-    page.click("#facets button.fv[data-dim='ql']:has-text('complete')")  # every fixture row is complete
+    page.click("#facets button.fv[data-dim='cn']:has-text('Concept one')")  # every fixture row carries it
     page.wait_for_timeout(100)
     assert page.evaluate("document.querySelectorAll('#toc tbody tr').length") == ROWS
-    assert "n=" not in page.evaluate("location.hash")
+    assert page.evaluate("new URLSearchParams(location.hash.slice(1)).get('n')") is None
 
 
 def test_facets_no_row_can_answer_are_hidden_and_the_finding_says_only_what_it_can(page):
@@ -144,3 +144,28 @@ def test_the_hash_restores_a_view_and_a_pending_debounce_cannot_undo_it(page, pa
     assert page.evaluate("location.hash") == "#ch=beta"
     assert page.input_value("#q") == ""
     assert "channel beta" in page.text_content("#active-title")
+
+
+def test_a_concept_in_the_rail_narrows_the_list(page):
+    names = page.eval_on_selector_all("#facets button.fv[data-dim='cn'] .name", "els => els.map(e => e.textContent)")
+    assert names == ["Concept one", "Concept two"]
+    page.click("#facets button.fv[data-dim='cn']:has-text('Concept two')")
+    page.wait_for_timeout(100)
+    assert page.text_content("#active-title").startswith(f"{ROWS // 2} of {ROWS} videos")
+    assert "cn=dom.c2" in page.evaluate("location.hash")
+
+
+def test_the_concept_filter_box_narrows_the_facet_and_keeps_focus(page):
+    page.fill("#facets input[data-filter='cn']", "two")
+    page.wait_for_timeout(100)
+    names = page.eval_on_selector_all("#facets button.fv[data-dim='cn'] .name", "els => els.map(e => e.textContent)")
+    assert names == ["Concept two"]
+    assert page.evaluate("document.activeElement.getAttribute('data-filter')") == "cn"
+    assert page.input_value("#facets input[data-filter='cn']") == "two"
+
+
+def test_quality_facet_uses_plain_labels_and_hides_zero_counts(page):
+    names = page.eval_on_selector_all("#facets button.fv[data-dim='ql'] .name", "els => els.map(e => e.textContent)")
+    assert names == ["complete", "not assessed", "no transcript"]
+    badges = page.eval_on_selector_all("#cards .badge", "els => els.map(e => e.textContent)")
+    assert set(badges) <= {"not assessed", "no transcript"}

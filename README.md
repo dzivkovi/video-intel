@@ -187,7 +187,7 @@ Scanning and search answer questions you already know to ask. The catalog is the
 
 ![Cards view: thumbnail, mind-map headings that double as timestamped links, concept chips](docs/images/catalog-cards.png)
 
-Three views over one filtered set. **Cards** show the thumbnail, the mind-map's branch headings (each one a link that opens the video at that second) and the concepts the video touches. **Compact** is a dated table of contents. **Grid** is channel by month, darker where more videos landed; click a cell to list exactly those.
+Three views over one filtered set. **Cards** show the thumbnail, the mind-map's branch headings (each one a link that opens the video at that second; Gemini wrote those timestamps while watching the video, so they work even where no transcript exists) and the concepts the video touches. **Compact** is a dated table of contents. **Grid** is channel by month, darker where more videos landed; click a cell to list exactly those.
 
 ![Grid view: channel by month, darker means more videos](docs/images/catalog-grid.png)
 
