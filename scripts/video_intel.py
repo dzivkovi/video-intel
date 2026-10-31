@@ -7391,8 +7391,12 @@ def call_gemini_text(
     *,
     on_response: Callable[[object], None] | None = None,
     response_mime_type: str = "application/json",
+    cached_content: str | None = None,
 ):
     """Send text-only content to Gemini and get the raw response text.
+
+    ``cached_content`` names an explicit Gemini cache whose contents are
+    prepended to ``text_content`` server-side (``ConceptsPromptCache``).
 
     The default ``response_mime_type`` is ``"application/json"`` for back-compat
     with the concepts caller. Callers that need markdown (issue #54
@@ -7408,6 +7412,8 @@ def call_gemini_text(
         "response_mime_type": response_mime_type,
         "safety_settings": build_permissive_safety_settings(types),
     }
+    if cached_content:
+        config_kwargs["cached_content"] = cached_content
     contents = types.Content(parts=[types.Part(text=text_content)])
 
     max_retries_rate = 3
@@ -7447,6 +7453,115 @@ def call_gemini_text(
             time.sleep(wait)
 
 
+def build_concepts_prompt_prefix(taxonomy_concepts: dict) -> str:
+    """The concepts prompt with the taxonomy filled in: the part every video shares.
+
+    One definition for the inline call and the explicit cache, so the two can
+    never send Gemini different instructions [core: one-definition].
+    """
+    return load_prompt("concepts").replace("{{taxonomy}}", json.dumps(taxonomy_concepts, indent=2))
+
+
+def concepts_mindmap_tail(mindmap_text: str) -> str:
+    """The per-video part of the concepts prompt, appended after the shared prefix."""
+    return f"\n\n---\n\n## Mind Map to Analyze\n\n{mindmap_text}"
+
+
+class ConceptsPromptCache:
+    """An explicit Gemini cache over the concepts prompt prefix for one batch.
+
+    Each concepts call carries the whole taxonomy (~280k tokens). Gemini's
+    implicit cache was measured hitting 0 of 25 back-to-back calls on
+    2026-10-31 (gemini-3.7-flash), which made every call pay full input price;
+    an explicit cache over the same prefix served 99.7% of the prompt from
+    cache on the first probe.
+
+    The cache holds a SNAPSHOT of the taxonomy. Concepts minted later in the
+    same run (ADR-0010 accumulation, which only ever adds keys) travel in the
+    uncached part of the prompt as a delta block, so each video still
+    normalizes against everything earlier videos found. The cache is rebuilt
+    when it nears expiry or the delta grows past ``max_delta``.
+
+    Every failure degrades to ``None`` (the caller then sends the full prompt
+    inline, exactly as before): a cache is a cost optimization, never a reason
+    for a paid batch to stop.
+    """
+
+    TTL_SECONDS = 3600
+    REFRESH_MARGIN_SECONDS = 300
+    max_delta = 150
+
+    def __init__(self, client, types):
+        self.client = client
+        self.types = types
+        self.name: str | None = None
+        self.model: str | None = None
+        self.snapshot_keys: frozenset = frozenset()
+        self.created_at = 0.0
+        self.disabled = False
+
+    def _create(self, model: str, taxonomy_concepts: dict) -> None:
+        self.close()
+        prefix_text = build_concepts_prompt_prefix(taxonomy_concepts)
+        cache = self.client.caches.create(
+            model=model,
+            config=self.types.CreateCachedContentConfig(
+                contents=[self.types.Content(role="user", parts=[self.types.Part(text=prefix_text)])],
+                ttl=f"{self.TTL_SECONDS}s",
+            ),
+        )
+        self.name = cache.name
+        self.model = model
+        self.snapshot_keys = frozenset(taxonomy_concepts)
+        self.created_at = time.monotonic()
+        log.info("  Concepts prompt cache created (%d concepts): %s", len(self.snapshot_keys), self.name)
+
+    def prompt_for(self, model: str, taxonomy_concepts: dict) -> tuple[str, str] | None:
+        """Return ``(cache_name, delta_text)`` for this call, or ``None`` to go inline."""
+        if self.disabled:
+            return None
+        delta = {k: v for k, v in taxonomy_concepts.items() if k not in self.snapshot_keys}
+        stale = (
+            self.name is None
+            or model != self.model
+            or time.monotonic() - self.created_at > self.TTL_SECONDS - self.REFRESH_MARGIN_SECONDS
+            or len(delta) > self.max_delta
+        )
+        if stale:
+            try:
+                self._create(model, taxonomy_concepts)
+            except Exception as e:
+                # Too small to cache, a model without caching, a quota: all mean
+                # "go inline". Disable for the rest of the batch so a failure is
+                # paid for once, not once per video.
+                log.warning("  Concepts prompt cache unavailable, sending the full prompt inline: %s", e)
+                self.disabled = True
+                self.name = None
+                return None
+            delta = {}
+        delta_text = ""
+        if delta:
+            delta_text = (
+                "\n\n## Existing Taxonomy, continued (concepts added earlier in this run)\n\n"
+                f"```json\n{json.dumps(delta, indent=2)}\n```"
+            )
+        return self.name, delta_text
+
+    def invalidate(self) -> None:
+        """Forget the cache after a failed cached call; the next call rebuilds it."""
+        self.name = None
+
+    def close(self) -> None:
+        if self.name is None:
+            return
+        try:
+            self.client.caches.delete(name=self.name)
+        except Exception as e:
+            # Expiry deletes it anyway; storage is billed until the TTL ends.
+            log.warning("  Could not delete concepts prompt cache %s: %s", self.name, e)
+        self.name = None
+
+
 def process_concepts(
     client,
     types,
@@ -7461,6 +7576,7 @@ def process_concepts(
     source_prompt=None,
     force=False,
     prefix: str | None = None,
+    prompt_cache: ConceptsPromptCache | None = None,
 ):
     """Extract and normalize concepts from a mindmap against the taxonomy.
 
@@ -7481,19 +7597,34 @@ def process_concepts(
         return prefix, "skipped (exists)"
 
     try:
-        # Build the prompt with taxonomy context
-        prompt_text = load_prompt("concepts")
-        taxonomy_context = json.dumps(taxonomy.get("concepts", {}), indent=2)
-        prompt_with_taxonomy = prompt_text.replace("{{taxonomy}}", taxonomy_context)
-
-        full_text = f"{prompt_with_taxonomy}\n\n---\n\n## Mind Map to Analyze\n\n{mindmap_text}"
-        raw = call_gemini_text(
-            client,
-            types,
-            full_text,
-            model,
-            on_response=lambda r: log_usage_metadata(r, "concepts"),
-        )
+        taxonomy_concepts = taxonomy.get("concepts", {})
+        raw = None
+        cached = prompt_cache.prompt_for(model, taxonomy_concepts) if prompt_cache is not None else None
+        if cached is not None:
+            cache_name, delta_text = cached
+            try:
+                raw = call_gemini_text(
+                    client,
+                    types,
+                    delta_text + concepts_mindmap_tail(mindmap_text),
+                    model,
+                    on_response=lambda r: log_usage_metadata(r, "concepts"),
+                    cached_content=cache_name,
+                )
+            except Exception as e:
+                # An expired or evicted cache must cost one inline call, not the
+                # video: retry this one inline and let the next call rebuild it.
+                log.warning("  Cached concepts call failed, retrying inline: %s", e)
+                prompt_cache.invalidate()
+        if raw is None:
+            full_text = build_concepts_prompt_prefix(taxonomy_concepts) + concepts_mindmap_tail(mindmap_text)
+            raw = call_gemini_text(
+                client,
+                types,
+                full_text,
+                model,
+                on_response=lambda r: log_usage_metadata(r, "concepts"),
+            )
         result = json.loads(raw)
 
         # Normalize: ensure it has the expected structure
@@ -8488,45 +8619,52 @@ def cmd_scan(args, config):
 
             if concept_candidates:
                 log.info("  Extracting concepts (%d videos)...", len(concept_candidates))
-                for v, mindmap_path, prefix in concept_candidates:
-                    mindmap_text = mindmap_path.read_text(encoding="utf-8")
-                    out_prefix, status = process_concepts(
-                        client,
-                        types,
-                        v,
-                        mindmap_text,
-                        taxonomy,
-                        model,
-                        output_dir,
-                        ch_name,
-                        source_file=mindmap_path.name,
-                        # The WRITER's own record, never a re-derivation:
-                        # `process_mindmap` stamps `prompt` into meta.json,
-                        # and this loop already parsed that meta a few lines
-                        # above. Re-deriving it from config disagreed with
-                        # the artifact on 1,004 of 2,383 corpus files (42%),
-                        # because a mindmap built from a transcript records
-                        # `mindmap-from-transcript` while config says
-                        # `mindmap-knowledge`. The sibling `cmd_concepts`
-                        # always did this correctly. Measured by the issue
-                        # #210 review pass; PR #136's checker/writer rule.
-                        source_prompt=meta.get("prompt"),
-                        force=args.force,
-                        prefix=prefix,
-                    )
-                    log.info("    %s: %s", out_prefix, status)
-                    if status.startswith("error"):
-                        errors.append((ch_name, out_prefix, status))
-                    else:
-                        # Accumulate into the SAME in-memory taxonomy the next
-                        # video (this channel or the next) normalizes
-                        # against - ADR-0010, mirroring cmd_concepts. Skip
-                        # only on "error"; "skipped (exists)" still
-                        # accumulates because the on-disk file it points at
-                        # is real, current vocabulary (issue #176).
-                        accumulate_concepts_into_taxonomy(
-                            taxonomy, output_dir / ch_name / f"{out_prefix}.concepts.json"
+                # Two or more calls pay back the one-off cache build; one goes inline.
+                concepts_cache = ConceptsPromptCache(client, types) if len(concept_candidates) > 1 else None
+                try:
+                    for v, mindmap_path, prefix in concept_candidates:
+                        mindmap_text = mindmap_path.read_text(encoding="utf-8")
+                        out_prefix, status = process_concepts(
+                            client,
+                            types,
+                            v,
+                            mindmap_text,
+                            taxonomy,
+                            model,
+                            output_dir,
+                            ch_name,
+                            source_file=mindmap_path.name,
+                            # The WRITER's own record, never a re-derivation:
+                            # `process_mindmap` stamps `prompt` into meta.json,
+                            # and this loop already parsed that meta a few lines
+                            # above. Re-deriving it from config disagreed with
+                            # the artifact on 1,004 of 2,383 corpus files (42%),
+                            # because a mindmap built from a transcript records
+                            # `mindmap-from-transcript` while config says
+                            # `mindmap-knowledge`. The sibling `cmd_concepts`
+                            # always did this correctly. Measured by the issue
+                            # #210 review pass; PR #136's checker/writer rule.
+                            source_prompt=meta.get("prompt"),
+                            force=args.force,
+                            prefix=prefix,
+                            prompt_cache=concepts_cache,
                         )
+                        log.info("    %s: %s", out_prefix, status)
+                        if status.startswith("error"):
+                            errors.append((ch_name, out_prefix, status))
+                        else:
+                            # Accumulate into the SAME in-memory taxonomy the next
+                            # video (this channel or the next) normalizes
+                            # against - ADR-0010, mirroring cmd_concepts. Skip
+                            # only on "error"; "skipped (exists)" still
+                            # accumulates because the on-disk file it points at
+                            # is real, current vocabulary (issue #176).
+                            accumulate_concepts_into_taxonomy(
+                                taxonomy, output_dir / ch_name / f"{out_prefix}.concepts.json"
+                            )
+                finally:
+                    if concepts_cache is not None:
+                        concepts_cache.close()
 
     if errors:
         log.warning("--- %d FAILED ---", len(errors))
@@ -10402,32 +10540,39 @@ def cmd_concepts(args, config):
         return
 
     t0 = time.monotonic()
-    for i, (ch_name, video, mindmap_path, source_prompt, disk_prefix) in enumerate(to_process, 1):
-        mindmap_text = mindmap_path.read_text(encoding="utf-8")
-        source_file = mindmap_path.name
+    # Two or more calls pay back the one-off cache build; one goes inline.
+    concepts_cache = ConceptsPromptCache(client, types) if total > 1 else None
+    try:
+        for i, (ch_name, video, mindmap_path, source_prompt, disk_prefix) in enumerate(to_process, 1):
+            mindmap_text = mindmap_path.read_text(encoding="utf-8")
+            source_file = mindmap_path.name
 
-        prefix, status = process_concepts(
-            client,
-            types,
-            video,
-            mindmap_text,
-            taxonomy,
-            model,
-            output_dir,
-            ch_name,
-            source_file=source_file,
-            source_prompt=source_prompt,
-            force=args.force,
-            prefix=disk_prefix,
-        )
-        log.info("[%d/%d] [%s] %s: %s", i, total, ch_name, prefix, status)
+            prefix, status = process_concepts(
+                client,
+                types,
+                video,
+                mindmap_text,
+                taxonomy,
+                model,
+                output_dir,
+                ch_name,
+                source_file=source_file,
+                source_prompt=source_prompt,
+                force=args.force,
+                prefix=disk_prefix,
+                prompt_cache=concepts_cache,
+            )
+            log.info("[%d/%d] [%s] %s: %s", i, total, ch_name, prefix, status)
 
-        # Accumulate new concepts into in-memory taxonomy so the next video
-        # can normalize against concepts discovered in earlier videos
-        # (ADR-0010). Shared with cmd_scan's auto_concepts loop - see
-        # accumulate_concepts_into_taxonomy for the paid-loop robustness
-        # contract (issue #176).
-        accumulate_concepts_into_taxonomy(taxonomy, output_dir / ch_name / f"{prefix}.concepts.json")
+            # Accumulate new concepts into in-memory taxonomy so the next video
+            # can normalize against concepts discovered in earlier videos
+            # (ADR-0010). Shared with cmd_scan's auto_concepts loop - see
+            # accumulate_concepts_into_taxonomy for the paid-loop robustness
+            # contract (issue #176).
+            accumulate_concepts_into_taxonomy(taxonomy, output_dir / ch_name / f"{prefix}.concepts.json")
+    finally:
+        if concepts_cache is not None:
+            concepts_cache.close()
 
     elapsed = time.monotonic() - t0
     minutes, seconds = divmod(int(elapsed), 60)
