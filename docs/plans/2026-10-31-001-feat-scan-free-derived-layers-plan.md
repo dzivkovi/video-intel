@@ -85,6 +85,6 @@ Template: the existing `TestPageScript` (`node --check`) and the browser smoke c
 
 Per-video incremental embedding (#284). Any change to what `dedupe` and `prune-shorts` print or do after `--apply`.
 
-## Doc review (2026-10-31)
+## Doc review
 
 Coherence and feasibility reviewers ran on this plan. Applied: the helper returns the index state; the issue's "each channel it touched" narrowed on purpose; the recipe ends with the catalog commands so the facet can be refreshed; the rebuild runs once after all channels; a three-way index read so an unknown state never prescribes a full re-embed; `build_catalog` instead of calling `main` with argv; non-zero exits count as failures; the measured cost replaces "cheap"; one home for the index names. Deferred: `build_taxonomy` still raises on one unreadable `concepts.json` (a pre-existing behaviour of `taxonomy-build`; scan now logs it with the command instead of crashing) - follow-up candidate.

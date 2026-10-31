@@ -14,6 +14,7 @@ Prerequisites:
 import argparse
 import csv
 import functools
+import hashlib
 import itertools
 import json
 import logging
@@ -7862,31 +7863,35 @@ def rebuild_free_derived_layers(output_dir: Path, config: dict) -> str | None:
 
 
 def log_scan_index_recipe(channels: list[str], index_state: str | None, output_dir: Path, index_dir: Path) -> None:
-    """Print the search-index recipe for the channels whose transcripts changed (issue #283).
+    """Print the search-index recipe after a scan that wrote transcripts (issues #283, #284).
 
     Scan never embeds: the index is paid and slow, so it stays a command the
-    operator runs. Only a CONFIRMED absent index (`atlas_build.INDEX_ABSENT`)
-    switches the recipe to the full build, because `index --channel` is
-    refused there (#183); an unknown state keeps the per-channel lines, which
-    are right whenever an index exists and whose refusal names the full build
-    when one does not, so a read failure never prescribes a paid re-embed of
-    the whole corpus. It ends with the catalog
-    commands, because the catalog built above recorded the index as it was
-    before these lines run.
+    operator runs. The command is ONE corpus-wide `index --incremental`, not a
+    line per channel: it embeds only the new or edited transcripts, and one
+    pass reads the table and compacts it once (measured: about a minute and a
+    half to walk a corpus of a few thousand transcripts on a cloud mount with
+    nothing to embed), where a
+    line per channel would repeat both for every channel. The channels are
+    named in the header so the operator still sees what changed.
+
+    Only a CONFIRMED absent index (`atlas_build.INDEX_ABSENT`) switches the
+    recipe to the full build, because `--incremental` is refused there; an
+    unknown state keeps the incremental line, whose refusal names the full
+    build when no index exists, so a read failure never prescribes a paid
+    re-embed of the whole corpus. It ends with the catalog commands, because
+    the catalog built above recorded the index as it was before this runs.
     """
-    log.info(
-        "Search index not rebuilt by scan (paid and slow). To refresh it for the channels whose transcripts changed:"
-    )
     import atlas_build
 
+    log.info("Search index not rebuilt by scan (paid and slow). Transcripts changed in: %s", ", ".join(channels))
     if index_state == atlas_build.INDEX_ABSENT:
         # Also what an `index --force` that is still running looks like: it
         # drops the table first and only recreates it at the end.
         log.info("  python scripts/video_intel.py index")
         log.info("  (no index was found; if an index --force is running right now, let it finish instead)")
     else:
-        for name in channels:
-            log.info("  python scripts/video_intel.py index --channel %s", _shell_arg(name))
+        log.info("  python scripts/video_intel.py index --incremental")
+        log.info("  (embeds only the new or edited transcripts, across every channel, in one pass)")
     log.info("Then refresh the catalog's in-search-index facet:")
     log.info('  python scripts/atlas_build.py --corpus "%s" --index-dir "%s"', output_dir, index_dir)
     log.info(
@@ -11050,6 +11055,68 @@ def _extract_video_metadata(prefix: str, channel_dir: Path, channel_name: str) -
     return {"title": title, "published": published, "video_id": video_id, "channel": channel_name}
 
 
+#: Index columns a writer drops when the table it ADDS rows to predates them
+#: (issue #284). LanceDB raises on an `add` with an extra column, so an index
+#: built before the column existed must keep accepting `--channel` and
+#: `--incremental` rows; a full rebuild always writes every column.
+OPTIONAL_INDEX_COLUMNS = frozenset({"transcript_sha256"})
+
+
+def _transcript_records(tx_path: Path, channel_dir: Path, ch_name: str) -> list[dict]:
+    """One index record per chunk of one transcript, the shape every index writer adds.
+
+    `transcript_sha256` is the SHA-256 of the transcript file's bytes, repeated
+    on every chunk row of that video; `index --incremental` compares it to
+    decide whether a video's rows are current (issue #284).
+    """
+    prefix = tx_path.name.replace(".transcript.md", "")
+    concept_ids = _load_concepts_for_video(channel_dir / f"{prefix}.concepts.json")
+    meta = _extract_video_metadata(prefix, channel_dir, ch_name)
+    digest = hashlib.sha256(tx_path.read_bytes()).hexdigest()
+    return [
+        {
+            "text": chunk["text"],
+            "timestamp": chunk["timestamp"],
+            "timestamp_seconds": chunk["timestamp_seconds"],
+            "video_id": meta["video_id"],
+            "channel": meta["channel"],
+            "title": meta["title"],
+            "published": meta["published"],
+            "concept_ids": json.dumps(concept_ids),
+            "source_file": str(tx_path),
+            "transcript_sha256": digest,
+        }
+        for chunk in chunk_transcript(tx_path)
+    ]
+
+
+def conform_records_to_table(table: Any, records: list[dict]) -> list[str]:
+    """Drop the optional columns `table` does not have from every record; return their names.
+
+    Only `OPTIONAL_INDEX_COLUMNS` are ever dropped, so any other disagreement
+    still reaches `index_schema_mismatch` and is refused before embedding.
+    """
+    table_fields = {f.name for f in table.schema}
+    dropped = sorted(c for c in OPTIONAL_INDEX_COLUMNS if c not in table_fields)
+    for rec in records:
+        for column in dropped:
+            rec.pop(column, None)
+    return dropped
+
+
+def _index_identity(channel: str, video_id: str, source_file: str) -> tuple[str, str]:
+    """The key one video's rows are grouped under for `index --incremental` (issue #284).
+
+    `(channel, video_id)`, falling back to the transcript's FILE NAME when the
+    meta has no video_id - the identity `_hit_video_key` falls back to, minus
+    the folder part, because `source_file` stores an absolute path that moves
+    whenever the corpus is mounted somewhere else.
+    """
+    if video_id:
+        return channel, video_id
+    return channel, "file:" + source_file.replace("\\", "/").rsplit("/", 1)[-1]
+
+
 def _embed_batch(vo_client, texts: list[str], model: str, input_type: str) -> list[list[float]]:
     """Embed a list of texts with Voyage AI, with adaptive batch-halving on
     per-batch token-cap errors plus exponential backoff on rate-limit and
@@ -11306,26 +11373,7 @@ def build_search_index(
         log.info("[%s] Found %d transcripts", ch_name, len(transcripts))
 
         for tx_path in transcripts:
-            prefix = tx_path.name.replace(".transcript.md", "")
-            concepts_path = channel_dir / f"{prefix}.concepts.json"
-            concept_ids = _load_concepts_for_video(concepts_path)
-            meta = _extract_video_metadata(prefix, channel_dir, ch_name)
-
-            chunks = chunk_transcript(tx_path)
-            for chunk in chunks:
-                all_records.append(
-                    {
-                        "text": chunk["text"],
-                        "timestamp": chunk["timestamp"],
-                        "timestamp_seconds": chunk["timestamp_seconds"],
-                        "video_id": meta["video_id"],
-                        "channel": meta["channel"],
-                        "title": meta["title"],
-                        "published": meta["published"],
-                        "concept_ids": json.dumps(concept_ids),
-                        "source_file": str(tx_path),
-                    }
-                )
+            all_records.extend(_transcript_records(tx_path, channel_dir, ch_name))
 
     if not all_records:
         log.warning("No transcript chunks found to index.")
@@ -11351,6 +11399,9 @@ def build_search_index(
     # Probe before you pay: a schema mismatch is knowable without embeddings.
     if channel_filter:
         existing = db.open_table(LANCEDB_TABLE)
+        # An index built before an optional column existed keeps working: the
+        # rows added here match it (issue #284).
+        conform_records_to_table(existing, all_records)
         mismatch = index_schema_mismatch(existing, set(all_records[0]))
         if mismatch:
             log.error("Existing index schema does not match the current record shape (%s).", mismatch)
@@ -11641,10 +11692,248 @@ def _select_hits_by_video(hits: list[dict], limit: int, *, dedup: bool = True) -
     return kept
 
 
+def _incremental_delete_predicates(stale: dict[str, tuple[set[str], set[str]]]) -> list[str]:
+    """Delete predicates for the stale rows of the selected videos, per channel, in batches.
+
+    `stale` maps a channel to (video ids, stored source_file values for the
+    blank-id videos). Every literal goes through `escape_sql_string_literal`
+    (#183 invariant 6); the channel term keeps a video id shared by two
+    channel folders from deleting the other folder's rows.
+    """
+    predicates = []
+    for channel in sorted(stale):
+        ids, files = stale[channel]
+        terms = [("video_id", v) for v in sorted(ids)] + [("source_file", f) for f in sorted(files)]
+        for start in range(0, len(terms), 200):
+            batch = terms[start : start + 200]
+            by_column: dict[str, list[str]] = {}
+            for column, value in batch:
+                by_column.setdefault(column, []).append(f"'{escape_sql_string_literal(value)}'")
+            either = " OR ".join(f"{col} IN ({', '.join(vals)})" for col, vals in sorted(by_column.items()))
+            predicates.append(f"channel = '{escape_sql_string_literal(channel)}' AND ({either})")
+    return predicates
+
+
+def build_search_index_incremental(
+    output_dir: Path,
+    *,
+    channel_filter: str | None = None,
+    config: dict[str, Any] | None = None,
+) -> int:
+    """Embed only the transcripts the index does not hold as they are on disk (issue #284).
+
+    A video is selected when its `_index_identity` has no rows (new), or when
+    the table stores `transcript_sha256` and the stored hashes differ from the
+    file's (changed). Selected videos' old rows are deleted AFTER the new
+    embeddings are in hand, the new rows appended, and the table compacted
+    once. Everything else is untouched. Returns the number of chunks embedded.
+
+    An index built before `transcript_sha256` existed still works but sees NEW
+    videos only, and says so once: a full `index --force` turns change
+    detection on. Rows for transcripts that left the disk are not retired (the
+    same as `--channel`); a full rebuild retires them.
+    """
+    lancedb = require_lancedb()
+    voyageai = require_voyageai()
+
+    vo_key = os.environ.get("VOYAGE_API_KEY")
+    if not vo_key:
+        log.error("VOYAGE_API_KEY not set. Sign up free at https://dash.voyageai.com/")
+        sys.exit(1)
+
+    db_path = resolve_vector_db_dir(config or {}, output_dir)
+    ok, reason = probe_atomic_writes(db_path)
+    if not ok:
+        log.error("Cannot use vector_db_dir=%s", db_path)
+        log.error("%s", reason)
+        sys.exit(1)
+
+    db = lancedb.connect(str(db_path))
+    if LANCEDB_TABLE not in db.list_tables().tables:
+        log.error("No existing index at %s, so there is nothing for --incremental to update.", db_path)
+        log.error("Build the whole corpus first: video_intel.py index")
+        sys.exit(1)
+    if channel_filter and not (output_dir / channel_filter).is_dir():
+        # A typo must not read as "Index already current".
+        log.error("No channel folder '%s' under %s; nothing was read or written.", channel_filter, output_dir)
+        sys.exit(1)
+    table = db.open_table(LANCEDB_TABLE)
+    has_hash = "transcript_sha256" in {f.name for f in table.schema}
+
+    # One projection of what the index holds. A short read would make indexed
+    # videos look new and re-embed them - silent spend - so it is a refusal.
+    columns = ["channel", "video_id", "source_file"] + (["transcript_sha256"] if has_hash else [])
+    predicate = f"channel = '{escape_sql_string_literal(channel_filter)}'" if channel_filter else None
+    query = table.search().select(columns)
+    if predicate:
+        query = query.where(predicate)
+    held = query.limit(0).to_arrow().to_pylist()
+    expected = table.count_rows(predicate) if predicate else table.count_rows()
+    if len(held) != expected:
+        log.error("The index returned %d of %d rows; refusing to guess what is already indexed.", len(held), expected)
+        sys.exit(1)
+    indexed: dict[tuple[str, str], dict[str, set]] = {}
+    for row in held:
+        key = _index_identity(row["channel"] or "", row["video_id"] or "", row["source_file"] or "")
+        entry = indexed.setdefault(key, {"hashes": set(), "files": set()})
+        entry["hashes"].add(row.get("transcript_sha256"))
+        entry["files"].add(row["source_file"] or "")
+
+    on_disk: dict[tuple[str, str], list[tuple[Path, Path, str, str]]] = {}
+    channel_dirs = [d for d in output_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+    for channel_dir in sorted(channel_dirs):
+        ch_name = channel_dir.name
+        if channel_filter and ch_name != channel_filter:
+            continue
+        for tx_path in sorted(channel_dir.glob("*.transcript.md")):
+            prefix = tx_path.name.replace(".transcript.md", "")
+            video_id = _extract_video_metadata(prefix, channel_dir, ch_name)["video_id"]
+            digest = hashlib.sha256(tx_path.read_bytes()).hexdigest()
+            key = _index_identity(ch_name, video_id, str(tx_path))
+            on_disk.setdefault(key, []).append((tx_path, channel_dir, ch_name, digest))
+
+    new_keys = [k for k in on_disk if k not in indexed]
+    changed_keys = [
+        k for k in on_disk if k in indexed and has_hash and indexed[k]["hashes"] != {d for *_, d in on_disk[k]}
+    ]
+    log.info(
+        "Incremental index: %d new, %d changed, %d unchanged video(s)%s",
+        len(new_keys),
+        len(changed_keys),
+        len(on_disk) - len(new_keys) - len(changed_keys),
+        f" in channel '{channel_filter}'" if channel_filter else "",
+    )
+    if not has_hash:
+        log.warning(
+            "This index predates the transcript_sha256 column, so --incremental adds NEW videos only and "
+            "cannot see edited transcripts. A one-time full rebuild turns change detection on: "
+            "video_intel.py index --force"
+        )
+    selected = new_keys + changed_keys
+    if not selected:
+        _finish_interrupted_compaction(table)
+        return 0
+
+    # Records are built per identity so an identity whose transcript now
+    # yields no chunks is dropped from BOTH sides: never deleted without a
+    # replacement, whatever else changed in the same run (Codex peer pass).
+    records: list[dict] = []
+    for key in list(selected):
+        chunks = [
+            rec
+            for tx_path, channel_dir, ch_name, _digest in on_disk[key]
+            for rec in _transcript_records(tx_path, channel_dir, ch_name)
+        ]
+        if not chunks:
+            log.warning("[%s] %s produced no chunks; its index rows were left as they are.", key[0], key[1])
+            selected.remove(key)
+            if key in changed_keys:
+                changed_keys.remove(key)
+            continue
+        records.extend(chunks)
+    if not records:
+        log.warning("The selected transcripts produced no chunks; nothing was changed.")
+        _finish_interrupted_compaction(table)
+        return 0
+    conform_records_to_table(table, records)
+    mismatch = index_schema_mismatch(table, set(records[0]))
+    if mismatch:
+        log.error("Existing index schema does not match the current record shape (%s).", mismatch)
+        log.error("Rebuild the whole corpus: video_intel.py index --force")
+        sys.exit(1)
+
+    log.info("Embedding %d chunks with %s...", len(records), VOYAGE_DOC_MODEL)
+    vo = voyageai.Client()
+    embeddings = _embed_batch(vo, [r["text"] for r in records], VOYAGE_DOC_MODEL, input_type="document")
+    for rec, vec in zip(records, embeddings, strict=True):
+        rec["vector"] = vec
+    dim_mismatch = vector_dimension_mismatch(table, embeddings)
+    if dim_mismatch:
+        log.error("Refusing the incremental update: %s", dim_mismatch)
+        log.error("Nothing was deleted. Rebuild the whole corpus: video_intel.py index --force")
+        sys.exit(1)
+
+    stale: dict[str, tuple[set[str], set[str]]] = {}
+    for channel, ident in changed_keys:
+        ids, files = stale.setdefault(channel, (set(), set()))
+        if ident.startswith("file:"):
+            files.update(indexed[(channel, ident)]["files"])
+        else:
+            ids.add(ident)
+    # A video indexed under a blank id whose meta later gained one (repair-metas
+    # backfills it) is a NEW identity now; its old file-keyed rows go with it,
+    # or search would return the same talk twice (correctness review).
+    for channel, ident in new_keys:
+        if ident.startswith("file:"):
+            continue
+        for tx_path, *_rest in on_disk.get((channel, ident), []):
+            old_key = (channel, "file:" + tx_path.name)
+            if old_key in indexed and old_key not in on_disk:
+                stale.setdefault(channel, (set(), set()))[1].update(indexed[old_key]["files"])
+    try:
+        for clause in _incremental_delete_predicates(stale):
+            table.delete(clause)
+        table.add(records)
+    except Exception:
+        log.error(
+            "Incremental index update failed partway through. The %d changed video(s) may now be MISSING "
+            "from the index.",
+            len(changed_keys),
+        )
+        # A re-run repairs it: an identity whose rows were deleted reads as new.
+        log.error(
+            "Recover by re-running the same command: video_intel.py index --incremental%s",
+            f" --channel {_shell_arg(channel_filter)}" if channel_filter else "",
+        )
+        raise
+    try:
+        # Fold the appended rows into the vector and FTS indexes.
+        table.optimize()
+    except Exception:
+        # The rows ARE written, so the re-run finds nothing to embed; it
+        # compacts instead, because _finish_interrupted_compaction sees the
+        # uncompacted rows (Codex peer pass).
+        log.error(
+            "The new rows are written and searchable, but compaction failed, so they are not yet folded "
+            "into the indexes (slower search). Recover by re-running: video_intel.py index --incremental"
+        )
+        raise
+    log.info("Indexed %d chunks for %d video(s) into %s", len(records), len(selected), db_path)
+    return len(records)
+
+
+def _finish_interrupted_compaction(table: Any) -> None:
+    """Compact when an earlier run wrote rows but never compacted them.
+
+    Reads each index's `num_unindexed_rows`; any count above zero means rows
+    not yet folded into the vector or FTS index (searched the slow way). An
+    unreadable statistic is not evidence of a problem and changes nothing.
+    """
+    try:
+        pending = sum(table.index_stats(ix.name).num_unindexed_rows for ix in table.list_indices())
+    except Exception:
+        return
+    if pending:
+        log.info("Compacting %d row(s) an earlier run wrote but did not compact.", pending)
+        table.optimize()
+
+
 def cmd_index(args, config):
     """Build or rebuild the vector search index."""
     output_dir = resolve_output_dir(config)
     t0 = time.time()
+    if getattr(args, "incremental", False):
+        count = build_search_index_incremental(output_dir, channel_filter=args.channel, config=config)
+        elapsed = time.time() - t0
+        mins, secs = divmod(int(elapsed), 60)
+        scope = f" in channel '{args.channel}'" if args.channel else ""
+        if count == 0:
+            # Not "No transcripts found": an unchanged corpus is the normal
+            # steady state of --incremental, not an empty one.
+            print(f"Index already current{scope}: nothing to embed (counts logged above).")
+        else:
+            print(f"Incremental index{scope}: embedded {count} chunks in {mins}m {secs:02d}s (counts logged above).")
+        return
     count = build_search_index(output_dir, channel_filter=args.channel, force=args.force, config=config)
     elapsed = time.time() - t0
 
@@ -15990,12 +16279,23 @@ Examples:
             "rows are preserved. Requires an existing index."
         ),
     )
-    index_parser.add_argument(
+    index_mode = index_parser.add_mutually_exclusive_group()
+    index_mode.add_argument(
         "--force",
         action="store_true",
         help=(
             "Rebuild the whole index from scratch. Ignored with --channel, where "
             "a run already re-embeds that channel and must never drop the table."
+        ),
+    )
+    index_mode.add_argument(
+        "--incremental",
+        action="store_true",
+        help=(
+            "Embed only transcripts the index does not hold as they are on disk "
+            "(new videos, and edited ones once the index stores content hashes); "
+            "everything else is untouched. Combine with --channel to walk one channel. "
+            "Requires an existing index."
         ),
     )
 

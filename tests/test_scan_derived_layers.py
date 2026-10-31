@@ -330,8 +330,8 @@ class TestIndexRecipe:
             cmd_scan(_args(), self._config(index_dir))
 
         recipe = _recipe(caplog)
-        assert "  python scripts/video_intel.py index --channel alpha" in recipe
-        assert not any("--channel beta" in line for line in recipe)
+        assert "  python scripts/video_intel.py index --incremental" in recipe
+        assert recipe[0].endswith("Transcripts changed in: alpha")  # beta wrote only a mind map
         assert not any(line == "  python scripts/video_intel.py index" for line in recipe)
         assert any("atlas_build.py --corpus" in line and str(index_dir) in line for line in recipe)
         assert scan_env.voyage.clients == 0
@@ -353,7 +353,7 @@ class TestIndexRecipe:
         note = recipe[recipe.index("  python scripts/video_intel.py index") + 1]
         assert "index --force is running" in note  # a running full rebuild looks the same as no index
 
-    def test_an_unknown_index_state_keeps_the_per_channel_lines(self, scan_env, tmp_path, monkeypatch, caplog):
+    def test_an_unknown_index_state_keeps_the_incremental_line(self, scan_env, tmp_path, monkeypatch, caplog):
         index_dir = tmp_path / "index"
         index_dir.mkdir()
         monkeypatch.setattr(
@@ -365,7 +365,7 @@ class TestIndexRecipe:
             cmd_scan(_args(), self._config(index_dir))
 
         recipe = _recipe(caplog)
-        assert "  python scripts/video_intel.py index --channel alpha" in recipe
+        assert "  python scripts/video_intel.py index --incremental" in recipe
         assert "  python scripts/video_intel.py index" not in recipe
 
     def test_a_mindmap_only_scan_prints_no_recipe(self, scan_env, caplog):
@@ -468,7 +468,5 @@ class TestReadSearchIndex:
         ("o'brien", '"o\'brien"'),
     ],
 )
-def test_recipe_channel_names_are_pasteable(name, printed, caplog, tmp_path):
-    with caplog.at_level(logging.INFO, logger="video_intel"):
-        video_intel.log_scan_index_recipe([name], "read", tmp_path, tmp_path / "index")
-    assert f"  python scripts/video_intel.py index --channel {printed}" in [r.getMessage() for r in caplog.records]
+def test_printed_channel_names_are_pasteable(name, printed):
+    assert video_intel._shell_arg(name) == printed
