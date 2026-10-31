@@ -271,6 +271,7 @@ class TestTheDestructiveWindowBetweenDeleteAndAdd:
             "published",
             "concept_ids",
             "source_file",
+            "transcript_sha256",
         }
         assert vi.index_schema_mismatch(table, healthy) is None
         assert vi.index_schema_mismatch(table, healthy | {"brand_new"})

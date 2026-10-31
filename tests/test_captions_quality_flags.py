@@ -261,6 +261,8 @@ class TestFieldInventoryCannotDrift:
         "transcript_source_cli",
         "transcript_timeout_seconds",
         "transcript_max_duration_seconds",
+        # A search-index row column (issue #284), never written to meta.json.
+        "transcript_sha256",
     }
 
     def test_every_transcript_meta_key_in_the_module_is_classified(self) -> None:

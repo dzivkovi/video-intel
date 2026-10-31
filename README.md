@@ -445,7 +445,7 @@ python scripts/video_intel.py concepts --channel natebjones
 # Rebuild master taxonomy from all concept files
 # (scan does this itself, plus topics.json and the catalog, whenever it wrote
 # an artifact; it never rebuilds the search index and prints the
-# `index --channel <name>` lines to run instead)
+# `index --incremental` line to run instead)
 python scripts/video_intel.py taxonomy-build
 
 # Search corpus by concept (matches labels + aliases)
@@ -510,10 +510,10 @@ After `dedupe --apply` or `prune-shorts --apply`, rebuild the derived layers you
 
 ```bash
 python scripts/video_intel.py taxonomy-build
-python scripts/video_intel.py index --channel <affected-channel>   # incremental
+python scripts/video_intel.py index --channel <affected-channel>   # re-embeds that one channel
 ```
 
-`index --channel` is the only incremental primitive here: it re-embeds one channel and leaves every other channel's rows alone. Plain `index` re-embeds the whole corpus, so prefer the scoped form after a maintenance pass.
+`index --channel` re-embeds one channel and leaves every other channel's rows alone; plain `index` re-embeds the whole corpus. To make newly scanned videos searchable, use `index --incremental` (what `scan` prints): it embeds only transcripts the index does not hold as they are on disk, so adding one talk to a large channel embeds that talk's chunks, not the channel's. An index built before content hashes were stored sees new videos only until one full `index --force`.
 
 ### Catch-up briefings (Markdown + PDF)
 
