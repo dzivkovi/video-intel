@@ -2,16 +2,16 @@
 project: video-intel
 status: active
 cadence: monthly
-updated: 2026-10-06
+updated: 2026-10-31
 backend: github-issues
 trap: the repair trap - corpus cleanup counted as progress. The prize this corpus currently serves is a SALES ledger that lives in magma-rainmaker, and a clean index moves it by zero. Price any unrequested repair in one line before doing it.
 ---
 
 ## Next best action
-Daniel: read `work/2026-10-05/06-night-summary.md` (or say `/read-along last night`), answer its six Decisions, then run `python scripts/video_intel.py headlines --dry-run`, pick the one or two uploads worth `process --url`, and go back to the magma-rainmaker ledger.
+Daniel: decide whether Peter Ahn and Austin Marchese keep a scan slot (issue #273) after looking at their videos: the scores and deep links are in `G:\My Driveideo-intel\_briefings\sales6-10-31-finding-and-talking-to-customers.md`, or use the catalog's Channel facet. Then read the two new briefings on Kindle and go back to the magma-rainmaker ledger.
 
 ```text
-Done overnight 2026-10-05: #248 (PR #251), #139 (#252), #247 (#253), #249 (#254) all merged on green after ce-code-review plus the Codex peer pass; follow-up #250 filed (chunk-size A/B). Five worktrees under .claude/worktrees/ are still on disk because the permission layer denied removal: the commands are in the night summary, Decisions item 6.
+Done 2026-10-31: AI Engineer catch-up (204 talks, Sept 25 to Oct 30) plus about 100 videos from the kept channels, all with concepts; 13 coding-tutorial and founder-news channels parked to headline-only, rob-snyder, lennyspodcast and peterahnsales promoted. PR #271 (explicit Gemini cache for concepts: 0 uncached calls over 304, about CA$0.045 per video) and PR #272 (catalog thumbnail retry) merged. About CA$108 Gemini spend. Briefings: _briefings/ai-engineering/2026-10-31-ai-engineer-autumn-2026 and _briefings/sales/2026-10-31-finding-and-talking-to-customers (md, PDF, EPUB).
 ```
 
 ## Waiting on
