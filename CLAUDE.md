@@ -8,7 +8,11 @@ Before executing any task, you MUST read and strictly adhere to the constraints 
 
 ## Backlog
 
-Use GitHub Issues for feature requests and bugs. Do not create file-based todos.
+Use GitHub Issues for feature requests and bugs in the tool. Do not create file-based todos for tool work.
+
+## This repository is public: the tool is public, the operation stays local
+
+Tracked files, issues, PR bodies and commit messages describe the tool. Anything that answers "what is the operator doing, watching, reading, selling or deciding" is operating state and never enters them: which channels are being weighed, what a briefing concluded, reading lists, priorities, the state of any other project. Operating state lives in `NEXT.md` and `work/` (both gitignored) or in a private repo. A decision about the operation (which channel to keep, what to read next) is a line in `NEXT.md`, never a GitHub issue. The same allowlist thinking the catalog exporter uses applies to the whole tree: public is what was chosen for publication, not everything minus secrets. A user-level hook blocks a commit or push in this repo that stages `NEXT.md`, `work/` or `plans/*.md`, or that carries a term from the operator's private guardrail list.
 
 ## What This Is
 

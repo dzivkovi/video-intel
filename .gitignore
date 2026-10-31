@@ -92,3 +92,6 @@ config.yaml.backup-*
 # config.yaml. A real-data screenshot or a zipped copy is private too.
 _atlas/
 *.zip
+
+# Operating state (the Lighthouse cockpit file): local only, never in a public tree.
+/NEXT.md
