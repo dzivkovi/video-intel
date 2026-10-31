@@ -19,7 +19,7 @@ A new flag, `index --incremental`, embeds only transcripts the index does not al
 
 ### 1. Video identity and the content hash
 
-- A transcript's identity is `(channel, video_id)`, falling back to `(channel, transcript file name)` when the meta has none (the ~750 blank-id chunks in the live index). The channel is part of the key because the same `video_id` lives in two channel folders in the live corpus, with different transcript bytes; the file name, not the absolute `source_file`, because that path moves whenever the corpus is mounted elsewhere.
+- A transcript's identity is `(channel, video_id)`, falling back to `(channel, transcript file name)` when the meta has none (the live index carries some blank-id chunks). The channel is part of the key because the same `video_id` lives in two channel folders in the live corpus, with different transcript bytes; the file name, not the absolute `source_file`, because that path moves whenever the corpus is mounted elsewhere.
 - Each record gains `transcript_sha256`: the SHA-256 of the transcript file's bytes, one value per video, repeated on every chunk row.
 - A video is selected when its identity has no rows in the table (new), or when the table carries `transcript_sha256` and the stored set of hashes for that identity differs from the current set (changed). Two transcripts with one `video_id` in ONE channel folder (a title-rotation duplicate) are one identity with a set of two hashes.
 - Only the transcript bytes are hashed. Title, `concept_ids` and `source_file` are not refreshed when only they change; title is BM25-searched and `source_file` is printed by search, so a title rotation or a `dedupe` move leaves stale ranking and paths until a full rebuild. Known limit, stated.
@@ -66,12 +66,12 @@ Falsify by removing the hash comparison (test 3 fails) and the selection (test 1
 
 ## Retrieval eval
 
-Retrieval logic is unchanged, but index construction changed, so `pytest tests/evals/test_search_quality.py` is run by name against a complete full index (the 2026-10-31 `index --force` once it finishes, confirmed by row count against the transcript chunk count) and the N/25 goes in the PR body, with `tests/evals/test_instrument.py` run first.
+Retrieval logic is unchanged, but index construction changed, so `pytest tests/evals/test_search_quality.py` is run by name against a complete full index (the most recent `index --force` once it finishes, confirmed by row count against the transcript chunk count) and the N/25 goes in the PR body, with `tests/evals/test_instrument.py` run first.
 
 ## Out of scope
 
 Retiring rows for deleted transcripts; re-embedding on title or concept changes; a meta whose blank `video_id` is later backfilled (zero live cases; its old blank-id rows would stay until a full rebuild); any change to the full rebuild beyond writing the `transcript_sha256` column, or to `--channel`'s meaning.
 
-## Doc review (2026-10-31)
+## Doc review
 
 One combined coherence and feasibility pass. Applied: per-channel identity and channel-scoped deletes (its P1, measured on two live shared ids with different bytes); file-name identity for blank ids and deletes built from stored paths (remount test); "Index already current" message; recovery is a re-run, not a paid full rebuild (failure test); out-of-scope wording; parse-time refusal first; skill frontmatter. Deferred: blank-to-real id drift (zero live cases). Not applied: running the eval on an index this branch built. The owner's instruction for this run was to measure the existing full index and rebuild only if incomplete; the eval exercises retrieval, which this branch does not change, and the embeddings a rebuild would write are identical. Stated as a premise in the PR.

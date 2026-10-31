@@ -7868,8 +7868,9 @@ def log_scan_index_recipe(channels: list[str], index_state: str | None, output_d
     Scan never embeds: the index is paid and slow, so it stays a command the
     operator runs. The command is ONE corpus-wide `index --incremental`, not a
     line per channel: it embeds only the new or edited transcripts, and one
-    pass reads the table and compacts it once (measured: about 94 s to walk a
-    3,653-transcript corpus on a cloud mount with nothing to embed), where a
+    pass reads the table and compacts it once (measured: about a minute and a
+    half to walk a corpus of a few thousand transcripts on a cloud mount with
+    nothing to embed), where a
     line per channel would repeat both for every channel. The channels are
     named in the header so the operator still sees what changed.
 
