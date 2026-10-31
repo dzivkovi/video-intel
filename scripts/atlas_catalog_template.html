@@ -373,20 +373,23 @@
     source: makeDim("ts", "Transcript source", "one", sourceLabel),
     briefing: makeDim("br", "Already in a briefing", "one", yesNo),
     wiki: makeDim("wk", "Has wiki page", "one", yesNo),
+    indexed: makeDim("ix", "In search index", "one", yesNo),
     concept: makeDim("cn", "Concept (all required)", "all", labelOf)
   };
-  var DIMS = [D.channel, D.topic, D.year, D.month, D.quality, D.source, D.briefing, D.wiki, D.concept];
+  var DIMS = [D.channel, D.topic, D.year, D.month, D.quality, D.source, D.briefing, D.wiki, D.indexed, D.concept];
   var hasTopics = rows.some(function (r) { return r.topics && r.topics.length; });
   var hasBriefings = rows.some(function (r) { return r.in_briefings; });
   var hasWiki = rows.some(function (r) { var w = r.wiki || {}; return w.creator || (w.concepts && w.concepts.length); });
   var hasSource = rows.some(function (r) { return typeof r.transcript_source === "string" && r.transcript_source; });
-  var RAIL_DIMS = [D.channel].concat(hasTopics ? [D.topic] : [], [D.concept, D.year, D.month, D.quality], hasSource ? [D.source] : [], hasBriefings ? [D.briefing] : [], hasWiki ? [D.wiki] : []);
+  // Shown only when the build read a search index; an older atlas, or one built without an index, has no booleans here.
+  var hasIndex = rows.some(function (r) { return typeof r.in_search_index === "boolean"; });
+  var RAIL_DIMS = [D.channel].concat(hasTopics ? [D.topic] : [], [D.concept, D.year, D.month, D.quality], hasSource ? [D.source] : [], hasBriefings ? [D.briefing] : [], hasWiki ? [D.wiki] : [], hasIndex ? [D.indexed] : []);
   // Facets whose zero-count values are noise rather than a choice: hidden unless selected.
   var HIDE_ZERO = [D.concept, D.quality, D.source];
   var FILTERABLE = [D.concept];
 
   QUALITY.forEach(function (q) { codeOf(D.quality, q); });
-  ["yes", "no"].forEach(function (v) { codeOf(D.briefing, v); codeOf(D.wiki, v); });
+  ["yes", "no"].forEach(function (v) { codeOf(D.briefing, v); codeOf(D.wiki, v); codeOf(D.indexed, v); });
   Object.keys(summary.topics || {}).sort().forEach(function (t) { codeOf(D.topic, t); });
   var unthreadedCode = codeOf(D.topic, UNTHREADED);
 
@@ -402,6 +405,7 @@
     D.briefing.codes[i] = codeOf(D.briefing, r.in_briefings ? "yes" : "no");
     var w = r.wiki || {};
     D.wiki.codes[i] = codeOf(D.wiki, w.creator || (w.concepts && w.concepts.length) ? "yes" : "no");
+    D.indexed.codes[i] = codeOf(D.indexed, r.in_search_index === true ? "yes" : "no");
     var tps = r.topics || [];
     D.topic.codes[i] = tps.length ? tps.map(function (t) { return codeOf(D.topic, t); }) : [unthreadedCode];
     var seen = new Set(), cc = [];
@@ -539,6 +543,7 @@
     });
     if (D.briefing.sel.size === 1) parts.push(D.briefing.sel.has(D.briefing.index.get("yes")) ? "already in a briefing" : "not yet in a briefing");
     if (D.wiki.sel.size === 1) parts.push(D.wiki.sel.has(D.wiki.index.get("yes")) ? "with a wiki page" : "without a wiki page");
+    if (D.indexed.sel.size === 1) parts.push(D.indexed.sel.has(D.indexed.index.get("yes")) ? "in the search index" : "not in the search index");
     var c = selLabels(D.concept); if (c.length) parts.push((c.length > 1 ? "concepts " : "concept ") + c.join(" and "));
     var n = res.matched.length;
     var title = fmt(n) + " of " + fmt(N) + " videos" + (parts.length ? ", " + parts.join(", ") : "");

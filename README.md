@@ -443,6 +443,9 @@ python scripts/video_intel.py concepts
 python scripts/video_intel.py concepts --channel natebjones
 
 # Rebuild master taxonomy from all concept files
+# (scan does this itself, plus topics.json and the catalog, whenever it wrote
+# an artifact; it never rebuilds the search index and prints the
+# `index --channel <name>` lines to run instead)
 python scripts/video_intel.py taxonomy-build
 
 # Search corpus by concept (matches labels + aliases)

@@ -43,6 +43,11 @@ META_SUFFIX = ".meta.json"
 CONCEPTS_SUFFIX = ".concepts.json"
 MINDMAP_SUFFIX = ".mindmap.md"
 TRANSCRIPT_SUFFIX = ".transcript.md"
+#: The search index's default folder under the corpus and its one LanceDB
+#: table. `video_intel` writes the index (`LANCEDB_DIR`, `LANCEDB_TABLE` are
+#: these objects); `atlas_build` reads it for the in-search-index facet.
+SEARCH_INDEX_DIRNAME = ".lancedb"
+SEARCH_INDEX_TABLE = "transcript_chunks"
 
 #: Per-file read cap for a meta or concepts JSON. A real meta is a few KB; a
 #: file this large is not one, and reading it whole would only cost memory.
