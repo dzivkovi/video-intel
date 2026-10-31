@@ -33,6 +33,6 @@ The `output_dir` in `config.yaml` should point outside the plugin folder (e.g. `
    ```
 
 4. Push commits and tag: `git push origin main --tags`
-5. (Optional) Create a GitHub Release tied to the tag with release notes — useful for humans browsing changes, even though Claude Code itself does not consume a release asset under the documented install paths.
+5. (Optional) Create a GitHub Release tied to the tag with release notes — useful for humans browsing changes, even though Claude Code itself does not consume a release asset under the documented install paths. When the notes file starts with the title on line 1, pass that line as `--title` and only the lines after it as the body (`gh release create vX.Y.Z --title "<line 1>" --notes-file <file without line 1>`): passing the whole file prints the title twice, and earlier releases carry it only in the release name.
 
 **Users installing from a previous release:** The repo went from "single skill at repo root" to "plugin with two skills under `skills/`." Anyone who previously installed by copying the old layout to `~/.claude/skills/video-intel/` should remove that directory and re-install via one of the documented plugin paths. Claude Code manages the actual plugin cache itself (`~/.claude/plugins/cache/...`); end users do not copy files there directly.

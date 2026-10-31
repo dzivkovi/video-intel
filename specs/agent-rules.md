@@ -23,10 +23,10 @@
 * **Local validation before declaring done.** A task is not complete until this passes:
 
   ```bash
-  ruff format . && ruff check . --fix && pytest -m "not integration" -q
+  ruff format <changed files> && ruff check . --fix && pytest -m "not integration" -q
   ```
 
-  If the change touches integration paths, also run `pytest -m "integration"`.
+  Format only the files in your diff: a repo-wide `ruff format .` reformats unrelated files whenever the tree carries formatting drift, which breaks "surgical changes only" (§1); fix drift in its own commit. If the change touches integration paths, also run `pytest -m "integration"`.
 * **TDD cycle:**
   1. **RED:** write a failing test first.
   2. **GREEN:** make it pass.
@@ -43,7 +43,7 @@
 
 * **Never commit unless I explicitly ask.** Do not auto-commit, even on local branches, even after a successful test pass. When I do ask for a commit, prefer new follow-up commits over amending unless I specifically ask for `--amend`.
 * **Don't rush commits.** Wait for peer review before committing if we are still mid-discussion. The cost of a follow-up commit is nothing; the cost of an unwanted commit is context loss and noisy history.
-* **Revert on failure.** If you break the test suite while iterating, `git reset --hard` back to the last green state rather than guessing fixes by overwriting files. If there are uncommitted changes you did not create, confirm before resetting.
+* **Revert on failure.** If you break the test suite while iterating, restore the file from a `cp` backup taken before the change, rather than guessing fixes by overwriting files. Do not use `git reset --hard` or `git checkout --` for this: both also destroy uncommitted work, your own included. If there are uncommitted changes you did not create, confirm before restoring.
 * **Execution strategy.** Default to sequential work for coupled changes: write one file, test it, verify, move on. Use parallel sub-agents only when tasks are truly independent and touch separate files.
 * **Worktrees for parallel sessions.** When the working tree is unfamiliar (untracked files you did not create, branch differs from session start, `git status` shows changes you did not make), suspect a concurrent Claude session. Do not stash, checkout, or reset; that overwrites the other session's in-flight work. Isolate via `git worktree add ../<repo>-<feature> <your-branch>` and continue from the worktree (shared `.git` is safe, only the working tree needs isolation). CE's `ce-worktree` skill is opt-in, so invoke it proactively when parallel work is anticipated rather than recovering after the conflict. *Why:* parallel Claude sessions share one index/HEAD without a worktree, so one will silently lose work.
 
