@@ -264,6 +264,28 @@ class TestScanRebuildsTheFreeLayers:
 
         assert "fresh_oooooooooo1" in json.loads((scan_env.corpus / "taxonomy.json").read_text("utf-8"))["concepts"]
 
+    def test_a_concepts_write_whose_meta_update_failed_still_rebuilds(self, scan_env, monkeypatch):
+        """process_concepts writes concepts.json BEFORE its meta update, so an
+        `error` status can follow a real write; the taxonomy must still follow."""
+        channel_dir = scan_env.corpus / "alpha"
+        channel_dir.mkdir()
+        (channel_dir / "2026-09-01-old-talk.mindmap.md").write_text("# Mind map\n\n## Branch [00:01:00]\n", "utf-8")
+        (channel_dir / "2026-09-01-old-talk.meta.json").write_text(
+            json.dumps({"video_id": "oooooooooo1", "title": "Old talk", "published": "2026-09-01"}), encoding="utf-8"
+        )
+        written = video_intel.process_concepts
+
+        def write_then_fail(*args, **kw):
+            written(*args, **kw)
+            return kw["prefix"], "error: meta update failed"
+
+        monkeypatch.setattr(video_intel, "process_concepts", write_then_fail)
+        config = {"channels": [{"name": "alpha", "url": "alpha", "auto_concepts": True}]}
+
+        cmd_scan(_args(), config)
+
+        assert "fresh_oooooooooo1" in json.loads((scan_env.corpus / "taxonomy.json").read_text("utf-8"))["concepts"]
+
     def test_a_title_rotation_alone_rebuilds(self, scan_env, monkeypatch):
         video = _video("aaaaaaaaaa1", "First talk")
         scan_env.videos["UC-alpha"] = [video]
@@ -435,3 +457,18 @@ class TestReadSearchIndex:
         }
         without = atlas_build.build_rows(corpus)
         assert {r["in_search_index"] for r in without.rows} == {None}
+
+
+@pytest.mark.parametrize(
+    ("name", "printed"),
+    [
+        ("alpha", "alpha"),
+        ("my-channel_2", "my-channel_2"),
+        ("two words", '"two words"'),
+        ("o'brien", '"o\'brien"'),
+    ],
+)
+def test_recipe_channel_names_are_pasteable(name, printed, caplog, tmp_path):
+    with caplog.at_level(logging.INFO, logger="video_intel"):
+        video_intel.log_scan_index_recipe([name], "read", tmp_path, tmp_path / "index")
+    assert f"  python scripts/video_intel.py index --channel {printed}" in [r.getMessage() for r in caplog.records]

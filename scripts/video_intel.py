@@ -7767,6 +7767,29 @@ def scan_status_wrote_artifact(status: str) -> bool:
     return not (status.startswith("skipped") or status.startswith("error"))
 
 
+def _file_stamp(path: Path) -> tuple[int, int] | None:
+    """(mtime_ns, size) of a file, or None when it is absent or unreadable.
+
+    The concepts loop compares a stamp from before and after the call because
+    `process_concepts` writes concepts.json BEFORE its meta update, so an
+    `error` status can follow a real write (Codex peer pass on #283).
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return st.st_mtime_ns, st.st_size
+
+
+def _shell_arg(value: str) -> str:
+    """`value` ready to paste into a printed command: bare when it is a plain
+    token, else double-quoted, which bash, cmd.exe and PowerShell all accept
+    for a name with spaces or an apostrophe."""
+    if re.fullmatch(r"[A-Za-z0-9_.@:/\\-]+", value):
+        return value
+    return '"' + value.replace('"', '\\"') + '"'
+
+
 def rebuild_free_derived_layers(output_dir: Path, config: dict) -> str | None:
     """Rebuild taxonomy.json, topics.json and the catalog after a scan (issue #283).
 
@@ -7863,7 +7886,7 @@ def log_scan_index_recipe(channels: list[str], index_state: str | None, output_d
         log.info("  (no index was found; if an index --force is running right now, let it finish instead)")
     else:
         for name in channels:
-            log.info("  python scripts/video_intel.py index --channel %s", name)
+            log.info("  python scripts/video_intel.py index --channel %s", _shell_arg(name))
     log.info("Then refresh the catalog's in-search-index facet:")
     log.info('  python scripts/atlas_build.py --corpus "%s" --index-dir "%s"', output_dir, index_dir)
     log.info(
@@ -8754,6 +8777,7 @@ def cmd_scan(args, config):
                 try:
                     for v, mindmap_path, prefix in concept_candidates:
                         mindmap_text = mindmap_path.read_text(encoding="utf-8")
+                        stamp_before = _file_stamp(output_dir / ch_name / f"{prefix}.concepts.json")
                         out_prefix, status = process_concepts(
                             client,
                             types,
@@ -8780,7 +8804,9 @@ def cmd_scan(args, config):
                             prompt_cache=concepts_cache,
                         )
                         log.info("    %s: %s", out_prefix, status)
-                        if scan_status_wrote_artifact(status):
+                        if scan_status_wrote_artifact(status) or (
+                            _file_stamp(output_dir / ch_name / f"{out_prefix}.concepts.json") != stamp_before
+                        ):
                             changed_channels.add(ch_name)
                         if status.startswith("error"):
                             errors.append((ch_name, out_prefix, status))
