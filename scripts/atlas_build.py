@@ -6,7 +6,7 @@ row per `video_id`, plus the referenced-concept label lookup and a summary.
 `main` serializes that into `<corpus>/_atlas/atlas.json` (or `--out`) and
 prints one counts-only line:
 
-    python scripts/atlas_build.py --corpus <output_dir> [--out DIR] [--generated-at STAMP]
+    python scripts/atlas_build.py --corpus <output_dir> [--out DIR] [--index-dir DIR] [--generated-at STAMP]
 
 Contracts this module keeps:
 
@@ -57,6 +57,8 @@ from corpus_walk import (
     CONCEPTS_SUFFIX,
     HEALTHY_TRANSCRIPT_STATUSES,
     MINDMAP_SUFFIX,
+    SEARCH_INDEX_DIRNAME,
+    SEARCH_INDEX_TABLE,
     TRANSCRIPT_STATUS_TRUNCATED,
     TRANSCRIPT_SUFFIX,
     MetaRecord,
@@ -105,6 +107,7 @@ ROW_KEYS = (
     "briefing_count",
     "wiki",
     "aliases",
+    "in_search_index",
 )
 
 #: Cap on any title, heading or label carried into the catalog (KTD9).
@@ -396,6 +399,58 @@ def concept_labels(corpus: Path, referenced: set[str], skipped: list[str], warni
     return labels
 
 
+#: `IndexRead.state` values. Only `read` carries ids; `absent` is a confirmed
+#: "no index here" (no folder, or no table in it), `unknown` is every failure
+#: to find out. The scan's recipe treats the two differently, because the
+#: answer to `absent` is a paid full `index` run.
+INDEX_READ = "read"
+INDEX_ABSENT = "absent"
+INDEX_UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class IndexRead:
+    state: str
+    video_ids: frozenset[str] | None = None
+
+
+def read_search_index(index_dir: Path | None) -> IndexRead:
+    """Which video ids have at least one row in the search index.
+
+    Read-only: one `video_id` column projection, no embedding call, no write.
+    `lancedb` is imported here and never at module level, so `import
+    atlas_build` stays stdlib-only (#152). A projection that comes back short
+    is `unknown`, never a partial set: a partial read would mark indexed
+    videos as missing, the worst answer the facet can give.
+    """
+    if index_dir is None or not index_dir.is_dir():
+        return IndexRead(INDEX_ABSENT)
+    try:
+        import lancedb
+    except ImportError:
+        log.warning("lancedb is not installed; the catalog leaves out the in-search-index facet")
+        return IndexRead(INDEX_UNKNOWN)
+    try:
+        db = lancedb.connect(str(index_dir))
+        if SEARCH_INDEX_TABLE not in db.list_tables().tables:
+            return IndexRead(INDEX_ABSENT)
+        table = db.open_table(SEARCH_INDEX_TABLE)
+        arrow = table.search().select(["video_id"]).limit(0).to_arrow()
+        expected = table.count_rows()
+    except Exception as exc:  # any failure of a third-party read means "unknown", never a crash
+        log.warning("cannot read the search index at %s (%s); the catalog leaves out that facet", index_dir, exc)
+        return IndexRead(INDEX_UNKNOWN)
+    if arrow.num_rows != expected:
+        log.warning(
+            "the search index returned %d of %d rows; the catalog leaves out the in-search-index facet",
+            arrow.num_rows,
+            expected,
+        )
+        return IndexRead(INDEX_UNKNOWN)
+    ids = frozenset(v for v in arrow.column("video_id").to_pylist() if isinstance(v, str) and v)
+    return IndexRead(INDEX_READ, ids)
+
+
 def _parse_processed(value: object) -> dt.datetime | None:
     if not isinstance(value, str):
         return None
@@ -418,8 +473,13 @@ def _row_sort_key(row: dict) -> tuple[str, str]:
     return (row.get("published") or "", row.get("video_id") or "")
 
 
-def build_rows(corpus: Path) -> BuildResult:
-    """Build every catalog row, the concept lookup and the summary. Writes nothing."""
+def build_rows(corpus: Path, indexed: frozenset[str] | None = None) -> BuildResult:
+    """Build every catalog row, the concept lookup and the summary. Writes nothing.
+
+    `indexed` is `read_search_index(...).video_ids`: each row's
+    `in_search_index` is membership in it, or None for every row when the
+    index was not read.
+    """
     walk = iter_meta_records(corpus)
     skipped = list(walk.skipped_files)
     warnings: set[str] = set()
@@ -460,6 +520,7 @@ def build_rows(corpus: Path) -> BuildResult:
                 "concepts": sorted(cid for cid in ids if cid in wiki_concept_ids),
             },
             "aliases": [clean_text(a) for a in record.aliases],
+            "in_search_index": None if indexed is None else record.video_id in indexed,
         }
         rows.append(row)
         stamp = _parse_processed(meta.get("processed"))
@@ -655,6 +716,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Output folder for {ATLAS_FILENAME} (default: <corpus>/{ATLAS_DIRNAME})",
     )
     parser.add_argument(
+        "--index-dir",
+        type=Path,
+        default=None,
+        help=f"Search index folder (vector_db_dir) read for the in-search-index facet "
+        f"(default: <corpus>/{SEARCH_INDEX_DIRNAME}, right only when vector_db_dir is unset; "
+        "the facet is left out when no index is found there)",
+    )
+    parser.add_argument(
         "--generated-at",
         default=None,
         help="Value for the generated_at header, emitted verbatim "
@@ -698,6 +767,32 @@ def refused_line(summary: dict) -> str:
     )
 
 
+def build_catalog(
+    corpus: Path, out_dir: Path, index_dir: Path | None, generated_at: str | None = None
+) -> tuple[int, str]:
+    """Write `out_dir/atlas.json` from `corpus`; return (exit code, the index read's state).
+
+    The one build behind both this script's CLI and the end of `video_intel
+    scan`, which reads the state to choose its index recipe. Prints the one
+    counts-only stdout line.
+    """
+    sweep_stale_temps(out_dir)
+    # Refuse before the walk too: a foreign file should not cost a full corpus read.
+    check_ownership(out_dir / ATLAS_FILENAME)
+    index = read_search_index(index_dir)
+    result = build_rows(corpus, index.video_ids)
+    if result.summary["unlistable_channels"]:
+        # A channel the walk could not list is absent from every counter, so
+        # the partition still balances; publishing would ship a catalog with
+        # that channel silently missing. Keep the previous file instead.
+        print(refused_line(result.summary))
+        return EXIT_UNLISTABLE, index.state
+    document = serialize_atlas(build_header(corpus, result, generated_at))
+    write_atlas(out_dir, document)
+    print(summary_line(out_dir, corpus, result.summary))
+    return 0, index.state
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s", stream=sys.stderr)
     args = build_parser().parse_args(argv)
@@ -705,21 +800,9 @@ def main(argv: list[str] | None = None) -> int:
     if not corpus.is_dir():
         sys.exit(f"corpus not found: {corpus}")
     out_dir = args.out.resolve() if args.out else corpus / ATLAS_DIRNAME
-
-    sweep_stale_temps(out_dir)
-    # Refuse before the walk too: a foreign file should not cost a full corpus read.
-    check_ownership(out_dir / ATLAS_FILENAME)
-    result = build_rows(corpus)
-    if result.summary["unlistable_channels"]:
-        # A channel the walk could not list is absent from every counter, so
-        # the partition still balances; publishing would ship a catalog with
-        # that channel silently missing. Keep the previous file instead.
-        print(refused_line(result.summary))
-        return EXIT_UNLISTABLE
-    document = serialize_atlas(build_header(corpus, result, args.generated_at))
-    write_atlas(out_dir, document)
-    print(summary_line(out_dir, corpus, result.summary))
-    return 0
+    index_dir = args.index_dir.expanduser().resolve() if args.index_dir else corpus / SEARCH_INDEX_DIRNAME
+    code, _ = build_catalog(corpus, out_dir, index_dir, args.generated_at)
+    return code
 
 
 if __name__ == "__main__":

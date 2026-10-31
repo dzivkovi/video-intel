@@ -58,6 +58,8 @@ from corpus_walk import (  # noqa: F401 - re-exports
     QUALITY_FLAG_BLIND_GAP_SEVERE,
     QUALITY_FLAG_CHUNK_WINDOW_MISMATCH_SEVERE,
     QUALITY_FLAG_MONOLITHIC_SEVERE,
+    SEARCH_INDEX_DIRNAME,
+    SEARCH_INDEX_TABLE,
     TRANSCRIPT_STATUS_TRUNCATED,
     TRANSCRIPT_SUFFIX,
     briefing_video_counts,
@@ -7754,6 +7756,145 @@ def build_taxonomy(output_dir: Path) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def scan_status_wrote_artifact(status: str) -> bool:
+    """Whether a per-video scan status means an artifact was written (issue #283).
+
+    The one rule for the transcript, mind map and concepts loops. Every status
+    that writes nothing starts with `skipped` (`skipped (exists)`, the
+    `mindmap_source=none` and livestream skips) or `error`; everything else
+    (`done`, `done (captions)`, every `partial ...`) left an artifact on disk.
+    """
+    return not (status.startswith("skipped") or status.startswith("error"))
+
+
+def _file_stamp(path: Path) -> tuple[int, int] | None:
+    """(mtime_ns, size) of a file, or None when it is absent or unreadable.
+
+    The concepts loop compares a stamp from before and after the call because
+    `process_concepts` writes concepts.json BEFORE its meta update, so an
+    `error` status can follow a real write (Codex peer pass on #283).
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return st.st_mtime_ns, st.st_size
+
+
+def _shell_arg(value: str) -> str:
+    """`value` ready to paste into a printed command: bare when it is a plain
+    token, else double-quoted, which bash, cmd.exe and PowerShell all accept
+    for a name with spaces or an apostrophe."""
+    if re.fullmatch(r"[A-Za-z0-9_.@:/\\-]+", value):
+        return value
+    return '"' + value.replace('"', '\\"') + '"'
+
+
+def rebuild_free_derived_layers(output_dir: Path, config: dict) -> str | None:
+    """Rebuild taxonomy.json, topics.json and the catalog after a scan (issue #283).
+
+    The same functions `taxonomy-build`, `topics-build`, `atlas_build.py` and
+    `atlas_render.py` run, so each layer keeps one definition. Free: no Gemini,
+    no Voyage, no network, but not instant: each walks the whole corpus, and the
+    catalog build alone measured about four minutes on a Drive-mounted corpus,
+    so every step logs its elapsed time. Each step is caught on its own and
+    logged with the command that redoes it, so one failure never aborts a scan
+    whose paid work is already on disk, and the later steps still run.
+
+    Returns the catalog build's index-read state (`atlas_build.INDEX_READ`,
+    `INDEX_ABSENT`, `INDEX_UNKNOWN`), also when the build read the index but
+    refused to write (an unlistable channel), or None when it raised:
+    `log_scan_index_recipe` reads it, so the index is read once per scan.
+    """
+    log.info("Rebuilding the free derived layers (taxonomy, topics, catalog)...")
+    started = time.monotonic()
+    try:
+        taxonomy = build_taxonomy(output_dir)
+        log.info(
+            "  taxonomy.json: %d concepts from %d concept files (%.0fs)",
+            len(taxonomy["concepts"]),
+            taxonomy["built_from"],
+            time.monotonic() - started,
+        )
+    except Exception as e:
+        log.warning("  taxonomy.json not rebuilt (%s). Run: python scripts/video_intel.py taxonomy-build", e)
+    started = time.monotonic()
+    try:
+        topics = build_topics(output_dir)
+        write_topics(output_dir, topics)
+        log.info("  topics.json: %d topics (%.0fs)", topics["summary"]["topics"], time.monotonic() - started)
+    except Exception as e:
+        log.warning("  topics.json not rebuilt (%s). Run: python scripts/video_intel.py topics-build", e)
+
+    import atlas_render
+
+    import atlas_build
+
+    index_dir = resolve_vector_db_dir(config, output_dir)
+    atlas_dir = output_dir / atlas_build.ATLAS_DIRNAME
+    atlas_path = atlas_dir / atlas_build.ATLAS_FILENAME
+    build_cmd = f'python scripts/atlas_build.py --corpus "{output_dir}" --index-dir "{index_dir}"'
+    started = time.monotonic()
+    try:
+        # SystemExit is the build's ownership refusal; it must not end the scan.
+        code, index_state = atlas_build.build_catalog(output_dir, atlas_dir, index_dir)
+    except (Exception, SystemExit) as e:
+        log.warning("  catalog not rebuilt (%s). Run: %s", e, build_cmd)
+        return None
+    if code != 0:
+        # The index was still read (only the write was refused), so its state
+        # stays valid for the recipe.
+        log.warning("  catalog not rebuilt (exit %d). Run: %s", code, build_cmd)
+        return index_state
+    try:
+        render_code = atlas_render.main(["--atlas", str(atlas_path)])
+    except (Exception, SystemExit) as e:
+        render_code = e
+    if render_code != 0:
+        log.warning(
+            '  catalog page not rendered (%s). Run: python scripts/atlas_render.py --atlas "%s"',
+            render_code,
+            atlas_path,
+        )
+    else:
+        log.info("  catalog: %s (%.0fs)", atlas_path.parent, time.monotonic() - started)
+    return index_state
+
+
+def log_scan_index_recipe(channels: list[str], index_state: str | None, output_dir: Path, index_dir: Path) -> None:
+    """Print the search-index recipe for the channels whose transcripts changed (issue #283).
+
+    Scan never embeds: the index is paid and slow, so it stays a command the
+    operator runs. Only a CONFIRMED absent index (`atlas_build.INDEX_ABSENT`)
+    switches the recipe to the full build, because `index --channel` is
+    refused there (#183); an unknown state keeps the per-channel lines, which
+    are right whenever an index exists and whose refusal names the full build
+    when one does not, so a read failure never prescribes a paid re-embed of
+    the whole corpus. It ends with the catalog
+    commands, because the catalog built above recorded the index as it was
+    before these lines run.
+    """
+    log.info(
+        "Search index not rebuilt by scan (paid and slow). To refresh it for the channels whose transcripts changed:"
+    )
+    import atlas_build
+
+    if index_state == atlas_build.INDEX_ABSENT:
+        # Also what an `index --force` that is still running looks like: it
+        # drops the table first and only recreates it at the end.
+        log.info("  python scripts/video_intel.py index")
+        log.info("  (no index was found; if an index --force is running right now, let it finish instead)")
+    else:
+        for name in channels:
+            log.info("  python scripts/video_intel.py index --channel %s", _shell_arg(name))
+    log.info("Then refresh the catalog's in-search-index facet:")
+    log.info('  python scripts/atlas_build.py --corpus "%s" --index-dir "%s"', output_dir, index_dir)
+    log.info(
+        '  python scripts/atlas_render.py --atlas "%s"',
+        output_dir / atlas_build.ATLAS_DIRNAME / atlas_build.ATLAS_FILENAME,
+    )
+
+
 def cmd_scan(args, config):
     """Scan channels for new videos and generate mind maps."""
     require_channels_config(config)
@@ -7821,6 +7962,12 @@ def cmd_scan(args, config):
     # (issue #176). Lazy, not hoisted-unconditional, so a scan with no
     # auto_concepts channel pays no file read.
     scan_taxonomy: dict | None = None
+    # Issue #283: which channels this scan wrote an artifact for, and which of
+    # them got a new or replaced transcript (the only input the search index
+    # reads). They decide whether the free derived layers are rebuilt at the
+    # end and which `index --channel` lines the recipe prints.
+    changed_channels: set[str] = set()
+    index_channels: set[str] = set()
 
     for ch in channels:
         ch_name = ch["name"]
@@ -7939,7 +8086,8 @@ def cmd_scan(args, config):
         # meta.json when it fires).
         if not args.dry_run:
             for v in videos:
-                record_alt_title_if_rotated(output_dir, ch_name, v)
+                if record_alt_title_if_rotated(output_dir, ch_name, v):
+                    changed_channels.add(ch_name)
 
         # Shorts classification + filter (per docs/plans/2026-04-24-002).
         # Always fetch durations so meta.json carries duration_seconds going
@@ -8382,6 +8530,9 @@ def cmd_scan(args, config):
                         prefix, status = future.result()
                         transcript_results[prefix] = status
                         log.info("    %s: %s", prefix, status)
+                        if scan_status_wrote_artifact(status):
+                            changed_channels.add(ch_name)
+                            index_channels.add(ch_name)
                         if status.startswith("error"):
                             errors.append((ch_name, prefix, status))
 
@@ -8525,6 +8676,8 @@ def cmd_scan(args, config):
                     v = futures[future]
                     prefix, status = future.result()
                     log.info("    %s: %s", prefix, status)
+                    if scan_status_wrote_artifact(status):
+                        changed_channels.add(ch_name)
                     if status == LIVESTREAM_MINDMAP_SKIP_STATUS:
                         _log_livestream_recovery_recipe(v, ch_name)
                     if status.startswith("error"):
@@ -8624,6 +8777,7 @@ def cmd_scan(args, config):
                 try:
                     for v, mindmap_path, prefix in concept_candidates:
                         mindmap_text = mindmap_path.read_text(encoding="utf-8")
+                        stamp_before = _file_stamp(output_dir / ch_name / f"{prefix}.concepts.json")
                         out_prefix, status = process_concepts(
                             client,
                             types,
@@ -8650,6 +8804,10 @@ def cmd_scan(args, config):
                             prompt_cache=concepts_cache,
                         )
                         log.info("    %s: %s", out_prefix, status)
+                        if scan_status_wrote_artifact(status) or (
+                            _file_stamp(output_dir / ch_name / f"{out_prefix}.concepts.json") != stamp_before
+                        ):
+                            changed_channels.add(ch_name)
                         if status.startswith("error"):
                             errors.append((ch_name, out_prefix, status))
                         else:
@@ -8666,12 +8824,25 @@ def cmd_scan(args, config):
                     if concepts_cache is not None:
                         concepts_cache.close()
 
+    # Issue #283: the free derived layers end consistent with what this scan
+    # wrote; the paid, slow search index is only printed as a recipe below.
+    # Once, after every channel's concepts loop, and never on a scan that
+    # changed nothing (a --dry-run always lands here with both sets empty).
+    index_state: str | None = None
+    if changed_channels:
+        index_state = rebuild_free_derived_layers(output_dir, config)
+
     if errors:
         log.warning("--- %d FAILED ---", len(errors))
         for ch, prefix, status in errors:
             log.warning("  [%s] %s: %s", ch, prefix, status)
         log.warning("Failed items will retry on next run.")
         log.warning('To skip permanently: set "skip": true in the video\'s .meta.json')
+
+    if index_channels:
+        log_scan_index_recipe(
+            sorted(index_channels), index_state, output_dir, resolve_vector_db_dir(config, output_dir)
+        )
 
     # Headline digest (issue #113): peripheral vision over channels the user does
     # not actively follow (enabled:false + headline_digest:true). Rendered LAST -
@@ -10707,8 +10878,8 @@ def cmd_status(args, config):
 # Vector search (Phase 2): LanceDB + Voyage AI
 # ---------------------------------------------------------------------------
 
-LANCEDB_DIR = ".lancedb"
-LANCEDB_TABLE = "transcript_chunks"
+LANCEDB_DIR = SEARCH_INDEX_DIRNAME
+LANCEDB_TABLE = SEARCH_INDEX_TABLE
 VOYAGE_DOC_MODEL = "voyage-4-large"
 VOYAGE_QUERY_MODEL = "voyage-4-lite"
 VOYAGE_DIMS = 1024

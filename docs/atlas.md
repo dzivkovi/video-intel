@@ -15,7 +15,7 @@ The corpus catalog and the Creator Atlas wiki are different tools that happen to
 ## Build it
 
 ```bash
-python scripts/atlas_build.py --corpus <output_dir>
+python scripts/atlas_build.py --corpus <output_dir> --index-dir <vector_db_dir>
 ```
 
 Flags:
@@ -24,7 +24,10 @@ Flags:
 |---|---|
 | `--corpus` | The corpus folder (your `output_dir`). Required, must exist. |
 | `--out` | Folder for `atlas.json`. Default: `<corpus>/_atlas`. |
+| `--index-dir` | The search index folder (your `vector_db_dir`), read for the "in search index" facet. Default: `<corpus>/.lancedb`, which is right only when `vector_db_dir` is unset. Pass it whenever your config sets `vector_db_dir`: without it the build reads the wrong folder, so every row carries `null` (no index there) or, if an old `.lancedb` folder lingers in the corpus, stale `true`/`false` values. |
 | `--generated-at` | A value for the `generated_at` header, written verbatim. Default: derived from the corpus, never the clock (see "Determinism"). |
+
+`scan` runs this build and the page render itself at the end of any scan that wrote an artifact, with `--index-dir` set to the resolved `vector_db_dir`, so a manual run is only needed after `index`, `dedupe` or `prune-shorts`, or to refresh the facet after re-indexing.
 
 For example, to write a scratch copy somewhere else:
 
@@ -117,7 +120,7 @@ The folder name is on stderr. Fix the access problem and run again.
 
 The full contract is [`schemas/atlas.schema.json`](../schemas/atlas.schema.json). The file's top-level keys are, in order: `schema_version`, `generator`, `generator_version`, `generated_from` (the corpus folder name, never a path), `generated_at`, `summary`, `concepts` (concept id to label, only for ids some row references) and `rows` (sorted by `published`, then `video_id`).
 
-Each row has these eighteen keys, in this order:
+Each row has these nineteen keys, in this order:
 
 1. `video_id`
 2. `title`
@@ -137,6 +140,7 @@ Each row has these eighteen keys, in this order:
 16. `briefing_count`
 17. `wiki` (`{"creator": <channel or null>, "concepts": [<concept ids>]}`: page keys read from the wiki pages' own front matter, so a renderer maps them to files)
 18. `aliases` (titles of the losing duplicate records)
+19. `in_search_index` (`true` or `false` when the build read a search index, `null` when it found none: read from the LanceDB table by `video_id`, with no embedding call. It reflects the index at the time of the build, so re-run the build after `index` to refresh it.)
 
 ## Plain text for renderers
 

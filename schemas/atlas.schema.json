@@ -117,7 +117,8 @@
         "in_briefings",
         "briefing_count",
         "wiki",
-        "aliases"
+        "aliases",
+        "in_search_index"
       ],
       "additionalProperties": false,
       "properties": {
@@ -167,6 +168,10 @@
         "aliases": {
           "type": "array",
           "items": {"type": "string", "contentMediaType": "text/plain"}
+        },
+        "in_search_index": {
+          "type": ["boolean", "null"],
+          "description": "Whether the search index held at least one row for this video_id when the catalog was built; null when no index was read."
         }
       }
     }

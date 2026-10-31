@@ -1,7 +1,7 @@
 """Tests for scripts/atlas_build.py, the data layer (issue #260, unit U2).
 
 Contract under test:
-- `build_rows` returns one row per walker record with the eighteen R11 keys
+- `build_rows` returns one row per walker record with the nineteen R11 keys
   in schema order, built by explicit projection: free-text meta fields never
   reach a row;
 - the synopsis is the mindmap's `##` headings only, and the generator never
@@ -47,6 +47,7 @@ ROW_KEYS = [
     "briefing_count",
     "wiki",
     "aliases",
+    "in_search_index",
 ]
 
 SENTINEL = "SENTINEL-TRANSCRIPT-TEXT-7f3a"
@@ -160,7 +161,7 @@ def _row(result, video_id):
 
 
 class TestHappyPath:
-    def test_rows_have_the_eighteen_keys_in_order(self, tmp_path):
+    def test_rows_have_the_nineteen_keys_in_order(self, tmp_path):
         result = ab.build_rows(_happy_corpus(tmp_path))
         assert len(result.rows) == 4
         for row in result.rows:
@@ -928,8 +929,8 @@ class TestBytes:
         corpus, before = self._bytes(tmp_path, capsys)
         real = ab.build_rows
 
-        def with_nan(path):
-            result = real(path)
+        def with_nan(path, indexed=None):
+            result = real(path, indexed)
             result.rows[0]["duration_seconds"] = float("nan")
             return result
 
