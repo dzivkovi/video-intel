@@ -8,7 +8,7 @@ trap: the repair trap - corpus cleanup counted as progress. The prize this corpu
 ---
 
 ## Next best action
-Daniel: decide whether Peter Ahn and Austin Marchese keep a scan slot (issue #273) after looking at their videos: the scores and deep links are in `G:\My Driveideo-intel\_briefings\sales6-10-31-finding-and-talking-to-customers.md`, or use the catalog's Channel facet. Then read the two new briefings on Kindle and go back to the magma-rainmaker ledger.
+Daniel: decide whether Peter Ahn and Austin Marchese keep a scan slot (issue #273) after looking at their videos: the scores and deep links are in `G:/My Drive/video-intel/_briefings/sales/2026-10-31-finding-and-talking-to-customers.md`, or use the catalog's Channel facet. Then read the two new briefings on Kindle and go back to the magma-rainmaker ledger.
 
 ```text
 Done 2026-10-31: AI Engineer catch-up (204 talks, Sept 25 to Oct 30) plus about 100 videos from the kept channels, all with concepts; 13 coding-tutorial and founder-news channels parked to headline-only, rob-snyder, lennyspodcast and peterahnsales promoted. PR #271 (explicit Gemini cache for concepts: 0 uncached calls over 304, about CA$0.045 per video) and PR #272 (catalog thumbnail retry) merged. About CA$108 Gemini spend. Briefings: _briefings/ai-engineering/2026-10-31-ai-engineer-autumn-2026 and _briefings/sales/2026-10-31-finding-and-talking-to-customers (md, PDF, EPUB).
