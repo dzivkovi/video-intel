@@ -353,7 +353,7 @@ class TestIndexRecipe:
         note = recipe[recipe.index("  python scripts/video_intel.py index") + 1]
         assert "index --force is running" in note  # a running full rebuild looks the same as no index
 
-    def test_an_unknown_index_state_keeps_the_per_channel_lines(self, scan_env, tmp_path, monkeypatch, caplog):
+    def test_an_unknown_index_state_keeps_the_incremental_line(self, scan_env, tmp_path, monkeypatch, caplog):
         index_dir = tmp_path / "index"
         index_dir.mkdir()
         monkeypatch.setattr(

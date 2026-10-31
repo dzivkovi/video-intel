@@ -185,6 +185,153 @@ class TestRobustness:
         assert len(a1) == 1 and "alpha rewritten" in a1[0]
 
 
+class TestCodexFindings:
+    def test_a_failed_compaction_is_finished_by_a_rerun(self, corpus, monkeypatch) -> None:
+        vi.build_search_index(corpus.output_dir, config=corpus.config)
+        _write_video(corpus.output_dir / "beta", vid="b2", slug="beta-second", body="beta fresh")
+        table_cls = type(lancedb.connect(str(corpus.db_path)).open_table(vi.LANCEDB_TABLE))
+        original = table_cls.optimize
+
+        def boom(self, *a, **k):
+            raise RuntimeError("compaction failed")
+
+        monkeypatch.setattr(table_cls, "optimize", boom)
+        with pytest.raises(RuntimeError):
+            _incremental(corpus)
+        monkeypatch.setattr(table_cls, "optimize", original)
+
+        def pending():
+            table = lancedb.connect(str(corpus.db_path)).open_table(vi.LANCEDB_TABLE)
+            return sum(table.index_stats(ix.name).num_unindexed_rows for ix in table.list_indices())
+
+        assert pending() > 0, "fixture must leave rows the FTS index cannot see"
+        assert _incremental(corpus) == 0  # nothing to embed...
+        assert pending() == 0  # ...but the compaction is finished
+
+    def test_a_changed_transcript_with_no_chunks_keeps_its_rows_even_when_another_video_changes(self, corpus) -> None:
+        vi.build_search_index(corpus.output_dir, config=corpus.config)
+        a1_before = [r for r in _rows(corpus.db_path) if r["video_id"] == "a1"]
+        (corpus.output_dir / "alpha" / "2026-01-01-alpha-first.transcript.md").write_text(
+            "# Transcript\n\nno timestamped entries any more\n", encoding="utf-8"
+        )
+        _write_video(corpus.output_dir / "beta", vid="b2", slug="beta-second", body="beta fresh")
+
+        _incremental(corpus)
+
+        after = _rows(corpus.db_path)
+        assert [r for r in after if r["video_id"] == "a1"] == a1_before
+        assert any(r["video_id"] == "b2" for r in after)
+
+
+class TestCorrectnessFindings:
+    def test_a_mistyped_channel_is_an_error_not_already_current(self, corpus, monkeypatch, capsys) -> None:
+        vi.build_search_index(corpus.output_dir, config=corpus.config)
+        monkeypatch.setattr(vi, "resolve_output_dir", lambda _cfg: corpus.output_dir)
+        capsys.readouterr()
+
+        with pytest.raises(SystemExit) as exc:
+            vi.cmd_index(argparse.Namespace(channel="alfa", force=False, incremental=True), corpus.config)
+
+        assert exc.value.code == 1
+        assert "Index already current" not in capsys.readouterr().out
+
+    def test_a_backfilled_video_id_replaces_its_blank_id_rows(self, corpus) -> None:
+        vi.build_search_index(corpus.output_dir, config=corpus.config)
+        _write_video(corpus.output_dir / "alpha", vid="a9", slug="alpha-noid", body="alpha nameless")
+
+        _incremental(corpus)
+
+        rows = [r for r in _rows(corpus.db_path) if "alpha nameless" in r["text"]]
+        assert [r["video_id"] for r in rows] == ["a9"], "one copy, under the backfilled id"
+
+
+def _pending(db_path) -> int:
+    table = lancedb.connect(str(db_path)).open_table(vi.LANCEDB_TABLE)
+    return sum(table.index_stats(ix.name).num_unindexed_rows for ix in table.list_indices())
+
+
+class TestTestingFindings:
+    """Each case below was a mutation the testing review showed surviving."""
+
+    def test_an_id_video_and_a_blank_id_video_changed_together_each_keep_one_copy(self, corpus) -> None:
+        vi.build_search_index(corpus.output_dir, config=corpus.config)
+        _write_video(corpus.output_dir / "alpha", vid="a1", slug="alpha-first", body="alpha rewritten")
+        _write_video(corpus.output_dir / "alpha", vid="", slug="alpha-noid", body="alpha renamed body")
+
+        _incremental(corpus)
+
+        alpha = [r["text"] for r in _rows(corpus.db_path) if r["channel"] == "alpha"]
+        assert len(alpha) == 2
+        assert any("alpha rewritten" in t for t in alpha) and any("alpha renamed body" in t for t in alpha)
+
+    def test_delete_predicates_are_batched_scoped_and_escaped(self) -> None:
+        ids = {f"id{i:04d}" for i in range(450)}
+        preds = vi._incremental_delete_predicates({"alpha": (ids, set())})
+        assert len(preds) == 3
+        assert all(p.startswith("channel = 'alpha' AND (") for p in preds)
+        assert {i for i in ids if any(f"'{i}'" in p for p in preds)} == ids
+
+        (pred,) = vi._incremental_delete_predicates({"o'brien": ({"x'y"}, {"C:/O'Brien/a.transcript.md"})})
+        assert pred.startswith("channel = 'o''brien' AND (")
+        assert "'x''y'" in pred and "'C:/O''Brien/a.transcript.md'" in pred
+        assert " OR " in pred
+
+    def test_a_remounted_corpus_with_an_edited_blank_id_video_keeps_one_copy(self, corpus, tmp_path) -> None:
+        vi.build_search_index(corpus.output_dir, config=corpus.config)
+        moved = tmp_path / "remounted"
+        corpus.output_dir.rename(moved)
+        corpus.output_dir = moved
+        _write_video(moved / "alpha", vid="", slug="alpha-noid", body="alpha renamed body")
+
+        _incremental(corpus)
+
+        blank = [r["text"] for r in _rows(corpus.db_path) if r["video_id"] == ""]
+        assert len(blank) == 1 and "alpha renamed body" in blank[0]
+
+    def test_a_voyage_failure_leaves_the_changed_videos_rows_in_place(self, corpus) -> None:
+        vi.build_search_index(corpus.output_dir, config=corpus.config)
+        before = _rows(corpus.db_path)
+        _write_video(corpus.output_dir / "alpha", vid="a1", slug="alpha-first", body="alpha rewritten")
+
+        def fail(*_a, **_kw):
+            raise RuntimeError("voyage down")
+
+        corpus.voyage.embed = fail
+        with pytest.raises(RuntimeError):
+            _incremental(corpus)
+        assert _rows(corpus.db_path) == before
+
+    def test_a_vector_width_change_refuses_before_deleting_anything(self, corpus) -> None:
+        vi.build_search_index(corpus.output_dir, config=corpus.config)
+        before = _rows(corpus.db_path)
+        _write_video(corpus.output_dir / "alpha", vid="a1", slug="alpha-first", body="alpha rewritten")
+        corpus.voyage.embed = lambda texts, *_a, **_kw: SimpleNamespace(embeddings=[[0.0] * 8 for _ in texts])
+
+        with pytest.raises(SystemExit) as exc:
+            _incremental(corpus)
+        assert exc.value.code == 1
+        assert _rows(corpus.db_path) == before
+
+    def test_added_rows_are_compacted_into_the_indexes(self, corpus) -> None:
+        vi.build_search_index(corpus.output_dir, config=corpus.config)
+        _write_video(corpus.output_dir / "beta", vid="b2", slug="beta-second", body="beta fresh")
+
+        _incremental(corpus)
+
+        assert _pending(corpus.db_path) == 0
+
+    def test_cmd_index_passes_the_channel_through(self, corpus, monkeypatch) -> None:
+        vi.build_search_index(corpus.output_dir, config=corpus.config)
+        _write_video(corpus.output_dir / "alpha", vid="a3", slug="alpha-third", body="alpha new")
+        _write_video(corpus.output_dir / "beta", vid="b3", slug="beta-third", body="beta new")
+        monkeypatch.setattr(vi, "resolve_output_dir", lambda _cfg: corpus.output_dir)
+        corpus.voyage.embedded.clear()
+
+        vi.cmd_index(argparse.Namespace(channel="alpha", force=False, incremental=True), corpus.config)
+
+        assert corpus.voyage.embedded and all("alpha new" in t for t in corpus.voyage.embedded)
+
+
 def _old_schema_index(corpus) -> None:
     """An index as code before #284 wrote it: no transcript_sha256 column."""
     vi.build_search_index(corpus.output_dir, config=corpus.config)

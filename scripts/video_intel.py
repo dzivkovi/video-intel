@@ -11753,6 +11753,10 @@ def build_search_index_incremental(
         log.error("No existing index at %s, so there is nothing for --incremental to update.", db_path)
         log.error("Build the whole corpus first: video_intel.py index")
         sys.exit(1)
+    if channel_filter and not (output_dir / channel_filter).is_dir():
+        # A typo must not read as "Index already current".
+        log.error("No channel folder '%s' under %s; nothing was read or written.", channel_filter, output_dir)
+        sys.exit(1)
     table = db.open_table(LANCEDB_TABLE)
     has_hash = "transcript_sha256" in {f.name for f in table.schema}
 
@@ -11807,14 +11811,29 @@ def build_search_index_incremental(
         )
     selected = new_keys + changed_keys
     if not selected:
+        _finish_interrupted_compaction(table)
         return 0
 
+    # Records are built per identity so an identity whose transcript now
+    # yields no chunks is dropped from BOTH sides: never deleted without a
+    # replacement, whatever else changed in the same run (Codex peer pass).
     records: list[dict] = []
-    for key in selected:
-        for tx_path, channel_dir, ch_name, _digest in on_disk[key]:
-            records.extend(_transcript_records(tx_path, channel_dir, ch_name))
+    for key in list(selected):
+        chunks = [
+            rec
+            for tx_path, channel_dir, ch_name, _digest in on_disk[key]
+            for rec in _transcript_records(tx_path, channel_dir, ch_name)
+        ]
+        if not chunks:
+            log.warning("[%s] %s produced no chunks; its index rows were left as they are.", key[0], key[1])
+            selected.remove(key)
+            if key in changed_keys:
+                changed_keys.remove(key)
+            continue
+        records.extend(chunks)
     if not records:
         log.warning("The selected transcripts produced no chunks; nothing was changed.")
+        _finish_interrupted_compaction(table)
         return 0
     conform_records_to_table(table, records)
     mismatch = index_schema_mismatch(table, set(records[0]))
@@ -11841,12 +11860,20 @@ def build_search_index_incremental(
             files.update(indexed[(channel, ident)]["files"])
         else:
             ids.add(ident)
+    # A video indexed under a blank id whose meta later gained one (repair-metas
+    # backfills it) is a NEW identity now; its old file-keyed rows go with it,
+    # or search would return the same talk twice (correctness review).
+    for channel, ident in new_keys:
+        if ident.startswith("file:"):
+            continue
+        for tx_path, *_rest in on_disk.get((channel, ident), []):
+            old_key = (channel, "file:" + tx_path.name)
+            if old_key in indexed and old_key not in on_disk:
+                stale.setdefault(channel, (set(), set()))[1].update(indexed[old_key]["files"])
     try:
         for clause in _incremental_delete_predicates(stale):
             table.delete(clause)
         table.add(records)
-        # Appended rows are invisible to the FTS indexes until compaction.
-        table.optimize()
     except Exception:
         log.error(
             "Incremental index update failed partway through. The %d changed video(s) may now be MISSING "
@@ -11859,8 +11886,36 @@ def build_search_index_incremental(
             f" --channel {_shell_arg(channel_filter)}" if channel_filter else "",
         )
         raise
+    try:
+        # Fold the appended rows into the vector and FTS indexes.
+        table.optimize()
+    except Exception:
+        # The rows ARE written, so the re-run finds nothing to embed; it
+        # compacts instead, because _finish_interrupted_compaction sees the
+        # uncompacted rows (Codex peer pass).
+        log.error(
+            "The new rows are written and searchable, but compaction failed, so they are not yet folded "
+            "into the indexes (slower search). Recover by re-running: video_intel.py index --incremental"
+        )
+        raise
     log.info("Indexed %d chunks for %d video(s) into %s", len(records), len(selected), db_path)
     return len(records)
+
+
+def _finish_interrupted_compaction(table: Any) -> None:
+    """Compact when an earlier run wrote rows but never compacted them.
+
+    Reads each index's `num_unindexed_rows`; any count above zero means rows
+    not yet folded into the vector or FTS index (searched the slow way). An
+    unreadable statistic is not evidence of a problem and changes nothing.
+    """
+    try:
+        pending = sum(table.index_stats(ix.name).num_unindexed_rows for ix in table.list_indices())
+    except Exception:
+        return
+    if pending:
+        log.info("Compacting %d row(s) an earlier run wrote but did not compact.", pending)
+        table.optimize()
 
 
 def cmd_index(args, config):

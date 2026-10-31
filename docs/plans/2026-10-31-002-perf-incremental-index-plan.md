@@ -70,7 +70,7 @@ Retrieval logic is unchanged, but index construction changed, so `pytest tests/e
 
 ## Out of scope
 
-Retiring rows for deleted transcripts; re-embedding on title or concept changes; a meta whose blank `video_id` is later backfilled (zero live cases; its old blank-id rows would stay until a full rebuild); any change to the full rebuild beyond writing the `transcript_sha256` column, or to `--channel`'s meaning.
+Retiring rows for deleted transcripts; re-embedding on title or concept changes; any change to the full rebuild beyond writing the `transcript_sha256` column, or to `--channel`'s meaning.
 
 ## Doc review
 
