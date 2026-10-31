@@ -115,17 +115,22 @@ def scan_env(monkeypatch, tmp_path):
         prefix = kw["prefix"]
         body = {
             "video_id": video["video_id"],
-            "concepts": [
-                {"concept_id": f"fresh_{video['video_id']}", "preferred_label": f"Fresh {video['video_id']}"}
-            ],
+            "concepts": [{"concept_id": f"fresh_{video['video_id']}", "preferred_label": f"Fresh {video['video_id']}"}],
         }
         (output_dir / ch_name / f"{prefix}.concepts.json").write_text(json.dumps(body), encoding="utf-8")
         return prefix, "done"
 
     def fake_transcribe(**kw):
-        (kw["channel_dir"] / f"{kw['prefix']}.transcript.md").parent.mkdir(parents=True, exist_ok=True)
-        (kw["channel_dir"] / f"{kw['prefix']}.transcript.md").write_text("# Transcript\n", encoding="utf-8")
-        return kw["prefix"], "done"
+        channel_dir, prefix, video = kw["channel_dir"], kw["prefix"], kw["video"]
+        channel_dir.mkdir(parents=True, exist_ok=True)
+        (channel_dir / f"{prefix}.transcript.md").write_text("# Transcript\n", encoding="utf-8")
+        meta = channel_dir / f"{prefix}.meta.json"
+        if not meta.exists():  # the transcript loop runs first and stamps identity (#66)
+            meta.write_text(
+                json.dumps({"video_id": video["video_id"], "title": video["title"], "published": video["published"]}),
+                encoding="utf-8",
+            )
+        return prefix, "done"
 
     monkeypatch.setattr(video_intel, "process_mindmap", fake_mindmap)
     monkeypatch.setattr(video_intel, "process_concepts", fake_concepts)
@@ -231,6 +236,46 @@ class TestScanRebuildsTheFreeLayers:
         assert any("catalog not rebuilt" in r.getMessage() for r in caplog.records)
         assert caplog.records[-1].getMessage() == "Done."
 
+    # Each loop's hook has to mark the channel on its own: a scan where only that
+    # loop wrote anything still rebuilds (the testing review deleted each hook
+    # in turn and these cases are what fail).
+
+    def test_a_transcript_only_scan_rebuilds(self, scan_env):
+        scan_env.videos["UC-alpha"] = [_video("aaaaaaaaaa1", "First talk")]
+        config = {"channels": [{"name": "alpha", "url": "alpha", "auto_transcript": "all", "mindmap_source": "none"}]}
+
+        cmd_scan(_args(), config)
+
+        atlas = json.loads((scan_env.corpus / "_atlas" / "atlas.json").read_text(encoding="utf-8"))
+        assert [r["video_id"] for r in atlas["rows"]] == ["aaaaaaaaaa1"]
+        assert not list((scan_env.corpus / "alpha").glob("*.mindmap.md"))
+
+    def test_a_concepts_backfill_with_no_new_video_rebuilds_the_taxonomy(self, scan_env):
+        channel_dir = scan_env.corpus / "alpha"
+        channel_dir.mkdir()
+        (channel_dir / "2026-09-01-old-talk.mindmap.md").write_text("# Mind map\n\n## Branch [00:01:00]\n", "utf-8")
+        (channel_dir / "2026-09-01-old-talk.meta.json").write_text(
+            json.dumps({"video_id": "oooooooooo1", "title": "Old talk", "published": "2026-09-01"}), encoding="utf-8"
+        )
+        _seed_taxonomy(scan_env.corpus)
+        config = {"channels": [{"name": "alpha", "url": "alpha", "auto_concepts": True}]}
+
+        cmd_scan(_args(), config)  # YouTube returns nothing; only the concepts loop writes
+
+        assert "fresh_oooooooooo1" in json.loads((scan_env.corpus / "taxonomy.json").read_text("utf-8"))["concepts"]
+
+    def test_a_title_rotation_alone_rebuilds(self, scan_env, monkeypatch):
+        video = _video("aaaaaaaaaa1", "First talk")
+        scan_env.videos["UC-alpha"] = [video]
+        config = {"channels": [{"name": "alpha", "url": "alpha"}]}
+        cmd_scan(_args(), config)  # first run writes the mind map
+        (scan_env.corpus / "_atlas" / "atlas.json").unlink()
+        monkeypatch.setattr(video_intel, "record_alt_title_if_rotated", lambda *a, **kw: True)
+
+        cmd_scan(_args(), config)  # nothing new to process; only the rotation was recorded
+
+        assert (scan_env.corpus / "_atlas" / "atlas.json").is_file()
+
 
 # ---------------------------------------------------------------------------
 # The recipe
@@ -283,11 +328,15 @@ class TestIndexRecipe:
         recipe = _recipe(caplog)
         assert "  python scripts/video_intel.py index" in recipe
         assert not any("--channel" in line for line in recipe if "video_intel.py index" in line)
+        note = recipe[recipe.index("  python scripts/video_intel.py index") + 1]
+        assert "index --force is running" in note  # a running full rebuild looks the same as no index
 
     def test_an_unknown_index_state_keeps_the_per_channel_lines(self, scan_env, tmp_path, monkeypatch, caplog):
         index_dir = tmp_path / "index"
         index_dir.mkdir()
-        monkeypatch.setattr(atlas_build, "read_search_index", lambda _d: atlas_build.IndexRead(atlas_build.INDEX_UNKNOWN))
+        monkeypatch.setattr(
+            atlas_build, "read_search_index", lambda _d: atlas_build.IndexRead(atlas_build.INDEX_UNKNOWN)
+        )
         scan_env.videos["UC-alpha"] = [_video("aaaaaaaaaa1", "Alpha talk")]
 
         with caplog.at_level(logging.INFO, logger="video_intel"):
@@ -348,6 +397,24 @@ class TestReadSearchIndex:
         read = atlas_build.read_search_index(tmp_path)
         assert read.state == atlas_build.INDEX_READ
         assert read.video_ids == frozenset({"aaaaaaaaaa1", "bbbbbbbbbb2"})
+
+    def test_an_index_that_will_not_open_is_unknown_not_absent(self, tmp_path, monkeypatch):
+        def connect(_path):
+            raise OSError("locked")
+
+        monkeypatch.setitem(sys.modules, "lancedb", types.SimpleNamespace(connect=connect))
+        assert atlas_build.read_search_index(tmp_path).state == atlas_build.INDEX_UNKNOWN
+
+    def test_a_short_projection_is_unknown_never_a_partial_set(self, tmp_path, monkeypatch):
+        arrow = MagicMock(num_rows=3)
+        table = MagicMock()
+        table.search.return_value.select.return_value.limit.return_value.to_arrow.return_value = arrow
+        table.count_rows.return_value = 5
+        db = MagicMock()
+        db.list_tables.return_value.tables = [corpus_walk.SEARCH_INDEX_TABLE]
+        db.open_table.return_value = table
+        monkeypatch.setitem(sys.modules, "lancedb", types.SimpleNamespace(connect=lambda _p: db))
+        assert atlas_build.read_search_index(tmp_path) == atlas_build.IndexRead(atlas_build.INDEX_UNKNOWN)
 
     def test_a_missing_package_is_unknown_not_absent(self, tmp_path, monkeypatch):
         monkeypatch.setitem(sys.modules, "lancedb", None)

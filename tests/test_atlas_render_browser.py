@@ -51,6 +51,7 @@ def smoke_atlas() -> dict:
                 "briefing_count": 0,
                 "wiki": {"creator": None, "concepts": []},
                 "aliases": [],
+                "in_search_index": i % 2 == 0,
             }
         )
     rows.sort(key=lambda r: (r["published"], r["video_id"]))
@@ -241,6 +242,37 @@ def test_an_atlas_without_the_source_field_shows_no_source_facet(browser, tmp_pa
         # A hash naming the hidden facet selects nothing, so all five rows stay in view.
         assert pg.text_content("#active-title").startswith("5 of 5 videos")
         assert pg.evaluate("document.querySelectorAll('.badge.q-captions').length") == 0
+        assert errors == [], errors
+    finally:
+        pg.close()
+
+
+def test_the_search_index_facet_filters_and_names_the_filter(page):
+    page.click("#facets button.fv[data-dim='ix']:has-text('No')")
+    page.wait_for_timeout(100)
+    title = page.text_content("#active-title")
+    assert title.startswith(f"{ROWS // 2} of {ROWS} videos")
+    assert title.endswith("not in the search index")
+    assert page.evaluate("new URLSearchParams(location.hash.slice(1)).getAll('ix')") == ["no"]
+
+
+def test_an_atlas_built_without_an_index_shows_no_index_facet(browser, tmp_path):
+    atlas = smoke_atlas()
+    atlas["rows"] = atlas["rows"][:5]
+    for row in atlas["rows"]:
+        row["in_search_index"] = None
+    atlas_path = tmp_path / "atlas.json"
+    atlas_path.write_text(json.dumps(atlas), encoding="utf-8")
+    assert ar.main(["--atlas", str(atlas_path)]) == 0
+    pg = browser.new_page(viewport={"width": 1280, "height": 900})
+    errors: list[str] = []
+    pg.on("pageerror", lambda e: errors.append(str(e)))
+    try:
+        pg.goto((tmp_path / "catalog.html").resolve().as_uri() + "#ix=no")
+        pg.wait_for_selector("#active-title:not(:empty)", timeout=15000)
+        dims = pg.eval_on_selector_all("#facets details.facet", "els => els.map(e => e.getAttribute('data-dim'))")
+        assert "ql" in dims and "ix" not in dims
+        assert pg.text_content("#active-title").startswith("5 of 5 videos")
         assert errors == [], errors
     finally:
         pg.close()

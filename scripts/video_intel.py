@@ -7779,7 +7779,8 @@ def rebuild_free_derived_layers(output_dir: Path, config: dict) -> str | None:
     whose paid work is already on disk, and the later steps still run.
 
     Returns the catalog build's index-read state (`atlas_build.INDEX_READ`,
-    `INDEX_ABSENT`, `INDEX_UNKNOWN`), or None when the catalog step failed:
+    `INDEX_ABSENT`, `INDEX_UNKNOWN`), also when the build read the index but
+    refused to write (an unlistable channel), or None when it raised:
     `log_scan_index_recipe` reads it, so the index is read once per scan.
     """
     log.info("Rebuilding the free derived layers (taxonomy, topics, catalog)...")
@@ -7818,8 +7819,10 @@ def rebuild_free_derived_layers(output_dir: Path, config: dict) -> str | None:
         log.warning("  catalog not rebuilt (%s). Run: %s", e, build_cmd)
         return None
     if code != 0:
+        # The index was still read (only the write was refused), so its state
+        # stays valid for the recipe.
         log.warning("  catalog not rebuilt (exit %d). Run: %s", code, build_cmd)
-        return None
+        return index_state
     try:
         render_code = atlas_render.main(["--atlas", str(atlas_path)])
     except (Exception, SystemExit) as e:
@@ -7854,13 +7857,19 @@ def log_scan_index_recipe(channels: list[str], index_state: str | None, output_d
     import atlas_build
 
     if index_state == atlas_build.INDEX_ABSENT:
+        # Also what an `index --force` that is still running looks like: it
+        # drops the table first and only recreates it at the end.
         log.info("  python scripts/video_intel.py index")
+        log.info("  (no index was found; if an index --force is running right now, let it finish instead)")
     else:
         for name in channels:
             log.info("  python scripts/video_intel.py index --channel %s", name)
     log.info("Then refresh the catalog's in-search-index facet:")
     log.info('  python scripts/atlas_build.py --corpus "%s" --index-dir "%s"', output_dir, index_dir)
-    log.info('  python scripts/atlas_render.py --atlas "%s"', output_dir / "_atlas" / "atlas.json")
+    log.info(
+        '  python scripts/atlas_render.py --atlas "%s"',
+        output_dir / atlas_build.ATLAS_DIRNAME / atlas_build.ATLAS_FILENAME,
+    )
 
 
 def cmd_scan(args, config):

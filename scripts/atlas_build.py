@@ -720,7 +720,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=f"Search index folder (vector_db_dir) read for the in-search-index facet "
-        f"(default: <corpus>/{SEARCH_INDEX_DIRNAME}; the facet is left out when no index is found there)",
+        f"(default: <corpus>/{SEARCH_INDEX_DIRNAME}, right only when vector_db_dir is unset; "
+        "the facet is left out when no index is found there)",
     )
     parser.add_argument(
         "--generated-at",

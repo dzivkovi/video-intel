@@ -198,7 +198,7 @@ The page turned out to be a data-quality check as much as a browsing tool. Facet
 **Try it:** [the live demo](https://dzivkovi.github.io/video-intel/) is a real public subset, 1,646 videos from twelve public channels over twelve months, built by the same commands you would run on your own corpus. The same file is [examples/catalog/catalog.html](examples/catalog/catalog.html), next to the policy that produced it; it needs no server and fetches nothing but YouTube thumbnails, which a button turns off.
 
 ```bash
-python scripts/atlas_build.py --corpus <output_dir>                          # the private catalog: every video, one JSON file
+python scripts/atlas_build.py --corpus <output_dir> --index-dir <vector_db_dir>   # the private catalog: every video, one JSON file
 python scripts/atlas_render.py --atlas <output_dir>/_atlas/atlas.json        # the private page, next to it
 python scripts/atlas_export.py --atlas <output_dir>/_atlas/atlas.json --policy <output_dir>/_atlas/export-policy.yaml --deny-terms <your private term list>   # a shareable subset
 ```
@@ -748,7 +748,7 @@ Retrieval finds a passage; this layer files what you learn back into the corpus 
 
 See **[docs/wiki-layer.md](docs/wiki-layer.md)** for full usage, the safety rules around overwriting pages, and troubleshooting.
 
-To see everything in the corpus as one machine-readable file (one row per video with facets, headings, deep links and already-seen signals; read-only, no Gemini), run `python scripts/atlas_build.py --corpus <output_dir>` and read **[docs/atlas.md](docs/atlas.md)**. It writes a private catalog to `_atlas/atlas.json`, separate from the wiki pages; the page built from it is described in [The catalog](#the-catalog-your-whole-library-on-one-page) above.
+To see everything in the corpus as one machine-readable file (one row per video with facets, headings, deep links and already-seen signals; read-only, no Gemini), run `python scripts/atlas_build.py --corpus <output_dir> --index-dir <vector_db_dir>` and read **[docs/atlas.md](docs/atlas.md)**. It writes a private catalog to `_atlas/atlas.json`, separate from the wiki pages; the page built from it is described in [The catalog](#the-catalog-your-whole-library-on-one-page) above.
 
 ## The intelligence layer (optional)
 

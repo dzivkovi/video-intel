@@ -15,7 +15,7 @@ The corpus catalog and the Creator Atlas wiki are different tools that happen to
 ## Build it
 
 ```bash
-python scripts/atlas_build.py --corpus <output_dir>
+python scripts/atlas_build.py --corpus <output_dir> --index-dir <vector_db_dir>
 ```
 
 Flags:
@@ -24,7 +24,7 @@ Flags:
 |---|---|
 | `--corpus` | The corpus folder (your `output_dir`). Required, must exist. |
 | `--out` | Folder for `atlas.json`. Default: `<corpus>/_atlas`. |
-| `--index-dir` | The search index folder (your `vector_db_dir`), read for the "in search index" facet. Default: `<corpus>/.lancedb`. When no index is found there, every row carries `null` and the page hides the facet. |
+| `--index-dir` | The search index folder (your `vector_db_dir`), read for the "in search index" facet. Default: `<corpus>/.lancedb`, which is right only when `vector_db_dir` is unset. Pass it whenever your config sets `vector_db_dir`: without it the build reads the wrong folder, so every row carries `null` (no index there) or, if an old `.lancedb` folder lingers in the corpus, stale `true`/`false` values. |
 | `--generated-at` | A value for the `generated_at` header, written verbatim. Default: derived from the corpus, never the clock (see "Determinism"). |
 
 `scan` runs this build and the page render itself at the end of any scan that wrote an artifact, with `--index-dir` set to the resolved `vector_db_dir`, so a manual run is only needed after `index`, `dedupe` or `prune-shorts`, or to refresh the facet after re-indexing.
