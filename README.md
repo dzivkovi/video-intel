@@ -44,7 +44,7 @@ Not everyone wants everything. Start with mind maps. Add transcripts, then searc
 | --- | --- | --- | --- |
 | **0 - Skim** | know which new videos deserve your time | `scan`, mind maps only | ~$0.15-0.25 per 15-minute video; the free tier covers a weekly scan |
 | **1 - Read** | a transcript that includes what was on screen, with speakers named | `scan` with `auto_transcript: all` | ~$0.33 per video-hour |
-| **2 - Search** | "what did anyone say about X", with a link to the exact second | `index` once (needs a free Voyage AI key), then `search --vector` | the one-time index is a few cents per channel; then ~$0.02 per query |
+| **2 - Search** | "what did anyone say about X", with a link to the exact second | `index` once (needs a free Voyage AI key), then `search --vector`; after each scan, the `index --incremental` line it prints | the one-time index is a few cents per channel; each later update embeds only new transcripts; ~$0.02 per query |
 | **3 - Synthesize** | a brief that compares creators, a personalized catch-up guide, topic threads | `nugget`, `briefings --unseen`, `topics-build` | one text-only Gemini call per brief; briefings and topics are free |
 | **4 - Analyze** | who reached an idea first, what is spiking, which creators cluster | the intelligence layer (DuckDB) | free, no API calls |
 | **Side path** | Bosnian/Croatian/Serbian subtitles for one video | `translate_video.py` | cents per video |
@@ -212,7 +212,7 @@ The private page is complete by design, so it stays on your machine. A shared co
 - **Three decoupled tasks, not one prompt.** Transcription, screen content and speaker identification run as separate tasks inside one prompt, so they do not compete for the model's attention (borrowed from Laurent Picard's research).
 - **Read the mind map before the transcript.** A 30-second read before a 30-minute commitment. When transcripts are on, the pipeline runs the other way - it transcribes first and derives the mind map from the text, because that is cheaper - but your reading order is still mind map first.
 - **One model replaces the four-tool transcription stack.** For getting words, speakers and slides out of a video, Gemini Flash does what Whisper + pyannote + Claude + Gemini did separately, and captures the visual channel they never could. (Discovery, embeddings and triage still use their own tools.)
-- **Idempotent.** Re-running a scan skips what is done. Safe to interrupt, safe to re-run.
+- **Idempotent.** Re-running a scan skips what is done, and `index --incremental` embeds only transcripts that are new or edited, so keeping search current after a scan costs cents, not a full re-embed. Safe to interrupt, safe to re-run.
 - **Prompts are files.** Every prompt lives in `prompts/`, self-contained and swappable. No hidden prefix assembly. The shipped templates are plain defaults: list your own folders in `prompt_dirs:` (or `$VIDEO_INTEL_PROMPT_DIR`) and a private file of the same name wins over the bundled one, so an opinionated version can live outside this repo while a fork keeps working on the defaults.
 - **Per-channel config.** A daily creator gets `since: 10d`, a monthly one `since: 120d`. Each entry captures your relationship with that creator.
 - **The tool only does the Gemini work.** Triage and deep-dives are conversations with Claude over the files, not API calls. They were in the design, then deliberately cut.
@@ -224,7 +224,7 @@ together; Claude picks the right one based on what you ask.
 
 | Skill | What it does | Trigger phrases |
 | ----- | ------------ | --------------- |
-| **video-intel** | **Curate.** Scan YouTube channels, produce rich transcripts with on-screen content, generate mind maps, extract concepts, build the search index, and run corpus maintenance. Every command that writes to the corpus lives here. | "scan my channels", "transcribe this video", "rebuild the index", "clean up duplicates" |
+| **video-intel** | **Curate.** Scan YouTube channels, produce rich transcripts with on-screen content, generate mind maps, extract concepts, build the search index, and run corpus maintenance. Every command that writes to the corpus lives here. | "scan my channels", "transcribe this video", "update the search index", "clean up duplicates" |
 | **video-intel-search** | **Query.** Search the corpus, retrieve evidence with timestamped deep links, synthesize a cross-creator brief, report corpus status. Read-only apart from the brief `nugget` saves. Safe to install globally and use from any project - see [INSTALLATION.md](INSTALLATION.md#claude-code-user-level-access-the-search-skill-from-any-project). | "what videos cover X", "what did [creator] say about Y", "nugget brief on X", "show me everything tagged [topic]" |
 | **translate-bcs** | Translate YouTube videos and rich transcripts into Bosnian/Croatian/Serbian (BCS) subtitles. Two paths: fast captions-first via YouTube SRT for short videos, or rich-transcript-first via video-intel for long videos where the SRT path drifts. Also downloads English SRT only on request. | "translate to Bosnian/Croatian/Serbian", "BCS subtitles", "titl na bosanski", "just give me the SRT" |
 
@@ -456,6 +456,7 @@ python scripts/video_intel.py search "context window" --channel natebjones --lim
 # (requires VOYAGE_API_KEY — free at https://dash.voyageai.com/)
 pip install lancedb voyageai
 python scripts/video_intel.py index                          # build index (one-time)
+python scripts/video_intel.py index --incremental            # after a scan: embed only new or edited transcripts
 python scripts/video_intel.py search "helium supply chain" --vector
 python scripts/video_intel.py search "code beats markdown" --vector --preview
 
