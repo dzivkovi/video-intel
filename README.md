@@ -205,6 +205,14 @@ python scripts/atlas_export.py --atlas <output_dir>/_atlas/atlas.json --policy <
 
 The private page is complete by design, so it stays on your machine. A shared copy is a separate export behind a policy you write (which channels, from which date), limited to videos the YouTube API reports as public (unlisted ones never leave), projected onto public fields only (no topic tags, briefing membership or wiki keys), and, when you pass your private term list, scanned against it before a byte is written. Details in [docs/atlas.md](docs/atlas.md).
 
+**The catalog shows what the corpus holds; a briefing is what it gives back.** I no longer watch these videos. The pipeline watches and indexes them, and the assistant writes a briefing ranked against my [audience profile](examples/audience.md). [AI Engineer, November 2026: the model may not write the number](examples/briefings/2026-11-09-ai-engineer-november-2026.md) is a real one, published as written apart from references to private work: 27 conference talks reduced to one thesis and seven to watch, with every claim linked to the second in the video where it is said. One source, three ways to take it in:
+
+| Format | For |
+| --- | --- |
+| [Markdown](examples/briefings/2026-11-09-ai-engineer-november-2026.md) | agents, and reading on GitHub |
+| [PDF](examples/briefings/2026-11-09-ai-engineer-november-2026.pdf) | printing and reading on screen |
+| [EPUB](examples/briefings/2026-11-09-ai-engineer-november-2026.epub) | Kindle and other e-readers, including listening through text-to-speech |
+
 ## Design principles
 
 - **Gemini watches, Claude thinks.** Gemini sees frames at 1 FPS, reads on-screen text and hears audio in one pass. Claude never calls Gemini during triage: it reads the files Gemini produced. Best tool for each job, not competing models.
@@ -558,7 +566,7 @@ See **[docs/topics-layer.md](docs/topics-layer.md)** for the full guide: the rem
 
 The `--pdf` flag is for reading on the go and sharing: it renders the ranked set as a one-page-friendly PDF whose video titles and timestamped moments are bold, accent-colored hyperlinks that open YouTube at the exact second. It is purely additive, the Markdown is always written and remains the record of what has been surfaced. The PDF writer is self-contained ([`scripts/briefing_pdf.py`](scripts/briefing_pdf.py), ~90 lines on top of `reportlab`), so anyone who installs the plugin gets it with no external service.
 
-`briefings --unseen` ranks deterministically; it is the candidate feed, not the final word. The richer, *curated* briefing - a named audience profile, a "watch these N" prioritization, pillar grouping, a "why it matters to you" line per video, and explicit signal/noise calls - is an editorial layer authored on top of that feed. See [`examples/catch-up-briefing-personalized-sample.pdf`](examples/catch-up-briefing-personalized-sample.pdf) for the target output; the curation layer that produces it directly is tracked in [#84](https://github.com/dzivkovi/video-intel/issues/84).
+`briefings --unseen` ranks deterministically; it is the candidate feed, not the final word. The richer, *curated* briefing - a named audience profile, a "watch these N" prioritization, pillar grouping, a "why it matters to you" line per video, and explicit signal/noise calls - is an editorial layer authored on top of that feed. See [the November 2026 AI Engineer briefing](examples/briefings/2026-11-09-ai-engineer-november-2026.md) ([PDF](examples/briefings/2026-11-09-ai-engineer-november-2026.pdf), [EPUB](examples/briefings/2026-11-09-ai-engineer-november-2026.epub)) for the current output, and [`examples/catch-up-briefing-personalized-sample.pdf`](examples/catch-up-briefing-personalized-sample.pdf) for an earlier one from the first months; the curation layer that produces it directly is tracked in [#84](https://github.com/dzivkovi/video-intel/issues/84).
 
 Those curated briefings are free-form Markdown (authored per topic, not a fixed `ranked` shape), so they render through a general companion, [`scripts/markdown_pdf.py`](scripts/markdown_pdf.py) - the same bold/accent/hyperlink aesthetic as `briefing_pdf.py`, but for arbitrary Markdown. It strips a leading YAML front-matter block, keeps `[text](url)` and bare-URL links (including `&t=` deep-links) clickable even inside `**bold**` headers, and runs standalone:
 
