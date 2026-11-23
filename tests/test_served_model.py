@@ -1,9 +1,9 @@
-"""Record the Gemini model that SERVED each call, beside the one we asked for (issue #295).
+"""Record the model name the provider REPORTED for each Gemini call (issue #295).
 
-Google can serve a different model than the request names (every request naming
-one retired Flash is answered by its successor), and before this every artifact
-recorded only the requested name. The served name is read off the response the
-callers already receive, so no extra call is made.
+The reported name can differ from the requested one (an alias resolving to its
+backing model, a version suffix, or a different model served), and before this
+every artifact recorded only the requested name. The reported name is read off
+the response the callers already receive, so no extra call is made.
 
 The writer tests drive the REAL writers with only the Gemini client faked (the
 paid boundary) and the real ``google.genai.types``, and assert on what reached
@@ -556,7 +556,7 @@ class TestWarningRule:
         assert _meta(tmp_path / "chan" / "2026-01-02-a-talk.meta.json")["transcript_model_served"] == REQUESTED
         assert _mismatch_warnings(caplog) == []
 
-    def test_models_prefixed_and_bare_request_warn_once_for_one_redirect(self, caplog):
+    def test_models_prefixed_and_bare_request_warn_once_for_one_mismatch(self, caplog):
         for requested in (f"models/{REQUESTED}", REQUESTED):
             vi._capture_served_model(SimpleNamespace(model_version=SERVED), {}, requested=requested, mode="transcript")
 
@@ -665,3 +665,64 @@ class TestConceptsProvenanceAndVerdict:
 
         verdict = card.split("## Verdict", 1)[1]
         assert f"- `{REQUESTED}` (served {SERVED}) vs `{SERVED}`: mean max_gap" in verdict
+
+
+class TestReportedNameRules:
+    """The WARNING tolerates a version suffix; the scorecard shows any difference."""
+
+    @pytest.mark.parametrize(
+        ("requested", "served", "differs"),
+        [
+            ("gemini-2.0-flash", "gemini-2.0-flash-001", False),
+            ("models/gemini-2.0-flash", "models/gemini-2.0-flash-001", False),
+            ("gemini-2.0-flash", "gemini-2.0-flashy", True),
+            (REQUESTED, SERVED, True),
+            ("gemini-flash-latest", SERVED, True),
+        ],
+    )
+    def test_served_model_differs_tolerates_only_a_hyphenated_version_suffix(self, requested, served, differs):
+        assert gemini_common.served_model_differs(requested, served) is differs
+
+    @pytest.mark.parametrize(
+        ("requested", "served", "differs"),
+        [
+            ("gemini-2.0-flash", "gemini-2.0-flash-001", True),
+            ("models/gemini-2.0-flash", "gemini-2.0-flash", False),
+            (REQUESTED, None, False),
+        ],
+    )
+    def test_reported_name_differs_flags_any_difference_after_prefix_strip(self, requested, served, differs):
+        assert gemini_common.reported_name_differs(requested, served) is differs
+
+    def test_version_suffix_records_reported_name_without_warning(self, tmp_path, caplog):
+        client = FakeClient(_response(_transcript_payload([0, 1, 2, 3]), f"{REQUESTED}-001"))
+
+        _run_single_shot(tmp_path, client)
+
+        meta = _meta(tmp_path / "chan" / "2026-01-02-a-talk.meta.json")
+        assert meta["transcript_model_served"] == f"{REQUESTED}-001"
+        assert _mismatch_warnings(caplog) == []
+
+    @pytest.mark.parametrize(
+        ("requested", "served"),
+        [("gemini-2.0-flash", "gemini-2.0-flashy"), (REQUESTED, SERVED), ("gemini-flash-latest", SERVED)],
+        ids=["no_hyphen_boundary", "different_version", "alias"],
+    )
+    def test_mismatch_warns_once_with_neutral_wording(self, caplog, requested, served):
+        vi._capture_served_model(SimpleNamespace(model_version=served), {}, requested=requested, mode="mindmap")
+
+        warnings = _mismatch_warnings(caplog)
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert requested in message and served in message
+        assert "alias" in message and "different model" in message and "mindmap_model_served" in message
+        assert "redirect" not in message.lower() and "retired" not in message.lower()
+
+    def test_card_shows_a_version_suffix_the_warning_ignores(self):
+        base = model_eval.score(_transcript_payload([10, 11]), {"prompt": 10}, REQUESTED, 600, None, start_secs=600)
+        row = {**base, "fixture": "fx1", "model_served": f"{REQUESTED}-001"}
+        manifest = {"fixtures": [{"id": "fx1", "facet": "a"}]}
+
+        card = model_eval.render([row], [REQUESTED], manifest, None)
+
+        assert f"{REQUESTED} (served {REQUESTED}-001)" in card

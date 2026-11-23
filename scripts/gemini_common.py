@@ -187,11 +187,12 @@ def bare_model_name(name: str) -> str:
 
 
 def served_model_from_response(response: object) -> str | None:
-    """The model that actually SERVED a Gemini call, or ``None`` (issue #295).
+    """The model name the provider REPORTED for a Gemini call, or ``None`` (issue #295).
 
-    Google can answer a request naming one model with another (a retired Flash
-    is silently served by its successor), so the requested name is not
-    provenance. The SDK exposes the answer as
+    The reported name can differ from the requested one: an alias resolves to
+    its backing model, a dated version suffix is added, or the provider serves a
+    different model. It is the provider's report, not proof of identity in
+    either direction (a provider can echo an alias). The SDK exposes it as
     ``GenerateContentResponse.model_version: Optional[str]`` (google-genai
     ``types.py``, mapped from the wire field ``modelVersion``).
 
@@ -217,12 +218,28 @@ def served_model_from_response(response: object) -> str | None:
 
 
 def served_model_differs(requested: str, served: str | None) -> bool:
-    """Whether the served model is a different model from the requested one (issue #295).
+    """Whether the reported model name is a MISMATCH worth a warning (issue #295).
 
-    The ONE comparison rule [core: one-definition]: exact equality after the
-    ``models/`` strip. Nothing on disk shows the API returning a suffixed name
-    (``X-001``) for an un-redirected request; if a live call ever does, widen
-    the rule here and nowhere else. ``None`` (unreadable) never differs.
+    The tolerant rule, used by the warn-once WARNING [core: one-definition].
+    After the ``models/`` strip, ``served == requested`` or a version suffix on
+    the requested name (``served.startswith(requested + "-")``, e.g. requested
+    ``gemini-2.0-flash``, reported ``gemini-2.0-flash-001``) is the same model:
+    provider documentation shows version-suffixed reported names for ordinary
+    requests. The hyphen boundary matters: ``Xy`` is not a version of ``X``.
+    Everything else is a mismatch. ``None`` (unreadable) never differs.
+    """
+    if served is None:
+        return False
+    req, srv = bare_model_name(requested), bare_model_name(served)
+    return not (srv == req or srv.startswith(req + "-"))
+
+
+def reported_name_differs(requested: str, served: str | None) -> bool:
+    """Whether the reported model name is not the requested name (issue #295).
+
+    The strict rule, used by the model scorecard [core: one-definition]: any
+    difference after the ``models/`` strip, a version suffix included, because a
+    scorecard is exactly where the dated version matters. ``None`` never differs.
     """
     if served is None:
         return False

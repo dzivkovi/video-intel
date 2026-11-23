@@ -3063,8 +3063,8 @@ SERVED_MODEL_CAPTURE_KEY = "served_model"
 
 #: (requested, served) pairs already warned about in this process (issue #295),
 #: keyed on the bare names so ``models/X`` and ``X`` are one pair.
-#: One WARNING per distinct pair, not one per call: a redirect applies to every
-#: call in a run, and a line per video would bury everything else in the log.
+#: One WARNING per distinct pair, not one per call: a reported-name mismatch
+#: repeats on every call in a run, and a line per video would bury the log.
 _SERVED_MODEL_MISMATCHES_WARNED: set[tuple[str, str]] = set()
 _SERVED_MODEL_MISMATCHES_LOCK = threading.Lock()
 
@@ -3074,10 +3074,11 @@ def _capture_served_model(response: object, capture: dict, *, requested: str, mo
 
     Called from every ``on_response`` callback, AFTER any counts refill that
     clears the dict. An unreadable value removes the key so a writer records
-    nothing rather than a stale value. When the served model differs from
-    ``requested`` (``served_model_differs``, the one comparison rule), warns
-    once per process per (requested, served) pair; ``mode`` names the meta
-    field the writer records it in.
+    nothing rather than a stale value. The REPORTED name is always what is
+    captured. When it mismatches ``requested`` under the tolerant rule
+    (``served_model_differs``: a version suffix is not a mismatch), warns once
+    per process per (requested, served) pair; ``mode`` names the meta field
+    the writer records it in.
     """
     served = served_model_from_response(response)
     if served is None:
@@ -3092,8 +3093,9 @@ def _capture_served_model(response: object, capture: dict, *, requested: str, mo
             return
         _SERVED_MODEL_MISMATCHES_WARNED.add(pair)
     log.warning(
-        "Gemini served %s for a request naming %s; meta.json records the served model in %s_model_served "
-        "when the artifact is written.",
+        "Gemini reported model %s for a request naming %s. That is either an alias resolving to its backing "
+        "model (normal) or the provider serving a different model than requested; meta.json records the "
+        "reported name in %s_model_served when the artifact is written.",
         served,
         requested,
         mode,

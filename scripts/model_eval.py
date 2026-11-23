@@ -50,7 +50,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import yaml
 
 import video_intel as v
-from gemini_common import served_model_differs, served_model_from_response
+from gemini_common import reported_name_differs, served_model_from_response
 from timestamp_utils import timestamp_tolerance
 
 REPO = Path(__file__).resolve().parent.parent
@@ -284,7 +284,7 @@ def served_label(model: str, rows: list[dict]) -> str:
         {
             r["model_served"]
             for r in rows
-            if r.get("model") == model and served_model_differs(model, r.get("model_served"))
+            if r.get("model") == model and reported_name_differs(model, r.get("model_served"))
         }
     )
     return f"`{model}` (served {', '.join(served)})" if served else f"`{model}`"
@@ -337,7 +337,7 @@ def render(rows: list[dict], models: list[str], manifest: dict, incumbent: str |
             "**MISSED**" if r.get("window_exceeded") is True else ("ok" if r.get("window_exceeded") is False else "-")
         )
         # Issue #295: name the model that answered when it is not the one asked for.
-        if served_model_differs(r["model"], r.get("model_served")):
+        if reported_name_differs(r["model"], r.get("model_served")):
             r["model"] = f"{r['model']} (served {r['model_served']})"
         out.append("| " + " | ".join(str(r.get(c[1], "")) for c in cols) + " |")
     out += ["", "## Per-facet notes", ""]
