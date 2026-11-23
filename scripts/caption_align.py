@@ -201,6 +201,7 @@ def plan_entry_split(
     target: float = REPAIR_TARGET_PIECE_SECONDS,
     anchor_words: int = REPAIR_ANCHOR_WORDS,
     min_coverage: float = REPAIR_MIN_ENTRY_COVERAGE,
+    max_stamp_exclusive: int | None = None,
 ) -> SplitPlan:
     """The split plan for one dialogue entry.
 
@@ -214,7 +215,10 @@ def plan_entry_split(
     the first usable boundary whose caption time reaches ``target`` seconds,
     or the usable one just before it when that is closer. The first piece
     keeps ``original_seconds``, always: it is the one stamp the transcript
-    itself gave.
+    itself gave. ``max_stamp_exclusive`` (the next dialogue entry's stamp)
+    makes a boundary usable only when its stamp is strictly below it, so a
+    piece can never be stamped at or after the entry that follows; the text
+    past the last usable boundary stays with the last piece.
     """
     words = normalize_words(text)
     if word_cues is None:
@@ -245,7 +249,13 @@ def plan_entry_split(
     cuts: list[tuple[int, int, int]] = []  # (sentence index, cue index, stamp)
     cur_k, cur_time, cur_stamp = 0, float(original_seconds), original_seconds
     while True:
-        usable = [b for b in boundaries if b[0] > cur_k and int(b[2]) > cur_stamp]
+        usable = [
+            b
+            for b in boundaries
+            if b[0] > cur_k
+            and int(b[2]) > cur_stamp
+            and (max_stamp_exclusive is None or int(b[2]) < max_stamp_exclusive)
+        ]
         crossing = next((i for i, b in enumerate(usable) if b[2] - cur_time >= target), None)
         if crossing is None:
             break

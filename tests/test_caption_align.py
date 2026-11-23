@@ -158,6 +158,14 @@ class TestPlanEntrySplit:
         assert stamps[0] == 100
         assert all(b > a for a, b in itertools.pairwise(stamps))
 
+    def test_plan_upper_bound_keeps_every_new_stamp_below_it(self):
+        text = " ".join(SENTENCES)
+        plan = _plan(text, _talk_cues(SENTENCES), original=5, max_stamp_exclusive=100)
+        stamps = [p.stamp_seconds for p in plan.pieces]
+        assert plan.repairable and all(s < 100 for s in stamps), stamps
+        assert " ".join(" ".join(p.text for p in plan.pieces).split()) == " ".join(text.split())
+        assert plan.pieces[-1].text.endswith(SENTENCES[-1])  # the rest stays with the last piece
+
     def test_plan_short_span_is_not_a_candidate(self):
         plan = _plan(" ".join(SENTENCES[:5]), _talk_cues(SENTENCES[:5]))  # 40 s of caption time
         assert not plan.candidate

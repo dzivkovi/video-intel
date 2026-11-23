@@ -23,7 +23,6 @@ import math
 import os
 import random
 import re
-import shlex
 import shutil
 import subprocess
 import sys
@@ -45,6 +44,10 @@ import yaml
 from googleapiclient.errors import HttpError
 from youtube_captions import (
     CAPTIONS_BLOCK_RECOVERY,
+    CAPTIONS_FAILURE_ABSENT,
+    CAPTIONS_FAILURE_EMPTY,
+    CAPTIONS_FAILURE_NO_LIBRARY,
+    CAPTIONS_FAILURE_VIDEO,
     CaptionsResult,
     captions_failure_is_refusal,
     fetch_english_captions,
@@ -4420,6 +4423,19 @@ def _log_lost_chunks_remedy(
         )
 
 
+def unclobbered_sidecar_path(path: Path) -> Path:
+    """``path``, or when that name is taken, the same name with a UTC timestamp before its suffix.
+
+    The one naming rule for forensic sidecars that must never overwrite an
+    earlier run's copy (issue #248's chunked partial, issue #289's
+    pre-repair copy) [core: one-definition].
+    """
+    if not path.exists():
+        return path
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    return path.with_name(f"{path.stem}.{stamp}{path.suffix}")
+
+
 def _finish_chunked_transcript(
     status: str,
     *,
@@ -4467,10 +4483,7 @@ def _finish_chunked_transcript(
             # forced rerun after a successful replacement would otherwise
             # overwrite partial A with partial B and, if captions then fail,
             # the cleanup below would delete the only surviving copy of A.
-            sidecar = channel_dir / f"{prefix}{CHUNKED_PARTIAL_SIDECAR_SUFFIX}"
-            if sidecar.exists():
-                stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-                sidecar = channel_dir / f"{prefix}{CHUNKED_PARTIAL_SIDECAR_SUFFIX[: -len('.txt')]}.{stamp}.txt"
+            sidecar = unclobbered_sidecar_path(channel_dir / f"{prefix}{CHUNKED_PARTIAL_SIDECAR_SUFFIX}")
             try:
                 shutil.copyfile(transcript_path, sidecar)
             except OSError as e:
@@ -6678,6 +6691,18 @@ def quality_guard_warning(flags: list[str]) -> str:
     return f"{QUALITY_GUARD_WARNING_PREFIX} ({', '.join(flags)}). It may be missing content."
 
 
+def transcript_warning_block(warning: str) -> str:
+    """The warning block a partial transcript carries under its header (one definition)."""
+    return (
+        f"{TRANSCRIPT_WARNING_HEADING}\n\n"
+        f"{warning}\n\n"
+        f"- Speech coverage may stop early.\n"
+        f"- `SCREEN` sections may be missing or incomplete.\n"
+        f"- Speaker identification may be incomplete.\n\n"
+        f"---\n\n"
+    )
+
+
 def transcript_header_status(transcript_status: str | None) -> str:
     """The Markdown header's ``**Status:**`` text for a meta ``transcript_status``.
 
@@ -6726,16 +6751,7 @@ def _write_transcript_md(
         )
     header += "---\n\n"
 
-    body = ""
-    if warning:
-        body += (
-            f"{TRANSCRIPT_WARNING_HEADING}\n\n"
-            f"{warning}\n\n"
-            f"- Speech coverage may stop early.\n"
-            f"- `SCREEN` sections may be missing or incomplete.\n"
-            f"- Speaker identification may be incomplete.\n\n"
-            f"---\n\n"
-        )
+    body = transcript_warning_block(warning) if warning else ""
     body += fused
 
     # Ensure the destination folder exists before the atomic tmp+replace write.
@@ -14372,6 +14388,21 @@ def merge_reassessed_quality_flags(
     return sorted(set(new_flags) | kept)
 
 
+def reassessed_transcript_status(status: object, severe: bool) -> str | None:
+    """The status a re-assessment of a transcript on disk sets, or None to leave it alone.
+
+    A meta with no status gets its first one from the verdict (``partial`` or
+    ``complete``); a severe verdict demotes a healthy status to ``partial``
+    (#157 invariant 6); any other status is kept. Shared by
+    ``assess-transcripts`` and ``repair-timestamps`` [core: one-definition].
+    """
+    if status is None:
+        return "partial" if severe else "complete"
+    if severe and status in _HEALTHY_TRANSCRIPT_STATUSES:
+        return "partial"
+    return None
+
+
 def assess_transcript_markdown(text: str, duration_seconds: int | None, *, captions: bool) -> tuple[dict, list[str]]:
     """Assess a transcript on disk: (the six persisted quality fields, sorted flags).
 
@@ -14568,13 +14599,11 @@ def cmd_assess_transcripts(args, config):
         counts[verdict] += 1
         new_meta = dict(meta)
         new_meta.update(fields)
-        if status is None:
-            # First status this transcript ever had: what the inspection found.
-            new_meta["transcript_status"] = "partial" if severe else "complete"
-            counts["demoted" if severe else "status_set"] += 1
-        elif severe and status in _HEALTHY_TRANSCRIPT_STATUSES:
-            new_meta["transcript_status"] = "partial"
-            counts["demoted"] += 1
+        # A missing status gets its first one; a severe verdict demotes a healthy one.
+        new_status = reassessed_transcript_status(status, severe)
+        if new_status is not None:
+            new_meta["transcript_status"] = new_status
+            counts["demoted" if new_status == "partial" else "status_set"] += 1
         log.info("  %s/%s: %s, %s", channel, prefix, ", ".join(flags) or "clean", verdict)
 
         if not apply or new_meta == meta:
@@ -14634,9 +14663,14 @@ PRE_REPAIR_SIDECAR_SUFFIX = ".transcript.raw.pre-repair.txt"
 REPAIR_FAILURE_EVIDENCE_FIELDS = (
     "transcript_failed_chunks",
     "transcript_thin_chunks",
+    "transcript_confabulated_chunks",
     "transcript_recovery",
     "transcript_parse_error",
 )
+#: A continuation line that opens like a stamp the entry pattern does not
+#: recognize (``[07:40.500] Guest: ...``) may be another speaker's line, and a
+#: split would relabel it with this entry's speaker.
+_STAMP_LIKE_LINE_RE = re.compile(r"^\[\d")
 
 
 def caption_cues_from_captions(captions: CaptionsResult) -> list[caption_align.Cue]:
@@ -14655,13 +14689,41 @@ def caption_cues_from_captions(captions: CaptionsResult) -> list[caption_align.C
 
 
 def _repair_stamp(seconds: int, like: str) -> str:
-    """``seconds`` in the shape of an existing stamp: ``HH:MM:SS``, or ``MM:SS`` with minutes past 59."""
+    """``seconds`` in the shape of an existing stamp: ``HH:MM:SS``, or the captions writer's ``MM:SS``."""
     if like.count(":") == 2:
         h, rem = divmod(seconds, 3600)
         m, s = divmod(rem, 60)
         return f"{h:02d}:{m:02d}:{s:02d}"
-    m, s = divmod(seconds, 60)
-    return f"{m:02d}:{s:02d}"
+    return _captions_timestamp(seconds)
+
+
+def _unsplittable_reason(entry: TranscriptBodyEntry, parts: DialogueEntryParts | None) -> str | None:
+    """Why a dialogue entry must stay whole even when its plan could split it, or None."""
+    if parts is None:
+        return "entry shape not recognized"
+    if any(_STAMP_LIKE_LINE_RE.match(_line_content(line)) for line in entry.lines[1:]):
+        return "a continuation line opens like an unrecognized stamp (possibly another speaker)"
+    return None
+
+
+def _splice_pieces(pieces: list[TranscriptBodyEntry], screens: list[TranscriptBodyEntry]) -> list[TranscriptBodyEntry]:
+    """The first piece, then the other pieces and the entry's own SCREEN blocks merged by stamp.
+
+    Both lists keep their own order; at an equal stamp the piece comes first,
+    as ``merge_transcript_json`` puts speech before a screen.
+    """
+    out = [pieces[0]]
+    rest, i, j = pieces[1:], 0, 0
+    while i < len(rest) or j < len(screens):
+        if j >= len(screens) or (
+            i < len(rest) and timestamp_to_seconds(rest[i].stamp) <= timestamp_to_seconds(screens[j].stamp)
+        ):
+            out.append(rest[i])
+            i += 1
+        else:
+            out.append(screens[j])
+            j += 1
+    return out
 
 
 @dataclass
@@ -14699,16 +14761,22 @@ def plan_transcript_repair(text: str, cues: list[caption_align.Cue]) -> Transcri
 
     One alignment of all dialogue entries against the track
     (``caption_align.align_entries``), one split plan per entry. A repairable
-    entry is replaced by its pieces: the first keeps the entry's stamp, each
-    later one carries the start of a real cue, the speaker label repeats, and
-    the text is the entry's own text cut at sentence boundaries. Only when
-    something was split is the body re-ordered, by a STABLE sort on each
-    entry's stamp, so SCREEN blocks interleave by their own untouched stamps
-    and equal stamps keep their order.
+    entry is replaced IN PLACE by its pieces: the first keeps the entry's
+    stamp, each later one carries the start of a real cue strictly below the
+    next dialogue entry's stamp, the speaker label repeats, and the text is
+    the entry's own text cut at sentence boundaries. Dialogue file order is
+    never changed: no other dialogue entry moves. Only the SCREEN blocks that
+    sat between the split entry and the next dialogue entry are re-placed
+    among its pieces, by their own untouched stamps.
     """
     body = parse_transcript_body(text)
     dialogue = [(e, split_dialogue_entry(e)) for e in body.entries if e.kind == TRANSCRIPT_ENTRY_DIALOGUE]
     texts = [parts.text if parts is not None else "".join(e.lines)[len(e.stamp) + 2 :] for e, parts in dialogue]
+    log.info(
+        "  aligning %d transcript words against %d caption cues",
+        sum(len(caption_align.normalize_words(t)) for t in texts),
+        len(cues),
+    )
     slices = caption_align.align_entries(texts, cues)
     total = sum(len(s) for s in slices)
     overall = sum(1 for s in slices for c in s if c is not None) / total if total else 0.0
@@ -14716,14 +14784,20 @@ def plan_transcript_repair(text: str, cues: list[caption_align.Cue]) -> Transcri
 
     candidates: list[RepairCandidate] = []
     replacements: dict[int, list[TranscriptBodyEntry]] = {}
-    for (entry, parts), entry_text, word_cues in zip(dialogue, texts, slices, strict=True):
+    for n, ((entry, parts), entry_text, word_cues) in enumerate(zip(dialogue, texts, slices, strict=True)):
+        bound = timestamp_to_seconds(dialogue[n + 1][0].stamp) if n + 1 < len(dialogue) else None
         plan = caption_align.plan_entry_split(
-            entry_text, cues, original_seconds=timestamp_to_seconds(entry.stamp), word_cues=word_cues
+            entry_text,
+            cues,
+            original_seconds=timestamp_to_seconds(entry.stamp),
+            word_cues=word_cues,
+            max_stamp_exclusive=bound,
         )
         if not plan.candidate:
             continue
-        if parts is None and plan.repairable:
-            plan = dataclasses.replace(plan, pieces=plan.pieces[:1], reason="entry shape not recognized")
+        reason = _unsplittable_reason(entry, parts) if plan.repairable else None
+        if reason is not None:
+            plan = dataclasses.replace(plan, pieces=plan.pieces[:1], reason=reason)
         stamps = [entry.stamp] + [_repair_stamp(p.stamp_seconds, entry.stamp) for p in plan.pieces[1:]]
         candidates.append(
             RepairCandidate(
@@ -14737,8 +14811,8 @@ def plan_transcript_repair(text: str, cues: list[caption_align.Cue]) -> Transcri
         if not plan.repairable:
             continue
         pieces: list[TranscriptBodyEntry] = []
-        for n, (piece, stamp) in enumerate(zip(plan.pieces, stamps, strict=True)):
-            last = n == len(plan.pieces) - 1
+        for k, (piece, stamp) in enumerate(zip(plan.pieces, stamps, strict=True)):
+            last = k == len(plan.pieces) - 1
             piece_parts = parts
             if not last and not parts.line_ending:
                 # The entry ended the file without a newline; only the final
@@ -14751,42 +14825,75 @@ def plan_transcript_repair(text: str, cues: list[caption_align.Cue]) -> Transcri
     if not replacements:
         return TranscriptRepair(text=text, candidates=candidates, overall_coverage=overall)
     entries: list[TranscriptBodyEntry] = []
-    for entry in body.entries:
-        entries.extend(replacements.get(id(entry), [entry]))
-    entries.sort(key=lambda e: timestamp_to_seconds(e.stamp))
+    i = 0
+    while i < len(body.entries):
+        entry = body.entries[i]
+        pieces = replacements.get(id(entry))
+        if pieces is None:
+            entries.append(entry)
+            i += 1
+            continue
+        j = i + 1
+        while j < len(body.entries) and body.entries[j].kind != TRANSCRIPT_ENTRY_DIALOGUE:
+            j += 1
+        entries.extend(_splice_pieces(pieces, body.entries[i + 1 : j]))
+        i = j
     repaired = TranscriptBody(header=body.header, entries=entries, trailer=body.trailer).render()
     return TranscriptRepair(text=repaired, candidates=candidates, overall_coverage=overall)
 
 
-def rewrite_transcript_header(text: str, transcript_status: str, *, drop_quality_warning: bool) -> str:
-    """The transcript with its header's ``**Status:**`` line matching ``transcript_status``.
+def _coverage_table_shows_failed_chunk(header: str) -> bool:
+    """True when a chunked transcript's coverage table has a FAILED row.
 
-    Only the header (everything before the first entry) is touched. A header
-    without a status line (the chunked coverage block) is left as it is. With
-    ``drop_quality_warning`` a quality-guard warning block is removed too,
-    found structurally (its heading through its closing ``---`` and the blank
-    line after it) and only when its text names the quality guard, so a
-    salvage warning is never removed.
+    The on-disk evidence of a lost chunk for metas written before
+    ``transcript_failed_chunks`` existed.
+    """
+    for line in header.splitlines():
+        if not line.lstrip().startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) >= 3 and cells[2].upper().startswith("FAILED"):
+            return True
+    return False
+
+
+def rewrite_transcript_header(text: str, transcript_status: str, quality_flags: list[str]) -> str:
+    """The transcript with its header matching the meta: status line and quality-guard warning.
+
+    Only a header that carries a ``**Status:**`` line (the single-shot shape)
+    is touched; the chunked coverage block is left as it is. The status line
+    gets ``transcript_header_status``; an existing quality-guard warning
+    block is removed (found structurally: its heading through its closing
+    ``---`` and the blank line after it, and only when its text names the
+    quality guard, so a salvage warning is never removed); and when the
+    status is not healthy and the flags are severe, a fresh block naming the
+    flags goes where the single-shot writer puts it, right under the header.
     """
     body = parse_transcript_body(text)
     lines = body.header.splitlines(keepends=True)
-    status_text = transcript_header_status(transcript_status)
+    status_at = next((i for i, line in enumerate(lines) if _line_content(line).startswith("**Status:** ")), None)
+    if status_at is None:
+        return text
+    newline = "\r\n" if "\r\n" in text else "\n"
+    old = lines[status_at]
+    lines[status_at] = f"**Status:** {transcript_header_status(transcript_status)}{old[len(_line_content(old)) :]}"
     for i, line in enumerate(lines):
-        content = _line_content(line)
-        if content.startswith("**Status:** "):
-            lines[i] = f"**Status:** {status_text}{line[len(content) :]}"
+        if _line_content(line) != TRANSCRIPT_WARNING_HEADING:
+            continue
+        end = next((j for j in range(i + 1, len(lines)) if lines[j].strip() == "---"), None)
+        if end is None or not any(QUALITY_GUARD_WARNING_PREFIX in lines[k] for k in range(i, end)):
             break
-    if drop_quality_warning:
-        for i, line in enumerate(lines):
-            if _line_content(line) != TRANSCRIPT_WARNING_HEADING:
-                continue
-            end = next((j for j in range(i + 1, len(lines)) if lines[j].strip() == "---"), None)
-            if end is None or not any(QUALITY_GUARD_WARNING_PREFIX in lines[k] for k in range(i, end)):
-                break
-            if end + 1 < len(lines) and not lines[end + 1].strip():
-                end += 1
-            del lines[i : end + 1]
-            break
+        if end + 1 < len(lines) and not lines[end + 1].strip():
+            end += 1
+        del lines[i : end + 1]
+        break
+    if transcript_status not in _HEALTHY_TRANSCRIPT_STATUSES and transcript_quality_flags_are_severe(quality_flags):
+        at = _transcript_body_start(lines)
+        if at is not None:
+            if at < len(lines) and not lines[at].strip():
+                at += 1
+            block = transcript_warning_block(quality_guard_warning(quality_flags)).replace("\n", newline)
+            lines[at:at] = block.splitlines(keepends=True)
     return "".join(lines) + text[len(body.header) :]
 
 
@@ -14797,20 +14904,29 @@ def repair_follow_up_commands(channel: str) -> list[str]:
     (issue #195), so both are named.
     """
     return [
-        f"python scripts/video_intel.py index --incremental --channel {shlex.quote(channel)}",
+        _render_cli_command(["index", "--incremental", "--channel", channel]),
         "python scripts/intel_graph.py load --force",
     ]
 
 
-def repaired_transcript_status(meta: dict, merged_flags: list[str]) -> str | None:
-    """The healthy status a repaired transcript earns, or None to leave the status alone.
+def repaired_transcript_status(
+    meta: dict, merged_flags: list[str], *, coverage_table_shows_failed: bool = False
+) -> str | None:
+    """The status a repaired transcript gets, or None to leave the status alone.
 
-    Only an exact ``partial`` is promoted, only when no severe flag remains
-    and no other failure evidence is recorded (``REPAIR_FAILURE_EVIDENCE_FIELDS``).
-    The literal is the writer family's: ``ok`` for a chunked transcript, else
-    ``complete``.
+    Both directions. Down: the shared ``reassessed_transcript_status`` rule,
+    so a severe verdict demotes a healthy (or missing) status to ``partial``.
+    Up: only an exact ``partial`` is promoted, only when no severe flag
+    remains and no other failure evidence exists (``REPAIR_FAILURE_EVIDENCE_FIELDS``
+    or a FAILED row in the coverage table); the literal is the writer
+    family's: ``ok`` for a chunked transcript, else ``complete``.
     """
-    if meta.get("transcript_status") != "partial" or transcript_quality_flags_are_severe(merged_flags):
+    status = meta.get("transcript_status")
+    severe = transcript_quality_flags_are_severe(merged_flags)
+    changed = reassessed_transcript_status(status, severe)
+    if changed is not None:
+        return changed
+    if status != "partial" or severe or coverage_table_shows_failed:
         return None
     if any(meta.get(field) for field in REPAIR_FAILURE_EVIDENCE_FIELDS):
         return None
@@ -14824,17 +14940,21 @@ def _repaired_meta(meta: dict, written_text: str, duration: int, coverage: float
     """The meta after a repair: the six quality fields re-assessed from ``written_text``.
 
     Flags go through the shared re-assessment rule, so writer-only flags
-    survive; no other key changes except the promoted status and the two
-    provenance fields.
+    survive; no other key changes except the status (either direction) and
+    the two provenance fields.
     """
     fields, recomputed = assess_transcript_markdown(written_text, duration, captions=False)
     merged = merge_reassessed_quality_flags(meta.get("transcript_quality_flags"), recomputed)
     fields["transcript_quality_flags"] = merged
     new_meta = dict(meta)
     new_meta.update(fields)
-    promoted = repaired_transcript_status(meta, merged)
-    if promoted is not None:
-        new_meta["transcript_status"] = promoted
+    status = repaired_transcript_status(
+        meta,
+        merged,
+        coverage_table_shows_failed=_coverage_table_shows_failed_chunk(parse_transcript_body(written_text).header),
+    )
+    if status is not None:
+        new_meta["transcript_status"] = status
     new_meta["transcript_timestamp_repair"] = TIMESTAMP_REPAIR_SOURCE
     new_meta["transcript_timestamp_repair_coverage"] = round(coverage, 3)
     return new_meta, merged
@@ -14845,7 +14965,7 @@ def _write_bytes_atomic(path: Path, data: bytes) -> None:
     try:
         tmp.write_bytes(data)
         os.replace(tmp, path)
-    except OSError:
+    except BaseException:
         tmp.unlink(missing_ok=True)
         raise
 
@@ -14853,20 +14973,74 @@ def _write_bytes_atomic(path: Path, data: bytes) -> None:
 def _keep_pre_repair_copy(channel_dir: Path, prefix: str, original: bytes) -> Path:
     """Copy the transcript aside before it changes; never clobber, always verify.
 
-    Same family and naming rule as the issue #248 chunked-partial sidecar: a
-    name already taken gets a UTC timestamp suffix. Raises on any failure,
-    leaving no partial copy behind.
+    The name follows ``unclobbered_sidecar_path``. The file is opened
+    exclusively, and on ANY failure after it was created (a short write, a
+    failed read-back, an interrupt) the partial copy is removed before the
+    exception propagates, so a truncated "original" never sits under the
+    canonical name.
     """
-    sidecar = channel_dir / f"{prefix}{PRE_REPAIR_SIDECAR_SUFFIX}"
-    if sidecar.exists():
-        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        sidecar = channel_dir / f"{prefix}{PRE_REPAIR_SIDECAR_SUFFIX[: -len('.txt')]}.{stamp}.txt"
-    with sidecar.open("xb") as fh:
-        fh.write(original)
-    if sidecar.read_bytes() != original:
+    sidecar = unclobbered_sidecar_path(channel_dir / f"{prefix}{PRE_REPAIR_SIDECAR_SUFFIX}")
+    handle = sidecar.open("xb")
+    try:
+        with handle:
+            handle.write(original)
+        if sidecar.read_bytes() != original:
+            raise OSError(f"{sidecar.name}: the copy does not match the transcript's bytes")
+    except BaseException:
         sidecar.unlink(missing_ok=True)
-        raise OSError(f"{sidecar.name}: the copy does not match the transcript's bytes")
+        raise
     return sidecar
+
+
+def _undo_repair(transcript_path: Path, original: bytes, sidecar: Path, transcript_changed: bool, exc) -> None:
+    """Put the transcript back after a failure, saying truthfully what worked."""
+    if transcript_changed:
+        try:
+            _write_bytes_atomic(transcript_path, original)
+        except OSError as restore_exc:
+            log.error(
+                "repair-timestamps: failed after writing the transcript (%r) and could not restore it (%r); "
+                "the original bytes are in %s",
+                exc,
+                restore_exc,
+                sidecar,
+            )
+            return
+        log.error("repair-timestamps: failed after writing the transcript (%r); the original is restored", exc)
+    else:
+        log.error("repair-timestamps: failed before the transcript changed (%r); it is untouched", exc)
+    try:
+        sidecar.unlink(missing_ok=True)
+    except OSError as unlink_exc:
+        log.error("repair-timestamps: could not remove the pre-repair copy %s (%r)", sidecar, unlink_exc)
+
+
+def _captions_decline_message(reason: dict) -> str:
+    """What a declined run says about the caption fetch, by the classified kind (issue #231).
+
+    Only a classified absence may say the video has no English track; an
+    unrecognized failure is never reported as one.
+    """
+    kind = reason.get("kind")
+    exc = reason.get("exception")
+    detail = f" ({exc})" if exc else ""
+    if captions_failure_is_refusal(kind):
+        return f"the caption request was refused{detail}; nothing changed. Run it again later or from another network."
+    if kind == CAPTIONS_FAILURE_ABSENT:
+        return f"the video has no English caption track{detail}; nothing changed."
+    if kind == CAPTIONS_FAILURE_EMPTY:
+        return "the English caption track came back empty; nothing changed."
+    if kind == CAPTIONS_FAILURE_VIDEO:
+        return f"YouTube reports the video unavailable{detail}; nothing changed."
+    if kind == CAPTIONS_FAILURE_NO_LIBRARY:
+        return (
+            "youtube-transcript-api is not installed, so the caption track could not be fetched; nothing changed. "
+            "Install it and re-run."
+        )
+    return (
+        f"the caption fetch failed for an unclassified reason{detail}; nothing changed. This says nothing about "
+        "whether the video has captions."
+    )
 
 
 def _first_words(text: str, n: int = 6) -> str:
@@ -14877,17 +15051,18 @@ def _first_words(text: str, n: int = 6) -> str:
 def cmd_repair_timestamps(args, config):
     """Re-stamp a wall-of-text Gemini transcript from its caption track's cue timings.
 
-    Resolves the video by id through the channel's ``_load_video_id_index``
-    (no YouTube Data API call), fetches the caption track through the one
-    captions fetcher, plans the split and prints it. Dry run by default:
-    nothing is written. With ``--apply``: the transcript is copied to a
-    verified ``.transcript.raw.pre-repair.txt`` sidecar, the repaired Markdown
-    is written atomically, the SAME assessor re-judges the file just written,
-    the verdict is merged into meta (writer-only flags kept, no unrelated key
-    touched, never ``update_meta``), ``partial`` is promoted only when nothing
-    else says the transcript is broken, the header status line is matched to
-    meta, and the re-index commands are printed. Any failure after the write
-    restores the original transcript and removes the sidecar.
+    Manual, one video per run. Resolves the video by id through the channel's
+    ``_load_video_id_index`` (no YouTube Data API call), fetches the caption
+    track through the one captions fetcher, plans the split and prints it.
+    Dry run by default: nothing is written. With ``--apply``: the transcript
+    is copied to a verified ``.transcript.raw.pre-repair.txt`` sidecar, the
+    repaired Markdown is written atomically, the SAME assessor re-judges the
+    file just written, the verdict is merged into meta (writer-only flags
+    kept, no unrelated key touched, never ``update_meta``), the status moves
+    in either direction through the shared rule, the header is matched to
+    meta, and the re-index commands are printed. Any failure or interrupt
+    after the sidecar exists restores the original transcript and removes the
+    sidecar.
 
     Exit codes: 0 repaired, dry run with a plan, or nothing to repair;
     ``EXIT_PARTIAL`` declined with the transcript unchanged; 1 cannot run.
@@ -14949,14 +15124,7 @@ def cmd_repair_timestamps(args, config):
     reason: dict = {}
     captions = fetch_english_captions(video_id, reason_sink=reason)
     if captions is None:
-        if captions_failure_is_refusal(reason.get("kind")):
-            log.warning(
-                "repair-timestamps: declined, caption request refused (%s). %s",
-                reason.get("exception") or "blocked",
-                CAPTIONS_BLOCK_RECOVERY,
-            )
-        else:
-            log.warning("repair-timestamps: declined, no English caption track (%s)", reason.get("kind") or "absent")
+        log.warning("repair-timestamps: declined, %s", _captions_decline_message(reason))
         sys.exit(EXIT_PARTIAL)
 
     repair = plan_transcript_repair(text, caption_cues_from_captions(captions))
@@ -15008,31 +15176,24 @@ def cmd_repair_timestamps(args, config):
     except OSError as exc:
         log.error("repair-timestamps: could not keep the original transcript aside (%s); nothing written", exc)
         sys.exit(1)
+    transcript_changed = False
     try:
         _write_bytes_atomic(transcript_path, repair.text.encode("utf-8"))
+        transcript_changed = True
         # [core: writer's-path] judge the file just written, not the plan in memory.
         written = transcript_path.read_bytes().decode("utf-8")
         new_meta, merged = _repaired_meta(meta, written, duration, coverage)
-        promoted = new_meta.get("transcript_status") != meta.get("transcript_status")
-        final_text = rewrite_transcript_header(
-            written, new_meta.get("transcript_status"), drop_quality_warning=promoted
-        )
+        final_text = rewrite_transcript_header(written, new_meta.get("transcript_status"), merged)
         if final_text != written:
             _write_bytes_atomic(transcript_path, final_text.encode("utf-8"))
         _write_meta_atomic(meta_path, new_meta)
-    except Exception as exc:
-        try:
-            _write_bytes_atomic(transcript_path, original)
-            sidecar.unlink(missing_ok=True)
-            log.error("repair-timestamps: failed after writing (%r); the original transcript is restored", exc)
-        except OSError as restore_exc:
-            log.error(
-                "repair-timestamps: failed after writing (%r) and could not restore (%r); the original is in %s",
-                exc,
-                restore_exc,
-                sidecar.name,
-            )
-        sys.exit(1)
+    except BaseException as exc:
+        # An interrupt between the two writes would otherwise leave a repaired
+        # transcript beside a stale meta that a re-run can never fix.
+        _undo_repair(transcript_path, original, sidecar, transcript_changed, exc)
+        if isinstance(exc, Exception):
+            sys.exit(1)
+        raise
 
     log.info(
         "repair-timestamps: repaired %d entr%s into %d; flags %s; transcript_status %s -> %s; original kept as %s",

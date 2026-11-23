@@ -92,11 +92,11 @@ def _single_shot_markdown(path: Path, text: str, stamp: str = "00:12") -> None:
     )
 
 
-def _chunked_markdown(path: Path, text: str) -> None:
+def _chunked_markdown(path: Path, text: str, *, failed_row: bool = True) -> None:
     body = vi.merge_transcript_json(_raw_json(text), {})
     rows = [
         {"range": "00:00 - 05:00", "status": "ok", "speakers": ["Host"]},
-        {"range": "05:00 - 10:00", "status": "FAILED (timeout)", "speakers": []},
+        {"range": "05:00 - 10:00", "status": "FAILED (timeout)" if failed_row else "ok", "speakers": []},
     ]
     coverage = vi._build_chunked_transcript_coverage_block(600, 5, rows)
     path.write_text(coverage + "\n" + body, encoding="utf-8")
@@ -160,14 +160,16 @@ def _paths(corpus: Path) -> SimpleNamespace:
     )
 
 
-def _write_corpus(corpus: Path, *, shape: str = "single", meta: dict | None = None, text: str | None = None):
+def _write_corpus(
+    corpus: Path, *, shape: str = "single", meta: dict | None = None, text: str | None = None, failed_row: bool = True
+):
     p = _paths(corpus)
     sentences, _ = _talk()
     text = text if text is not None else " ".join(sentences)
     if shape == "single":
         _single_shot_markdown(p.transcript, text)
     else:
-        _chunked_markdown(p.transcript, text)
+        _chunked_markdown(p.transcript, text, failed_row=failed_row)
     p.meta.write_text(json.dumps(meta if meta is not None else _meta(), indent=2), encoding="utf-8")
     return p
 
@@ -403,6 +405,7 @@ class TestDryRun:
         log = caplog.text
         assert "[00:12] coverage" in log
         assert "re-assessment would say" in log
+        assert "caption cues" in log
         assert "Dry run" in log
 
 
@@ -499,7 +502,9 @@ class TestApply:
             assert meta[key] == value
 
     def test_chunked_transcript_promotes_to_ok(self, corpus, monkeypatch):
-        p = _write_corpus(corpus, shape="chunked", meta=_meta(transcript_chunks=2, transcript_failed_chunks=0))
+        p = _write_corpus(
+            corpus, shape="chunked", meta=_meta(transcript_chunks=2, transcript_failed_chunks=0), failed_row=False
+        )
         _stub_captions(monkeypatch, _talk()[1])
 
         _run(corpus, apply=True)
@@ -568,12 +573,7 @@ class TestApply:
             f"{vi.TRANSCRIPT_WARNING_HEADING}\n\nGemini returned malformed JSON.\n\n---\n\n"
             '[00:05] Host: "x"\n'
         )
-        assert (
-            vi.rewrite_transcript_header(text, "complete", drop_quality_warning=True).count(
-                vi.TRANSCRIPT_WARNING_HEADING
-            )
-            == 1
-        )
+        assert vi.rewrite_transcript_header(text, "complete", []).count(vi.TRANSCRIPT_WARNING_HEADING) == 1
 
     def test_existing_sidecar_is_never_clobbered(self, corpus, monkeypatch):
         p = _write_corpus(corpus)
@@ -665,8 +665,8 @@ class TestDeclines:
             assert _exit_code(corpus, apply=True) == 3
 
         assert _snapshot(corpus) == before
-        assert "refused (IpBlocked)" in caplog.text
-        assert CAPTIONS_BLOCK_RECOVERY in caplog.text
+        assert "refused (IpBlocked); nothing changed" in caplog.text
+        assert CAPTIONS_BLOCK_RECOVERY not in caplog.text
 
     def test_unsplittable_candidate_declines_with_exit_3(self, corpus, monkeypatch):
         sentences, cues = _talk()
@@ -824,3 +824,455 @@ class TestSingleShotHeaderMatchesMeta:
         assert status == "done"
         assert "**Status:** Complete" in header
         assert vi.TRANSCRIPT_WARNING_HEADING not in header
+
+
+# ---------------------------------------------------------------------------
+# Review round: dialogue order, status in both directions, failure handling
+# ---------------------------------------------------------------------------
+
+
+def _host_guest_shape() -> tuple[str, list]:
+    """A Host wall at [00:12], then a Guest line Gemini stamped [01:50] although it is spoken later."""
+    sentences, cues = _talk()
+    host = " ".join(sentences[:50])  # beats 0-24: caption time 12 s to about 280 s
+    guest = " ".join(sentences[50:60])  # beats 25-29: spoken at about 287-330 s
+    md = (
+        "# Transcript: T\n\n---\n\n"
+        f'[00:12] Host: "{host}"\n\n'
+        "  SCREEN [00:40] [slide]: first slide\n\n"
+        "  SCREEN [01:20] [slide]: second slide\n\n"
+        f'[01:50] Guest: "{guest}"\n\n'
+        "  SCREEN [05:00] [slide]: later slide\n"
+    )
+    return md, cues
+
+
+def _non_monotone_pair_shape() -> tuple[str, list]:
+    sentences, cues = _talk()
+    wall = " ".join(sentences[:40])  # caption time 12 s to about 230 s
+    md = (
+        "# Transcript: T\n\n---\n\n"
+        f'[00:12] Host: "{wall}"\n\n'
+        '[05:00] Host: "A hand-edited late line."\n\n'
+        '[04:30] Host: "A hand-edited early line."\n'
+    )
+    return md, cues
+
+
+def _cue_records(raw_cues) -> list:
+    return [caption_align.Cue(s, 4.0, t) for s, t in raw_cues]
+
+
+ORDER_SHAPES = [*SHAPES, "host_guest", "non_monotone_pair"]
+
+
+def _order_shape(name: str, tmp_path: Path):
+    if name == "host_guest":
+        return _host_guest_shape()
+    if name == "non_monotone_pair":
+        return _non_monotone_pair_shape()
+    return _shape(name, tmp_path)
+
+
+class TestDialogueOrder:
+    def test_a_later_speaker_line_keeps_its_place_and_no_host_piece_follows_it(self):
+        text, raw = _host_guest_shape()
+
+        repair = vi.plan_transcript_repair(text, _cue_records(raw))
+
+        assert repair.repaired
+        dialogue = [(e, p) for e, p in _dialogue(vi.parse_transcript_body(repair.text))]
+        labels = [p.label for _, p in dialogue]
+        assert labels[-1] == "Guest" and set(labels[:-1]) == {"Host"}
+        guest_entry = dialogue[-1][0]
+        original_guest = next(e for e, p in _dialogue(vi.parse_transcript_body(text)) if p.label == "Guest")
+        assert guest_entry.lines == original_guest.lines
+        host_seconds = [vi.timestamp_to_seconds(e.stamp) for e, p in dialogue[:-1]]
+        assert all(s < vi.timestamp_to_seconds("01:50") for s in host_seconds), host_seconds
+
+    def test_screens_between_the_wall_and_the_next_line_interleave_and_later_screens_stay(self):
+        text, raw = _host_guest_shape()
+
+        body = vi.parse_transcript_body(vi.plan_transcript_repair(text, _cue_records(raw)).text)
+
+        kinds = [(e.kind, e.stamp) for e in body.entries]
+        first_screen = kinds.index((vi.TRANSCRIPT_ENTRY_SCREEN, "00:40"))
+        assert kinds[first_screen - 1][0] == vi.TRANSCRIPT_ENTRY_DIALOGUE
+        assert kinds[first_screen + 1][0] == vi.TRANSCRIPT_ENTRY_DIALOGUE  # a piece on both sides
+        assert kinds[-1] == (vi.TRANSCRIPT_ENTRY_SCREEN, "05:00")  # after the Guest line, untouched
+        assert kinds[-2][1] == "01:50"
+
+    def test_a_hand_edited_non_monotone_pair_is_byte_identical_after_a_split_elsewhere(self):
+        text, raw = _non_monotone_pair_shape()
+
+        repaired = vi.plan_transcript_repair(text, _cue_records(raw)).text
+
+        pair = '[05:00] Host: "A hand-edited late line."\n\n[04:30] Host: "A hand-edited early line."\n'
+        assert text.endswith(pair) and repaired.endswith(pair)
+        assert repaired.count("[00:") + repaired.count("[01:") + repaired.count("[02:") + repaired.count("[03:") > 1
+
+    @pytest.mark.parametrize("name", ORDER_SHAPES)
+    def test_dialogue_file_order_survives_a_split(self, tmp_path, name):
+        text, raw = _order_shape(name, tmp_path)
+
+        repair = vi.plan_transcript_repair(text, _cue_records(raw))
+
+        assert repair.repaired
+        split = {c.stamp: c for c in repair.repaired}
+        expected: list[str] = []
+        for entry, _ in _dialogue(vi.parse_transcript_body(text)):
+            candidate = split.get(entry.stamp)
+            if candidate is None:
+                expected.append("".join(entry.lines))
+            else:
+                expected.extend(
+                    f"{stamp}|{piece.text}"
+                    for stamp, piece in zip(candidate.piece_stamps, candidate.plan.pieces, strict=True)
+                )
+        got = []
+        for entry, parts in _dialogue(vi.parse_transcript_body(repair.text)):
+            key = "".join(entry.lines)
+            got.append(key if key in expected else f"{entry.stamp}|{parts.text}")
+        assert got == expected
+
+
+class TestStatusBothDirections:
+    def test_a_severe_verdict_demotes_a_healthy_status_with_header_and_warning(self, corpus, monkeypatch):
+        # A `complete` meta written while the duration was unknown: the talk starts
+        # at 11:40 of a 1300 s video, so the re-assessment finds a leading gap.
+        sentences, cues = _talk(n=50, first=700.0)
+        p = _paths(corpus)
+        _single_shot_markdown(p.transcript, " ".join(sentences), stamp="11:40")
+        p.meta.write_text(
+            json.dumps(_meta(duration_seconds=1300, transcript_status="complete", transcript_quality_flags=[])),
+            encoding="utf-8",
+        )
+        _stub_captions(monkeypatch, cues)
+
+        result = _run(corpus, apply=True)
+
+        assert result["outcome"] == "repaired"
+        meta = json.loads(p.meta.read_text(encoding="utf-8"))
+        assert "blind_gap_severe" in meta["transcript_quality_flags"]
+        assert meta["transcript_status"] == "partial"
+        header = _body(p.transcript).header
+        assert "**Status:** Partial transcript" in header
+        assert vi.TRANSCRIPT_WARNING_HEADING in header and "blind_gap_severe" in header
+
+    @pytest.mark.parametrize(
+        ("status", "severe", "expected"),
+        [
+            (None, True, "partial"),
+            (None, False, "complete"),
+            ("complete", True, "partial"),
+            ("ok", True, "partial"),
+            ("complete", False, None),
+            ("partial", True, None),
+            ("truncated_output", True, None),
+        ],
+    )
+    def test_reassessed_status_rule_table(self, status, severe, expected):
+        assert vi.reassessed_transcript_status(status, severe) == expected
+
+    def test_assess_transcripts_and_repair_call_the_one_status_rule(self):
+        import ast
+        import inspect
+
+        for fn in (vi.cmd_assess_transcripts, vi.repaired_transcript_status):
+            tree = ast.parse(inspect.getsource(fn))
+            calls = {n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+            assert "reassessed_transcript_status" in calls, fn.__name__
+
+    def test_confabulated_chunks_block_promotion(self, corpus, monkeypatch):
+        p = _write_corpus(corpus, meta=_meta(transcript_confabulated_chunks=1))
+        _stub_captions(monkeypatch, _talk()[1])
+
+        _run(corpus, apply=True)
+
+        assert json.loads(p.meta.read_text(encoding="utf-8"))["transcript_status"] == "partial"
+
+    def test_a_failed_row_in_the_coverage_table_blocks_promotion(self, corpus, monkeypatch):
+        # A meta written before the failed-chunk count existed: only the table says so.
+        p = _write_corpus(corpus, shape="chunked", meta=_meta(transcript_chunks=2))
+        assert "FAILED" in _body(p.transcript).header
+        _stub_captions(monkeypatch, _talk()[1])
+
+        _run(corpus, apply=True)
+
+        meta = json.loads(p.meta.read_text(encoding="utf-8"))
+        assert "monolithic_severe" not in meta["transcript_quality_flags"]
+        assert meta["transcript_status"] == "partial"
+
+
+class TestFailureHandling:
+    def test_a_copy_that_fails_part_way_leaves_no_sidecar_and_an_untouched_tree(self, corpus, monkeypatch):
+        _write_corpus(corpus)
+        _stub_captions(monkeypatch, _talk()[1])
+        before = _snapshot(corpus)
+        real_open = Path.open
+
+        class HalfWriter:
+            def __init__(self, handle):
+                self.handle = handle
+
+            def write(self, data):
+                self.handle.write(data[: len(data) // 2])
+                raise OSError("disk full")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.handle.close()
+
+        def fake_open(self, mode="r", *a, **kw):
+            handle = real_open(self, mode, *a, **kw)
+            return HalfWriter(handle) if mode == "xb" else handle
+
+        monkeypatch.setattr(Path, "open", fake_open)
+
+        assert _exit_code(corpus, apply=True) == 1
+        assert _snapshot(corpus) == before
+
+    def test_a_copy_that_reads_back_different_leaves_no_sidecar(self, corpus, monkeypatch):
+        p = _write_corpus(corpus)
+        _stub_captions(monkeypatch, _talk()[1])
+        before = _snapshot(corpus)
+        real_read = Path.read_bytes
+        monkeypatch.setattr(Path, "read_bytes", lambda self: b"not it" if self == p.sidecar else real_read(self))
+
+        assert _exit_code(corpus, apply=True) == 1
+        assert _snapshot(corpus) == before
+
+    def test_a_backup_that_cannot_be_made_never_becomes_an_overwrite(self, corpus, monkeypatch):
+        _write_corpus(corpus)
+        _stub_captions(monkeypatch, _talk()[1])
+        before = _snapshot(corpus)
+
+        def no_backup(*_a, **_kw):
+            raise OSError("read-only folder")
+
+        monkeypatch.setattr(vi, "_keep_pre_repair_copy", no_backup)
+
+        assert _exit_code(corpus, apply=True) == 1
+        assert _snapshot(corpus) == before
+
+    def test_an_interrupt_between_the_writes_restores_the_tree_and_re_raises(self, corpus, monkeypatch):
+        _write_corpus(corpus)
+        _stub_captions(monkeypatch, _talk()[1])
+        before = _snapshot(corpus)
+
+        def interrupt(*_a, **_kw):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(vi, "_write_meta_atomic", interrupt)
+
+        with pytest.raises(KeyboardInterrupt):
+            _run(corpus, apply=True)
+        assert _snapshot(corpus) == before
+
+    def test_a_first_write_that_never_landed_says_so(self, corpus, monkeypatch, caplog):
+        _write_corpus(corpus)
+        _stub_captions(monkeypatch, _talk()[1])
+        before = _snapshot(corpus)
+
+        def boom(*_a, **_kw):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(vi, "_write_bytes_atomic", boom)
+
+        with caplog.at_level(logging.INFO, logger="video_intel"):
+            assert _exit_code(corpus, apply=True) == 1
+        assert _snapshot(corpus) == before
+        assert "before the transcript changed" in caplog.text
+        assert "failed after writing" not in caplog.text
+
+    def test_a_sidecar_that_cannot_be_removed_is_named_and_not_called_a_failed_restore(
+        self, corpus, monkeypatch, caplog
+    ):
+        p = _write_corpus(corpus)
+        original = p.transcript.read_bytes()
+        _stub_captions(monkeypatch, _talk()[1])
+        real_unlink = Path.unlink
+
+        def stubborn(self, *a, **kw):
+            if self.name.startswith(f"{PREFIX}.transcript.raw.pre-repair"):
+                raise PermissionError("locked")
+            return real_unlink(self, *a, **kw)
+
+        def boom(*_a, **_kw):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(Path, "unlink", stubborn)
+        monkeypatch.setattr(vi, "_write_meta_atomic", boom)
+
+        with caplog.at_level(logging.INFO, logger="video_intel"):
+            assert _exit_code(corpus, apply=True) == 1
+        assert p.transcript.read_bytes() == original
+        assert "the original is restored" in caplog.text
+        assert "could not restore" not in caplog.text
+        assert f"could not remove the pre-repair copy {p.sidecar}" in caplog.text
+
+    def test_the_meta_is_judged_from_the_file_on_disk_not_the_plan(self, corpus, monkeypatch):
+        p = _write_corpus(corpus)
+        _stub_captions(monkeypatch, _talk()[1])
+        real_write = vi._write_bytes_atomic
+        calls = []
+
+        def altering(path, data):
+            calls.append(path)
+            if len(calls) == 1:
+                # Land a file that differs from the plan: drop every second dialogue entry.
+                body = vi.parse_transcript_body(data.decode("utf-8"))
+                kept, drop = [], False
+                for entry in body.entries:
+                    if entry.kind == vi.TRANSCRIPT_ENTRY_DIALOGUE:
+                        drop = not drop
+                        if drop and len(kept) > 1:
+                            continue
+                    kept.append(entry)
+                data = vi.TranscriptBody(body.header, kept, body.trailer).render().encode("utf-8")
+            real_write(path, data)
+
+        monkeypatch.setattr(vi, "_write_bytes_atomic", altering)
+
+        result = _run(corpus, apply=True)
+
+        meta = json.loads(p.meta.read_text(encoding="utf-8"))
+        on_disk, _ = vi.assess_transcript_markdown(p.transcript.read_text(encoding="utf-8"), 600, captions=False)
+        assert meta["transcript_dialogue_entries"] == on_disk["transcript_dialogue_entries"]
+        planned = sum(len(c.plan.pieces) for c in result["repair"].repaired)
+        assert meta["transcript_dialogue_entries"] < planned
+
+
+class TestShapesThatStayWhole:
+    def test_an_unrecognized_wall_shape_declines_with_exit_3(self, corpus, monkeypatch, caplog):
+        sentences, cues = _talk()
+        p = _paths(corpus)
+        p.transcript.write_text(
+            '# Transcript: T\n\n**Status:** Complete\n\n---\n\n[00:12] Host: "' + " ".join(sentences) + "\n",
+            encoding="utf-8",
+        )
+        p.meta.write_text(json.dumps(_meta()), encoding="utf-8")
+        _stub_captions(monkeypatch, cues)
+        before = _snapshot(corpus)
+
+        with caplog.at_level(logging.INFO, logger="video_intel"):
+            assert _exit_code(corpus, apply=True) == 3
+        assert _snapshot(corpus) == before
+        assert "entry shape not recognized" in caplog.text
+
+    def test_an_entry_hiding_an_unrecognized_stamp_line_stays_whole(self, corpus, monkeypatch, caplog):
+        sentences, cues = _talk()
+        p = _paths(corpus)
+        p.transcript.write_text(
+            "# Transcript: T\n\n**Status:** Complete\n\n---\n\n"
+            f'[00:12] Host: "{" ".join(sentences[:80])}"\n'
+            f'[07:40.500] Guest: "{" ".join(sentences[80:])}"\n',
+            encoding="utf-8",
+        )
+        p.meta.write_text(json.dumps(_meta()), encoding="utf-8")
+        _stub_captions(monkeypatch, cues)
+        before = _snapshot(corpus)
+
+        with caplog.at_level(logging.INFO, logger="video_intel"):
+            assert _exit_code(corpus, apply=True) == 3
+        assert _snapshot(corpus) == before
+        assert "unrecognized stamp" in caplog.text
+
+    def test_a_wall_ending_the_file_without_a_newline_puts_every_piece_on_its_own_line(self):
+        sentences, cues = _talk()
+        text = "# Transcript: T\n\n---\n\n" + f'[00:12] Host: "{" ".join(sentences)}"'
+
+        repair = vi.plan_transcript_repair(text, _cue_records(cues))
+
+        pieces = repair.repaired[0].plan.pieces
+        dialogue = _dialogue(vi.parse_transcript_body(repair.text))
+        assert len(pieces) > 2
+        assert len(dialogue) == len(pieces)
+        assert not repair.text.endswith("\n")
+
+    def test_no_dialogue_entries_exits_1_before_any_fetch(self, corpus, monkeypatch):
+        p = _paths(corpus)
+        p.transcript.write_text("# Transcript: T\n\n---\n\n  SCREEN [00:00] [slide]: only a slide\n", encoding="utf-8")
+        p.meta.write_text(json.dumps(_meta()), encoding="utf-8")
+        calls: list[str] = []
+        _stub_captions(monkeypatch, _talk()[1], calls=calls)
+
+        assert _exit_code(corpus, apply=True) == 1
+        assert calls == []
+
+
+class TestCaptionDeclineWording:
+    @pytest.mark.parametrize(
+        ("kind", "exception", "must", "must_not"),
+        [
+            ("blocked", "IpBlocked", "refused (IpBlocked); nothing changed. Run it again later", "no English"),
+            ("absent", "NoTranscriptFound", "no English caption track (NoTranscriptFound)", "refused"),
+            ("empty", None, "came back empty", "no English caption track"),
+            ("video_unavailable", "VideoUnavailable", "reports the video unavailable", "no English"),
+            ("no_library", None, "youtube-transcript-api is not installed", "no English"),
+            ("other", "YouTubeRequestFailed", "unclassified reason (YouTubeRequestFailed)", "no English"),
+        ],
+    )
+    def test_each_classified_kind_gets_its_own_truthful_wording(
+        self, corpus, monkeypatch, caplog, kind, exception, must, must_not
+    ):
+        _write_corpus(corpus)
+        _stub_no_captions(monkeypatch, kind, exception)
+        before = _snapshot(corpus)
+
+        with caplog.at_level(logging.INFO, logger="video_intel"):
+            assert _exit_code(corpus, apply=True) == 3
+
+        assert _snapshot(corpus) == before
+        assert must in caplog.text
+        assert must_not not in caplog.text
+        assert CAPTIONS_BLOCK_RECOVERY not in caplog.text
+        assert "transcript_source" not in caplog.text
+
+
+class TestSharedHelpers:
+    def test_unclobbered_sidecar_path_keeps_a_free_name_and_suffixes_a_taken_one(self, tmp_path):
+        free = tmp_path / "a.transcript.raw.pre-repair.txt"
+        assert vi.unclobbered_sidecar_path(free) == free
+        free.write_text("x")
+        taken = vi.unclobbered_sidecar_path(free)
+        assert taken.parent == free.parent and taken != free
+        assert taken.name.startswith("a.transcript.raw.pre-repair.") and taken.suffix == ".txt"
+
+    def test_follow_up_commands_double_quote_a_channel_with_a_space(self):
+        index_cmd, graph_cmd = vi.repair_follow_up_commands("my chan")
+        assert index_cmd == 'python scripts/video_intel.py index --incremental --channel "my chan"'
+        assert graph_cmd == "python scripts/intel_graph.py load --force"
+
+    def test_screen_recognizer_agrees_with_chunk_transcript(self, tmp_path):
+        samples = [
+            "  SCREEN [00:05] [slide]: indented",
+            "    SCREEN [100:30-101:00] [code]: minutes past 99",
+            "  SCREEN [1:02:03] [other]: hours",
+            "  SCREEN [00:08.5] [other]: fractional seconds",
+            "SCREEN [00:07] [slide]: not indented",
+            "  SCREEN [x] [slide]: not a stamp",
+            "\tSCREEN [00:09] [slide]: tab indented",
+        ]
+        path = tmp_path / "s.md"
+        path.write_text("\n".join(f'[00:00] A: "open"\n{line}' for line in samples) + "\n", encoding="utf-8")
+        chunked = [c["text"].splitlines()[0] for c in vi.chunk_transcript(path, chunk_size=1)]
+        mine = [
+            "".join(e.lines).splitlines()[0] for e in vi.parse_transcript_body(path.read_text(encoding="utf-8")).entries
+        ]
+        # chunk_transcript strips each chunk, so compare the lines stripped.
+        assert [line.strip() for line in chunked if "SCREEN" in line] == [
+            line.strip() for line in mine if "SCREEN" in line
+        ]
+        assert any("SCREEN" in line for line in mine)  # not vacuous
+
+    def test_the_screen_recognizer_is_built_from_the_entry_pattern(self):
+        assert vi.ENTRY_TIMESTAMP_PATTERN in vi._SCREEN_LINE_RE.pattern
+
+    def test_the_planner_says_when_alignment_starts(self, caplog):
+        text, raw = _host_guest_shape()
+        with caplog.at_level(logging.INFO, logger="video_intel"):
+            vi.plan_transcript_repair(text, _cue_records(raw))
+        assert f"against {len(raw)} caption cues" in caplog.text
