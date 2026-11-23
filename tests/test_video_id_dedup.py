@@ -121,6 +121,69 @@ def test_is_processed_cache_is_populated_once_per_channel(tmp_path, monkeypatch)
     assert call_count["n"] == 1, "meta.json glob must be cached after the first call"
 
 
+@pytest.mark.parametrize("reverse", [True, False], ids=["reverse-glob-order", "forward-glob-order"])
+def test_load_video_id_index_duplicate_video_id_sorted_prefix_wins_regardless_of_glob_order(
+    tmp_path, monkeypatch, reverse
+):
+    """Issue #276: two metas claim one video_id; the first in sorted file-name
+    order wins no matter what order the filesystem enumerates them in."""
+    ch = tmp_path / "chan"
+    for prefix in ("2026-01-02-bbb", "2026-01-01-aaa"):
+        _write_meta(ch, prefix, {"video_id": "vid001", "title": prefix})
+
+    original_glob = Path.glob
+
+    def ordered_glob(self, pattern):
+        return sorted(original_glob(self, pattern), reverse=reverse)
+
+    vi._invalidate_video_id_cache()
+    monkeypatch.setattr(Path, "glob", ordered_glob)
+    try:
+        index = vi._load_video_id_index(ch)
+    finally:
+        vi._invalidate_video_id_cache()
+
+    assert index["vid001"] == "2026-01-01-aaa"
+
+
+def test_load_video_id_index_slug_extension_first_file_name_wins(tmp_path):
+    """Issue #276: the walk sorts FILE NAMES, not prefixes. When one slug extends
+    another on the same date (a title that gained a suffix), the longer name
+    sorts first, because '-' sorts before the '.' of '.meta.json'. Pinned so the
+    code comment and CLAUDE.md cannot claim "first prefix" again."""
+    ch = tmp_path / "chan"
+    for prefix in ("2026-01-01-claude-code", "2026-01-01-claude-code-tips"):
+        _write_meta(ch, prefix, {"video_id": "vid001", "title": prefix})
+
+    vi._invalidate_video_id_cache()
+    try:
+        index = vi._load_video_id_index(ch)
+    finally:
+        vi._invalidate_video_id_cache()
+
+    assert index["vid001"] == "2026-01-01-claude-code-tips"
+    assert min("2026-01-01-claude-code", "2026-01-01-claude-code-tips") == "2026-01-01-claude-code"
+
+
+def test_load_video_id_index_mixed_case_stems_sort_by_code_point_on_every_os(tmp_path):
+    """Issue #276 (peer review): Path objects compare case-insensitively on
+    Windows and case-sensitively on POSIX, so sorting the paths themselves gave a
+    different winner per OS for mixed-case stems (a local-file ingest keeps its
+    case). The walk sorts the name string, so "Z" (0x5A) precedes "a" (0x61)
+    everywhere."""
+    ch = tmp_path / "chan"
+    for prefix in ("2026-01-01-apple", "2026-01-01-Zebra"):
+        _write_meta(ch, prefix, {"video_id": "vid001", "title": prefix})
+
+    vi._invalidate_video_id_cache()
+    try:
+        index = vi._load_video_id_index(ch)
+    finally:
+        vi._invalidate_video_id_cache()
+
+    assert index["vid001"] == "2026-01-01-Zebra"
+
+
 # ---------------------------------------------------------------------------
 # Cleanup: dedupe subcommand
 # ---------------------------------------------------------------------------
