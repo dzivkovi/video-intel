@@ -165,6 +165,25 @@ def test_load_video_id_index_slug_extension_first_file_name_wins(tmp_path):
     assert min("2026-01-01-claude-code", "2026-01-01-claude-code-tips") == "2026-01-01-claude-code"
 
 
+def test_load_video_id_index_mixed_case_stems_sort_by_code_point_on_every_os(tmp_path):
+    """Issue #276 (peer review): Path objects compare case-insensitively on
+    Windows and case-sensitively on POSIX, so sorting the paths themselves gave a
+    different winner per OS for mixed-case stems (a local-file ingest keeps its
+    case). The walk sorts the name string, so "Z" (0x5A) precedes "a" (0x61)
+    everywhere."""
+    ch = tmp_path / "chan"
+    for prefix in ("2026-01-01-apple", "2026-01-01-Zebra"):
+        _write_meta(ch, prefix, {"video_id": "vid001", "title": prefix})
+
+    vi._invalidate_video_id_cache()
+    try:
+        index = vi._load_video_id_index(ch)
+    finally:
+        vi._invalidate_video_id_cache()
+
+    assert index["vid001"] == "2026-01-01-Zebra"
+
+
 # ---------------------------------------------------------------------------
 # Cleanup: dedupe subcommand
 # ---------------------------------------------------------------------------

@@ -2819,7 +2819,7 @@ def _load_video_id_index(channel_dir: Path) -> dict[str, str]:
         return _VIDEO_ID_CACHE[key]
     index: dict[str, str] = {}
     if channel_dir.exists():
-        for meta_path in sorted(channel_dir.glob("*.meta.json")):
+        for meta_path in sorted(channel_dir.glob("*.meta.json"), key=lambda p: p.name):
             try:
                 data = json.loads(meta_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
@@ -2830,7 +2830,9 @@ def _load_video_id_index(channel_dir: Path) -> dict[str, str]:
                 # First-wins over a SORTED walk (issue #276): the first meta in
                 # sorted FILE NAME order claiming this video_id is the prevention
                 # path's canonical, the same on every run instead of whatever the
-                # filesystem enumerated first. File name, not prefix: when one
+                # filesystem enumerated first. The key is the name STRING, so the
+                # order is by code point on every OS (Path objects compare
+                # case-insensitively on Windows). File name, not prefix: when one
                 # slug extends another (a title that gained a suffix), the longer
                 # name sorts first because '-' sorts before the '.' of
                 # '.meta.json'. dedupe picks the true canonical separately
