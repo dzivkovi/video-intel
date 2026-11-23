@@ -2915,6 +2915,42 @@ def _invalidate_video_id_cache(channel_dir: Path | None = None) -> None:
         _VIDEO_ID_CACHE.pop(str(channel_dir), None)
 
 
+def _strict_video_id_claimant(channel_dir: Path, video_id: str) -> tuple[str | None, list[str]]:
+    """Find the meta that claims ``video_id``, and say whether the search was complete (issue #277).
+
+    Returns ``(prefix, unreadable)``: the first claimant in the same sorted
+    file-name order ``_load_video_id_index`` uses (first wins), or None, plus
+    the names of files that could not be read (``OSError``), decoded or parsed
+    (``ValueError``), or that parsed to something other than an object. An
+    empty ``unreadable`` means the walk was complete.
+
+    The index cannot answer "nothing claims this id": it skips exactly those
+    files, so a claiming meta whose read fails at that moment looks absent.
+    This is the strict walk a writer needs before it CREATES a meta. A
+    non-string ``video_id`` in some other meta is simply not a claimant. An
+    unreadable file or folder is reported, never raised. Used only by
+    ``_record_transcript_error``'s ``video`` branch.
+    """
+    unreadable: list[str] = []
+    try:
+        candidates = sorted(channel_dir.glob("*.meta.json"), key=lambda p: p.name)
+    except OSError:
+        return None, [channel_dir.name]
+    for meta_path in candidates:
+        try:
+            data = json.loads(meta_path.read_bytes().decode("utf-8"))
+        except (OSError, ValueError):
+            unreadable.append(meta_path.name)
+            continue
+        if not isinstance(data, dict):
+            unreadable.append(meta_path.name)
+            continue
+        claimed = data.get("video_id")
+        if isinstance(claimed, str) and claimed == video_id:
+            return meta_path.name.removesuffix(".meta.json"), unreadable
+    return None, unreadable
+
+
 # ---------------------------------------------------------------------------
 # YouTube Shorts classification
 # ---------------------------------------------------------------------------
@@ -4385,7 +4421,11 @@ def _finish_chunked_transcript(
             # failure it was trying to recover from. Record it, then re-raise
             # unchanged so every caller sees exactly what it saw before.
             if status.startswith("error"):
-                _record_transcript_error(meta_path, failure_note, video=video, channel_dir=channel_dir)
+                try:
+                    _record_transcript_error(meta_path, failure_note, video=video, channel_dir=channel_dir)
+                except Exception as record_exc:
+                    # Never let the record mask the captions exception.
+                    log.warning("    %s: could not record the chunked failure (%r)", prefix, record_exc)
             raise
         if fb is not None:
             _, captions_status = fb
@@ -4423,9 +4463,13 @@ def _finish_chunked_transcript(
         # is the chunked writer's OWN path [core: writer's-path], but that alone
         # does not make creating it safe: on a rotated title the caller's prefix
         # is the new slug while an older meta still claims the video_id. The
-        # recorder creates a meta only when nothing in the folder claims the id,
-        # and otherwise records on the claiming meta.
-        _record_transcript_error(meta_path, failure_note, video=video, channel_dir=channel_dir)
+        # recorder creates a meta only when a complete strict walk finds no claim
+        # on the id, and otherwise records on the claiming meta. A recording failure must
+        # never replace the status this tail returns.
+        try:
+            _record_transcript_error(meta_path, failure_note, video=video, channel_dir=channel_dir)
+        except Exception as record_exc:
+            log.warning("    %s: could not record the chunked failure (%r)", prefix, record_exc)
     return status
 
 
@@ -6599,11 +6643,13 @@ def _record_transcript_error(
     a key is absent or empty, never overwritten [core: identity #66]: a re-stamp
     must not replace the title the artifacts are named after with a rotated one
     (same rule as ``stamp_video_topics``). When ``meta_path`` does not exist, the
-    folder's video_id index is consulted first: if another prefix already claims
-    this id (a title rotation - scan and ``transcript --url`` hand in the NEW
-    title's prefix), the failure is recorded on THAT meta. A meta is created only
-    when nothing in the folder claims the id, because a second meta for one
-    video_id can win the first-wins index and re-queue paid work.
+    folder is walked strictly first (``_strict_video_id_claimant``): if another
+    prefix already claims this id (a title rotation - scan and ``transcript
+    --url`` hand in the NEW title's prefix), the failure is recorded on THAT
+    meta. A meta is created only when the walk was complete and nothing claims
+    the id, because a second meta for one video_id can win the first-wins index
+    and re-queue paid work. An incomplete walk records nothing (one WARNING):
+    no duplicate is preferred over the record.
 
     The no-``video`` read never raises [core: #124 read-guard]. The ``video``
     branch is a deliberate exception: it reads with ``raise_on_os_error=True``
@@ -6626,12 +6672,21 @@ def _record_transcript_error(
     created = False
     try:
         if not meta_path.exists() and video.get("video_id"):
-            # Fresh read, not the scan's cached index: a meta written earlier in
-            # this run must count as a claim.
-            _invalidate_video_id_cache(folder)
-            claimed = _load_video_id_index(folder).get(video["video_id"])
+            # A strict walk, not the (possibly cached, always lenient) index: a
+            # claimant whose read fails right now must not look absent.
+            claimed, unreadable = _strict_video_id_claimant(folder, video["video_id"])
             if claimed:
                 meta_path = folder / f"{claimed}.meta.json"
+            elif unreadable:
+                log.warning(
+                    "  not recording transcript failure: would create %s, but %s could not be read and may "
+                    "already claim %s (no duplicate meta is preferred over the record): %s",
+                    meta_path.name,
+                    ", ".join(unreadable),
+                    video["video_id"],
+                    error,
+                )
+                return
         created = not meta_path.exists()
         meta = _read_meta_best_effort(meta_path, raise_on_os_error=True)
         for key, value in _transcript_identity_fields(video, channel_dir).items():
@@ -6643,7 +6698,6 @@ def _record_transcript_error(
     except (OSError, ValueError) as exc:
         # An error path must not replace the failure it records with a
         # traceback: on `transcript --url` nothing above the tail catches it.
-        # ValueError covers an index read that hits an undecodable meta.
         log.warning("  could not record transcript failure in %s (%s): %s", meta_path.name, exc, error)
         return
     if created:

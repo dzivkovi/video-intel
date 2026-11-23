@@ -427,7 +427,8 @@ def _seed_old(cdir):
 def _metas_claiming_the_id(cdir):
     out = []
     for p in sorted(cdir.glob("*.meta.json")):
-        if json.loads(p.read_text(encoding="utf-8")).get("video_id") == VIDEO_ID:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and data.get("video_id") == VIDEO_ID:
             out.append(p.name)
     return out
 
@@ -536,6 +537,180 @@ class TestTitleRotationKeepsOneMetaPerVideo:
 
         assert len(wired.gemini_calls) == 2
         _assert_one_meta_on_the_old_prefix(wired.cdir)
+
+
+class TestStrictWalkMatchesTheIndex:
+    """Drift guard [core: one-definition]: on a readable folder the strict walk picks the index's claimant."""
+
+    def test_claimant_equals_the_index_on_a_fully_readable_folder(self, tmp_path):
+        cdir = tmp_path / "alpha"
+        cdir.mkdir()
+        metas = {
+            "2026-08-12-b-talk": {"video_id": VIDEO_ID, "title": "B"},
+            "2026-08-12-a-talk": {"video_id": VIDEO_ID, "title": "A"},
+            # '-' sorts before the '.' of '.meta.json', so this name comes first.
+            "2026-08-12-a-talk-extended": {"video_id": VIDEO_ID, "title": "A extended"},
+            "2026-08-12-other": {"video_id": "zzzzzzzzzzz"},
+            "2026-08-12-no-id": {"title": "no id"},
+        }
+        for prefix, data in metas.items():
+            (cdir / f"{prefix}.meta.json").write_text(json.dumps(data), encoding="utf-8")
+        vi._invalidate_video_id_cache()
+        index = vi._load_video_id_index(cdir)
+
+        for vid in (VIDEO_ID, "zzzzzzzzzzz", "missing0000"):
+            claimant, unreadable = vi._strict_video_id_claimant(cdir, vid)
+            assert claimant == index.get(vid), vid
+            assert unreadable == [], vid
+
+        # Companion: the comparison is not vacuous, several metas claim the id.
+        assert vi._strict_video_id_claimant(cdir, VIDEO_ID)[0] == "2026-08-12-a-talk-extended"
+        vi._invalidate_video_id_cache()
+
+    def test_unreadable_shapes_make_the_walk_incomplete_and_a_list_id_does_not(self, tmp_path):
+        cdir = tmp_path / "alpha"
+        cdir.mkdir()
+        (cdir / "a-list.meta.json").write_text("[]", encoding="utf-8")
+        (cdir / "b-torn.meta.json").write_bytes(b'{"video_id": "abc')
+        (cdir / "c-bad-utf8.meta.json").write_bytes(b'{"title": "\xd0')  # lead byte of a 2-byte char, torn
+        (cdir / "d-list-id.meta.json").write_text(json.dumps({"video_id": ["x"]}), encoding="utf-8")
+
+        claimant, unreadable = vi._strict_video_id_claimant(cdir, VIDEO_ID)
+
+        assert claimant is None
+        assert unreadable == ["a-list.meta.json", "b-torn.meta.json", "c-bad-utf8.meta.json"]
+
+
+def _capturing_captions_raise(raised: list):
+    def captions_raise(video_id, *, reason_sink=None):
+        exc = _NetDown("network unreachable")
+        raised.append(exc)
+        raise exc
+
+    return captions_raise
+
+
+def _late_file(monkeypatch, path, payload: str):
+    """Write `payload` to `path` as the shared tail starts: a meta that appears mid-run."""
+    real_tail = vi._finish_chunked_transcript
+
+    def tail_with_late_file(*args, **kwargs):
+        path.write_text(payload, encoding="utf-8")
+        return real_tail(*args, **kwargs)
+
+    monkeypatch.setattr(vi, "_finish_chunked_transcript", tail_with_late_file)
+
+
+class TestUnreadableClaimantNeverGetsADuplicate:
+    def test_old_meta_unreadable_while_recording_leaves_one_meta_untouched(self, wired, monkeypatch, caplog):
+        _seed_old(wired.cdir)
+        old = wired.cdir / f"{OLD_PREFIX}.meta.json"
+        before = old.read_bytes()
+        armed = {"on": False}
+        real_read_bytes, real_read_text = vi.Path.read_bytes, vi.Path.read_text
+
+        def read_bytes(self):
+            if armed["on"] and self.name == old.name:
+                raise OSError("stub transient read failure")
+            return real_read_bytes(self)
+
+        def read_text(self, *args, **kwargs):
+            if armed["on"] and self.name == old.name:
+                raise OSError("stub transient read failure")
+            return real_read_text(self, *args, **kwargs)
+
+        real_record = vi._record_transcript_error
+
+        def arm_while_recording(*args, **kwargs):
+            armed["on"] = True
+            try:
+                return real_record(*args, **kwargs)
+            finally:
+                armed["on"] = False
+
+        monkeypatch.setattr(vi.Path, "read_bytes", read_bytes)
+        monkeypatch.setattr(vi.Path, "read_text", read_text)
+        monkeypatch.setattr(vi, "_record_transcript_error", arm_while_recording)
+        caplog.set_level("WARNING")
+
+        vi.cmd_transcript(_args(title=NEW_TITLE), CONFIG_GEMINI)
+
+        assert len(wired.gemini_calls) == 2
+        assert sorted(p.name for p in wired.cdir.glob("*.meta.json")) == [old.name]
+        assert old.read_bytes() == before
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert any(old.name in m and "would create" in m and ALL_FAILED in m for m in warnings), warnings
+
+
+class TestAMalformedMetaNeverMasksTheCaptionsException:
+    def test_list_meta_appearing_mid_run_makes_the_walk_incomplete(self, wired, monkeypatch, caplog):
+        raised: list = []
+        monkeypatch.setattr(vi, "fetch_english_captions", _capturing_captions_raise(raised))
+        wired.cdir.mkdir()
+        _late_file(monkeypatch, wired.cdir / "2026-08-12-other.meta.json", "[]")
+        caplog.set_level("WARNING")
+
+        with pytest.raises(_NetDown) as exc:
+            vi.cmd_transcript(_args(), CONFIG_AUTO)
+
+        assert exc.value is raised[0]
+        assert not (wired.cdir / f"{PREFIX}.meta.json").exists()
+        assert _metas_claiming_the_id(wired.cdir) == []
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert any("2026-08-12-other.meta.json" in m and "would create" in m for m in warnings), warnings
+
+    def test_list_video_id_meta_appearing_mid_run_is_not_a_claimant(self, wired, monkeypatch):
+        raised: list = []
+        monkeypatch.setattr(vi, "fetch_english_captions", _capturing_captions_raise(raised))
+        wired.cdir.mkdir()
+        _late_file(monkeypatch, wired.cdir / "2026-08-12-other.meta.json", json.dumps({"video_id": ["x"]}))
+
+        with pytest.raises(_NetDown) as exc:
+            vi.cmd_transcript(_args(), CONFIG_AUTO)
+
+        assert exc.value is raised[0]
+        _assert_failure_recorded(wired.cdir)
+
+
+def _recording_explodes(*_args, **_kwargs):
+    raise RuntimeError("unexpected recorder failure")
+
+
+class TestARecordingFailureNeverMasksTheOutcome:
+    def test_captions_exception_still_propagates(self, wired, monkeypatch, caplog):
+        raised: list = []
+        monkeypatch.setattr(vi, "fetch_english_captions", _capturing_captions_raise(raised))
+        monkeypatch.setattr(vi, "_strict_video_id_claimant", _recording_explodes)
+        caplog.set_level("WARNING")
+
+        with pytest.raises(_NetDown) as exc:
+            vi.cmd_transcript(_args(), CONFIG_AUTO)
+
+        assert exc.value is raised[0]
+        assert "could not record the chunked failure" in caplog.text
+        assert "unexpected recorder failure" in caplog.text
+
+    def test_the_tail_still_returns_its_status(self, wired, monkeypatch, caplog):
+        monkeypatch.setattr(vi, "_strict_video_id_claimant", _recording_explodes)
+        caplog.set_level("WARNING")
+        wired.cdir.mkdir()
+        status = "error: all chunks failed parsing (raw sidecars saved)"
+
+        result = vi._finish_chunked_transcript(
+            status,
+            video=dict(_VIDEO),
+            channel_dir=wired.cdir,
+            prefix=PREFIX,
+            transcript_source="gemini",
+            captions_already_tried=False,
+            force=False,
+            duration_seconds=3600,
+            chunk_minutes=30,
+        )
+
+        assert result == status
+        assert "could not record the chunked failure" in caplog.text
+        assert vi.cmd_transcript(_args(), CONFIG_GEMINI) is None
 
 
 class TestRecordTranscriptErrorContract:
