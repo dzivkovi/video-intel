@@ -34,6 +34,7 @@ LIVING_DOCS = [
     "INSTALLATION.md",
     "docs/translate-bcs.md",
     "docs/testing.md",
+    "docs/model-benchmark-runbook.md",
     "docs/troubleshooting.md",
     "docs/reading-layer.md",
     "docs/cost-model.md",

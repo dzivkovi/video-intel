@@ -17,6 +17,12 @@
 #
 # Adding a fixture is cheap and encouraged. Removing one needs a reason - each is
 # here because it represents a way the transcript step has actually degraded.
+#
+# Optional per fixture (both default to true): a roll that returns no speakers
+# or no screen_content is a hard fail unless the fixture says it does not expect
+# them. Set expects_screen: false on a fixture with little or nothing on screen.
+#   expects_speakers: true
+#   expects_screen: false
 
 defaults:
   segment_seconds: 600

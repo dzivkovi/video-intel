@@ -255,6 +255,7 @@ If you allow the same "close enough" window for both, a mindmap-sourced answer l
 
 ## See Also
 
+- [Model and prompt benchmark runbook](model-benchmark-runbook.md) - what to run when a new Gemini model or a transcript prompt candidate arrives, and how to read the verdict `scripts/model_eval.py` prints.
 - [ADR-0017 — Staged KB-Layer Strategy](adr/ADR-0017-kb-layer-strategy.md)
 - [ADR-0013 — Hybrid Search RRF Fusion](adr/ADR-0013-hybrid-search-rrf-fusion.md)
 - [`docs/search-internals.md`](search-internals.md) — retrieval pipeline
