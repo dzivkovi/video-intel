@@ -161,7 +161,6 @@ def _scan_setup_with_transcript(monkeypatch, videos, durations=None):
     monkeypatch.setattr(vi, "enrich_with_durations", fake_enrich)
     # Issue #70: stub the new pre-flight metadata call (keep all videos).
     monkeypatch.setattr(vi, "fetch_preflight_status", lambda _yt, ids: {vid: {} for vid in ids})
-    monkeypatch.setattr(vi, "_is_youtube_short_url", lambda video_id: False)
 
     captured = {"mindmaps": [], "transcripts": [], "chunked": []}
 
@@ -510,7 +509,6 @@ class TestPerModeSkipAutoConcepts:
         monkeypatch.setattr(vi, "get_channel_id", lambda yt, url: ("chid", "ChTitle"))
         monkeypatch.setattr(vi, "fetch_channel_videos", lambda yt, cid, since: [])
         monkeypatch.setattr(vi, "enrich_with_durations", lambda _yt, ids: dict.fromkeys(ids))
-        monkeypatch.setattr(vi, "_is_youtube_short_url", lambda video_id: False)
 
         captured = {"concepts": []}
 
@@ -557,7 +555,6 @@ class TestPerModeSkipAutoConcepts:
         monkeypatch.setattr(vi, "get_channel_id", lambda yt, url: ("chid", "ChTitle"))
         monkeypatch.setattr(vi, "fetch_channel_videos", lambda yt, cid, since: [])
         monkeypatch.setattr(vi, "enrich_with_durations", lambda _yt, ids: dict.fromkeys(ids))
-        monkeypatch.setattr(vi, "_is_youtube_short_url", lambda video_id: False)
 
         captured = {"concepts": []}
 
@@ -1067,7 +1064,6 @@ class TestSkipVideoIdsConfig:
         monkeypatch.setattr(vi, "create_client", lambda *a, **kw: None)
         monkeypatch.setattr(vi, "get_channel_id", lambda yt, url: ("chid", "ChTitle"))
         monkeypatch.setattr(vi, "fetch_channel_videos", lambda yt, cid, since: list(videos))
-        monkeypatch.setattr(vi, "_is_youtube_short_url", lambda video_id: False)
 
         enrich_calls: list = []
 

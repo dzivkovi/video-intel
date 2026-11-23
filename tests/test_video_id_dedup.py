@@ -1025,10 +1025,9 @@ def test_scan_dry_run_does_not_call_alt_title_recorder(tmp_path, monkeypatch):
     # Unit 3 (skip-shorts) added an enrich_with_durations call inside cmd_scan
     # that runs regardless of dry_run. Stub it so these tests don't crash on
     # the None youtube client. Returning all-None durations means is_short()
-    # falls through to the URL check, which is also stubbed below.
+    # falls through to the URL check, which conftest's no_shorts_probe pins off.
     monkeypatch.setattr(vi, "enrich_with_durations", lambda _yt, ids: dict.fromkeys(ids))
     monkeypatch.setattr(vi, "fetch_preflight_status", lambda _yt, ids: {vid: {} for vid in ids})
-    monkeypatch.setattr(vi, "_is_youtube_short_url", lambda _vid: False)
 
     rotated = [{"video_id": "v1", "title": "Rotated", "published": "2026-04-15"}]
     monkeypatch.setattr(vi, "fetch_channel_videos", lambda yt, cid, since: rotated)
@@ -1086,10 +1085,9 @@ def test_scan_without_dry_run_calls_alt_title_recorder_on_rotation(tmp_path, mon
     # Unit 3 (skip-shorts) added an enrich_with_durations call inside cmd_scan
     # that runs regardless of dry_run. Stub it so these tests don't crash on
     # the None youtube client. Returning all-None durations means is_short()
-    # falls through to the URL check, which is also stubbed below.
+    # falls through to the URL check, which conftest's no_shorts_probe pins off.
     monkeypatch.setattr(vi, "enrich_with_durations", lambda _yt, ids: dict.fromkeys(ids))
     monkeypatch.setattr(vi, "fetch_preflight_status", lambda _yt, ids: {vid: {} for vid in ids})
-    monkeypatch.setattr(vi, "_is_youtube_short_url", lambda _vid: False)
 
     rotated = [{"video_id": "v1", "title": "Rotated", "published": "2026-04-15"}]
     monkeypatch.setattr(vi, "fetch_channel_videos", lambda yt, cid, since: rotated)

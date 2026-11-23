@@ -209,7 +209,6 @@ class TestScanCanChunk:
         monkeypatch.setattr(vi, "fetch_channel_videos", lambda yt, cid, since: list(videos))
         monkeypatch.setattr(vi, "enrich_with_durations", lambda _yt, ids: dict.fromkeys(ids, duration))
         monkeypatch.setattr(vi, "fetch_preflight_status", lambda _yt, ids: {v: {} for v in ids})
-        monkeypatch.setattr(vi, "_is_youtube_short_url", lambda video_id: False)
         monkeypatch.setattr(vi, "process_mindmap", lambda *a, **kw: ("dense1", "done"))
 
         seen = {"chunked": [], "single": []}
@@ -419,7 +418,6 @@ class TestScanSurvivesABadChunkMinutes:
         monkeypatch.setattr(vi, "fetch_channel_videos", lambda yt, cid, since: list(videos))
         monkeypatch.setattr(vi, "enrich_with_durations", lambda _yt, ids: dict.fromkeys(ids, "PT10M"))
         monkeypatch.setattr(vi, "fetch_preflight_status", lambda _yt, ids: {v: {} for v in ids})
-        monkeypatch.setattr(vi, "_is_youtube_short_url", lambda _v: False)
         seen = []
         monkeypatch.setattr(vi, "process_mindmap", lambda *a, **kw: (seen.append(a[2]["video_id"]), ("p", "done"))[1])
         monkeypatch.setattr(vi, "process_transcript", lambda *a, **kw: ("p", "done"))

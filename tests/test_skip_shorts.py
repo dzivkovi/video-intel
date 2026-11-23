@@ -373,10 +373,6 @@ def _scan_setup(monkeypatch, videos, durations=None, raise_on_enrich=None):
     # Issue #70: cmd_scan now calls fetch_preflight_status right after enrich;
     # stub it to empty status (keep all) so these tests' behavior is unchanged.
     monkeypatch.setattr(vi, "fetch_preflight_status", lambda _yt, ids: {vid: {} for vid in ids})
-    # Default URL check returns False (long-form) so cmd_scan tests don't hit
-    # real YouTube. Tests that want a "short via URL" decision pass durations
-    # under 60s so the duration short-circuit fires before the URL check.
-    monkeypatch.setattr(vi, "_is_youtube_short_url", lambda video_id: False)
 
     captured = {"processed": []}
 
@@ -481,7 +477,6 @@ class TestCmdScanSkipShorts:
         monkeypatch.setattr(vi, "create_client", lambda *a, **kw: None)
         monkeypatch.setattr(vi, "get_channel_id", lambda yt, url: ("chid", "ChTitle"))
         monkeypatch.setattr(vi, "fetch_channel_videos", fake_fetch)
-        monkeypatch.setattr(vi, "_is_youtube_short_url", lambda video_id: False)
 
         # First enrich call raises quota HttpError; second succeeds.
         enrich_state = {"n": 0}
@@ -768,8 +763,6 @@ class TestPruneShorts:
 
     def test_long_form_video_not_deleted(self, tmp_path, monkeypatch):
         _prune_setup(monkeypatch)
-        # also stub _is_youtube_short_url so this test is offline-clean
-        monkeypatch.setattr(vi, "_is_youtube_short_url", lambda video_id: False)
         ch = tmp_path / "ch1"
         _write_meta(
             ch,
@@ -792,8 +785,6 @@ class TestPruneShorts:
 
     def test_legacy_meta_without_duration_seconds_triggers_enrich(self, tmp_path, monkeypatch):
         _prune_setup(monkeypatch)
-        # Stub out the network-bound URL check too
-        monkeypatch.setattr(vi, "_is_youtube_short_url", lambda video_id: False)
 
         enrich_calls = {"video_ids": []}
 

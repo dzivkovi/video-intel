@@ -666,7 +666,6 @@ class _ScanEnvironment:
         monkeypatch.setattr(vi, "fetch_channel_videos", lambda yt, cid, since: list(videos_by_channel_url.get(cid, [])))
         monkeypatch.setattr(vi, "enrich_with_durations", lambda _yt, ids: dict.fromkeys(ids))
         monkeypatch.setattr(vi, "fetch_preflight_status", lambda _yt, ids: {vid: {} for vid in ids})
-        monkeypatch.setattr(vi, "_is_youtube_short_url", lambda video_id: False)
         monkeypatch.setattr(
             vi, "process_transcript", _RaisesIfCalled("process_transcript") if dry_run else self._fake_transcript
         )

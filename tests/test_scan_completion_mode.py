@@ -133,10 +133,6 @@ class TestCallerLevel:
             monkeypatch.setattr(vi, "backup_config_if_changed", lambda *_a, **_k: None)
             monkeypatch.setattr(vi, "record_alt_title_if_rotated", lambda *_a, **_k: False)
             monkeypatch.setattr(vi, "render_headline_digest", lambda *_a, **_k: None)
-            # is_short() makes a live HEAD request to youtube.com/shorts/<id>
-            # for ids it cannot classify from duration. Unstubbed, this class
-            # reaches the network and becomes load-sensitive.
-            monkeypatch.setattr(vi, "is_short", lambda *_a, **_k: False)
 
             def record_mindmap(*a, **k):
                 submitted.append(k.get("prefix") or "called")
