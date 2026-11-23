@@ -274,6 +274,22 @@ def cell_measured_its_window(row: dict) -> bool:
     return row.get("window_exceeded") is not True
 
 
+def served_label(model: str, rows: list[dict]) -> str:
+    """``model`` in backticks, plus ``(served X)`` when its cells were answered by another model.
+
+    Issue #295: a verdict between two names that one model served measures that
+    model against itself, so the line that compares them must say so.
+    """
+    served = sorted(
+        {
+            r["model_served"]
+            for r in rows
+            if r.get("model") == model and served_model_differs(model, r.get("model_served"))
+        }
+    )
+    return f"`{model}` (served {', '.join(served)})" if served else f"`{model}`"
+
+
 def render(rows: list[dict], models: list[str], manifest: dict, incumbent: str | None) -> str:
     stamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
     out = [f"# Model scorecard - {', '.join(models)}", "", f"Generated {stamp} by `scripts/model_eval.py`.", ""]
@@ -355,7 +371,7 @@ def render(rows: list[dict], models: list[str], manifest: dict, incumbent: str |
             c_old = [r["cost_per_video_hour"] for r in theirs if r["cost_per_video_hour"]]
             am = lambda xs: round(sum(xs) / len(xs), 3) if xs else None  # noqa: E731
             out.append(
-                f"- `{m}` vs `{incumbent}`: mean max_gap "
+                f"- {served_label(m, rows)} vs {served_label(incumbent, rows)}: mean max_gap "
                 f"**{am(g_new)}s** vs {am(g_old)}s; mean cost/video-hour "
                 f"**${am(c_new)}** vs ${am(c_old)}."
             )

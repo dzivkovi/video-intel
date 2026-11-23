@@ -446,3 +446,222 @@ class TestModelEvalScorecard:
 
         assert f"{REQUESTED} (served {SERVED})" in card
         assert f"{SERVED} (served" not in card
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups: guards that a mutation could otherwise remove unnoticed
+# ---------------------------------------------------------------------------
+
+
+class _TextRaises:
+    """A response whose callback fires normally but whose ``.text`` raises."""
+
+    model_version = SERVED
+    candidates = None
+    usage_metadata = None
+
+    @property
+    def text(self):
+        raise RuntimeError("404 NOT_FOUND: CachedContent not found")
+
+
+class _FakePromptCache:
+    def __init__(self) -> None:
+        self.invalidated = False
+
+    def prompt_for(self, model, taxonomy_concepts):
+        return "cachedContents/c1", ""
+
+    def invalidate(self) -> None:
+        self.invalidated = True
+
+
+class _CacheThenInlineClient:
+    """The cached call answers (callback fires with SERVED) and then fails; the inline retry answers."""
+
+    def __init__(self, inline_response: SimpleNamespace) -> None:
+        self.inline_response = inline_response
+        self.models = SimpleNamespace(generate_content=self._generate)
+
+    def _generate(self, model, contents, config):
+        return _TextRaises() if config.cached_content else self.inline_response
+
+
+class TestConceptsRetireAndRetry:
+    _BODY = TestConcepts._BODY
+
+    def test_process_concepts_unreadable_rerun_drops_previous_served(self, tmp_path):
+        TestConcepts._run(tmp_path, FakeClient(_response(self._BODY)))
+        meta_path = tmp_path / "chan" / "2026-01-02-a-talk.meta.json"
+        assert _meta(meta_path)["concepts_model_served"] == SERVED
+
+        _, status = TestConcepts._run(tmp_path, FakeClient(_response(self._BODY, _MISSING)))
+
+        assert status.startswith("done")
+        assert "concepts_model_served" not in _meta(meta_path)
+
+    def _run_cached_then_inline(self, tmp_path):
+        cache = _FakePromptCache()
+        prefix, status = vi.process_concepts(
+            _CacheThenInlineClient(_response(self._BODY, _MISSING)),
+            genai_types,
+            _video(),
+            "## Topic\n",
+            {"version": 1, "concepts": {}},
+            REQUESTED,
+            tmp_path,
+            "chan",
+            force=True,
+            prompt_cache=cache,
+        )
+        assert cache.invalidated, "the cached call must have failed into the inline retry"
+        assert status.startswith("done"), status
+        return _meta(tmp_path / "chan" / f"{prefix}.meta.json")
+
+    def test_failed_cached_call_served_model_is_not_credited_to_the_inline_retry(self, tmp_path):
+        meta = self._run_cached_then_inline(tmp_path)
+
+        assert "concepts_model_served" not in meta
+
+    def test_inline_callback_failing_before_capture_cannot_inherit_the_cached_value(self, tmp_path, monkeypatch):
+        real = vi.log_usage_metadata
+        calls = {"n": 0}
+
+        def flaky(response, label):
+            calls["n"] += 1
+            if calls["n"] == 2:  # the inline retry's callback dies before the capture runs
+                raise RuntimeError("callback broke")
+            return real(response, label)
+
+        monkeypatch.setattr(vi, "log_usage_metadata", flaky)
+
+        meta = self._run_cached_then_inline(tmp_path)
+
+        assert "concepts_model_served" not in meta
+
+    def test_capture_served_model_unreadable_removes_a_stale_value(self):
+        capture = {vi.SERVED_MODEL_CAPTURE_KEY: SERVED, "prompt": 10}
+
+        vi._capture_served_model(SimpleNamespace(), capture, requested=REQUESTED, mode="concepts")
+
+        assert capture == {"prompt": 10}
+
+
+class TestWarningRule:
+    def test_served_equal_to_requested_records_value_without_warning(self, tmp_path, caplog):
+        client = FakeClient(_response(_transcript_payload([0, 1, 2, 3]), REQUESTED))
+
+        _run_single_shot(tmp_path, client)
+
+        assert _meta(tmp_path / "chan" / "2026-01-02-a-talk.meta.json")["transcript_model_served"] == REQUESTED
+        assert _mismatch_warnings(caplog) == []
+
+    def test_models_prefixed_and_bare_request_warn_once_for_one_redirect(self, caplog):
+        for requested in (f"models/{REQUESTED}", REQUESTED):
+            vi._capture_served_model(SimpleNamespace(model_version=SERVED), {}, requested=requested, mode="transcript")
+
+        assert len(_mismatch_warnings(caplog)) == 1
+
+
+class _ChunkScriptClient:
+    """Each chunk's call either returns a response or raises (``TranscriptTimeout``: no callback fires)."""
+
+    def __init__(self, *script) -> None:
+        self.script = list(script)
+        self.models = SimpleNamespace(generate_content=self._generate)
+
+    def _generate(self, model, contents, config):
+        item = self.script.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+class TestChunkedPerChunkCapture:
+    @staticmethod
+    def _run(tmp_path: Path, client) -> str:
+        return vi._run_chunked_transcript_url(
+            client=client,
+            types=genai_types,
+            video=_video(),
+            prompt_text="P",
+            model=REQUESTED,
+            channel_dir=tmp_path / "chan",
+            prefix="p",
+            chunks=[(0, 600), (600, 1200), (1200, 1800)],
+            duration_seconds=1800,
+            chunk_minutes=10,
+            force=True,
+        )
+
+    def test_a_chunk_whose_call_did_not_return_contributes_nothing(self, tmp_path):
+        client = _ChunkScriptClient(
+            _response(_transcript_payload([0, 2, 4, 6, 8]), SERVED),
+            vi.TranscriptTimeout("chunk 2 hung"),
+            _response(_transcript_payload([20, 22, 24, 26, 28]), OTHER_SERVED),
+        )
+
+        self._run(tmp_path, client)
+
+        assert _meta(tmp_path / "chan" / "p.meta.json")["transcript_model_served"] == f"{SERVED},{OTHER_SERVED}"
+
+    def test_only_the_returning_chunk_is_recorded(self, tmp_path):
+        client = _ChunkScriptClient(
+            _response(_transcript_payload([0, 2, 4, 6, 8]), SERVED),
+            vi.TranscriptTimeout("chunk 2 hung"),
+            vi.TranscriptTimeout("chunk 3 hung"),
+        )
+
+        self._run(tmp_path, client)
+
+        assert _meta(tmp_path / "chan" / "p.meta.json")["transcript_model_served"] == SERVED
+
+    def test_each_chunk_has_its_own_capture_so_a_later_chunk_never_inherits_an_earlier_one(self, tmp_path):
+        # Chunk 1 is discarded by the prompt==0 guard (its call returned, so its
+        # served model still counts). Chunk 2's response carries no usage
+        # metadata, so its callback cannot refill a shared dict: with one dict
+        # hoisted out of the loop, chunk 2 would inherit chunk 1's prompt=0 and
+        # be discarded too, losing every chunk and the meta write with them.
+        no_usage = SimpleNamespace(
+            text=_transcript_payload([10, 12, 14, 16, 18]), candidates=None, usage_metadata=None, model_version=SERVED
+        )
+        client = _ChunkScriptClient(
+            _response(_transcript_payload([0, 2, 4, 6, 8]), OTHER_SERVED, prompt=0),
+            no_usage,
+        )
+
+        vi._run_chunked_transcript_url(
+            client=client,
+            types=genai_types,
+            video=_video(),
+            prompt_text="P",
+            model=REQUESTED,
+            channel_dir=tmp_path / "chan",
+            prefix="p",
+            chunks=[(0, 600), (600, 1200)],
+            duration_seconds=1200,
+            chunk_minutes=10,
+            force=True,
+        )
+
+        meta = _meta(tmp_path / "chan" / "p.meta.json")
+        assert meta["transcript_confabulated_chunks"] == 1
+        assert meta["transcript_model_served"] == f"{SERVED},{OTHER_SERVED}"
+
+
+class TestConceptsProvenanceAndVerdict:
+    def test_concepts_served_model_is_carried_by_dedupe_provenance(self):
+        loser = {"concepts_model_served": SERVED, "concepts_status": "ok"}
+
+        assert vi._mode_provenance_fields("concepts", loser) == {"concepts_model_served": SERVED}
+
+    def test_verdict_line_names_the_served_model_of_each_side(self):
+        base = model_eval.score(_transcript_payload([10, 11]), {"prompt": 10}, REQUESTED, 600, None, start_secs=600)
+        candidate = {**base, "fixture": "fx1", "model": REQUESTED, "model_served": SERVED}
+        incumbent = {**base, "fixture": "fx1", "model": SERVED, "model_served": SERVED}
+        manifest = {"fixtures": [{"id": "fx1", "facet": "a"}]}
+
+        card = model_eval.render([candidate, incumbent], [REQUESTED, SERVED], manifest, SERVED)
+
+        verdict = card.split("## Verdict", 1)[1]
+        assert f"- `{REQUESTED}` (served {SERVED}) vs `{SERVED}`: mean max_gap" in verdict

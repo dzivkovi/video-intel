@@ -176,8 +176,12 @@ def log_usage_metadata(response: object, label: str) -> dict | None:
 _MODELS_PREFIX = "models/"
 
 
-def _bare_model_name(name: str) -> str:
-    """``name`` stripped of whitespace and a leading ``models/``."""
+def bare_model_name(name: str) -> str:
+    """``name`` stripped of whitespace and a leading ``models/`` (issue #295).
+
+    The one normalization the served-model reader, the comparison rule and the
+    warn-once memo all key on [core: one-definition].
+    """
     name = name.strip()
     return name[len(_MODELS_PREFIX) :] if name.startswith(_MODELS_PREFIX) else name
 
@@ -205,7 +209,7 @@ def served_model_from_response(response: object) -> str | None:
     if not isinstance(value, str):
         log.debug("served model unreadable: model_version is %s", type(value).__name__)
         return None
-    bare = _bare_model_name(value)
+    bare = bare_model_name(value)
     if not bare:
         log.debug("served model unreadable: model_version is empty")
         return None
@@ -222,7 +226,7 @@ def served_model_differs(requested: str, served: str | None) -> bool:
     """
     if served is None:
         return False
-    return _bare_model_name(requested) != _bare_model_name(served)
+    return bare_model_name(requested) != bare_model_name(served)
 
 
 # ---------------------------------------------------------------------------

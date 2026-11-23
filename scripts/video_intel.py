@@ -76,6 +76,7 @@ from corpus_walk import (  # noqa: F401 - re-exports
 from corpus_walk import SEVERE_QUALITY_FLAGS as _SEVERE_QUALITY_FLAGS  # noqa: F401
 from gemini_common import (
     MAX_RETRIES_TRANSPORT,
+    bare_model_name,
     build_permissive_safety_settings,
     create_client,
     get_retry_delay,
@@ -3060,7 +3061,8 @@ def _finish_reason_of(response: object) -> str | None:
 #: usage counts, so nothing new is threaded through the call path.
 SERVED_MODEL_CAPTURE_KEY = "served_model"
 
-#: (requested, served) pairs already warned about in this process (issue #295).
+#: (requested, served) pairs already warned about in this process (issue #295),
+#: keyed on the bare names so ``models/X`` and ``X`` are one pair.
 #: One WARNING per distinct pair, not one per call: a redirect applies to every
 #: call in a run, and a line per video would bury everything else in the log.
 _SERVED_MODEL_MISMATCHES_WARNED: set[tuple[str, str]] = set()
@@ -3084,10 +3086,11 @@ def _capture_served_model(response: object, capture: dict, *, requested: str, mo
     capture[SERVED_MODEL_CAPTURE_KEY] = served
     if not served_model_differs(requested, served):
         return
+    pair = (bare_model_name(requested), served)
     with _SERVED_MODEL_MISMATCHES_LOCK:
-        if (requested, served) in _SERVED_MODEL_MISMATCHES_WARNED:
+        if pair in _SERVED_MODEL_MISMATCHES_WARNED:
             return
-        _SERVED_MODEL_MISMATCHES_WARNED.add((requested, served))
+        _SERVED_MODEL_MISMATCHES_WARNED.add(pair)
     log.warning(
         "Gemini served %s for a request naming %s; meta.json records the served model in %s_model_served "
         "when the artifact is written.",
@@ -7269,13 +7272,14 @@ def process_transcript(
         if counts is not None:
             usage_capture.clear()
             usage_capture.update(counts)
-        # After the refill above, which would otherwise wipe the key.
-        _capture_served_model(r, usage_capture, requested=model, mode="transcript")
         # Issue #128: the output-cap check needs the finish reason too, because
         # candidates_token_count can be unreadable on a response that really did
         # truncate (Gemini can also reach MAX_TOKENS with thinking consuming the
         # budget, leaving the candidates count absent entirely).
         finish_capture["reason"] = _finish_reason_of(r)
+        # Last, after the refill above (which would otherwise wipe the key) and
+        # after the finish reason, which nothing here may cost.
+        _capture_served_model(r, usage_capture, requested=model, mode="transcript")
 
     # Issue #120: a livestream VOD gets exactly ONE Gemini call. The parse retry
     # exists for stochastic JSON malformation on a healthy ingest; when the URI
@@ -12744,6 +12748,10 @@ _MINDMAP_PROVENANCE_FIELDS: tuple[str, ...] = (
     "mindmap_model_served",  # issue #295
 )
 
+#: The concepts artifact's provenance (issue #295): which model served the call
+#: that produced the moved `.concepts.json`.
+_CONCEPTS_PROVENANCE_FIELDS: tuple[str, ...] = ("concepts_model_served",)
+
 
 def _mode_provenance_fields(mode: str, loser_data: dict) -> dict:
     """Fields to copy from a loser meta onto canonical when `mode`'s
@@ -12761,6 +12769,8 @@ def _mode_provenance_fields(mode: str, loser_data: dict) -> dict:
         wanted |= {key for key in loser_data if isinstance(key, str) and key.startswith("transcript_")}
     elif mode == "scan":
         wanted = set(_MINDMAP_PROVENANCE_FIELDS)
+    elif mode == "concepts":
+        wanted = set(_CONCEPTS_PROVENANCE_FIELDS)
     else:
         wanted = set()
     return {key: loser_data[key] for key in wanted if key in loser_data}
