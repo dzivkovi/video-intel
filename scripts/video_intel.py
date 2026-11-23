@@ -8748,7 +8748,7 @@ def cmd_scan(args, config):
             # should point there, not here. Without --force the pre-filter
             # below is unchanged (it is already bounded, by construction, to
             # videos lacking a concepts.json).
-            concept_candidates: list[tuple[dict, Path, str]] = []
+            concept_candidates: list[tuple[dict, Path, str, str | None]] = []
             if channel_dir_for_concepts.exists():
                 for meta_file in sorted(channel_dir_for_concepts.glob("*.meta.json")):
                     prefix = meta_file.name[: -len(".meta.json")]
@@ -8773,14 +8773,14 @@ def cmd_scan(args, config):
                         "title": meta.get("title", prefix),
                         "published": meta.get("published", ""),
                     }
-                    concept_candidates.append((synthetic_video, mindmap_path, prefix))
+                    concept_candidates.append((synthetic_video, mindmap_path, prefix, meta.get("prompt")))
 
             if concept_candidates:
                 log.info("  Extracting concepts (%d videos)...", len(concept_candidates))
                 # Two or more calls pay back the one-off cache build; one goes inline.
                 concepts_cache = ConceptsPromptCache(client, types) if len(concept_candidates) > 1 else None
                 try:
-                    for v, mindmap_path, prefix in concept_candidates:
+                    for v, mindmap_path, prefix, source_prompt in concept_candidates:
                         mindmap_text = mindmap_path.read_text(encoding="utf-8")
                         stamp_before = _file_stamp(output_dir / ch_name / f"{prefix}.concepts.json")
                         out_prefix, status = process_concepts(
@@ -8795,15 +8795,18 @@ def cmd_scan(args, config):
                             source_file=mindmap_path.name,
                             # The WRITER's own record, never a re-derivation:
                             # `process_mindmap` stamps `prompt` into meta.json,
-                            # and this loop already parsed that meta a few lines
-                            # above. Re-deriving it from config disagreed with
+                            # and the value for THIS video travels on the
+                            # candidate tuple (issue #287: read off the stale
+                            # collection-loop variable here, every video got
+                            # the LAST candidate's prompt).
+                            # Re-deriving it from config disagreed with
                             # the artifact on 1,004 of 2,383 corpus files (42%),
                             # because a mindmap built from a transcript records
                             # `mindmap-from-transcript` while config says
                             # `mindmap-knowledge`. The sibling `cmd_concepts`
                             # always did this correctly. Measured by the issue
                             # #210 review pass; PR #136's checker/writer rule.
-                            source_prompt=meta.get("prompt"),
+                            source_prompt=source_prompt,
                             force=args.force,
                             prefix=prefix,
                             prompt_cache=concepts_cache,
