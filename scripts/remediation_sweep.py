@@ -148,7 +148,7 @@ def collect_rows(output_dir: Path, only_channel: str | None = None) -> list[dict
             except OSError as e:
                 log.warning("unreadable transcript %s (%s)", tx_path.name, e)
                 continue
-            duration = meta.get("duration_seconds")
+            duration = vi.known_duration_seconds(meta.get("duration_seconds"))
             rows.append(
                 {
                     "channel": channel_dir.name,
@@ -158,8 +158,8 @@ def collect_rows(output_dir: Path, only_channel: str | None = None) -> list[dict
                     "url": meta.get("video_url", ""),
                     "model": meta.get("model"),
                     "transcript_status": meta.get("transcript_status"),
-                    "duration_seconds": duration if isinstance(duration, int) and duration > 0 else None,
-                    "duration_source": "meta" if isinstance(duration, int) and duration > 0 else None,
+                    "duration_seconds": duration,
+                    "duration_source": "meta" if duration is not None else None,
                     "floor_seconds": last_timestamp_seconds(text),
                     "entries": parse_dialogue_entries(text),
                     "bytes": len(text),

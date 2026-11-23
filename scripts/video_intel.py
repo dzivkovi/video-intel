@@ -2986,6 +2986,20 @@ def _parse_iso8601_duration(iso: str | None) -> int | None:
     return hours * 3600 + minutes * 60 + seconds
 
 
+def known_duration_seconds(seconds: object) -> int | None:
+    """``seconds`` when it is a usable stored duration, else None (issue #274).
+
+    The one test for "is this ``duration_seconds`` usable": a positive int.
+    ``bool`` is rejected because ``isinstance(True, int)`` holds and would
+    assess a whole transcript against a one-second video. Shared by the meta
+    writers (via ``_video_duration_seconds``), ``assess-transcripts`` and
+    ``scripts/remediation_sweep.py``.
+    """
+    if isinstance(seconds, int) and not isinstance(seconds, bool) and seconds > 0:
+        return seconds
+    return None
+
+
 def _video_duration_seconds(video: dict) -> int | None:
     """The duration this video dict knows, in seconds, or None (issue #275).
 
@@ -2994,8 +3008,8 @@ def _video_duration_seconds(video: dict) -> int | None:
     scan's dict carries YouTube's ``duration_iso``. A bool, zero, negative or
     non-int ``duration_seconds`` is ignored, never persisted.
     """
-    seconds = video.get("duration_seconds")
-    if isinstance(seconds, int) and not isinstance(seconds, bool) and seconds > 0:
+    seconds = known_duration_seconds(video.get("duration_seconds"))
+    if seconds is not None:
         return seconds
     parsed = _parse_iso8601_duration(video.get("duration_iso"))
     if parsed is not None and parsed > 0:
@@ -7063,7 +7077,7 @@ def _captions_assessment_window(
     if start_offset is None and end_offset is None:
         return None
     lo = start_offset if start_offset is not None else 0
-    known_duration = duration_seconds if isinstance(duration_seconds, int) and duration_seconds > 0 else None
+    known_duration = known_duration_seconds(duration_seconds)
     hi = end_offset if end_offset is not None else known_duration
     if hi is None:
         return None
@@ -13912,24 +13926,6 @@ def cmd_repair_metas(args, config):
 ASSESS_TRANSCRIPTS_MANIFEST = "manifest.csv"
 
 
-def _assessable_duration(meta: dict) -> int | None:
-    """``duration_seconds`` when it is a positive number, else None (unknown).
-
-    ``bool`` is rejected first because ``isinstance(True, int)`` holds and
-    ``int(True) == 1`` would assess a whole transcript against a one-second
-    video. Unknown duration makes the assessor skip gap and density rather
-    than guess, which is the designed fail-safe.
-    """
-    raw = meta.get("duration_seconds")
-    if isinstance(raw, bool) or not isinstance(raw, int | float):
-        return None
-    try:
-        value = int(raw)
-    except (OverflowError, ValueError):
-        return None
-    return value if value > 0 else None
-
-
 def assess_transcript_markdown(text: str, duration_seconds: int | None, *, captions: bool) -> tuple[dict, list[str]]:
     """Assess a transcript on disk: (the six persisted quality fields, sorted flags).
 
@@ -14028,7 +14024,17 @@ def cmd_assess_transcripts(args, config):
     backup_dir = Path(args.backup_dir).expanduser() if apply else None
 
     counts = dict.fromkeys(
-        ("candidates", "clean", "mild", "severe", "demoted", "status_set", "skipped_unparseable", "skipped_no_entries"),
+        (
+            "candidates",
+            "clean",
+            "mild",
+            "severe",
+            "unassessable",
+            "demoted",
+            "status_set",
+            "skipped_unparseable",
+            "skipped_no_entries",
+        ),
         0,
     )
     changed = 0
@@ -14073,16 +14079,36 @@ def cmd_assess_transcripts(args, config):
             counts["skipped_no_entries"] += 1
             log.warning("  %s/%s: transcript unreadable (%s); skipped", channel, prefix, exc)
             continue
-        if not dialogue_entries_from_transcript_markdown(text):
+        entries = dialogue_entries_from_transcript_markdown(text)
+        if not entries:
             # An empty entry list would read as a collapse; it is a parse
             # question, not evidence about the transcript.
             counts["skipped_no_entries"] += 1
             log.warning("  %s/%s: no dialogue entries parsed; skipped", channel, prefix)
             continue
 
+        duration = known_duration_seconds(meta.get("duration_seconds"))
+        if duration is None:
+            # Issue #274: without a duration the gap, density, monolithic and
+            # overrun checks are all gated off, so an empty flag list here is
+            # not a verdict. Nothing is written - not even a partial flag list,
+            # which would read as "assessed and healthy" - and what the
+            # duration-free checks saw is logged so the evidence is not lost.
+            counts["candidates"] += 1
+            counts["unassessable"] += 1
+            metrics = assess_transcript_artifact(entries, None)
+            seen = sorted(set(metrics["severe"]) | set(metrics["mild"]))
+            note = ""
+            if seen:
+                note = f"; note: {', '.join(seen)} seen"
+                if metrics["max_backward_jump_seconds"]:
+                    note += f" (backward jump {metrics['max_backward_jump_seconds']}s)"
+            log.info("  %s/%s: unassessable (unknown duration)%s", channel, prefix, note)
+            continue
+
         fields, flags = assess_transcript_markdown(
             text,
-            _assessable_duration(meta),
+            duration,
             captions=meta.get("transcript_source") == TRANSCRIPT_SOURCE_CAPTIONS,
         )
         severe = transcript_quality_flags_are_severe(flags)
@@ -14116,18 +14142,25 @@ def cmd_assess_transcripts(args, config):
 
     tail = f"applied, backups in {backup_dir}" if apply else "dry run"
     log.info(
-        "assess-transcripts: candidates=%d clean=%d mild=%d severe=%d demoted=%d status_set=%d "
+        "assess-transcripts: candidates=%d clean=%d mild=%d severe=%d unassessable=%d demoted=%d status_set=%d "
         "skipped_unparseable=%d skipped_no_entries=%d (%s)",
         counts["candidates"],
         counts["clean"],
         counts["mild"],
         counts["severe"],
+        counts["unassessable"],
         counts["demoted"],
         counts["status_set"],
         counts["skipped_unparseable"],
         counts["skipped_no_entries"],
         tail,
     )
+    if counts["unassessable"]:
+        log.info(
+            "%d transcript(s) have no usable `duration_seconds` (a positive whole number of seconds) and were not "
+            "judged; store one in their meta.json and re-run.",
+            counts["unassessable"],
+        )
     return counts
 
 

@@ -49,7 +49,7 @@ Two paths judging the same entry with private predicates drift, invisibly to any
 - A guard against silent incompleteness reads its control keys with required access. `missing_pipeline_artifacts` reads `step["requested"]`, so a misspelled key raises instead of quietly dropping a step from the check. `.get(default)` is right only where the default is the correct answer for every caller, as with its optional `quality_severe` key.
 - Keep "could not determine" apart from "clean" or "absent". `scripts/remediation_sweep.py` puts a transcript with no known duration in an `unassessable` bucket, never `clean`, because without a duration the gap, density and monolithic checks are all gated off. Manual `--url` channel resolution (issue #205, `.claude/rules/scan-config.md` item 9) logs a line when a lookup raised for a request-wide reason such as quota or a bad key, instead of silently routing as "unconfigured", and a companion test proves a genuine no-match does not carry that line.
 - Converting a per-item exception into log-and-continue changes the economics of every batch driver above it. `scripts/remediation_run.py` stops after `--max-consecutive-failures` (default 3) hard failures, and separately after consecutive re-runs that exit cleanly but do not improve the transcript.
-- Open follow-up: `assess-transcripts` still tallies a transcript with unknown duration under `clean` in its summary counter. The same "unassessable is not clean" rule applies there.
+- Open follow-up: `assess-transcripts` still tallies a transcript with unknown duration under `clean` in its summary counter. The same "unassessable is not clean" rule applies there. (Closed by issue #274.)
 
 ## Related Issues
 

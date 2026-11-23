@@ -533,6 +533,11 @@ class TestTheAssessmentWindowTreatsOffsetsAsUntrusted:
     def test_zero_start_is_a_real_offset_not_a_missing_one(self) -> None:
         assert vi._captions_assessment_window(0, 600, 1200) == (0, 600)
 
+    def test_a_bool_duration_is_unknown_not_one_second(self) -> None:
+        """`isinstance(True, int)` holds; a bool must not clamp the end to 1s (issue #274)."""
+        assert vi._captions_assessment_window(0, 600, True) == (0, 600)
+        assert vi._captions_assessment_window(0, None, True) is None
+
     def test_an_overwide_end_does_not_false_flag_a_healthy_track(self, paths, monkeypatch) -> None:
         """The end-to-end version of the Codex case, through the real writer."""
         snippets = [(i * 120, f"sparse but real line {i}") for i in range(10)]

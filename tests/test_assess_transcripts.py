@@ -11,9 +11,11 @@ import ast
 import csv
 import inspect
 import json
+import logging
 import sys
 import textwrap
 import types as _types
+from pathlib import Path
 
 import pytest
 
@@ -204,18 +206,15 @@ class TestAssessment:
             (_healthy_body(1200), 1200),
             (MONOLITHIC_BODY, 1200),
             (_healthy_body(600, step=5) + ['[05:00] Host: "rewind"'], 900),
-            (_healthy_body(1200), None),
-            (_healthy_body(1200), True),
         ],
-        ids=["healthy", "monolithic", "backward-jump", "unknown-duration", "bool-duration"],
+        ids=["healthy", "monolithic", "backward-jump"],
     )
     def test_persisted_values_equal_an_independent_assessment(self, tmp_path, corpus, body, duration):
         text = _md(body)
         meta_path = _write(corpus / "chan", "v", _meta(duration_seconds=duration), text)
         _run(tmp_path, apply=True, backup_dir=str(tmp_path / "bk"))
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        expected_duration = duration if isinstance(duration, int) and not isinstance(duration, bool) else None
-        metrics = vi.assess_transcript_artifact(vi.dialogue_entries_from_transcript_markdown(text), expected_duration)
+        metrics = vi.assess_transcript_artifact(vi.dialogue_entries_from_transcript_markdown(text), duration)
         assert meta["transcript_quality_flags"] == sorted(set(metrics["severe"]) | set(metrics["mild"]))
         assert meta["transcript_max_blind_gap_seconds"] == metrics["max_blind_gap_seconds"]
         assert meta["transcript_blind_gap_at_seconds"] == metrics["blind_gap_at_seconds"]
@@ -236,6 +235,137 @@ class TestAssessment:
         assert vi.QUALITY_FLAG_BLIND_GAP_SEVERE not in meta["transcript_quality_flags"]
         assert vi.QUALITY_FLAG_CAPTIONS_LEADING_GAP_MILD in meta["transcript_quality_flags"]
         assert meta["transcript_status"] == "complete"
+
+
+_MISSING = object()
+UNKNOWN_DURATIONS = [_MISSING, 0, None, "1200", True, 12.5, 1200.0, -5]
+UNKNOWN_DURATION_IDS = ["missing", "zero", "none", "string", "bool", "float", "whole-float", "negative"]
+
+
+def _no_duration_meta(duration=_MISSING, **extra):
+    meta = _meta(**extra)
+    del meta["duration_seconds"]
+    if duration is not _MISSING:
+        meta["duration_seconds"] = duration
+    return meta
+
+
+class TestKnownDurationSeconds:
+    def test_known_duration_seconds_positive_int_returns_it(self):
+        assert vi.known_duration_seconds(1200) == 1200
+
+    @pytest.mark.parametrize("value", [0, -5, None, "1200", True, False, 12.5, 1200.0, [1200]])
+    def test_known_duration_seconds_unusable_value_returns_none(self, value):
+        assert vi.known_duration_seconds(value) is None
+
+    def test_video_duration_seconds_rejects_what_the_predicate_rejects(self):
+        assert vi._video_duration_seconds({"duration_seconds": True}) is None
+        assert vi._video_duration_seconds({"duration_seconds": 90}) == 90
+
+
+class TestUnknownDurationIsUnassessable:
+    """Issue #274: no usable duration means no verdict, never `clean`."""
+
+    @pytest.mark.parametrize("duration", UNKNOWN_DURATIONS, ids=UNKNOWN_DURATION_IDS)
+    def test_unknown_duration_dry_run_and_apply_leave_meta_byte_identical(self, tmp_path, corpus, duration):
+        # Arrange
+        meta = _no_duration_meta(duration)
+        del meta["transcript_status"]
+        meta_path = _write(corpus / "chan", "v", meta, _md(_healthy_body(1200)))
+        before = meta_path.read_bytes()
+        backup_dir = tmp_path / "bk"
+
+        # Act
+        dry = _run(tmp_path)
+        applied = _run(tmp_path, apply=True, backup_dir=str(backup_dir))
+
+        # Assert
+        assert meta_path.read_bytes() == before
+        assert not (backup_dir / "chan").exists()
+        assert not (backup_dir / vi.ASSESS_TRANSCRIPTS_MANIFEST).exists()
+        for counts in (dry, applied):
+            assert counts["unassessable"] == 1
+            assert counts["candidates"] == 1
+            assert counts["clean"] == 0
+            assert counts["status_set"] == 0
+            assert counts["demoted"] == 0
+
+    def test_already_assessed_meta_with_no_duration_under_force_is_untouched(self, tmp_path, corpus):
+        meta_path = _write(
+            corpus / "chan",
+            "v",
+            _no_duration_meta(transcript_quality_flags=[], transcript_status="complete"),
+            _md(_healthy_body(1200)),
+        )
+        before = meta_path.read_bytes()
+
+        counts = _run(tmp_path, force=True, apply=True, backup_dir=str(tmp_path / "bk"))
+
+        assert meta_path.read_bytes() == before
+        assert counts["unassessable"] == 1
+        assert counts["clean"] == 0
+        assert not (tmp_path / "bk" / "chan").exists()
+
+    def test_backward_jump_with_no_duration_is_logged_never_persisted(self, tmp_path, corpus, caplog):
+        caplog.set_level(logging.INFO, logger=vi.log.name)
+        body = _healthy_body(1200) + ['[08:00] Host: "rewind"']
+        meta_path = _write(corpus / "chan", "v", _no_duration_meta(), _md(body))
+        before = meta_path.read_bytes()
+
+        counts = _run(tmp_path, apply=True, backup_dir=str(tmp_path / "bk"))
+
+        assert meta_path.read_bytes() == before
+        assert counts["unassessable"] == 1
+        assert counts["severe"] == 0
+        line = next(r.getMessage() for r in caplog.records if "chan/v:" in r.getMessage())
+        assert "unassessable (unknown duration)" in line
+        assert vi.QUALITY_FLAG_BACKWARD_JUMP_SEVERE in line
+        assert "backward jump 700s" in line
+
+    def test_mixed_corpus_counts_add_up_and_summary_names_the_unassessable(self, tmp_path, corpus, caplog):
+        caplog.set_level(logging.INFO, logger=vi.log.name)
+        chan = corpus / "chan"
+        _write(chan, "a-clean", _meta(), _md(_healthy_body(1200)))
+        _write(chan, "b-severe", _meta(), _md(MONOLITHIC_BODY))
+        _write(chan, "c-mild", _meta(), _md(_healthy_body(1200) + ['[18:00] Host: "small rewind"']))
+        _write(chan, "d-unknown", _no_duration_meta(), _md(_healthy_body(1200)))
+        _write(chan, "e-unknown", _no_duration_meta(duration=0), _md(MONOLITHIC_BODY))
+
+        counts = _run(tmp_path)
+
+        assert counts["candidates"] == 5
+        assert counts["clean"] + counts["mild"] + counts["severe"] + counts["unassessable"] == counts["candidates"]
+        assert (counts["clean"], counts["mild"], counts["severe"], counts["unassessable"]) == (1, 1, 1, 2)
+        messages = [r.getMessage() for r in caplog.records]
+        summary = next(m for m in messages if m.startswith("assess-transcripts: candidates="))
+        assert "unassessable=2" in summary
+        hint = next(m for m in messages if "were not judged" in m)
+        assert hint == (
+            "2 transcript(s) have no usable `duration_seconds` (a positive whole number of seconds) and were not "
+            "judged; store one in their meta.json and re-run."
+        )
+
+    def test_no_unknown_duration_prints_no_hint(self, tmp_path, corpus, caplog):
+        caplog.set_level(logging.INFO, logger=vi.log.name)
+        _write(corpus / "chan", "a", _meta(), _md(_healthy_body(1200)))
+        _run(tmp_path)
+        assert not any("were not judged" in r.getMessage() for r in caplog.records)
+
+
+class TestRemediationSweepSharesThePredicate:
+    def test_collect_rows_bool_duration_is_not_a_meta_duration(self, tmp_path):
+        import remediation_sweep
+
+        chan = tmp_path / "chan"
+        _write(chan, "flagged", {"duration_seconds": True}, _md(_healthy_body(1200)))
+        _write(chan, "known", {"duration_seconds": 1200}, _md(_healthy_body(1200)))
+
+        rows = {r["prefix"]: r for r in remediation_sweep.collect_rows(tmp_path)}
+
+        assert rows["flagged"]["duration_seconds"] is None
+        assert rows["flagged"]["duration_source"] is None
+        assert rows["known"]["duration_seconds"] == 1200
+        assert rows["known"]["duration_source"] == "meta"
 
 
 class TestDryRunAndBackups:
@@ -398,3 +528,86 @@ class TestParserUsesTheSharedBoundaryPattern:
     def test_the_parser_regex_is_built_from_the_shared_pattern(self):
         offenders = [c for c in _parser_regex_calls() if "ENTRY_TIMESTAMP_PATTERN" not in c]
         assert offenders == [], f"the parser hard-codes its timestamp regex: {offenders}"
+
+
+# Issue #274: "is this stored duration usable" has ONE definition,
+# `known_duration_seconds`.
+_DURATION_TEST_ALLOWED = {"known_duration_seconds"}
+_SCRIPTS = Path(vi.__file__).resolve().parent
+
+
+def _is_hand_rolled_duration_test(node: ast.BoolOp) -> bool:
+    """`isinstance(x, int ...) and ... x > 0` on a duration-ish name."""
+    checked = {
+        v.args[0].id
+        for v in node.values
+        if isinstance(v, ast.Call)
+        and isinstance(v.func, ast.Name)
+        and v.func.id == "isinstance"
+        and len(v.args) == 2
+        and isinstance(v.args[0], ast.Name)
+        and any(isinstance(n, ast.Name) and n.id == "int" for n in ast.walk(v.args[1]))
+    }
+    positive = {
+        v.left.id
+        for v in node.values
+        if isinstance(v, ast.Compare)
+        and isinstance(v.left, ast.Name)
+        and [type(op) for op in v.ops] == [ast.Gt]
+        and isinstance(v.comparators[0], ast.Constant)
+        and v.comparators[0].value == 0
+    }
+    return any("duration" in name or "second" in name for name in checked & positive)
+
+
+def _hand_rolled_duration_tests(source: str) -> list[tuple[str, int]]:
+    found: list[tuple[str, int]] = []
+
+    def visit(node: ast.AST, func: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            name = child.name if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef) else func
+            if isinstance(child, ast.BoolOp) and isinstance(child.op, ast.And) and _is_hand_rolled_duration_test(child):
+                found.append((name, child.lineno))
+            visit(child, name)
+
+    visit(ast.parse(source), "<module>")
+    return found
+
+
+def _module_source(name: str) -> str:
+    return (_SCRIPTS / f"{name}.py").read_text(encoding="utf-8")
+
+
+class TestOneDurationPredicate:
+    @pytest.mark.parametrize("module", ["video_intel", "remediation_sweep"])
+    def test_no_hand_rolled_duration_test_outside_the_predicate(self, module):
+        offenders = [
+            hit for hit in _hand_rolled_duration_tests(_module_source(module)) if hit[0] not in _DURATION_TEST_ALLOWED
+        ]
+        assert offenders == [], (
+            f"{module} re-derives the usable-duration test; call known_duration_seconds: {offenders}"
+        )
+
+    def test_the_walk_finds_the_predicate_itself(self):
+        hits = _hand_rolled_duration_tests(_module_source("video_intel"))
+        assert "known_duration_seconds" in [name for name, _ in hits]
+
+    def test_the_detector_flags_the_pre_fix_sweep_shape(self):
+        snippet = textwrap.dedent(
+            """\
+            def collect_rows(meta):
+                duration = meta.get("duration_seconds")
+                return duration if isinstance(duration, int) and duration > 0 else None
+            """
+        )
+        assert _hand_rolled_duration_tests(snippet) == [("collect_rows", 3)]
+
+    def test_the_sweep_calls_the_shared_predicate(self):
+        calls = [
+            node
+            for node in ast.walk(ast.parse(_module_source("remediation_sweep")))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "known_duration_seconds"
+        ]
+        assert calls, "remediation_sweep no longer calls vi.known_duration_seconds"
