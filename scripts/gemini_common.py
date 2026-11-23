@@ -173,6 +173,79 @@ def log_usage_metadata(response: object, label: str) -> dict | None:
         return None
 
 
+_MODELS_PREFIX = "models/"
+
+
+def bare_model_name(name: str) -> str:
+    """``name`` stripped of whitespace and a leading ``models/`` (issue #295).
+
+    The one normalization the served-model reader, the comparison rule and the
+    warn-once memo all key on [core: one-definition].
+    """
+    name = name.strip()
+    return name[len(_MODELS_PREFIX) :] if name.startswith(_MODELS_PREFIX) else name
+
+
+def served_model_from_response(response: object) -> str | None:
+    """The model name the provider REPORTED for a Gemini call, or ``None`` (issue #295).
+
+    The reported name can differ from the requested one: an alias resolves to
+    its backing model, a dated version suffix is added, or the provider serves a
+    different model. It is the provider's report, not proof of identity in
+    either direction (a provider can echo an alias). The SDK exposes it as
+    ``GenerateContentResponse.model_version: Optional[str]`` (google-genai
+    ``types.py``, mapped from the wire field ``modelVersion``).
+
+    Returns the stripped name with a leading ``models/`` removed. An absent
+    attribute, a non-string, or an empty value returns ``None`` and logs at
+    DEBUG: unreadable means "record nothing", never a guess. Never raises -
+    this runs inside the ``on_response`` observability callbacks, which must
+    never break the call.
+    """
+    try:
+        value = getattr(response, "model_version", None)
+    except Exception as exc:
+        log.debug("served model unreadable: model_version raised %s", exc)
+        return None
+    if not isinstance(value, str):
+        log.debug("served model unreadable: model_version is %s", type(value).__name__)
+        return None
+    bare = bare_model_name(value)
+    if not bare:
+        log.debug("served model unreadable: model_version is empty")
+        return None
+    return bare
+
+
+def served_model_differs(requested: str, served: str | None) -> bool:
+    """Whether the reported model name is a MISMATCH worth a warning (issue #295).
+
+    The tolerant rule, used by the warn-once WARNING [core: one-definition].
+    After the ``models/`` strip, ``served == requested`` or a version suffix on
+    the requested name (``served.startswith(requested + "-")``, e.g. requested
+    ``gemini-2.0-flash``, reported ``gemini-2.0-flash-001``) is the same model:
+    provider documentation shows version-suffixed reported names for ordinary
+    requests. The hyphen boundary matters: ``Xy`` is not a version of ``X``.
+    Everything else is a mismatch. ``None`` (unreadable) never differs.
+    """
+    if served is None:
+        return False
+    req, srv = bare_model_name(requested), bare_model_name(served)
+    return not (srv == req or srv.startswith(req + "-"))
+
+
+def reported_name_differs(requested: str, served: str | None) -> bool:
+    """Whether the reported model name is not the requested name (issue #295).
+
+    The strict rule, used by the model scorecard [core: one-definition]: any
+    difference after the ``models/`` strip, a version suffix included, because a
+    scorecard is exactly where the dated version matters. ``None`` never differs.
+    """
+    if served is None:
+        return False
+    return bare_model_name(requested) != bare_model_name(served)
+
+
 # ---------------------------------------------------------------------------
 # Lazy imports
 # ---------------------------------------------------------------------------

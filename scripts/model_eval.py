@@ -50,6 +50,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import yaml
 
 import video_intel as v
+from gemini_common import reported_name_differs, served_model_from_response
 from timestamp_utils import timestamp_tolerance
 
 REPO = Path(__file__).resolve().parent.parent
@@ -177,6 +178,10 @@ def score(
         "cost_per_video_hour": round(cost_seg * (3600 / seg_secs), 3) if cost_seg is not None else None,
         "promo_until": promo,
         "wall_s": round(wall, 1) if wall else None,
+        # Issue #295: the model that actually answered. A request can be served
+        # by another model, so `model` alone does not say what was measured.
+        # None when unreadable, or for a cell cached before this field existed.
+        "model_served": usage.get(v.SERVED_MODEL_CAPTURE_KEY),
     }
 
 
@@ -239,7 +244,11 @@ def run_one(client, types, fx: dict, model: str, thinking: str | None, seg: int,
                 end_offset=fx["start"] + seg,
                 thinking_config=tc,
                 media_resolution=types.MediaResolution.MEDIA_RESOLUTION_LOW,
-                on_response=lambda r, c=usage, m=model: c.update(v.log_usage_metadata(r, m) or {}),
+                on_response=lambda r, c=usage, m=model: c.update(
+                    v.log_usage_metadata(r, m) or {},
+                    # Issue #295: cached with the counts, so a warm re-render keeps it.
+                    **{v.SERVED_MODEL_CAPTURE_KEY: served_model_from_response(r)},
+                ),
             )
         except Exception as e:
             print(f"  [FAIL]   {tag}: {type(e).__name__}: {str(e)[:140]}")
@@ -263,6 +272,22 @@ def cell_measured_its_window(row: dict) -> bool:
     cached row out of the verdict. Only an explicit `True` excludes a cell.
     """
     return row.get("window_exceeded") is not True
+
+
+def served_label(model: str, rows: list[dict]) -> str:
+    """``model`` in backticks, plus ``(served X)`` when its cells were answered by another model.
+
+    Issue #295: a verdict between two names that one model served measures that
+    model against itself, so the line that compares them must say so.
+    """
+    served = sorted(
+        {
+            r["model_served"]
+            for r in rows
+            if r.get("model") == model and reported_name_differs(model, r.get("model_served"))
+        }
+    )
+    return f"`{model}` (served {', '.join(served)})" if served else f"`{model}`"
 
 
 def render(rows: list[dict], models: list[str], manifest: dict, incumbent: str | None) -> str:
@@ -311,6 +336,9 @@ def render(rows: list[dict], models: list[str], manifest: dict, incumbent: str |
         r["window_ok"] = (
             "**MISSED**" if r.get("window_exceeded") is True else ("ok" if r.get("window_exceeded") is False else "-")
         )
+        # Issue #295: name the model that answered when it is not the one asked for.
+        if reported_name_differs(r["model"], r.get("model_served")):
+            r["model"] = f"{r['model']} (served {r['model_served']})"
         out.append("| " + " | ".join(str(r.get(c[1], "")) for c in cols) + " |")
     out += ["", "## Per-facet notes", ""]
     by_id = {f["id"]: f for f in manifest["fixtures"]}
@@ -343,7 +371,7 @@ def render(rows: list[dict], models: list[str], manifest: dict, incumbent: str |
             c_old = [r["cost_per_video_hour"] for r in theirs if r["cost_per_video_hour"]]
             am = lambda xs: round(sum(xs) / len(xs), 3) if xs else None  # noqa: E731
             out.append(
-                f"- `{m}` vs `{incumbent}`: mean max_gap "
+                f"- {served_label(m, rows)} vs {served_label(incumbent, rows)}: mean max_gap "
                 f"**{am(g_new)}s** vs {am(g_old)}s; mean cost/video-hour "
                 f"**${am(c_new)}** vs ${am(c_old)}."
             )

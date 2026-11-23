@@ -25,7 +25,10 @@ Every processed video has a `{date}-{slug}.meta.json` sidecar in its channel fol
 | Field | Type | Written by | Allowed values / notes |
 |---|---|---|---|
 | `processed` | str (ISO-8601) | every writer | Last-processed timestamp. |
-| `model` | str | mindmap, transcript | Gemini model used. |
+| `model` | str | mindmap (success and error), chunked transcript, `--file` identity block | The model REQUESTED by whichever of those writers ran last. Single-shot, salvage and captions transcripts and concepts never write it, and the per-step `models:` config block can send each step a different model, so `model` is not the requested counterpart of any `*_model_served` field. |
+| `transcript_model_served` | str | transcript writers (single-shot, salvage, chunked) | The model name the provider REPORTED for the transcript call, read from the response's `model_version` (issue #295). It can differ from the requested name (an alias resolving to its backing model, a version suffix, or a different model served) and is the provider's report, not proof of identity; `model` is never overwritten. Do not compare a `*_model_served` value with `model` to detect a mismatch: they can legitimately differ per step. The mismatch signal is the runtime WARNING, which compares each call's reported name with the name that call requested. A chunked run stores one value when every chunk that returned agreed, else the distinct values sorted and joined with `,` (always a string). Absent when the response did not carry a readable value. A transcript-artifact field (`TRANSCRIPT_ARTIFACT_FIELDS`), so a captions transcript, which calls no model, retires it. |
+| `mindmap_model_served` | str | mindmap | Same, for the mindmap call (video or transcript source). A re-run that cannot read the value removes the previous one. |
+| `concepts_model_served` | str | concepts success writer | Same, for the concepts call. The requested concepts model is recorded nowhere, and `concepts.json` carries neither. |
 | `modes_completed` | list[str] | every writer | Subset of `scan`, `transcript`, `mindmap`, `concepts`. Append-only via `update_meta`. |
 | `mindmap_source` | str | mindmap | `transcript` or `video` - what the mindmap was built from (issue #54). |
 | `mindmap_source_status` | str | mindmap | `partial` when the source transcript was non-healthy; absent otherwise. |
