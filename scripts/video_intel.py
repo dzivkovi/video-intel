@@ -2932,10 +2932,15 @@ def _strict_video_id_claimant(channel_dir: Path, video_id: str) -> tuple[str | N
     ``_record_transcript_error``'s ``video`` branch.
     """
     unreadable: list[str] = []
+    # os.listdir, not Path.glob: on Python 3.12 glob swallows listing errors, so
+    # a transient failure would read as "empty folder, nothing claims the id".
     try:
-        candidates = sorted(channel_dir.glob("*.meta.json"), key=lambda p: p.name)
+        names = os.listdir(channel_dir)
+    except FileNotFoundError:
+        return None, []  # no folder: nothing can claim the id
     except OSError:
-        return None, [channel_dir.name]
+        return None, [str(channel_dir)]
+    candidates = [channel_dir / name for name in sorted(names) if name.endswith(".meta.json")]
     for meta_path in candidates:
         try:
             data = json.loads(meta_path.read_bytes().decode("utf-8"))

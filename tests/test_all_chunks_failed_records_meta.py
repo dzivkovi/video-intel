@@ -676,6 +676,60 @@ def _recording_explodes(*_args, **_kwargs):
     raise RuntimeError("unexpected recorder failure")
 
 
+class TestAFolderListingFailureIsAnIncompleteWalk:
+    def test_listing_error_while_recording_creates_no_second_meta(self, wired, monkeypatch, caplog):
+        _seed_old(wired.cdir)
+        old = wired.cdir / f"{OLD_PREFIX}.meta.json"
+        before = old.read_bytes()
+        armed = {"on": False}
+        real_listdir, real_scandir = vi.os.listdir, vi.os.scandir
+
+        def listdir(path="."):
+            if armed["on"] and vi.Path(path) == wired.cdir:
+                raise OSError("stub transient listing failure")
+            return real_listdir(path)
+
+        # Path.glob lists through os.scandir and swallows its errors on Python 3.12;
+        # failing it too is what makes a glob-based walk see an empty folder.
+        def scandir(path="."):
+            if armed["on"] and vi.Path(path) == wired.cdir:
+                raise OSError("stub transient listing failure")
+            return real_scandir(path)
+
+        real_record = vi._record_transcript_error
+
+        def arm_while_recording(*args, **kwargs):
+            armed["on"] = True
+            try:
+                return real_record(*args, **kwargs)
+            finally:
+                armed["on"] = False
+
+        monkeypatch.setattr(vi.os, "listdir", listdir)
+        monkeypatch.setattr(vi.os, "scandir", scandir)
+        monkeypatch.setattr(vi, "_record_transcript_error", arm_while_recording)
+        caplog.set_level("WARNING")
+
+        vi.cmd_transcript(_args(title=NEW_TITLE), CONFIG_GEMINI)
+
+        assert len(wired.gemini_calls) == 2
+        assert sorted(p.name for p in wired.cdir.glob("*.meta.json")) == [old.name]
+        assert old.read_bytes() == before
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert len([m for m in warnings if str(wired.cdir) in m and "would create" in m]) == 1, warnings
+
+    def test_a_folder_that_does_not_exist_is_a_complete_empty_walk(self, tmp_path):
+        cdir = tmp_path / "brand-new-channel"
+
+        assert vi._strict_video_id_claimant(cdir, VIDEO_ID) == (None, [])
+        vi._record_transcript_error(cdir / f"{PREFIX}.meta.json", "boom", video=dict(_VIDEO), channel_dir=cdir)
+
+        meta = json.loads((cdir / f"{PREFIX}.meta.json").read_text(encoding="utf-8"))
+        assert meta["video_id"] == VIDEO_ID
+        assert meta["channel"] == "brand-new-channel"
+        assert meta["last_error"] == "boom"
+
+
 class TestARecordingFailureNeverMasksTheOutcome:
     def test_captions_exception_still_propagates(self, wired, monkeypatch, caplog):
         raised: list = []
