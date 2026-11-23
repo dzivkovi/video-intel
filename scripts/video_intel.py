@@ -14929,9 +14929,11 @@ def cmd_repair_timestamps(args, config):
         # collapse, so a re-assessment would "clear" the flag by blindness.
         log.error(
             "repair-timestamps: %s has no usable duration_seconds; the re-assessment that must clear the flag "
-            "cannot judge it. Store the duration in its meta.json and re-run.",
+            "cannot judge it. Store the duration (dry run first), then re-run:",
             prefix,
         )
+        log.error("  %s", _render_cli_command(["backfill-durations", "--channel", args.channel]))
+        log.error("  %s", _render_cli_command(["backfill-durations", "--channel", args.channel, "--apply"]))
         sys.exit(1)
     try:
         original = transcript_path.read_bytes()

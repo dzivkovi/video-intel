@@ -734,6 +734,26 @@ class TestCannotRun:
         assert calls == []
         assert _snapshot(corpus) == before
 
+    def test_unknown_duration_names_backfill_commands_that_parse(self, corpus, monkeypatch, caplog, tmp_path):
+        meta = _meta()
+        del meta["duration_seconds"]
+        _write_corpus(corpus, meta=meta)
+        with caplog.at_level(logging.INFO, logger="video_intel"):
+            assert _exit_code(corpus, apply=True) == 1
+        commands = [r.getMessage().strip() for r in caplog.records if "scripts/video_intel.py" in r.getMessage()]
+        assert len(commands) == 2
+        monkeypatch.setattr(vi, "load_config", lambda: {"output_dir": str(tmp_path)})
+        monkeypatch.setattr(vi, "backup_config_if_changed", lambda *_a, **_kw: None)
+        parsed = []
+        monkeypatch.setattr(vi, "cmd_backfill_durations", lambda args, config: parsed.append(vars(args)))
+        for command in commands:
+            monkeypatch.setattr(sys, "argv", ["video_intel.py", *shlex.split(command)[2:]])
+            vi.main()
+        assert [(a["command"], a["channel"], a["apply"]) for a in parsed] == [
+            ("backfill-durations", "chan", False),
+            ("backfill-durations", "chan", True),
+        ]
+
     def test_unreadable_meta_exits_1(self, corpus, monkeypatch):
         p = _write_corpus(corpus)
         p.meta.write_bytes(b'{"video_id": "' + VIDEO_ID.encode() + b'", "title": "\xe2\x82"}')

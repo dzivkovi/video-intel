@@ -486,7 +486,7 @@ See [`examples/nugget-lightrag-vs-openbrain-architectural-tension.md`](examples/
 
 ### Corpus maintenance
 
-Four commands repair a corpus rather than grow one. The first three are **dry-run by default** and print exactly what they would touch; nothing changes until you add `--apply`. All three also take `--channel` to scope the pass.
+Seven commands repair a corpus rather than grow one. The first six are **dry-run by default** and print exactly what they would touch; nothing changes until you add `--apply`. The first five also take `--channel` to scope the pass; `repair-timestamps` needs it to find the video.
 
 ```bash
 # Same video, two filenames, because the creator A/B-tested the title.
