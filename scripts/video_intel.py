@@ -2827,10 +2827,14 @@ def _load_video_id_index(channel_dir: Path) -> dict[str, str]:
             vid = data.get("video_id")
             if vid:
                 prefix = meta_path.name.removesuffix(".meta.json")
-                # First-wins over a SORTED walk (issue #276): the alphabetically
-                # first prefix claiming this video_id is the prevention path's
-                # canonical, the same on every run and every filesystem. dedupe
-                # picks the true canonical separately (quality, then processed).
+                # First-wins over a SORTED walk (issue #276): the first meta in
+                # sorted FILE NAME order claiming this video_id is the prevention
+                # path's canonical, the same on every run instead of whatever the
+                # filesystem enumerated first. File name, not prefix: when one
+                # slug extends another (a title that gained a suffix), the longer
+                # name sorts first because '-' sorts before the '.' of
+                # '.meta.json'. dedupe picks the true canonical separately
+                # (quality, then processed).
                 index.setdefault(vid, prefix)
     _VIDEO_ID_CACHE[key] = index
     return index

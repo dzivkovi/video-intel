@@ -125,8 +125,8 @@ def test_is_processed_cache_is_populated_once_per_channel(tmp_path, monkeypatch)
 def test_load_video_id_index_duplicate_video_id_sorted_prefix_wins_regardless_of_glob_order(
     tmp_path, monkeypatch, reverse
 ):
-    """Issue #276: two metas claim one video_id; the alphabetically first prefix
-    wins no matter what order the filesystem enumerates them in."""
+    """Issue #276: two metas claim one video_id; the first in sorted file-name
+    order wins no matter what order the filesystem enumerates them in."""
     ch = tmp_path / "chan"
     for prefix in ("2026-01-02-bbb", "2026-01-01-aaa"):
         _write_meta(ch, prefix, {"video_id": "vid001", "title": prefix})
@@ -144,6 +144,25 @@ def test_load_video_id_index_duplicate_video_id_sorted_prefix_wins_regardless_of
         vi._invalidate_video_id_cache()
 
     assert index["vid001"] == "2026-01-01-aaa"
+
+
+def test_load_video_id_index_slug_extension_first_file_name_wins(tmp_path):
+    """Issue #276: the walk sorts FILE NAMES, not prefixes. When one slug extends
+    another on the same date (a title that gained a suffix), the longer name
+    sorts first, because '-' sorts before the '.' of '.meta.json'. Pinned so the
+    code comment and CLAUDE.md cannot claim "first prefix" again."""
+    ch = tmp_path / "chan"
+    for prefix in ("2026-01-01-claude-code", "2026-01-01-claude-code-tips"):
+        _write_meta(ch, prefix, {"video_id": "vid001", "title": prefix})
+
+    vi._invalidate_video_id_cache()
+    try:
+        index = vi._load_video_id_index(ch)
+    finally:
+        vi._invalidate_video_id_cache()
+
+    assert index["vid001"] == "2026-01-01-claude-code-tips"
+    assert min("2026-01-01-claude-code", "2026-01-01-claude-code-tips") == "2026-01-01-claude-code"
 
 
 # ---------------------------------------------------------------------------
