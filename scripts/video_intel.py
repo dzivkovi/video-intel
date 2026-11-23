@@ -8798,7 +8798,8 @@ def cmd_scan(args, config):
                             # and the value for THIS video travels on the
                             # candidate tuple (issue #287: read off the stale
                             # collection-loop variable here, every video got
-                            # the LAST candidate's prompt).
+                            # the prompt of the last meta that loop parsed,
+                            # which need not even be a candidate).
                             # Re-deriving it from config disagreed with
                             # the artifact on 1,004 of 2,383 corpus files (42%),
                             # because a mindmap built from a transcript records
