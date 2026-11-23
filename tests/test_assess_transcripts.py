@@ -677,7 +677,14 @@ def _random_sorted_case(rng: random.Random) -> tuple[str, int, bool]:
                 secs += rng.randint(600, 3000)
     captions = rng.random() < 0.5
     screens: list[tuple[int, int]] = []
-    if not captions and rng.random() < 0.5:
+    if not captions and rng.random() < 0.1:
+        # A dedicated collapsed shape (issue #278): healthy dialogue across the
+        # whole video and overlapping SCREEN blocks crowded at its start, so
+        # the recomputable-side expectation never rests on a lucky draw.
+        duration = rng.choice([900, 1800, 3600])
+        stamps = list(range(0, duration, rng.choice([5, 20, 60])))
+        screens = [(i, i + 20) for i in range(rng.randint(5, 8))]
+    elif not captions and rng.random() < 0.5:
         # SCREEN blocks (issue #278): spread or crowded, overlapping or not.
         at = rng.choice([0, rng.randrange(0, duration)])
         step, length = rng.choice([1, 10, 60]), rng.choice([1, 20])

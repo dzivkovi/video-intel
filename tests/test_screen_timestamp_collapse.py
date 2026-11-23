@@ -138,12 +138,29 @@ class TestFalseAlarmShapesDoNotFlag:
         metrics = vi.assess_transcript_artifact(ISSUE_DIALOGUE, None, screen_entries=ISSUE_SCREEN)
         assert FLAG not in _flags(metrics)
 
-    def test_captions_transcript_carries_no_screen_flag(self, tmp_path, corpus):
-        body = [f'[{s // 60:02d}:{s % 60:02d}] "cue {s}"' for s in range(0, DURATION, 15)]
-        _write(corpus / "chan", "cap", _meta(transcript_source=vi.TRANSCRIPT_SOURCE_CAPTIONS), _md(body))
-        _run(tmp_path, force=True, apply=True, backup_dir=str(tmp_path / "bk"))
-        meta = json.loads((corpus / "chan" / "cap.meta.json").read_text(encoding="utf-8"))
+    def test_captions_writer_output_gives_the_reader_no_screen_entries(self, tmp_path, monkeypatch):
+        # Cue text that LOOKS like a SCREEN line is rendered inside a quoted
+        # caption line, so neither the writer nor a later re-assessment can
+        # judge it as one. Built by the real captions writer, read back by the
+        # real SCREEN reader.
+        cues = [(float(i), f"SCREEN [00:{i:02d}-00:30] [slide]: fake {i}") for i in range(8)]
+        cues += [(float(s), f"cue {s}") for s in range(10, DURATION, 15)]
+        monkeypatch.setattr(vi, "fetch_english_captions", lambda _vid, **_kw: vi.CaptionsResult(cues, False, "en"))
+        prefix = "2026-06-13-cap"
+        result = vi._try_captions_transcript(
+            _video(),
+            tmp_path / f"{prefix}.transcript.md",
+            tmp_path / f"{prefix}.meta.json",
+            prefix,
+            duration_seconds=DURATION,
+        )
+        assert result is not None
+        text = (tmp_path / f"{prefix}.transcript.md").read_text(encoding="utf-8")
+        meta = json.loads((tmp_path / f"{prefix}.meta.json").read_text(encoding="utf-8"))
+        assert "SCREEN [00:00-00:30]" in text
+        assert vi.screen_entries_from_transcript_markdown(text) == []
         assert FLAG not in meta["transcript_quality_flags"]
+        assert FLAG not in vi.assess_transcript_markdown(text, DURATION, captions=True)[1]
 
 
 class TestThresholdBoundaries:
@@ -187,6 +204,23 @@ class TestThresholdBoundaries:
         dialogue = _dialogue(lo, lo + DURATION)
         assert vi.screen_timestamp_collapse(_screen(spans), dialogue, lo, lo + DURATION) is True
         assert vi.screen_timestamp_collapse(_screen(spans), dialogue, lo - CROWD - 1, lo + DURATION) is False
+
+    def test_an_end_and_a_start_at_the_same_second_do_not_overlap(self):
+        # MIN_CONCURRENT - 1 screens all end at second 30; one more starts at
+        # second 30. Counted as overlapping they would reach the threshold.
+        touching = [(i, 30) for i in range(MIN_CONCURRENT - 1)] + [(30, 40)]
+        fillers = _sequential(MIN_ENTRIES, at=60, length=5)
+        assert self._hit(touching + fillers) is False
+        assert self._hit([(i, 31) for i in range(MIN_CONCURRENT - 1)] + [(30, 40)] + fillers) is True
+
+    def test_an_end_at_or_before_its_start_counts_as_one_second(self):
+        fillers = _sequential(MIN_ENTRIES, at=60, length=5)
+        same_instant = [(10, 10)] * (MIN_CONCURRENT // 2) + [(10, 5)] * (MIN_CONCURRENT - MIN_CONCURRENT // 2)
+        one_apart = [(10 + i, 10 + i) for i in range(MIN_CONCURRENT)]
+        # Same start: each lasts one second, so all are on at once.
+        assert self._hit(same_instant + fillers) is True
+        # One second apart: one second each, so they never meet.
+        assert self._hit(one_apart + fillers) is False
 
 
 class TestMalformedScreenEntriesAreSkipped:
@@ -442,6 +476,109 @@ class TestChunkedWriter:
         # Assert
         assert FLAG not in meta["transcript_quality_flags"]
 
+    def test_absolute_collapsed_stamps_at_a_later_chunk_start_flag(self, tmp_path, monkeypatch):
+        # Chunk 2's SCREEN stamps come back ABSOLUTE, all crowded at its real
+        # start (30:01 onwards): relativization must bring them into the frame.
+        collapsed = _collapsed(8, at=1801, length=20)
+
+        status, meta, _ = _run_chunked(tmp_path, monkeypatch, self._responses(collapsed), THREE_CHUNKS, 5400)
+
+        assert status == "done"
+        assert FLAG in meta["transcript_quality_flags"]
+
+
+class TestChunkRelativizationSkipsUnplaceableScreenStamps:
+    """A SCREEN stamp the chunk cannot place is skipped, never piled onto the
+    chunk start. Driven through `_assess_chunk_coverage` with a chunk start > 0."""
+
+    def _flags(self, screen_content):
+        parsed = {"transcripts": _dialogue(1800, 3600), "screen_content": screen_content, "speakers": []}
+        _, metrics = vi._assess_chunk_coverage(parsed, 1800, 3600, 5400, 2)
+        return _flags(metrics)
+
+    def test_unparseable_stamps(self):
+        assert FLAG not in self._flags([{"start": "N/A", "end": "N/A"}] * (MIN_ENTRIES + 3))
+
+    def test_relative_fractional_stamps_spread_over_the_chunk(self):
+        spread = [
+            {"start": f"{m:02d}:{s:02d}.5", "end": f"{m:02d}:{s + 5:02d}.5"}
+            for m, s in ((i * 3, 10) for i in range(MIN_ENTRIES + 4))
+        ]
+        assert FLAG not in self._flags(spread)
+
+    def test_stamps_that_land_before_the_chunk_start(self):
+        # Fractional, so the classifier leaves them unplaced: they parse to the
+        # chunk's first seconds of the VIDEO, not of the chunk.
+        early = [{"start": f"00:{i:02d}.0", "end": "00:40.0"} for i in range(MIN_ENTRIES + 3)]
+        assert FLAG not in self._flags(early)
+
+    def test_implausible_stamps(self):
+        assert FLAG not in self._flags([{"start": "9:00:00", "end": "9:00:30"}] * (MIN_ENTRIES + 3))
+
+    def test_an_unplaceable_end_is_dropped_not_clamped(self):
+        entries = vi._relativize_chunk_entries(
+            [{"start": "30:05", "end": "N/A"}, {"start": "N/A"}],
+            1800,
+            1800,
+            keys=("start", "end"),
+            drop_unplaceable=True,
+        )
+        assert entries == [{"start": "0:00:05"}]
+
+    def test_placeable_stamps_still_flag(self):
+        assert FLAG in self._flags(_screen(_collapsed(8, at=1801, length=20)))
+
+    def test_dialogue_mode_is_unchanged(self):
+        dialogue = [{"start": "N/A"}, {"start": "00:05.5"}, {"start": "30:10"}, {"start": "9:00:00"}]
+        assert vi._relativize_chunk_entries(dialogue, 1800, 1800) == [
+            {"start": "0:00:00"},
+            {"start": "0:00:00"},
+            {"start": "0:00:10"},
+            {"start": "8:30:00"},
+        ]
+
+
+class TestWriterOutputRoundTripsThroughTheReaders:
+    """[core: writer's-path] The readers see what the real writers wrote."""
+
+    def test_stitched_transcript_from_the_real_chunked_writer(self, tmp_path, monkeypatch):
+        # Arrange: chunk 2 names no speakers (an empty speaker cell) and
+        # carries a start-only SCREEN entry.
+        responses = [
+            _chunk_response(0, 1800, [(5, 15), (600, None)]),
+            {"transcripts": _dialogue(1800, 3725), "screen_content": _screen([(1805, 1820), (3000, None)])},
+        ]
+        chunks = [(0, 1800), (1800, 3725)]
+
+        # Act
+        _, _, transcript_path = _run_chunked(tmp_path, monkeypatch, responses, chunks, 3725)
+        text = transcript_path.read_text(encoding="utf-8")
+
+        # Assert
+        assert "| 2 | 30:00 - 1:02:05 | ok | — |" in text
+        assert vi.chunk_windows_from_transcript_markdown(text) == chunks
+        assert vi.screen_entries_from_transcript_markdown(text) == [
+            {"start": "00:05", "end": "00:15"},
+            {"start": "10:00"},
+            {"start": "30:05", "end": "30:20"},
+            {"start": "50:00"},
+        ]
+
+    def test_coverage_block_writer_rows_parse(self):
+        rows = [
+            {"range": vi._format_chunk_range_label(0, 1800), "status": "ok", "speakers": ["A"]},
+            {"range": vi._format_chunk_range_label(1800, 3600), "status": "FAILED (timeout)", "speakers": []},
+            {"range": vi._format_chunk_range_label(3600, 3725), "status": "thin", "speakers": []},
+        ]
+        block = vi._build_chunked_transcript_coverage_block(3725, 30, rows)
+        body = vi.merge_transcript_json(
+            {"transcripts": _dialogue(0, 60), "screen_content": [{"start": "00:07", "type": "slide"}], "speakers": []},
+            {},
+        )
+        text = block + "\n" + body
+        assert vi.chunk_windows_from_transcript_markdown(text) == [(0, 1800), (1800, 3600), (3600, 3725)]
+        assert vi.screen_entries_from_transcript_markdown(text) == [{"start": "00:07"}]
+
 
 # --- assess-transcripts over Markdown -----------------------------------------
 
@@ -547,6 +684,10 @@ class TestMarkdownParsers:
         text = _chunked_md([(0, 1800), (1800, 3600)], [0], [], 3600).replace("30:00 - 1:00:00", "30:00 - soon")
         assert vi.chunk_windows_from_transcript_markdown(text) is None
 
+    def test_windows_out_of_order_are_none(self):
+        assert vi.chunk_windows_from_transcript_markdown(_chunked_md([(1800, 3600), (0, 1800)], [0], [], 3600)) is None
+        assert vi.chunk_windows_from_transcript_markdown(_chunked_md([(0, 1800), (1700, 3600)], [0], [], 3600)) is None
+
 
 class TestAssessTranscriptsFromMarkdown:
     def test_whole_video_collapse_is_flagged(self, tmp_path, corpus):
@@ -587,6 +728,23 @@ class TestAssessTranscriptsFromMarkdown:
 
         assert meta_path.read_bytes() == before
         assert counts["unassessable"] == 1
+
+    def test_chunked_file_with_unknown_duration_records_nothing(self, tmp_path, corpus):
+        # The coverage table alone would give windows; without a known duration
+        # nothing is judged, at the command and in the Markdown assessor.
+        windows = [(0, 1800), (1800, 3600)]
+        md = _chunked_md(windows, range(0, 3600, 20), _collapsed(8, at=1801, length=20), 3600)
+        meta = _meta()
+        del meta["duration_seconds"]
+        meta_path = _write(corpus / "chan", "v", meta, md)
+        before = meta_path.read_bytes()
+
+        counts = _run(tmp_path, force=True, apply=True, backup_dir=str(tmp_path / "bk"))
+
+        assert meta_path.read_bytes() == before
+        assert counts["unassessable"] == 1
+        assert FLAG not in vi.assess_transcript_markdown(md, None, captions=False)[1]
+        assert FLAG in vi.assess_transcript_markdown(md, 3600, captions=False)[1]
 
     def test_forced_reassessment_replaces_a_stale_flag(self, tmp_path, corpus):
         # The flag is recomputable from the Markdown, so it is NOT writer-only.

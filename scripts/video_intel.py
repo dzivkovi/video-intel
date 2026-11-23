@@ -5537,10 +5537,16 @@ def assess_transcript_artifact(
 
 
 def _relativize_chunk_entries(
-    transcripts: list, start_secs: int, allotted_span: int, keys: tuple[str, ...] = ("start",)
+    transcripts: list,
+    start_secs: int,
+    allotted_span: int,
+    keys: tuple[str, ...] = ("start",),
+    *,
+    drop_unplaceable: bool = False,
 ) -> list[dict]:
-    """Rewrite each RAW per-chunk dialogue timestamp into the chunk's own
-    ``[0, allotted_span)`` frame, for gap/density assessment only.
+    """Rewrite each RAW per-chunk dialogue timestamp (and, on request, a SCREEN
+    entry's ``start`` and ``end``) into the chunk's own ``[0, allotted_span)``
+    frame, for assessment only.
 
     Gemini is inconsistent about whether a per-chunk timestamp is
     chunk-relative or absolute-to-the-video (see
@@ -5561,6 +5567,17 @@ def _relativize_chunk_entries(
     ``start`` is always skipped, and any other key is rewritten only when it
     holds a usable stamp (issue #278 passes ``("start", "end")`` for SCREEN
     entries, whose overlap is judged from both).
+
+    ``drop_unplaceable`` (SCREEN only, issue #278 review): the dialogue mode
+    clamps a stamp it cannot place to ``0:00:00`` (``max(0, ...)``), which
+    keeps the dialogue counts as they always were but would pile unplaceable
+    SCREEN stamps onto the chunk start and read as a collapse. In this mode a
+    stamp is placed only when the classified value parses
+    (``_safe_timestamp_to_seconds``), is not before the chunk start, and lies
+    inside the chunk by the classifier's own boundary
+    (``classify_timestamp_placement``); otherwise an unplaceable ``start``
+    skips the entry and an unplaceable other key is dropped from it. The
+    default keeps the dialogue output byte-identical.
     """
     # Issue #161 review (P1): same shared predicate as assess_transcript_artifact
     # and merge_transcript_json - see the comment there. entry["start"] is
@@ -5572,13 +5589,30 @@ def _relativize_chunk_entries(
         if not _usable_timestamp(entry, "start"):
             continue
         rewritten = dict(entry)
+        placed = True
         for key in keys:
             if not _usable_timestamp(entry, key):
                 continue
             absolute_ts = _classify_and_offset_timestamp(entry[key], start_secs, allotted_span)
-            secs = max(0, timestamp_to_seconds(absolute_ts) - start_secs)
+            if drop_unplaceable:
+                absolute = _safe_timestamp_to_seconds(absolute_ts)
+                if (
+                    absolute is None
+                    or absolute < start_secs
+                    or classify_timestamp_placement(absolute - start_secs, 0, allotted_span)
+                    == TIMESTAMP_PLACEMENT_IMPLAUSIBLE
+                ):
+                    if key == "start":
+                        placed = False
+                        break
+                    rewritten.pop(key, None)
+                    continue
+                secs = absolute - start_secs
+            else:
+                secs = max(0, timestamp_to_seconds(absolute_ts) - start_secs)
             rewritten[key] = f"{secs // 3600}:{(secs % 3600) // 60:02d}:{secs % 60:02d}"
-        relativized.append(rewritten)
+        if placed:
+            relativized.append(rewritten)
     return relativized
 
 
@@ -5660,7 +5694,9 @@ def _assess_chunk_coverage(
     else:
         allotted_span = max(1, end_secs - start_secs)
         relativized = _relativize_chunk_entries(transcripts, start_secs, allotted_span)
-        relativized_screen = _relativize_chunk_entries(screen, start_secs, allotted_span, keys=("start", "end"))
+        relativized_screen = _relativize_chunk_entries(
+            screen, start_secs, allotted_span, keys=("start", "end"), drop_unplaceable=True
+        )
         metrics = dict(
             assess_transcript_artifact(
                 relativized, allotted_span, window=(0, allotted_span), screen_entries=relativized_screen
@@ -6125,7 +6161,7 @@ def _dialogue_entries_from_raw_json(raw_json) -> list[dict]:
     return _raw_task_entries(raw_json, "transcripts")
 
 
-def _raw_task_entries(raw_json, key: str) -> list:
+def _raw_task_entries(raw_json: Any, key: str) -> list:
     """One task list (``transcripts`` or ``screen_content``) of a parsed
     response, unwrapped and guarded exactly as ``_dialogue_entries_from_raw_json``
     documents; issue #278 reads ``screen_content`` through it too. Silent: the
@@ -11712,6 +11748,8 @@ def screen_entries_from_transcript_markdown(text: str) -> list[dict]:
     line has one. Stamps are matched by ``ENTRY_TIMESTAMP_PATTERN`` and the
     header is skipped by the same rule ``dialogue_entries_from_transcript_markdown``
     uses (everything up to the first ``---`` after the ``# Transcript:`` title).
+    That rule is repeated here ON PURPOSE for now, so the dialogue reader stays
+    untouched; it is meant to be replaced by one shared body reader.
     """
     screen_line = re.compile(rf"^\s*SCREEN \[({ENTRY_TIMESTAMP_PATTERN})(?:-({ENTRY_TIMESTAMP_PATTERN}))?\]")
     lines = text.splitlines()
