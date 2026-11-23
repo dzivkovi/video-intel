@@ -4406,6 +4406,15 @@ def _finish_chunked_transcript(
                 log.warning("    %s: %s - no caption track to fill it; keeping the Gemini partial", prefix, status)
     if lost:
         _log_lost_chunks_remedy(video, channel_dir.name, chunk_minutes, status, captions_available=captions_available)
+    if status.startswith("error"):
+        # Issue #277: an all-chunks-failed run returns here having written only
+        # raw sidecars, so record it or the failure is unsweepable. Creating the
+        # meta is safe because `meta_path` is the chunked writer's OWN path (same
+        # channel_dir + prefix) [core: writer's-path]; `_record_concepts_error`
+        # refuses to create for the opposite reason, its caller's prefix can differ.
+        _record_transcript_error(
+            meta_path, f"chunked transcript failed: {status}", video=video, channel_dir=channel_dir
+        )
     return status
 
 
@@ -6564,11 +6573,45 @@ def _write_transcript_md(
     tmp_path.replace(path)
 
 
-def _record_transcript_error(meta_path: Path, error: str) -> None:
-    """Record last_error on an existing meta.json without clobbering other fields."""
-    if not meta_path.exists():
+def _record_transcript_error(
+    meta_path: Path,
+    error: str,
+    *,
+    video: dict | None = None,
+    channel_dir: Path | None = None,
+) -> None:
+    """Record last_error on a meta.json without clobbering other fields.
+
+    Without ``video`` (the single-shot call sites) a missing meta stays missing.
+
+    With ``video`` (issue #277, the chunked shared tail) the meta is CREATED when
+    absent and identity is filled where a key is absent or empty, never
+    overwritten [core: identity #66]: a re-stamp must not replace the title the
+    artifacts are named after with a rotated one (same rule as
+    ``stamp_video_topics``). A caller passing ``video`` must pass the WRITER's
+    own meta path, because creating a meta under any other prefix manufactures
+    a second meta for the same video_id (``_record_concepts_error``).
+
+    Either way this is an error path: the read never raises [core: #124
+    read-guard], and it never routes through ``update_meta``, which would clear
+    ``last_error`` and mark the mode complete.
+    """
+    if video is None and not meta_path.exists():
         return
     meta = _read_meta_best_effort(meta_path, raise_on_os_error=False)
+    if video is not None:
+        for key, value in _transcript_identity_fields(video, channel_dir).items():
+            if not meta.get(key):
+                meta[key] = value
+        meta["last_error"] = error
+        try:
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        except OSError as exc:
+            # A write failure must not replace the failure being recorded with a
+            # traceback: on `transcript --url` nothing above the tail catches it.
+            log.warning("  could not record transcript failure in %s (%s): %s", meta_path.name, exc, error)
+        return
     meta["last_error"] = error
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
