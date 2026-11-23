@@ -512,6 +512,18 @@ python scripts/video_intel.py repair-metas --apply
 python scripts/video_intel.py backfill-descriptions
 python scripts/video_intel.py backfill-descriptions --apply --channel thenextnewthingai
 
+# Fill the video duration into metas written without one. Without it the
+# transcript quality checks that depend on length (gaps, density, overrun) are
+# skipped. Writes only duration_seconds; 1 quota unit per 50 videos; the dry
+# run makes no API call. After --apply it prints the assess-transcripts --force
+# commands that turn the new durations into quality verdicts (corpus-wide unless
+# --channel is given). Videos YouTube no longer returns stay candidates and are
+# fetched again on every run. A transcript of only a segment, or of a trimmed
+# local file, gets the full published length. On a cloud-synced corpus, run
+# --apply while no scan is active.
+python scripts/video_intel.py backfill-durations
+python scripts/video_intel.py backfill-durations --apply --channel mychannel
+
 # Stop re-attempting one stage on one video, without blocking the others.
 # --mode is repeatable; --reason is recorded in the meta for your future self.
 python scripts/video_intel.py mark-skip --url "URL" --mode transcript --reason "2h+, truncates"

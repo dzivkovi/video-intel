@@ -51,6 +51,7 @@ from youtube_captions import (
 # and re-exported here, so every existing caller and test still resolves them
 # from video_intel. One definition each; never re-define one locally.
 from corpus_walk import (  # noqa: F401 - re-exports
+    _FLAG_COLLECTION_TYPES,
     _HEALTHY_TRANSCRIPT_STATUSES,
     CONCEPTS_SUFFIX,
     META_SUFFIX,
@@ -591,6 +592,9 @@ CONFIG_BACKUP_COMMANDS = frozenset(
         # `channels:`, like repair-metas.
         "assess-transcripts",
         "backfill-descriptions",
+        # Issue #294: writes duration_seconds into corpus metas. Needs no
+        # `channels:`, like backfill-descriptions.
+        "backfill-durations",
         "dedupe",
         "prune-shorts",
         "mark-skip",
@@ -13803,6 +13807,233 @@ def cmd_backfill_descriptions(args, config):
     return applied
 
 
+#: `videos.list` accepts at most 50 ids, and one call costs 1 quota unit.
+BACKFILL_DURATIONS_BATCH = 50
+_BACKFILL_DURATIONS_WALK_BUCKETS = ("has_duration", "no_youtube_id", "unreadable", "candidates")
+_BACKFILL_DURATIONS_APPLY_BUCKETS = ("written", "not_found", "no_duration", "changed_since_walk", "write_failed")
+
+
+def _read_meta_no_quarantine(meta_path: Path) -> dict | None:
+    """The meta as a non-empty dict, or None when its content is unusable.
+
+    Unlike ``_read_meta_best_effort`` this never quarantines: a dry run must
+    leave the corpus byte-identical, so unusable content is reported, not
+    moved. Bytes first, then decode + parse, catching ``ValueError`` so a
+    torn multibyte write lands here too (issue #124). An ``OSError``
+    propagates: a read that never happened is not evidence about the file.
+    """
+    raw_bytes = meta_path.read_bytes()
+    try:
+        data = json.loads(raw_bytes.decode("utf-8"))
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) and data else None
+
+
+def _write_backfilled_duration(meta_path: Path, video_id: str, seconds: int) -> str:
+    """Merge ``duration_seconds`` into the meta as it is on disk NOW; return the bucket.
+
+    The walk may be minutes old on a large corpus, so the meta is re-read just
+    before the write and only the one key is merged into what is there. A
+    meta that is gone, unusable, already carries a duration, or now names a
+    different video is left alone (``changed_since_walk``); a meta is never
+    created.
+    """
+    try:
+        meta = _read_meta_no_quarantine(meta_path)
+    except FileNotFoundError:
+        return "changed_since_walk"
+    if (
+        meta is None
+        or known_duration_seconds(meta.get("duration_seconds")) is not None
+        or meta.get("video_id") != video_id
+    ):
+        return "changed_since_walk"
+    meta["duration_seconds"] = seconds
+    _write_meta_atomic(meta_path, meta)
+    return "written"
+
+
+def backfill_durations_next_steps(output_dir: Path, channel: str | None, stamp: str) -> list[list[str]]:
+    """The re-assessment the operator runs after durations were filled: dry run, then apply.
+
+    The new durations change only what the transcript quality checks can see,
+    so the follow-up is `assess-transcripts --force` (re-assess transcripts
+    that were already assessed without a duration). The backup folder is
+    `_`-prefixed, like `_config-backups`, so corpus walkers skip it.
+    """
+    base = ["assess-transcripts", "--force"]
+    if channel:
+        base += ["--channel", channel]
+    backup_dir = Path(output_dir) / "_meta-backups" / f"assess-transcripts-{stamp}"
+    return [base, [*base, "--apply", "--backup-dir", str(backup_dir)]]
+
+
+def _render_cli_command(argv: list[str]) -> str:
+    """A paste-ready line; any argument with a space or a path separator is double-quoted."""
+    parts = [f'"{a}"' if any(c in a for c in " \\/") else a for a in argv]
+    return "python scripts/video_intel.py " + " ".join(parts)
+
+
+def cmd_backfill_durations(args, config):
+    """Fill ``duration_seconds`` into metas written without it (issue #294).
+
+    Every duration-dependent transcript quality check is skipped for a meta
+    with no duration. Walks ``<output_dir>/*/*.meta.json`` like
+    ``backfill-descriptions`` and picks metas whose ``video_id`` is a YouTube
+    id and where ``known_duration_seconds(meta.get("duration_seconds"))`` is
+    None - the same test ``assess-transcripts`` uses (issue #274). Fetches 50 ids per
+    ``videos.list(part=contentDetails)`` call through ``enrich_with_durations``
+    and writes only ``duration_seconds``.
+
+    Dry run by default: no YouTube client, no API key, no meta written; it reports
+    the buckets per channel and the quota estimate. ``--apply`` writes each
+    batch before fetching the next, so a quota failure keeps what was written
+    and a re-run continues where it stopped (written metas are no longer
+    candidates). Never routed through ``update_meta``, which clears
+    ``last_error`` and marks a mode complete. An unusable meta is counted,
+    never quarantined, never rewritten.
+    """
+    output_dir = resolve_output_dir(config)
+    only = getattr(args, "channel", None)
+    apply = bool(getattr(args, "apply", False))
+    buckets = _BACKFILL_DURATIONS_WALK_BUCKETS + (_BACKFILL_DURATIONS_APPLY_BUCKETS if apply else ())
+    totals = dict.fromkeys(buckets, 0)
+    # Issue #183 invariant 5c, as in backfill-descriptions: a mistyped
+    # --channel must not read like a channel that is already complete.
+    if only and not (output_dir / only).is_dir():
+        log.warning("No channel folder named %r under %s; nothing to back-fill.", only, output_dir)
+        return totals
+
+    per_channel: dict[str, dict[str, int]] = {}
+    pending: dict[str, list[Path]] = {}
+    for meta_path in sorted(output_dir.glob("*/*.meta.json")):
+        channel = meta_path.parent.name
+        if only and channel != only:
+            continue
+        counts = per_channel.setdefault(channel, dict.fromkeys(buckets, 0))
+        meta = _read_meta_no_quarantine(meta_path)
+        if meta is None:
+            counts["unreadable"] += 1
+            log.warning(
+                "  [%s] %s: meta.json unusable or empty; skipped (never quarantined here)", channel, meta_path.name
+            )
+            continue
+        if known_duration_seconds(meta.get("duration_seconds")) is not None:
+            counts["has_duration"] += 1
+            continue
+        video_id = meta.get("video_id")
+        # The same two predicates backfill-descriptions uses: a non-string id is
+        # never coerced (issue #146), and a local-file or other non-YouTube id
+        # would come back as "not found" and misattribute the cause.
+        if not usable_video_id(video_id) or not _YOUTUBE_VIDEO_ID_RE.fullmatch(video_id):
+            counts["no_youtube_id"] += 1
+            continue
+        counts["candidates"] += 1
+        pending.setdefault(video_id, []).append(meta_path)
+
+    if only and not per_channel:
+        # The folder guard passed but the walk matched nothing: on a
+        # case-insensitive filesystem `--channel Chan` finds the folder `chan`
+        # while the walk compares names exactly. All zeros would read as done.
+        log.warning("--channel %r selected no meta.json; check the exact spelling and case of the folder name.", only)
+
+    ids = sorted(pending)
+    quota_units = math.ceil(len(ids) / BACKFILL_DURATIONS_BATCH)
+
+    def _log_summary(tail: str) -> None:
+        for channel, counts in per_channel.items():
+            log.info("backfill-durations [%s]: %s", channel, " ".join(f"{k}={v}" for k, v in counts.items()))
+        for counts in per_channel.values():
+            for k, v in counts.items():
+                totals[k] += v
+        log.info(
+            "backfill-durations total: %s; %d unique video id(s), quota estimate %d unit(s) (%s)",
+            " ".join(f"{k}={v}" for k, v in totals.items()),
+            len(ids),
+            quota_units,
+            tail,
+        )
+
+    if not apply:
+        _log_summary("dry run - pass --apply to write")
+        return totals
+    if not ids:
+        _log_summary("nothing to fetch")
+        return totals
+
+    yt_key = os.environ.get("YOUTUBE_API_KEY")
+    if not yt_key:
+        log.error("YOUTUBE_API_KEY is not set; cannot fetch durations.")
+        sys.exit(1)
+    yt_build = require_youtube()
+    youtube = yt_build("youtube", "v3", developerKey=yt_key)
+
+    written = 0
+    write_failed = 0
+
+    def _log_next_steps() -> None:
+        # Printed on every exit path that wrote something, including the two
+        # that exit 1: the metas already filled need re-assessing either way.
+        if not written:
+            return
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        dry, full = backfill_durations_next_steps(output_dir, only, stamp)
+        log.info("Durations change what the transcript quality checks can see. Re-assess, dry run first:")
+        log.info("  %s", _render_cli_command(dry))
+        log.info("then apply (backs up every meta it changes):")
+        log.info("  %s", _render_cli_command(full))
+
+    def _stop(reason: str) -> None:
+        log.error("backfill-durations: %s; %d meta(s) written so far.", reason, written)
+        log.error("  Re-run the same command to continue: metas already written are no longer candidates.")
+        _log_next_steps()
+        sys.exit(1)
+
+    for start in range(0, len(ids), BACKFILL_DURATIONS_BATCH):
+        batch = ids[start : start + BACKFILL_DURATIONS_BATCH]
+        try:
+            durations = enrich_with_durations(youtube, batch)
+        except Exception as e:
+            _log_summary("stopped early")
+            _stop(f"stopped after {start} of {len(ids)} video id(s) ({e})")
+        for video_id in batch:
+            iso = durations.get(video_id)
+            # The same "usable duration" test the walk used: a zero (`PT0S`,
+            # `P0D` for a live or upcoming stream) or unparseable value is
+            # unknown, and unknown stays unknown.
+            seconds = known_duration_seconds(_parse_iso8601_duration(iso)) if iso is not None else None
+            for meta_path in pending[video_id]:
+                counts = per_channel[meta_path.parent.name]
+                if iso is None:
+                    # Deleted, private or region-blocked upstream (or no
+                    # duration field at all): enrich_with_durations maps both to None.
+                    counts["not_found"] += 1
+                    continue
+                if seconds is None:
+                    counts["no_duration"] += 1
+                    continue
+                try:
+                    outcome = _write_backfilled_duration(meta_path, video_id, seconds)
+                except OSError as e:
+                    # A locked file (PermissionError on Windows) or a failed
+                    # re-read: nothing was written for this meta. Count it and
+                    # carry on; the run exits 1 at the end.
+                    outcome = "write_failed"
+                    write_failed += 1
+                    log.warning("  [%s] %s: not written (%s)", meta_path.parent.name, meta_path.name, e)
+                counts[outcome] += 1
+                if outcome == "written":
+                    written += 1
+                    log.info("  [%s] %s: duration_seconds=%d", meta_path.parent.name, meta_path.name, seconds)
+
+    _log_summary("applied")
+    if write_failed:
+        _stop(f"{write_failed} meta(s) could not be written")
+    _log_next_steps()
+    return totals
+
+
 def cmd_repair_metas(args, config):
     """Backfill identity into identity-less transcript metas (issue #66).
 
@@ -13924,6 +14155,45 @@ def cmd_repair_metas(args, config):
 
 
 ASSESS_TRANSCRIPTS_MANIFEST = "manifest.csv"
+
+#: Quality flags that only the live transcript writer can compute, so a
+#: re-assessment of the Markdown on disk must never drop them (issue #294
+#: review). `backward_jump_*` reads the entries in Gemini's EMISSION order and
+#: `chunk_window_mismatch_*` comes from the per-chunk merge; the Markdown is
+#: written sorted and whole, so `assess_transcript_artifact` can recompute
+#: neither from it, and replacing the stored list would erase them.
+WRITER_ONLY_QUALITY_FLAGS = frozenset(
+    {
+        QUALITY_FLAG_BACKWARD_JUMP_SEVERE,
+        QUALITY_FLAG_BACKWARD_JUMP_MILD,
+        QUALITY_FLAG_CHUNK_WINDOW_MISMATCH_SEVERE,
+        QUALITY_FLAG_CHUNK_WINDOW_MISMATCH_MILD,
+    }
+)
+
+
+def merge_reassessed_quality_flags(
+    old_flags: object, new_flags: list[str], *, preserve_writer_only: bool = True
+) -> list[str]:
+    """The flag list a re-assessment persists: what it recomputed, plus the stored writer-only flags.
+
+    Every flag the Markdown CAN recompute is replaced by the new verdict, so a
+    flag that no longer applies goes away. A stored flag in
+    ``WRITER_ONLY_QUALITY_FLAGS`` is kept, because nothing on disk can prove
+    it wrong. ``old_flags`` is tolerated the way
+    ``transcript_quality_flags_are_severe`` tolerates it: a value that is not a
+    flag collection keeps nothing, and a non-string entry is ignored.
+
+    ``preserve_writer_only=False`` returns the recomputed list alone. A
+    captions transcript passes it: it has no chunk merge and no raw emission
+    order, so a stored writer-only flag on it can only be a stale leftover of
+    the Gemini artifact it replaced (a captions writer before issue #182 did
+    not retire its predecessor's fields).
+    """
+    kept: set[str] = set()
+    if preserve_writer_only and isinstance(old_flags, _FLAG_COLLECTION_TYPES):
+        kept = {f for f in old_flags if isinstance(f, str) and f in WRITER_ONLY_QUALITY_FLAGS}
+    return sorted(set(new_flags) | kept)
 
 
 def assess_transcript_markdown(text: str, duration_seconds: int | None, *, captions: bool) -> tuple[dict, list[str]]:
@@ -14106,11 +14376,16 @@ def cmd_assess_transcripts(args, config):
             log.info("  %s/%s: unassessable (unknown duration)%s", channel, prefix, note)
             continue
 
-        fields, flags = assess_transcript_markdown(
-            text,
-            duration,
-            captions=meta.get("transcript_source") == TRANSCRIPT_SOURCE_CAPTIONS,
+        captions = meta.get("transcript_source") == TRANSCRIPT_SOURCE_CAPTIONS
+        fields, recomputed = assess_transcript_markdown(text, duration, captions=captions)
+        # A forced re-assessment replaces what the Markdown can recompute and
+        # keeps the writer-only flags; severity, the demotion and the verdict
+        # bucket all read the MERGED list, so a kept severe flag stays severe.
+        # A captions transcript can never carry a writer-only flag of its own.
+        flags = merge_reassessed_quality_flags(
+            meta.get("transcript_quality_flags"), recomputed, preserve_writer_only=not captions
         )
+        fields["transcript_quality_flags"] = flags
         severe = transcript_quality_flags_are_severe(flags)
         verdict = "severe" if severe else ("mild" if flags else "clean")
         counts["candidates"] += 1
@@ -14156,11 +14431,16 @@ def cmd_assess_transcripts(args, config):
         tail,
     )
     if counts["unassessable"]:
+        scope = ["--channel", only] if only else []
         log.info(
             "%d transcript(s) have no usable `duration_seconds` (a positive whole number of seconds) and were not "
-            "judged; store one in their meta.json and re-run.",
+            "judged. Fill the durations in, dry run first:",
             counts["unassessable"],
         )
+        log.info("  %s", _render_cli_command(["backfill-durations", *scope]))
+        log.info("then apply, and re-assess with --force:")
+        log.info("  %s", _render_cli_command(["backfill-durations", *scope, "--apply"]))
+        log.info("  %s", _render_cli_command(["assess-transcripts", "--force", *scope]))
     return counts
 
 
@@ -16808,6 +17088,19 @@ Examples:
         help="Write the descriptions. Default is dry-run (report only).",
     )
 
+    # backfill-durations command (issue #294)
+    backfill_durations_parser = subparsers.add_parser(
+        "backfill-durations",
+        help="Fill the video duration into metas that have none, so the transcript quality checks can use it. "
+        "1 YouTube quota unit per 50 videos; the dry run makes no API call.",
+    )
+    backfill_durations_parser.add_argument("--channel", help="Restrict to this channel (default: all channels).")
+    backfill_durations_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Fetch and write the durations. Default is dry-run (report counts and the quota estimate only).",
+    )
+
     # prune-shorts command
     prune_parser = subparsers.add_parser(
         "prune-shorts",
@@ -16984,6 +17277,8 @@ Examples:
             cmd_status(args, config)
         elif args.command == "backfill-descriptions":
             cmd_backfill_descriptions(args, config)
+        elif args.command == "backfill-durations":
+            cmd_backfill_durations(args, config)
         elif args.command == "repair-metas":
             cmd_repair_metas(args, config)
         elif args.command == "assess-transcripts":
