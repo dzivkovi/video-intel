@@ -121,6 +121,31 @@ def test_is_processed_cache_is_populated_once_per_channel(tmp_path, monkeypatch)
     assert call_count["n"] == 1, "meta.json glob must be cached after the first call"
 
 
+@pytest.mark.parametrize("reverse", [True, False], ids=["reverse-glob-order", "forward-glob-order"])
+def test_load_video_id_index_duplicate_video_id_sorted_prefix_wins_regardless_of_glob_order(
+    tmp_path, monkeypatch, reverse
+):
+    """Issue #276: two metas claim one video_id; the alphabetically first prefix
+    wins no matter what order the filesystem enumerates them in."""
+    ch = tmp_path / "chan"
+    for prefix in ("2026-01-02-bbb", "2026-01-01-aaa"):
+        _write_meta(ch, prefix, {"video_id": "vid001", "title": prefix})
+
+    original_glob = Path.glob
+
+    def ordered_glob(self, pattern):
+        return sorted(original_glob(self, pattern), reverse=reverse)
+
+    vi._invalidate_video_id_cache()
+    monkeypatch.setattr(Path, "glob", ordered_glob)
+    try:
+        index = vi._load_video_id_index(ch)
+    finally:
+        vi._invalidate_video_id_cache()
+
+    assert index["vid001"] == "2026-01-01-aaa"
+
+
 # ---------------------------------------------------------------------------
 # Cleanup: dedupe subcommand
 # ---------------------------------------------------------------------------
