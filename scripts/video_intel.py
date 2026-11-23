@@ -14172,7 +14172,9 @@ WRITER_ONLY_QUALITY_FLAGS = frozenset(
 )
 
 
-def merge_reassessed_quality_flags(old_flags: object, new_flags: list[str]) -> list[str]:
+def merge_reassessed_quality_flags(
+    old_flags: object, new_flags: list[str], *, preserve_writer_only: bool = True
+) -> list[str]:
     """The flag list a re-assessment persists: what it recomputed, plus the stored writer-only flags.
 
     Every flag the Markdown CAN recompute is replaced by the new verdict, so a
@@ -14181,9 +14183,15 @@ def merge_reassessed_quality_flags(old_flags: object, new_flags: list[str]) -> l
     it wrong. ``old_flags`` is tolerated the way
     ``transcript_quality_flags_are_severe`` tolerates it: a value that is not a
     flag collection keeps nothing, and a non-string entry is ignored.
+
+    ``preserve_writer_only=False`` returns the recomputed list alone. A
+    captions transcript passes it: it has no chunk merge and no raw emission
+    order, so a stored writer-only flag on it can only be a stale leftover of
+    the Gemini artifact it replaced (a captions writer before issue #182 did
+    not retire its predecessor's fields).
     """
     kept: set[str] = set()
-    if isinstance(old_flags, _FLAG_COLLECTION_TYPES):
+    if preserve_writer_only and isinstance(old_flags, _FLAG_COLLECTION_TYPES):
         kept = {f for f in old_flags if isinstance(f, str) and f in WRITER_ONLY_QUALITY_FLAGS}
     return sorted(set(new_flags) | kept)
 
@@ -14368,15 +14376,15 @@ def cmd_assess_transcripts(args, config):
             log.info("  %s/%s: unassessable (unknown duration)%s", channel, prefix, note)
             continue
 
-        fields, recomputed = assess_transcript_markdown(
-            text,
-            duration,
-            captions=meta.get("transcript_source") == TRANSCRIPT_SOURCE_CAPTIONS,
-        )
+        captions = meta.get("transcript_source") == TRANSCRIPT_SOURCE_CAPTIONS
+        fields, recomputed = assess_transcript_markdown(text, duration, captions=captions)
         # A forced re-assessment replaces what the Markdown can recompute and
         # keeps the writer-only flags; severity, the demotion and the verdict
         # bucket all read the MERGED list, so a kept severe flag stays severe.
-        flags = merge_reassessed_quality_flags(meta.get("transcript_quality_flags"), recomputed)
+        # A captions transcript can never carry a writer-only flag of its own.
+        flags = merge_reassessed_quality_flags(
+            meta.get("transcript_quality_flags"), recomputed, preserve_writer_only=not captions
+        )
         fields["transcript_quality_flags"] = flags
         severe = transcript_quality_flags_are_severe(flags)
         verdict = "severe" if severe else ("mild" if flags else "clean")

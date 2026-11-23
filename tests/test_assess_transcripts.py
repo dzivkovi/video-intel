@@ -754,6 +754,40 @@ class TestForcedReassessmentKeepsWriterOnlyFlags:
             [vi.QUALITY_FLAG_BACKWARD_JUMP_SEVERE, vi.QUALITY_FLAG_CHUNK_WINDOW_MISMATCH_MILD]
         )
 
+    def test_captions_transcript_drops_a_stale_writer_only_flag(self, tmp_path, corpus):
+        # Arrange: a captions transcript still carrying the replaced Gemini
+        # artifact's flag (a captions writer before issue #182 left it there).
+        meta = _meta(
+            transcript_source=vi.TRANSCRIPT_SOURCE_CAPTIONS,
+            transcript_quality_flags=[vi.QUALITY_FLAG_CHUNK_WINDOW_MISMATCH_SEVERE],
+            transcript_status="complete",
+        )
+        meta_path = _write(corpus / "chan", "v", meta, _md(_healthy_body(1200)))
+
+        # Act
+        counts = _run(tmp_path, force=True, apply=True, backup_dir=str(tmp_path / "bk"))
+
+        # Assert
+        stored = json.loads(meta_path.read_text(encoding="utf-8"))
+        assert stored["transcript_quality_flags"] == []
+        assert stored["transcript_status"] == "complete"
+        assert counts["clean"] == 1
+        assert counts["demoted"] == 0
+
+    def test_gemini_transcript_keeps_the_same_stored_flag(self, tmp_path, corpus):
+        meta = _meta(
+            transcript_quality_flags=[vi.QUALITY_FLAG_CHUNK_WINDOW_MISMATCH_SEVERE],
+            transcript_status="complete",
+        )
+        meta_path = _write(corpus / "chan", "v", meta, _md(_healthy_body(1200)))
+
+        counts = _run(tmp_path, force=True, apply=True, backup_dir=str(tmp_path / "bk"))
+
+        stored = json.loads(meta_path.read_text(encoding="utf-8"))
+        assert stored["transcript_quality_flags"] == [vi.QUALITY_FLAG_CHUNK_WINDOW_MISMATCH_SEVERE]
+        assert stored["transcript_status"] == "partial"
+        assert counts["severe"] == 1
+
 
 class TestMergeReassessedQualityFlags:
     def test_merge_keeps_only_writer_only_entries_of_the_old_list(self):
@@ -769,6 +803,12 @@ class TestMergeReassessedQualityFlags:
     )
     def test_merge_malformed_old_flags_keep_nothing(self, old):
         assert vi.merge_reassessed_quality_flags(old, ["density_mild"]) == ["density_mild"]
+
+    def test_merge_without_preserving_returns_the_recomputed_list_only(self):
+        old = [vi.QUALITY_FLAG_BACKWARD_JUMP_SEVERE]
+        new = [vi.QUALITY_FLAG_DENSITY_MILD]
+        assert vi.merge_reassessed_quality_flags(old, new, preserve_writer_only=False) == new
+        assert vi.merge_reassessed_quality_flags(old, new) == sorted(old + new)
 
     def test_merge_tolerates_a_non_string_entry_beside_a_real_flag(self):
         old = [{"x": 1}, vi.QUALITY_FLAG_CHUNK_WINDOW_MISMATCH_SEVERE]
