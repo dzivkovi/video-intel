@@ -332,7 +332,7 @@ The repo only changes the default `model` on a measured scorecard, never on a sp
 | url | Yes | YouTube channel URL. Optional on an `enabled: false` placeholder for a non-YouTube source |
 | prompt | No | Override `default_prompt` |
 | auto_transcript | No | `all` or `none` (default: `none`) |
-| since | No | Override default lookback window (additive in selective mode) |
+| since | No | Override default lookback window (additive in selective mode; `since: none` (or `false`) on a selective channel turns the recent-uploads window off, and `--since` still overrides it) |
 | playlists | No | List of playlist names to scan (enables selective mode) |
 | keywords | No | List of search terms to scan (enables selective mode) |
 | enabled | No | `false` drops the channel from `scan` entirely, including an explicit `scan --channel <name>`, while keeping it addressable for `transcript --url --channel`, the `--file` paths and `concepts --channel`. Use it for Skool, Vimeo, members-only YouTube, and one-off creators (default: `true`) |
@@ -371,6 +371,8 @@ and `mindmap_source` - which reports a typo'd knob with the consequence it would
 have (whole scan aborted, channel skipped, or just that stage failing) before
 spending any quota. The rest are not preflighted: a bad `skip_shorts`,
 `enabled`, or `min_duration_seconds` surfaces only when the scan reaches it.
+The preflight also reports a channel with no `playlists` or `keywords` that sets
+`since: none` or `false`, which a real run skips because it would fetch nothing.
 
 ### Selective Mode
 
@@ -391,8 +393,8 @@ specific topics or curated collections.
 
 - Playlist names are resolved via YouTube API (case-insensitive contains matching)
 - Keywords search the entire channel history (capped at 200 results per keyword)
-- `since` is additive for selective channels: also fetches recent uploads alongside playlists/keywords
-- Without `since`, only playlists and keywords are fetched
+- `since` is additive for selective channels: also fetches recent uploads alongside playlists/keywords. `since: none` (or `false`) turns the recent-uploads window off, so only playlists and keywords are fetched even when `default_since` is set; `--since` still overrides it
+- Without a channel `since`, the window falls back to the top-level `default_since` when one is set, so recent uploads are still fetched; `since: none` is what turns it off
 - Videos from multiple playlists/keywords are deduplicated by video ID
 
 ### Since Formats
@@ -400,7 +402,7 @@ specific topics or curated collections.
 - Relative: `7d`, `10d`, `30d`, `120d`
 - Absolute: `2026-01-15`
 - Command-line `--since` overrides per-channel and default settings
-- For selective channels, `since` adds recent uploads alongside playlists/keywords
+- For selective channels, the channel `since` (or else `default_since`) adds recent uploads alongside playlists/keywords; `since: none` opts out
 
 ## Usage
 
