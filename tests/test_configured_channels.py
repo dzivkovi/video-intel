@@ -267,9 +267,7 @@ class TestTheAccessorIsTheOnlyReader:
                     # `not args.channel` shape) keeps the presence rule.
                     if strict_kw is None:
                         is_strict = False
-                    elif isinstance(strict_kw.value, ast.Constant) and isinstance(
-                        strict_kw.value.value, bool
-                    ):
+                    elif isinstance(strict_kw.value, ast.Constant) and isinstance(strict_kw.value.value, bool):
                         is_strict = strict_kw.value.value
                     else:
                         is_strict = True
