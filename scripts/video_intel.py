@@ -1501,6 +1501,7 @@ def validate_channel_knobs(
     config: dict,
     cli_chunk_minutes: int | None = None,
     cli_captions_over_duration: int | None = None,
+    cli_since: str | None = None,
 ) -> list[tuple[str, str, str]]:
     """Preflight-validate a channel's per-video config knobs (issue #169).
 
@@ -1561,6 +1562,13 @@ def validate_channel_knobs(
 
     def _reached(consequence: str) -> str:
         return consequence if transcript_all else KNOB_CONSEQUENCE_NOT_REACHED
+
+    # 0. `since: none` on a non-selective channel (issue #293) - cmd_scan skips
+    #    the channel right after this preflight, before get_channel_id(), so it
+    #    fires FIRST at runtime: ahead of `prompt` (load_prompt runs only after
+    #    the fetch and the --dry-run return). Same predicate the runtime uses.
+    if selective_since_misuse(channel_config, cli_since):
+        problems.append(("since", SINCE_OPT_OUT_MISUSE_MESSAGE, KNOB_CONSEQUENCE_SKIPS_CHANNEL))
 
     # 1. `prompt` - load_prompt() runs before any per-mode gate and answers an
     #    unresolvable name with sys.exit(1). The WORST of these knobs: it does
@@ -1822,6 +1830,58 @@ def parse_since(since_str):
     except ValueError:
         log.error("Invalid since format: %s. Use '10d' for relative days or 'YYYY-MM-DD' for absolute date.", since_str)
         sys.exit(1)
+
+
+#: Issue #293: shared by the runtime rejection in `cmd_scan` and the preflight
+#: in `validate_channel_knobs`, so the two cannot describe the misuse differently.
+SINCE_OPT_OUT_MISUSE_MESSAGE = (
+    "since: none (or false) turns off the recent-uploads window, which only makes sense "
+    "with playlists: or keywords:; this channel has neither, so it would fetch nothing"
+)
+
+
+def channel_is_selective(channel_config: dict) -> bool:
+    """True when the channel scans playlists/keywords instead of its uploads."""
+    return bool(channel_config.get("playlists") or channel_config.get("keywords"))
+
+
+def selective_since_opted_out(channel_config: dict) -> bool:
+    """True when the channel's own `since` says "no recent-uploads window" (issue #293).
+
+    The opt-out is the string `none` (case-insensitive, whitespace ignored) or the
+    YAML boolean `false`. An absent key, a YAML null and an empty string are NOT
+    opt-outs (they fall through to `default_since`), and boolean `true` is given
+    no meaning here.
+    """
+    raw = channel_config.get("since")
+    if raw is False:
+        return True
+    return isinstance(raw, str) and raw.strip().lower() == "none"
+
+
+def selective_since_misuse(channel_config: dict, cli_since: str | None) -> bool:
+    """True when a NON-selective channel carries the opt-out and no CLI `--since`
+    supplies a window: the channel would fetch nothing, so `cmd_scan` skips it and
+    `validate_channel_knobs` reports it. One predicate for both [core: writer's-path].
+    """
+    return not cli_since and not channel_is_selective(channel_config) and selective_since_opted_out(channel_config)
+
+
+def resolve_selective_since(channel_config: dict, config: dict, cli_since: str | None) -> datetime | None:
+    """The recent-uploads window for a selective channel, or None for no window.
+
+    The ONE place it is decided (issue #293). Precedence: CLI `--since` (wins even
+    over the opt-out, so an operator can force a lookback) > the channel's opt-out
+    (`since: none` / `false`) > the channel's `since` > top-level `default_since`
+    > no window. Every other value goes through `parse_since` exactly as before,
+    so `since: true` keeps today's behavior.
+    """
+    if cli_since:
+        return parse_since(cli_since)
+    if selective_since_opted_out(channel_config):
+        return None
+    since_str = channel_config.get("since") or config.get("default_since")
+    return parse_since(since_str) if since_str else None
 
 
 # ---------------------------------------------------------------------------
@@ -8029,6 +8089,7 @@ def cmd_scan(args, config):
             config,
             getattr(args, "chunk_minutes", None),
             getattr(args, "captions_over_duration", None),
+            getattr(args, "since", None),
         )
         for knob_name, error_message, consequence in knob_problems:
             log_fn = log.warning if consequence.startswith(KNOB_CONSEQUENCE_NOT_REACHED) else log.error
@@ -8044,6 +8105,15 @@ def cmd_scan(args, config):
         knob_consequences = {c for _, _, c in knob_problems}
         knob_aborts_scan = KNOB_CONSEQUENCE_ABORTS_SCAN in knob_consequences
         knob_blocks_channel = KNOB_CONSEQUENCE_SKIPS_CHANNEL in knob_consequences
+
+        # Issue #293: `since: none` on a channel with no playlists/keywords would
+        # fetch nothing. Skipped here, before get_channel_id(), so the rejection
+        # costs no quota; recorded in `errors` so the scan cannot report Done.
+        # with the channel silently dropped (the issue #135 rule).
+        if selective_since_misuse(ch, args.since):
+            log.error("[%s] invalid since (%s); skipping entire channel", ch_name, SINCE_OPT_OUT_MISUSE_MESSAGE)
+            errors.append((ch_name, ch_name, f"error: {SINCE_OPT_OUT_MISUSE_MESSAGE}"))
+            continue
 
         # Resolve channel
         channel_id, channel_title = get_channel_id(youtube, ch_url)
@@ -8064,13 +8134,13 @@ def cmd_scan(args, config):
             continue
 
         # Determine fetch strategy: selective (playlists/keywords) or date-based
-        is_selective = bool(ch.get("playlists") or ch.get("keywords"))
+        is_selective = channel_is_selective(ch)
 
         if is_selective:
             log.info("  Selective mode: playlists=%s, keywords=%s", ch.get("playlists", []), ch.get("keywords", []))
-            # since is additive for selective channels (also fetch recent uploads)
-            since_str = args.since or ch.get("since") or config.get("default_since")
-            selective_since = parse_since(since_str) if since_str else None
+            # since is additive for selective channels (also fetch recent uploads),
+            # unless the channel opts out with `since: none` (issue #293).
+            selective_since = resolve_selective_since(ch, config, args.since)
             videos = fetch_selective_videos(youtube, channel_id, ch, since_dt=selective_since)
         else:
             since_str = args.since or ch.get("since") or config.get("default_since", "10d")

@@ -470,6 +470,10 @@ class TestValidateChannelKnobsCheckOrderIsTheContract:
 
     def test_every_knob_bad_at_once_reports_in_documented_runtime_order_with_exactly_one_stopping_consequence(self):
         config = {
+            # Issue #293: `since: none` on a channel with no playlists/keywords
+            # is rejected before get_channel_id(), so it fires FIRST - ahead of
+            # `prompt`, whose load_prompt() runs only after the fetch.
+            "since": "none",
             "prompt": "does-not-exist-xyz",
             "auto_transcript": "all",
             "transcript_source": "bogus",
@@ -484,6 +488,7 @@ class TestValidateChannelKnobsCheckOrderIsTheContract:
         problems = validate_channel_knobs(config, {})
 
         assert [p[0] for p in problems] == [
+            "since",
             "prompt",
             "transcript_source",
             "chunk_minutes",
@@ -497,7 +502,7 @@ class TestValidateChannelKnobsCheckOrderIsTheContract:
         stopping = [c for c in consequences if c in vi._KNOB_STOPPING_CONSEQUENCES]
         assert len(stopping) == 1, f"expected exactly one stopping consequence, got: {consequences}"
         assert consequences[0] in vi._KNOB_STOPPING_CONSEQUENCES, (
-            "the FIRST knob in runtime order (prompt) must be the one that stops the channel here"
+            "the FIRST knob in runtime order (since) must be the one that stops the channel here"
         )
         assert all(c.startswith(KNOB_CONSEQUENCE_NOT_REACHED) for c in consequences[1:]), (
             f"every problem after the first stopping one must be downgraded to NOT_REACHED, got: {consequences}"

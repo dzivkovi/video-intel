@@ -200,6 +200,7 @@ channels:
     keywords:
       - specific topic
     auto_transcript: none
+    # since: none                # playlists/keywords only: no recent-uploads window even with default_since (--since still overrides)
 
   # One-off creator: not pulled by regular `scan`, but kept in config so
   # `mindmap --url --channel <name>`, `transcript --url --channel <name>`,

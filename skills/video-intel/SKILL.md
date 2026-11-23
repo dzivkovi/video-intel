@@ -944,6 +944,7 @@ content instead of scanning all uploads. Playlist names are resolved via YouTube
 (case-insensitive contains matching). Keywords search the entire channel history
 (capped at 200 results per keyword). If `since` is also set, recent uploads are
 fetched as an additional source alongside playlists/keywords.
+`since: none` (or `false`) on a selective channel turns that recent-uploads window off, even when `default_since` is set; `--since` still overrides it, and on a channel with no `playlists` or `keywords` it is rejected (the channel is skipped).
 
 **One-off creators (`enabled: false`):** When a creator posts content you
 occasionally want a transcript or mindmap of, but you do NOT want them in
