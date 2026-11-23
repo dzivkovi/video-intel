@@ -83,6 +83,8 @@ from gemini_common import (
     log_usage_metadata,
     require_gemini,
     require_youtube,
+    served_model_differs,
+    served_model_from_response,
 )
 from timestamp_utils import (
     TIMESTAMP_TOKEN_PATTERN,
@@ -3053,6 +3055,48 @@ def _finish_reason_of(response: object) -> str | None:
         return None
 
 
+#: Key under which a per-call ``on_response`` capture dict carries the served
+#: model (issue #295). It rides the same dict the callback already fills with
+#: usage counts, so nothing new is threaded through the call path.
+SERVED_MODEL_CAPTURE_KEY = "served_model"
+
+#: (requested, served) pairs already warned about in this process (issue #295).
+#: One WARNING per distinct pair, not one per call: a redirect applies to every
+#: call in a run, and a line per video would bury everything else in the log.
+_SERVED_MODEL_MISMATCHES_WARNED: set[tuple[str, str]] = set()
+_SERVED_MODEL_MISMATCHES_LOCK = threading.Lock()
+
+
+def _capture_served_model(response: object, capture: dict, *, requested: str, mode: str) -> None:
+    """Put the model that served ``response`` into ``capture`` (issue #295).
+
+    Called from every ``on_response`` callback, AFTER any counts refill that
+    clears the dict. An unreadable value removes the key so a writer records
+    nothing rather than a stale value. When the served model differs from
+    ``requested`` (``served_model_differs``, the one comparison rule), warns
+    once per process per (requested, served) pair; ``mode`` names the meta
+    field the writer records it in.
+    """
+    served = served_model_from_response(response)
+    if served is None:
+        capture.pop(SERVED_MODEL_CAPTURE_KEY, None)
+        return
+    capture[SERVED_MODEL_CAPTURE_KEY] = served
+    if not served_model_differs(requested, served):
+        return
+    with _SERVED_MODEL_MISMATCHES_LOCK:
+        if (requested, served) in _SERVED_MODEL_MISMATCHES_WARNED:
+            return
+        _SERVED_MODEL_MISMATCHES_WARNED.add((requested, served))
+    log.warning(
+        "Gemini served %s for a request naming %s; meta.json records the served model in %s_model_served "
+        "when the artifact is written.",
+        served,
+        requested,
+        mode,
+    )
+
+
 def hit_output_cap(candidates: int | None, finish_reason: str | None, *, max_output_tokens: int) -> bool:
     """Whether a Gemini response stopped because it ran out of OUTPUT budget.
 
@@ -3925,6 +3969,8 @@ def _run_chunked_transcript_url(
     # evidence only exists here, before merge/sort) plus the whole-stitched-
     # transcript flags computed after merge below.
     quality_flags: set[str] = set()
+    # Issue #295: the served model of every chunk whose call returned.
+    served_models: list[str] = []
 
     for chunk_idx, (start_secs, end_secs) in enumerate(chunks, start=1):
         gemini_start: int | None = None if (start_secs == 0 and end_secs == 0) else start_secs
@@ -3941,7 +3987,7 @@ def _run_chunked_transcript_url(
         # logs them, so the prompt == 0 confabulation guard can run here too.
         # Until now this path only LOGGED the usage, so a fabricated chunk was
         # parsed and stitched into the final transcript with status "ok".
-        usage_capture: dict[str, int | None] = {}
+        usage_capture: dict[str, int | str | None] = {}
 
         # Both loop variables are bound as defaults rather than closed over. The
         # dict is fresh per iteration, so a late-firing callback can only ever
@@ -3953,6 +3999,8 @@ def _run_chunked_transcript_url(
             if counts is not None:
                 _capture.clear()
                 _capture.update(counts)
+            # After the refill above, which would otherwise wipe the key.
+            _capture_served_model(r, _capture, requested=model, mode="transcript")
 
         try:
             # Issue #74: wall-clock cap per chunk. A hung chunk raises
@@ -3986,6 +4034,9 @@ def _run_chunked_transcript_url(
                 }
             )
             continue
+
+        if usage_capture.get(SERVED_MODEL_CAPTURE_KEY):
+            served_models.append(usage_capture[SERVED_MODEL_CAPTURE_KEY])
 
         # Issue #123 confabulation guard, the chunked member of the family that
         # #60 (single-shot transcript) and #119 (video mindmap) already closed.
@@ -4192,6 +4243,10 @@ def _run_chunked_transcript_url(
         "transcript_timestamp_overrun_entries": whole_metrics["timestamp_overrun_entries"],
         "transcript_chunk_window_violations": chunk_window_result["total_violations"],
     }
+    if served_models:
+        # One value when the chunks agree, else the distinct values sorted and
+        # comma-joined: always a string, so a sweep never has to branch on type.
+        meta_fields["transcript_model_served"] = ",".join(sorted(set(served_models)))
     if confabulated_chunks:
         # A dedicated field, NOT last_error: update_meta resets last_error to
         # None after merging, so anything written there would be silently
@@ -5594,6 +5649,9 @@ def process_mindmap(
     if mindmap_path.exists() and not force:
         return resolved_prefix, "skipped (exists)"
 
+    # Issue #295: the served model, filled by whichever source's callback runs.
+    served_capture: dict[str, str] = {}
+
     try:
         if source == "transcript":
             resolved_transcript = (
@@ -5624,13 +5682,17 @@ def process_mindmap(
                     "transcript_status", "ok"
                 )
 
+            def _on_text_resp(r: object) -> None:
+                log_usage_metadata(r, "mindmap")
+                _capture_served_model(r, served_capture, requested=model, mode="mindmap")
+
             result = call_gemini_text(
                 client,
                 types,
                 prompt_text + "\n\n# TRANSCRIPT TO PROCESS\n\n" + transcript_text,
                 model,
                 response_mime_type="text/plain",
-                on_response=lambda r: log_usage_metadata(r, "mindmap"),
+                on_response=_on_text_resp,
             )
 
             header_lines = [
@@ -5667,6 +5729,7 @@ def process_mindmap(
                 if counts is not None:
                     usage_capture.clear()
                     usage_capture.update(counts)
+                _capture_served_model(r, served_capture, requested=model, mode="mindmap")
 
             # Issue #249: the mindmap-from-video call is reached exactly when
             # Gemini is already misbehaving (it is the fallback after a failed
@@ -5751,7 +5814,17 @@ def process_mindmap(
         duration_seconds = _video_duration_seconds(video)
         if duration_seconds is not None:
             meta_fields["duration_seconds"] = duration_seconds
-        update_meta(meta_path, meta_fields, "scan")
+        # Issue #295: this writer replaced the mindmap, so it owns the field that
+        # names its served model - written when captured, else retired so a
+        # --force re-run never keeps the previous artifact's value.
+        if served_capture.get(SERVED_MODEL_CAPTURE_KEY):
+            meta_fields["mindmap_model_served"] = served_capture[SERVED_MODEL_CAPTURE_KEY]
+        update_meta(
+            meta_path,
+            meta_fields,
+            "scan",
+            drop_fields=() if "mindmap_model_served" in meta_fields else ("mindmap_model_served",),
+        )
 
         return resolved_prefix, "done"
 
@@ -6793,6 +6866,9 @@ TRANSCRIPT_ARTIFACT_FIELDS: tuple[str, ...] = (
     "transcript_recovery",
     "transcript_parse_error",
     "transcript_warning",
+    # Issue #295: which model served the Gemini call(s) behind this transcript.
+    # A captions transcript calls no model, so it must retire a predecessor's.
+    "transcript_model_served",
 )
 
 
@@ -7184,7 +7260,8 @@ def process_transcript(
     transcript_thinking_config = _make_thinking_config_for_transcript(types, model)
     # Issue #60 confabulation guard: capture the prompt-token count off the usage
     # callback so we can detect prompt == 0 (Gemini ingested no video tokens).
-    usage_capture: dict[str, int | None] = {}
+    # Issue #295: also carries the served model under SERVED_MODEL_CAPTURE_KEY.
+    usage_capture: dict[str, int | str | None] = {}
     finish_capture: dict[str, str | None] = {}
 
     def _on_resp(r):
@@ -7192,6 +7269,8 @@ def process_transcript(
         if counts is not None:
             usage_capture.clear()
             usage_capture.update(counts)
+        # After the refill above, which would otherwise wipe the key.
+        _capture_served_model(r, usage_capture, requested=model, mode="transcript")
         # Issue #128: the output-cap check needs the finish reason too, because
         # candidates_token_count can be unreadable on a response that really did
         # truncate (Gemini can also reach MAX_TOKENS with thinking consuming the
@@ -7340,6 +7419,8 @@ def process_transcript(
                 "transcript_dialogue_entries": quality_metrics["dialogue_entries"],
                 "transcript_timestamp_overrun_entries": quality_metrics["timestamp_overrun_entries"],
             }
+            if usage_capture.get(SERVED_MODEL_CAPTURE_KEY):
+                success_fields["transcript_model_served"] = usage_capture[SERVED_MODEL_CAPTURE_KEY]
             update_meta(
                 meta_path,
                 success_fields,
@@ -7417,6 +7498,8 @@ def process_transcript(
                 "transcript_dialogue_entries": salvage_quality_metrics["dialogue_entries"],
                 "transcript_timestamp_overrun_entries": salvage_quality_metrics["timestamp_overrun_entries"],
             }
+            if usage_capture.get(SERVED_MODEL_CAPTURE_KEY):
+                salvage_fields["transcript_model_served"] = usage_capture[SERVED_MODEL_CAPTURE_KEY]
             if truncated:
                 salvage_fields["transcript_output_tokens"] = usage_capture.get("candidates")
                 salvage_fields["transcript_finish_reason"] = finish_capture.get("reason")
@@ -7688,6 +7771,15 @@ def process_concepts(
     if concepts_path.exists() and not force:
         return prefix, "skipped (exists)"
 
+    # Issue #295: one capture dict for both call sites below (cached, then the
+    # inline retry), cleared before each call so only the call that produced
+    # `raw` can leave a value behind.
+    served_capture: dict[str, str] = {}
+
+    def _on_concepts_resp(r: object) -> None:
+        log_usage_metadata(r, "concepts")
+        _capture_served_model(r, served_capture, requested=model, mode="concepts")
+
     try:
         taxonomy_concepts = taxonomy.get("concepts", {})
         raw = None
@@ -7695,12 +7787,13 @@ def process_concepts(
         if cached is not None:
             cache_name, delta_text = cached
             try:
+                served_capture.clear()
                 raw = call_gemini_text(
                     client,
                     types,
                     delta_text + concepts_mindmap_tail(mindmap_text),
                     model,
-                    on_response=lambda r: log_usage_metadata(r, "concepts"),
+                    on_response=_on_concepts_resp,
                     cached_content=cache_name,
                 )
             except Exception as e:
@@ -7710,12 +7803,13 @@ def process_concepts(
                 prompt_cache.invalidate()
         if raw is None:
             full_text = build_concepts_prompt_prefix(taxonomy_concepts) + concepts_mindmap_tail(mindmap_text)
+            served_capture.clear()
             raw = call_gemini_text(
                 client,
                 types,
                 full_text,
                 model,
-                on_response=lambda r: log_usage_metadata(r, "concepts"),
+                on_response=_on_concepts_resp,
             )
         result = json.loads(raw)
 
@@ -7748,14 +7842,21 @@ def process_concepts(
         # update_meta resets last_error but knows nothing about per-stage
         # fields, so without this a recovered video would carry an error
         # record forever and read as broken in any corpus sweep.
+        concepts_fields = {
+            **_transcript_identity_fields(video, channel_dir),
+            "processed": datetime.now(UTC).isoformat(),
+            "concepts_status": "ok",
+        }
+        # Issue #295: written when captured, else retired (same rule as the
+        # mindmap writer). concepts.json records no requested model, so it gets
+        # no served one either.
+        if served_capture.get(SERVED_MODEL_CAPTURE_KEY):
+            concepts_fields["concepts_model_served"] = served_capture[SERVED_MODEL_CAPTURE_KEY]
         update_meta(
             meta_path,
-            {
-                **_transcript_identity_fields(video, channel_dir),
-                "processed": datetime.now(UTC).isoformat(),
-                "concepts_status": "ok",
-            },
+            concepts_fields,
             "concepts",
+            drop_fields=() if "concepts_model_served" in concepts_fields else ("concepts_model_served",),
         )
 
         n_new = sum(1 for c in result["concepts"] if c.get("status") == "new")
@@ -12640,6 +12741,7 @@ _MINDMAP_PROVENANCE_FIELDS: tuple[str, ...] = (
     "mindmap_source",
     "mindmap_source_status",
     "prompt",
+    "mindmap_model_served",  # issue #295
 )
 
 

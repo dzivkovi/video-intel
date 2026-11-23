@@ -173,6 +173,58 @@ def log_usage_metadata(response: object, label: str) -> dict | None:
         return None
 
 
+_MODELS_PREFIX = "models/"
+
+
+def _bare_model_name(name: str) -> str:
+    """``name`` stripped of whitespace and a leading ``models/``."""
+    name = name.strip()
+    return name[len(_MODELS_PREFIX) :] if name.startswith(_MODELS_PREFIX) else name
+
+
+def served_model_from_response(response: object) -> str | None:
+    """The model that actually SERVED a Gemini call, or ``None`` (issue #295).
+
+    Google can answer a request naming one model with another (a retired Flash
+    is silently served by its successor), so the requested name is not
+    provenance. The SDK exposes the answer as
+    ``GenerateContentResponse.model_version: Optional[str]`` (google-genai
+    ``types.py``, mapped from the wire field ``modelVersion``).
+
+    Returns the stripped name with a leading ``models/`` removed. An absent
+    attribute, a non-string, or an empty value returns ``None`` and logs at
+    DEBUG: unreadable means "record nothing", never a guess. Never raises -
+    this runs inside the ``on_response`` observability callbacks, which must
+    never break the call.
+    """
+    try:
+        value = getattr(response, "model_version", None)
+    except Exception as exc:
+        log.debug("served model unreadable: model_version raised %s", exc)
+        return None
+    if not isinstance(value, str):
+        log.debug("served model unreadable: model_version is %s", type(value).__name__)
+        return None
+    bare = _bare_model_name(value)
+    if not bare:
+        log.debug("served model unreadable: model_version is empty")
+        return None
+    return bare
+
+
+def served_model_differs(requested: str, served: str | None) -> bool:
+    """Whether the served model is a different model from the requested one (issue #295).
+
+    The ONE comparison rule [core: one-definition]: exact equality after the
+    ``models/`` strip. Nothing on disk shows the API returning a suffixed name
+    (``X-001``) for an un-redirected request; if a live call ever does, widen
+    the rule here and nowhere else. ``None`` (unreadable) never differs.
+    """
+    if served is None:
+        return False
+    return _bare_model_name(requested) != _bare_model_name(served)
+
+
 # ---------------------------------------------------------------------------
 # Lazy imports
 # ---------------------------------------------------------------------------
