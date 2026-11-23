@@ -2918,6 +2918,47 @@ def _invalidate_video_id_cache(channel_dir: Path | None = None) -> None:
         _VIDEO_ID_CACHE.pop(str(channel_dir), None)
 
 
+def _strict_video_id_claimant(channel_dir: Path, video_id: str) -> tuple[str | None, list[str]]:
+    """Find the meta that claims ``video_id``, and say whether the search was complete (issue #277).
+
+    Returns ``(prefix, unreadable)``: the first claimant in the same sorted
+    file-name order ``_load_video_id_index`` uses (first wins), or None, plus
+    the names of files that could not be read (``OSError``), decoded or parsed
+    (``ValueError``), or that parsed to something other than an object. An
+    empty ``unreadable`` means the walk was complete.
+
+    The index cannot answer "nothing claims this id": it skips exactly those
+    files, so a claiming meta whose read fails at that moment looks absent.
+    This is the strict walk a writer needs before it CREATES a meta. A
+    non-string ``video_id`` in some other meta is simply not a claimant. An
+    unreadable file or folder is reported, never raised. Used only by
+    ``_record_transcript_error``'s ``video`` branch.
+    """
+    unreadable: list[str] = []
+    # os.listdir, not Path.glob: on Python 3.12 glob swallows listing errors, so
+    # a transient failure would read as "empty folder, nothing claims the id".
+    try:
+        names = os.listdir(channel_dir)
+    except FileNotFoundError:
+        return None, []  # no folder: nothing can claim the id
+    except OSError:
+        return None, [str(channel_dir)]
+    candidates = [channel_dir / name for name in sorted(names) if name.endswith(".meta.json")]
+    for meta_path in candidates:
+        try:
+            data = json.loads(meta_path.read_bytes().decode("utf-8"))
+        except (OSError, ValueError):
+            unreadable.append(meta_path.name)
+            continue
+        if not isinstance(data, dict):
+            unreadable.append(meta_path.name)
+            continue
+        claimed = data.get("video_id")
+        if isinstance(claimed, str) and claimed == video_id:
+            return meta_path.name.removesuffix(".meta.json"), unreadable
+    return None, unreadable
+
+
 # ---------------------------------------------------------------------------
 # YouTube Shorts classification
 # ---------------------------------------------------------------------------
@@ -4390,6 +4431,9 @@ def _finish_chunked_transcript(
     transcript_path = channel_dir / f"{prefix}.transcript.md"
     meta_path = channel_dir / f"{prefix}.meta.json"
     lost = chunked_transcript_lost_chunks(status)
+    # Issue #277: the last_error recorded for an `error` status. It reuses the
+    # status verbatim, so an all-timeouts run reads "all chunks failed parsing".
+    failure_note = f"chunked transcript failed: {status}"
     captions_available = True
     if chunked_captions_failover_applies(status, transcript_source, captions_already_tried=captions_already_tried):
         sidecar: Path | None = None
@@ -4422,20 +4466,32 @@ def _finish_chunked_transcript(
             if lost
             else f"chunked transcript failed: {status}"
         )
-        fb = _try_captions_transcript(
-            video,
-            transcript_path,
-            meta_path,
-            prefix,
-            reason=reason,
-            # The partial on disk is THIS run's own output, so replacing it is
-            # not a clobber - the idempotency guard inside the writer exists to
-            # protect a PRIOR run's artifact. A hard error wrote nothing, so the
-            # caller's own force keeps its pre-#248 meaning there.
-            force=True if lost else force,
-            duration_seconds=duration_seconds,
-            reason_sink=captions_reason,
-        )
+        try:
+            fb = _try_captions_transcript(
+                video,
+                transcript_path,
+                meta_path,
+                prefix,
+                reason=reason,
+                # The partial on disk is THIS run's own output, so replacing it is
+                # not a clobber - the idempotency guard inside the writer exists to
+                # protect a PRIOR run's artifact. A hard error wrote nothing, so the
+                # caller's own force keeps its pre-#248 meaning there.
+                force=True if lost else force,
+                duration_seconds=duration_seconds,
+                reason_sink=captions_reason,
+            )
+        except Exception:
+            # Issue #277: a captions call that RAISES must not lose the Gemini
+            # failure it was trying to recover from. Record it, then re-raise
+            # unchanged so every caller sees exactly what it saw before.
+            if status.startswith("error"):
+                try:
+                    _record_transcript_error(meta_path, failure_note, video=video, channel_dir=channel_dir)
+                except Exception as record_exc:
+                    # Never let the record mask the captions exception.
+                    log.warning("    %s: could not record the chunked failure (%r)", prefix, record_exc)
+            raise
         if fb is not None:
             _, captions_status = fb
             if lost:
@@ -4466,6 +4522,19 @@ def _finish_chunked_transcript(
                 log.warning("    %s: %s - no caption track to fill it; keeping the Gemini partial", prefix, status)
     if lost:
         _log_lost_chunks_remedy(video, channel_dir.name, chunk_minutes, status, captions_available=captions_available)
+    if status.startswith("error"):
+        # Issue #277: an all-chunks-failed run returns here having written only
+        # raw sidecars, so record it or the failure is unsweepable. `meta_path`
+        # is the chunked writer's OWN path [core: writer's-path], but that alone
+        # does not make creating it safe: on a rotated title the caller's prefix
+        # is the new slug while an older meta still claims the video_id. The
+        # recorder creates a meta only when a complete strict walk finds no claim
+        # on the id, and otherwise records on the claiming meta. A recording failure must
+        # never replace the status this tail returns.
+        try:
+            _record_transcript_error(meta_path, failure_note, video=video, channel_dir=channel_dir)
+        except Exception as record_exc:
+            log.warning("    %s: could not record the chunked failure (%r)", prefix, record_exc)
     return status
 
 
@@ -6642,13 +6711,80 @@ def _write_transcript_md(
     tmp_path.replace(path)
 
 
-def _record_transcript_error(meta_path: Path, error: str) -> None:
-    """Record last_error on an existing meta.json without clobbering other fields."""
-    if not meta_path.exists():
+def _record_transcript_error(
+    meta_path: Path,
+    error: str,
+    *,
+    video: dict | None = None,
+    channel_dir: Path | None = None,
+) -> None:
+    """Record last_error on a meta.json without clobbering other fields.
+
+    Without ``video`` (the single-shot call sites) a missing meta stays missing.
+
+    With ``video`` (issue #277, the chunked shared tail) identity is filled where
+    a key is absent or empty, never overwritten [core: identity #66]: a re-stamp
+    must not replace the title the artifacts are named after with a rotated one
+    (same rule as ``stamp_video_topics``). When ``meta_path`` does not exist, the
+    folder is walked strictly first (``_strict_video_id_claimant``): if another
+    prefix already claims this id (a title rotation - scan and ``transcript
+    --url`` hand in the NEW title's prefix), the failure is recorded on THAT
+    meta. A meta is created only when the walk was complete and nothing claims
+    the id, because a second meta for one video_id can win the first-wins index
+    and re-queue paid work. An incomplete walk records nothing (one WARNING):
+    no duplicate is preferred over the record.
+
+    The no-``video`` read never raises [core: #124 read-guard]. The ``video``
+    branch is a deliberate exception: it reads with ``raise_on_os_error=True``
+    and SKIPS the write on a read ``OSError`` (one WARNING), because writing the
+    re-stamped identity over a meta it merely failed to read would destroy
+    ``alt_titles``, ``skip_modes`` and ``modes_completed``, while the failure it
+    is recording is still returned, logged and kept in the raw sidecars. A write
+    failure on that branch is logged the same way and never raises. Neither
+    branch routes through ``update_meta``, which would clear ``last_error`` and
+    mark the mode complete.
+    """
+    if video is None:
+        if not meta_path.exists():
+            return
+        meta = _read_meta_best_effort(meta_path, raise_on_os_error=False)
+        meta["last_error"] = error
+        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
         return
-    meta = _read_meta_best_effort(meta_path, raise_on_os_error=False)
-    meta["last_error"] = error
-    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    folder = meta_path.parent
+    created = False
+    try:
+        if not meta_path.exists() and video.get("video_id"):
+            # A strict walk, not the (possibly cached, always lenient) index: a
+            # claimant whose read fails right now must not look absent.
+            claimed, unreadable = _strict_video_id_claimant(folder, video["video_id"])
+            if claimed:
+                meta_path = folder / f"{claimed}.meta.json"
+            elif unreadable:
+                log.warning(
+                    "  not recording transcript failure: would create %s, but %s could not be read and may "
+                    "already claim %s (no duplicate meta is preferred over the record): %s",
+                    meta_path.name,
+                    ", ".join(unreadable),
+                    video["video_id"],
+                    error,
+                )
+                return
+        created = not meta_path.exists()
+        meta = _read_meta_best_effort(meta_path, raise_on_os_error=True)
+        for key, value in _transcript_identity_fields(video, channel_dir).items():
+            if not meta.get(key):
+                meta[key] = value
+        meta["last_error"] = error
+        folder.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        # An error path must not replace the failure it records with a
+        # traceback: on `transcript --url` nothing above the tail catches it.
+        log.warning("  could not record transcript failure in %s (%s): %s", meta_path.name, exc, error)
+        return
+    if created:
+        _invalidate_video_id_cache(folder)
 
 
 def _record_concepts_error(meta_path: Path, video: dict, channel_dir: Path, error: str) -> None:
