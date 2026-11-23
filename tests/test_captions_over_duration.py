@@ -156,12 +156,10 @@ class TestCallerLevel:
                         "name": "chan",
                         "url": "https://youtube.com/@chan",
                         "auto_transcript": "all",
-                        # skip_shorts defaults true, and is_short() makes a REAL
-                        # HEAD request to youtube.com/shorts/<id> for ids it
-                        # cannot classify from duration. Left on, these tests
-                        # reach the network and become load-sensitive - the
-                        # exact flakiness that made 31 unrelated tests fail
-                        # under a concurrent scan tonight.
+                        # skip_shorts off keeps these tests independent of the
+                        # Shorts classifier. It no longer guards the network:
+                        # conftest's no_shorts_probe pins the HEAD probe off
+                        # for the whole suite (issue #279).
                         "skip_shorts": False,
                         **channel_cfg,
                     }

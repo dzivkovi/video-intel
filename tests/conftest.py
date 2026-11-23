@@ -107,8 +107,9 @@ def no_shorts_probe():
     `httpx.head` to youtube.com/shorts/<id> for any video it cannot classify
     from duration. Each test file that reached scan used to stub the probe
     itself, and a new test that forgot made a network call. This stub answers
-    every HEAD with the 303 YouTube sends for long-form, so an unstubbed test
-    sees "not a Short", the same answer the per-file stubs gave. Tests of the
+    every HEAD with the 303 YouTube sends for long-form (or the 200 that
+    redirect leads to, if asked to follow it), so an unstubbed test sees
+    "not a Short", the same answer the per-file stubs gave. Tests of the
     probe itself patch `vi.httpx.head`, `is_short` or `_is_youtube_short_url`
     explicitly, and that patch wins over this pin.
 
@@ -126,8 +127,16 @@ def no_shorts_probe():
     # has no cache_clear().
     real_probe = vi._is_youtube_short_url
     saved_head = vi.httpx.head
-    vi.httpx.head = lambda _url, **_kwargs: httpx.Response(303)
+
+    def _long_form_head(*_args, follow_redirects=False, **_kwargs):
+        # Honors follow_redirects: a production change that followed the 303
+        # would classify every long-form video as a Short, and a stub that
+        # ignored the flag would keep the suite green over it.
+        return httpx.Response(200 if follow_redirects else 303)
+
+    # Cleared before the swap: if this raised, the stub would stay installed.
     real_probe.cache_clear()
+    vi.httpx.head = _long_form_head
     yield
     vi.httpx.head = saved_head
     real_probe.cache_clear()
