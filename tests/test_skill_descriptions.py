@@ -93,6 +93,10 @@ CURATE_TRIGGERS = [
     # not the same intent as judging a transcript (assess-transcripts).
     "backfill durations",
     "fill in missing video durations",
+    # Wall-of-text transcript repair (issue #289): rewrites a transcript.
+    "repair wall of text transcript",
+    "fix transcript timestamps",
+    "every search hit jumps to the same moment",
 ]
 
 
