@@ -25,6 +25,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
+from youtube_captions import CaptionsResult
+
 import video_intel as vi
 
 VIDEO_ID = "abcdefghijk"
@@ -113,11 +115,11 @@ def wired(monkeypatch, tmp_path):
     return _wire
 
 
-def _run(command: str, args) -> int:
+def _run(command: str, args, config: dict | None = None) -> int:
     """Run a real command; return its exit code (0 when it did not exit).
     Anything that is not a SystemExit propagates and fails the test."""
     try:
-        getattr(vi, command)(args, {"channels": []})
+        getattr(vi, command)(args, config if config is not None else {"channels": []})
     except SystemExit as exc:
         return exc.code if exc.code is not None else 0
     return 0
@@ -168,6 +170,85 @@ class TestEveryLookupSitePersistsTheDuration:
         assert lookups == [VIDEO_ID], "the video branch must be the one under test"
         assert (tmp_path / CHANNEL / f"{PREFIX}.mindmap.md").exists()
         assert _meta(tmp_path)["duration_seconds"] == SHORT_DURATION
+
+
+CONFIG_AUTO = {"channels": [{"name": CHANNEL, "url": "https://youtube.com/@chan", "transcript_source": "auto"}]}
+
+
+class _Captions:
+    """Recording stand-in for fetch_english_captions (shape of the failover tests)."""
+
+    def __init__(self, result):
+        self.result = result
+        self.calls: list[str] = []
+
+    def __call__(self, video_id, *, reason_sink=None):
+        self.calls.append(video_id)
+        return self.result
+
+
+class TestTheCaptionsWriterPersistsTheDuration:
+    """`_try_captions_transcript` is a separate writer; it must carry the duration too."""
+
+    def test_transcript_url_when_livestream_captions_first_persists_duration(self, wired, tmp_path, monkeypatch):
+        # Arrange: a long completed livestream routes captions-first under auto.
+        wired(LONG_DURATION)
+        captions = _Captions(CaptionsResult([(0.0, "cue one"), (1800.0, "cue two"), (3900.0, "cue three")], True, "en"))
+        monkeypatch.setattr(vi, "fetch_english_captions", captions)
+        monkeypatch.setattr(vi, "_lookup_was_livestream", lambda _v: True)
+        monkeypatch.setattr(vi, "refine_was_livestream", lambda _v, _flag: True)
+        monkeypatch.setattr(vi, "call_gemini", lambda *a, **k: pytest.fail("captions-first must not call Gemini"))
+        # Act
+        code = _run("cmd_transcript", _args(transcript_source=None), CONFIG_AUTO)
+        # Assert
+        assert code in (0, vi.EXIT_PARTIAL)
+        assert captions.calls == [VIDEO_ID]
+        meta = _meta(tmp_path)
+        assert meta["transcript_source"] == "youtube_captions"
+        assert meta["duration_seconds"] == LONG_DURATION
+
+    def test_transcript_url_when_gemini_fails_over_to_captions_persists_duration(self, wired, tmp_path, monkeypatch):
+        # Arrange: a short video, Gemini raises, auto fails over to captions.
+        wired(SHORT_DURATION)
+        captions = _Captions(CaptionsResult([(0.0, "cue one"), (300.0, "cue two"), (590.0, "cue three")], True, "en"))
+        monkeypatch.setattr(vi, "fetch_english_captions", captions)
+
+        def boom(*a, **k):
+            raise RuntimeError("stub Gemini failure")
+
+        monkeypatch.setattr(vi, "call_gemini", boom)
+        # Act
+        code = _run("cmd_transcript", _args(transcript_source=None), CONFIG_AUTO)
+        # Assert
+        assert code in (0, vi.EXIT_PARTIAL)
+        assert captions.calls == [VIDEO_ID]
+        meta = _meta(tmp_path)
+        assert meta["transcript_source"] == "youtube_captions"
+        assert meta["duration_seconds"] == SHORT_DURATION
+
+
+class TestTheSalvageWriterPersistsTheDuration:
+    def test_transcript_url_when_response_truncated_salvage_persists_duration(self, wired, tmp_path, monkeypatch):
+        # Arrange: 8 good entries, then a 9th cut off mid-object.
+        wired(SHORT_DURATION)
+        good = ", ".join(json.dumps({"start": f"0{i}:10", "voice": 1, "text": f"line {i}"}) for i in range(8))
+        truncated = '{"transcripts": [' + good + ', {"start": "08:1'
+
+        def fake(client, types, media_uri, prompt, model, response_json=False, **kw):
+            cb = kw.get("on_response")
+            if cb:
+                cb(_usage())
+            return truncated
+
+        monkeypatch.setattr(vi, "call_gemini", fake)
+        # Act
+        code = _run("cmd_transcript", _args())
+        # Assert
+        assert code in (0, vi.EXIT_PARTIAL)
+        meta = _meta(tmp_path)
+        assert meta["transcript_recovery"] == "salvaged_sections", "the salvage writer must be the one under test"
+        assert meta["transcript_status"] == "partial"
+        assert meta["duration_seconds"] == SHORT_DURATION
 
 
 class TestAnUnknownDurationNeverClobbers:
