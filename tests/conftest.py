@@ -99,6 +99,40 @@ def no_premiere_probe():
     vi._PREMIERE_PROBE_EXE_MEMO, vi._PREMIERE_PROBE_RESULTS = saved_exe, saved_results
 
 
+@pytest.fixture(autouse=True)
+def no_shorts_probe():
+    """Pin the Shorts HEAD probe OFF for every test (issue #279).
+
+    `is_short` falls back to `_is_youtube_short_url`, which sends a real
+    `httpx.head` to youtube.com/shorts/<id> for any video it cannot classify
+    from duration. Each test file that reached scan used to stub the probe
+    itself, and a new test that forgot made a network call. This stub answers
+    every HEAD with the 303 YouTube sends for long-form, so an unstubbed test
+    sees "not a Short", the same answer the per-file stubs gave. Tests of the
+    probe itself patch `vi.httpx.head`, `is_short` or `_is_youtube_short_url`
+    explicitly, and that patch wins over this pin.
+
+    The probe memoises per video id for the life of the process, so its cache
+    is cleared on both sides: a pinned answer must not leak into a test that
+    stubs its own response for the same id, and the reverse.
+
+    Like `no_premiere_probe`, deliberately does NOT request `monkeypatch`.
+    """
+    import httpx
+
+    import video_intel as vi
+
+    # Captured now: a test may patch the attribute to a plain lambda, which
+    # has no cache_clear().
+    real_probe = vi._is_youtube_short_url
+    saved_head = vi.httpx.head
+    vi.httpx.head = lambda _url, **_kwargs: httpx.Response(303)
+    real_probe.cache_clear()
+    yield
+    vi.httpx.head = saved_head
+    real_probe.cache_clear()
+
+
 @pytest.fixture
 def fake_lancedb(monkeypatch):
     """Wire up a capturing LanceDB stack and return the builder for assertions.

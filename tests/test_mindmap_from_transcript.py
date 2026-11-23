@@ -721,7 +721,6 @@ class TestCmdScanInversion:
             "enrich_with_durations",
             lambda *_a, **_kw: {fake_video["video_id"]: fake_video["duration_iso"]},
         )
-        monkeypatch.setattr(video_intel, "is_short", lambda *_a, **_kw: False)
         monkeypatch.setattr(
             video_intel,
             "record_alt_title_if_rotated",

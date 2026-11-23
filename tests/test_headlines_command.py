@@ -59,7 +59,6 @@ def _stub_headline_fetch(monkeypatch, videos):
     monkeypatch.setattr("video_intel.get_channel_id", lambda _yt, _url: ("UCabcdefghijklmnopqrstuv", "Peripheral"))
     monkeypatch.setattr("video_intel.fetch_channel_videos", _fetch)
     monkeypatch.setattr("video_intel.enrich_with_durations", lambda _yt, ids: dict.fromkeys(ids, "PT10M"))
-    monkeypatch.setattr("video_intel.is_short", lambda _vid, _dur: False)
     return calls
 
 

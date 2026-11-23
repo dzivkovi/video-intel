@@ -211,7 +211,6 @@ def _stub_headline_fetch(monkeypatch, videos):
         "video_intel.enrich_with_durations",
         lambda _yt, ids: dict.fromkeys(ids, "PT10M"),  # all long-form
     )
-    monkeypatch.setattr("video_intel.is_short", lambda _vid, _dur: False)
 
 
 def _headline_config(tmp_path):

@@ -241,7 +241,6 @@ class TestScanFallbackMindmapIsCappedByTheKnob:
         monkeypatch.setattr(vi, "fetch_channel_videos", lambda yt, cid, since: [dict(video)])
         monkeypatch.setattr(vi, "enrich_with_durations", lambda _yt, ids: dict.fromkeys(ids))
         monkeypatch.setattr(vi, "fetch_preflight_status", lambda _yt, ids: {vid: {} for vid in ids})
-        monkeypatch.setattr(vi, "_is_youtube_short_url", lambda video_id: False)
         config = {
             "output_dir": str(tmp_path),
             **_channel_config(auto_transcript="none", mindmap_source="video"),
@@ -341,7 +340,6 @@ def _scan_harness(monkeypatch, tmp_path):
     monkeypatch.setattr(vi, "fetch_channel_videos", lambda yt, cid, since: [dict(video)])
     monkeypatch.setattr(vi, "enrich_with_durations", lambda _yt, ids: dict.fromkeys(ids))
     monkeypatch.setattr(vi, "fetch_preflight_status", lambda _yt, ids: {vid: {} for vid in ids})
-    monkeypatch.setattr(vi, "_is_youtube_short_url", lambda video_id: False)
     return SimpleNamespace(dry_run=False, channel=None, force=False, since=None, model=None)
 
 

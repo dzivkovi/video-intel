@@ -474,7 +474,6 @@ class TestScanAutoConceptsForcePropagation:
             lambda *a, **kw: {v["video_id"]: v["duration_iso"] for v in new_videos},
         )
         monkeypatch.setattr(video_intel, "fetch_preflight_status", lambda *a, **kw: {})
-        monkeypatch.setattr(video_intel, "is_short", lambda *a, **kw: False)
         monkeypatch.setattr(video_intel, "record_alt_title_if_rotated", lambda *a, **kw: None)
         monkeypatch.setattr(video_intel, "load_taxonomy", lambda _od: {"version": 1, "concepts": {}})
 

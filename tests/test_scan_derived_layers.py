@@ -65,7 +65,6 @@ def scan_env(monkeypatch, tmp_path):
     monkeypatch.setattr(video_intel, "load_prompt", lambda name: f"prompt-for-{name}")
     monkeypatch.setattr(video_intel, "get_channel_id", lambda _yt, url: (f"UC-{url}", url))
     monkeypatch.setattr(video_intel, "fetch_preflight_status", lambda *a, **kw: {})
-    monkeypatch.setattr(video_intel, "is_short", lambda *a, **kw: False)
     monkeypatch.setattr(video_intel, "record_alt_title_if_rotated", lambda *a, **kw: False)
     monkeypatch.setattr(video_intel, "backup_config_if_changed", lambda *_a, **_kw: None)
     monkeypatch.setattr(video_intel, "render_headline_digest", lambda *_a, **_kw: None)

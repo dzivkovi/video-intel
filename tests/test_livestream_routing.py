@@ -670,7 +670,6 @@ def _scan_setup(monkeypatch, videos, statuses, transcript_result):
     monkeypatch.setattr(vi, "fetch_channel_videos", lambda yt, cid, since: list(videos))
     monkeypatch.setattr(vi, "enrich_with_durations", lambda _yt, ids: dict.fromkeys(ids, "PT20M"))
     monkeypatch.setattr(vi, "fetch_preflight_status", lambda _yt, ids: {vid: statuses.get(vid, {}) for vid in ids})
-    monkeypatch.setattr(vi, "_is_youtube_short_url", lambda video_id: False)
 
     captured: dict = {"transcript": [], "mindmap": []}
 

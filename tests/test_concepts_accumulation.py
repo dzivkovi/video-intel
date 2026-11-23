@@ -270,7 +270,6 @@ def _stub_scan_env(monkeypatch, tmp_path, new_videos_by_channel):
 
     monkeypatch.setattr(video_intel, "enrich_with_durations", fake_enrich)
     monkeypatch.setattr(video_intel, "fetch_preflight_status", lambda *a, **kw: {})
-    monkeypatch.setattr(video_intel, "is_short", lambda *a, **kw: False)
     monkeypatch.setattr(video_intel, "record_alt_title_if_rotated", lambda *a, **kw: None)
 
 

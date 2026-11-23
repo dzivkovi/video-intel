@@ -506,7 +506,6 @@ class TestScanSurvivesABadTimeoutKnob:
         monkeypatch.setattr(vi, "fetch_channel_videos", lambda yt, cid, since: list(videos.get(cid, [])))
         monkeypatch.setattr(vi, "enrich_with_durations", lambda _yt, ids: dict.fromkeys(ids))
         monkeypatch.setattr(vi, "fetch_preflight_status", lambda _yt, ids: {vid: {} for vid in ids})
-        monkeypatch.setattr(vi, "_is_youtube_short_url", lambda video_id: False)
         seen: list[str] = []
 
         def fake_transcript(*args, **kwargs):

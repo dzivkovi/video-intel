@@ -75,7 +75,6 @@ def count_gemini_calls(monkeypatch, tmp_path):
         monkeypatch.setattr(vi, "load_prompt", lambda _n: "PROMPT")
         monkeypatch.setattr(vi, "resolve_model", lambda *_a, **_k: "stub-model")
         monkeypatch.setattr(vi, "get_channel_id", lambda *_a, **_k: ("UCabc", "u"))
-        monkeypatch.setattr(vi, "is_short", lambda *_a, **_k: False)
         monkeypatch.setattr(
             vi,
             "fetch_channel_videos",
