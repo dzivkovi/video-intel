@@ -297,6 +297,247 @@ class TestMetaWriteFailureDoesNotRaise:
         assert list(wired.cdir.glob(f"{PREFIX}.transcript.raw.chunk*.txt"))
 
 
+def _usage(prompt):
+    return SimpleNamespace(
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=prompt,
+            cached_content_token_count=0,
+            thoughts_token_count=0,
+            candidates_token_count=5000,
+            total_token_count=prompt + 5000,
+        )
+    )
+
+
+class TestAllChunksConfabulated:
+    def test_every_chunk_prompt_zero_is_recorded_too(self, wired, monkeypatch):
+        def every_chunk_confabulates(client, types, media_uri, prompt, model, **kw):
+            kw["on_response"](_usage(0))
+            return json.dumps({"transcripts": [], "screen_content": [], "speakers": []})
+
+        monkeypatch.setattr(vi, "call_gemini", every_chunk_confabulates)
+
+        vi.cmd_transcript(_args(), CONFIG_GEMINI)
+
+        meta = _meta(wired.cdir)
+        assert meta["video_id"] == VIDEO_ID
+        assert meta["channel"] == "alpha"
+        assert "all chunks confabulated" in meta["last_error"]
+        assert "transcript_status" not in meta
+
+
+class _NetDown(ConnectionError):
+    pass
+
+
+def _captions_raise(video_id, *, reason_sink=None):
+    raise _NetDown("network unreachable")
+
+
+class TestCaptionsCallRaisesUnderAuto:
+    """The Gemini failure is recorded before the captions exception propagates, unchanged."""
+
+    def test_transcript_url_records_then_propagates(self, wired, monkeypatch):
+        monkeypatch.setattr(vi, "fetch_english_captions", _captions_raise)
+
+        with pytest.raises(_NetDown):
+            vi.cmd_transcript(_args(), CONFIG_AUTO)
+
+        _assert_failure_recorded(wired.cdir)
+
+    def test_process_url_records_and_exits_as_before(self, wired, monkeypatch):
+        monkeypatch.setattr(vi, "fetch_english_captions", _captions_raise)
+
+        code = _run_process_url(_args(), CONFIG_AUTO, monkeypatch)
+
+        assert code == vi.EXIT_PARTIAL
+        _assert_failure_recorded(wired.cdir)
+
+
+class TestReadFailureOnExistingMetaSkipsTheWrite:
+    def test_read_oserror_leaves_the_meta_bytes_untouched_and_warns(self, tmp_path, monkeypatch, caplog):
+        cdir = tmp_path / "alpha"
+        cdir.mkdir()
+        meta_path = cdir / "p.meta.json"
+        healthy = {
+            "video_id": VIDEO_ID,
+            "channel": "alpha",
+            "title": "Original",
+            "alt_titles": ["Other"],
+            "skip_modes": ["mindmap"],
+            "skip_reason": "operator choice",
+            "modes_completed": ["transcript"],
+        }
+        meta_path.write_text(json.dumps(healthy), encoding="utf-8")
+        before = meta_path.read_bytes()
+        real_read_bytes = vi.Path.read_bytes
+
+        def flaky_meta_read(self):
+            if self.name.endswith(".meta.json"):
+                raise OSError("stub transient read failure")
+            return real_read_bytes(self)
+
+        monkeypatch.setattr(vi.Path, "read_bytes", flaky_meta_read)
+        caplog.set_level("WARNING")
+
+        vi._record_transcript_error(meta_path, "chunked transcript failed: boom", video=dict(_VIDEO), channel_dir=cdir)
+
+        monkeypatch.setattr(vi.Path, "read_bytes", real_read_bytes)
+        assert meta_path.read_bytes() == before
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert any("p.meta.json" in m and "stub transient read failure" in m and "boom" in m for m in warnings), (
+            warnings
+        )
+
+
+# ---------------------------------------------------------------------------
+# Title rotation [core: writer's-path]: the caller hands the tail the NEW title's
+# prefix while an older meta still claims the video_id. The checker below derives
+# the expected meta from the OLD title on its own, never from the prefix a caller
+# hands in, and counts every meta in the folder that claims the id.
+# ---------------------------------------------------------------------------
+
+OLD_TITLE = "Zeta Talk"
+NEW_TITLE = "Alpha Talk"
+
+
+def _titled(title):
+    return {**_VIDEO, "title": title, "duration_iso": "PT60M"}
+
+
+OLD_PREFIX = vi.video_file_prefix(_titled(OLD_TITLE))
+OLD_SEED = {
+    "video_id": VIDEO_ID,
+    "video_url": URL,
+    "channel": "alpha",
+    "title": OLD_TITLE,
+    "published": "2026-08-12",
+    "processed": "2026-08-13T00:00:00+00:00",
+    "modes_completed": ["scan"],
+    "topics": ["sales"],
+}
+
+
+def _seed_old(cdir):
+    cdir.mkdir(parents=True, exist_ok=True)
+    (cdir / f"{OLD_PREFIX}.meta.json").write_text(json.dumps(OLD_SEED), encoding="utf-8")
+    (cdir / f"{OLD_PREFIX}.mindmap.md").write_text("# mm\n", encoding="utf-8")
+
+
+def _metas_claiming_the_id(cdir):
+    out = []
+    for p in sorted(cdir.glob("*.meta.json")):
+        if json.loads(p.read_text(encoding="utf-8")).get("video_id") == VIDEO_ID:
+            out.append(p.name)
+    return out
+
+
+def _assert_one_meta_on_the_old_prefix(cdir):
+    assert _metas_claiming_the_id(cdir) == [f"{OLD_PREFIX}.meta.json"]
+    meta = json.loads((cdir / f"{OLD_PREFIX}.meta.json").read_text(encoding="utf-8"))
+    for key, value in OLD_SEED.items():
+        assert meta[key] == value, key
+    assert ALL_FAILED in meta["last_error"]
+    return meta
+
+
+@pytest.fixture
+def scan_wired(wired, monkeypatch):
+    """The real `cmd_scan`; YouTube discovery, Gemini, captions and the mindmap writer are stubbed."""
+    from unittest.mock import MagicMock
+
+    feed: list[dict] = []
+    mindmap_calls: list[str] = []
+
+    def fake_mindmap(*args, **kwargs):
+        video = args[2]
+        prefix = kwargs.get("prefix") or vi.video_file_prefix(video)
+        mindmap_calls.append(prefix)
+        (wired.cdir / f"{prefix}.mindmap.md").write_text("# mm\n", encoding="utf-8")
+        vi.update_meta(wired.cdir / f"{prefix}.meta.json", vi._transcript_identity_fields(video, wired.cdir), "scan")
+        return prefix, "done"
+
+    monkeypatch.setattr(vi, "require_gemini", lambda: (MagicMock(), _TYPES))
+    monkeypatch.setattr(vi, "require_youtube", lambda: MagicMock())
+    monkeypatch.setattr(vi, "resolve_model", lambda *_a, **_kw: "stub-model")
+    monkeypatch.setattr(vi, "get_channel_id", lambda _yt, url: (f"UC-{url}", url))
+    monkeypatch.setattr(vi, "fetch_channel_videos", lambda *_a, **_kw: [dict(v) for v in feed])
+    monkeypatch.setattr(vi, "enrich_with_durations", lambda _yt, ids: dict.fromkeys(ids, "PT60M"))
+    monkeypatch.setattr(vi, "fetch_preflight_status", lambda *_a, **_kw: {})
+    monkeypatch.setattr(vi, "is_short", lambda *_a, **_kw: False)
+    monkeypatch.setattr(vi, "backup_config_if_changed", lambda *_a, **_kw: None)
+    monkeypatch.setattr(vi, "render_headline_digest", lambda *_a, **_kw: None)
+    monkeypatch.setattr(vi, "rebuild_free_derived_layers", lambda *_a, **_kw: None)
+    monkeypatch.setattr(vi, "process_mindmap", fake_mindmap)
+    monkeypatch.setenv("YOUTUBE_API_KEY", "fake")
+    wired.feed = feed
+    wired.mindmap_calls = mindmap_calls
+    return wired
+
+
+def _scan_config(source, **channel_extra):
+    channel = {"name": "alpha", "url": "alpha", "auto_transcript": "all", "transcript_source": source}
+    return {"channels": [{**channel, **channel_extra}]}
+
+
+def _scan(source="gemini", **channel_extra):
+    args = SimpleNamespace(channel=None, since=None, force=False, dry_run=False, model=None)
+    vi.cmd_scan(args, _scan_config(source, **channel_extra))
+
+
+# `last_error` is one field shared across stages: a later successful mindmap
+# write clears it. These two tests turn the mindmap stage off so the assertion
+# sees what the transcript stage recorded.
+_TRANSCRIPT_STAGE_ONLY = {"mindmap_source": "none"}
+
+
+class TestRealScanAllChunksFailed:
+    def test_cmd_scan_new_video_every_chunk_fails_records_identity_and_last_error(self, scan_wired):
+        scan_wired.feed.append(_titled("A Talk"))
+
+        _scan(**_TRANSCRIPT_STAGE_ONLY)
+
+        assert len(scan_wired.gemini_calls) == 2
+        _assert_failure_recorded(scan_wired.cdir)
+
+    def test_cmd_scan_captions_raise_under_auto_records_and_the_scan_continues(self, scan_wired, monkeypatch):
+        monkeypatch.setattr(vi, "fetch_english_captions", _captions_raise)
+        scan_wired.feed.append(_titled("A Talk"))
+
+        _scan("auto", **_TRANSCRIPT_STAGE_ONLY)
+
+        _assert_failure_recorded(scan_wired.cdir)
+
+
+class TestTitleRotationKeepsOneMetaPerVideo:
+    def test_precondition_the_new_title_sorts_first(self):
+        # Without this ordering the first-wins index would hide a second meta.
+        assert vi.video_file_prefix(_titled(NEW_TITLE)) < OLD_PREFIX
+
+    def test_two_real_scans_record_on_the_existing_meta_and_never_remake_the_mindmap(self, scan_wired):
+        _seed_old(scan_wired.cdir)
+        scan_wired.feed.append(_titled(NEW_TITLE))
+
+        _scan()
+        _assert_one_meta_on_the_old_prefix(scan_wired.cdir)
+        _scan()
+
+        meta = _assert_one_meta_on_the_old_prefix(scan_wired.cdir)
+        assert len(scan_wired.gemini_calls) == 4
+        assert scan_wired.mindmap_calls == []
+        assert meta["alt_titles"] == [NEW_TITLE]
+        vi._invalidate_video_id_cache()
+        assert vi._load_video_id_index(scan_wired.cdir) == {VIDEO_ID: OLD_PREFIX}
+
+    def test_real_transcript_url_records_on_the_existing_meta(self, wired):
+        _seed_old(wired.cdir)
+
+        vi.cmd_transcript(_args(title=NEW_TITLE), CONFIG_GEMINI)
+
+        assert len(wired.gemini_calls) == 2
+        _assert_one_meta_on_the_old_prefix(wired.cdir)
+
+
 class TestRecordTranscriptErrorContract:
     def test_without_video_and_no_meta_writes_nothing(self, tmp_path):
         meta_path = tmp_path / "x.meta.json"

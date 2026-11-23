@@ -4330,6 +4330,9 @@ def _finish_chunked_transcript(
     transcript_path = channel_dir / f"{prefix}.transcript.md"
     meta_path = channel_dir / f"{prefix}.meta.json"
     lost = chunked_transcript_lost_chunks(status)
+    # Issue #277: the last_error recorded for an `error` status. It reuses the
+    # status verbatim, so an all-timeouts run reads "all chunks failed parsing".
+    failure_note = f"chunked transcript failed: {status}"
     captions_available = True
     if chunked_captions_failover_applies(status, transcript_source, captions_already_tried=captions_already_tried):
         sidecar: Path | None = None
@@ -4362,20 +4365,28 @@ def _finish_chunked_transcript(
             if lost
             else f"chunked transcript failed: {status}"
         )
-        fb = _try_captions_transcript(
-            video,
-            transcript_path,
-            meta_path,
-            prefix,
-            reason=reason,
-            # The partial on disk is THIS run's own output, so replacing it is
-            # not a clobber - the idempotency guard inside the writer exists to
-            # protect a PRIOR run's artifact. A hard error wrote nothing, so the
-            # caller's own force keeps its pre-#248 meaning there.
-            force=True if lost else force,
-            duration_seconds=duration_seconds,
-            reason_sink=captions_reason,
-        )
+        try:
+            fb = _try_captions_transcript(
+                video,
+                transcript_path,
+                meta_path,
+                prefix,
+                reason=reason,
+                # The partial on disk is THIS run's own output, so replacing it is
+                # not a clobber - the idempotency guard inside the writer exists to
+                # protect a PRIOR run's artifact. A hard error wrote nothing, so the
+                # caller's own force keeps its pre-#248 meaning there.
+                force=True if lost else force,
+                duration_seconds=duration_seconds,
+                reason_sink=captions_reason,
+            )
+        except Exception:
+            # Issue #277: a captions call that RAISES must not lose the Gemini
+            # failure it was trying to recover from. Record it, then re-raise
+            # unchanged so every caller sees exactly what it saw before.
+            if status.startswith("error"):
+                _record_transcript_error(meta_path, failure_note, video=video, channel_dir=channel_dir)
+            raise
         if fb is not None:
             _, captions_status = fb
             if lost:
@@ -4408,13 +4419,13 @@ def _finish_chunked_transcript(
         _log_lost_chunks_remedy(video, channel_dir.name, chunk_minutes, status, captions_available=captions_available)
     if status.startswith("error"):
         # Issue #277: an all-chunks-failed run returns here having written only
-        # raw sidecars, so record it or the failure is unsweepable. Creating the
-        # meta is safe because `meta_path` is the chunked writer's OWN path (same
-        # channel_dir + prefix) [core: writer's-path]; `_record_concepts_error`
-        # refuses to create for the opposite reason, its caller's prefix can differ.
-        _record_transcript_error(
-            meta_path, f"chunked transcript failed: {status}", video=video, channel_dir=channel_dir
-        )
+        # raw sidecars, so record it or the failure is unsweepable. `meta_path`
+        # is the chunked writer's OWN path [core: writer's-path], but that alone
+        # does not make creating it safe: on a rotated title the caller's prefix
+        # is the new slug while an older meta still claims the video_id. The
+        # recorder creates a meta only when nothing in the folder claims the id,
+        # and otherwise records on the claiming meta.
+        _record_transcript_error(meta_path, failure_note, video=video, channel_dir=channel_dir)
     return status
 
 
@@ -6584,36 +6595,59 @@ def _record_transcript_error(
 
     Without ``video`` (the single-shot call sites) a missing meta stays missing.
 
-    With ``video`` (issue #277, the chunked shared tail) the meta is CREATED when
-    absent and identity is filled where a key is absent or empty, never
-    overwritten [core: identity #66]: a re-stamp must not replace the title the
-    artifacts are named after with a rotated one (same rule as
-    ``stamp_video_topics``). A caller passing ``video`` must pass the WRITER's
-    own meta path, because creating a meta under any other prefix manufactures
-    a second meta for the same video_id (``_record_concepts_error``).
+    With ``video`` (issue #277, the chunked shared tail) identity is filled where
+    a key is absent or empty, never overwritten [core: identity #66]: a re-stamp
+    must not replace the title the artifacts are named after with a rotated one
+    (same rule as ``stamp_video_topics``). When ``meta_path`` does not exist, the
+    folder's video_id index is consulted first: if another prefix already claims
+    this id (a title rotation - scan and ``transcript --url`` hand in the NEW
+    title's prefix), the failure is recorded on THAT meta. A meta is created only
+    when nothing in the folder claims the id, because a second meta for one
+    video_id can win the first-wins index and re-queue paid work.
 
-    Either way this is an error path: the read never raises [core: #124
-    read-guard], and it never routes through ``update_meta``, which would clear
-    ``last_error`` and mark the mode complete.
+    The no-``video`` read never raises [core: #124 read-guard]. The ``video``
+    branch is a deliberate exception: it reads with ``raise_on_os_error=True``
+    and SKIPS the write on a read ``OSError`` (one WARNING), because writing the
+    re-stamped identity over a meta it merely failed to read would destroy
+    ``alt_titles``, ``skip_modes`` and ``modes_completed``, while the failure it
+    is recording is still returned, logged and kept in the raw sidecars. A write
+    failure on that branch is logged the same way and never raises. Neither
+    branch routes through ``update_meta``, which would clear ``last_error`` and
+    mark the mode complete.
     """
-    if video is None and not meta_path.exists():
+    if video is None:
+        if not meta_path.exists():
+            return
+        meta = _read_meta_best_effort(meta_path, raise_on_os_error=False)
+        meta["last_error"] = error
+        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
         return
-    meta = _read_meta_best_effort(meta_path, raise_on_os_error=False)
-    if video is not None:
+    folder = meta_path.parent
+    created = False
+    try:
+        if not meta_path.exists() and video.get("video_id"):
+            # Fresh read, not the scan's cached index: a meta written earlier in
+            # this run must count as a claim.
+            _invalidate_video_id_cache(folder)
+            claimed = _load_video_id_index(folder).get(video["video_id"])
+            if claimed:
+                meta_path = folder / f"{claimed}.meta.json"
+        created = not meta_path.exists()
+        meta = _read_meta_best_effort(meta_path, raise_on_os_error=True)
         for key, value in _transcript_identity_fields(video, channel_dir).items():
             if not meta.get(key):
                 meta[key] = value
         meta["last_error"] = error
-        try:
-            meta_path.parent.mkdir(parents=True, exist_ok=True)
-            meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-        except OSError as exc:
-            # A write failure must not replace the failure being recorded with a
-            # traceback: on `transcript --url` nothing above the tail catches it.
-            log.warning("  could not record transcript failure in %s (%s): %s", meta_path.name, exc, error)
+        folder.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        # An error path must not replace the failure it records with a
+        # traceback: on `transcript --url` nothing above the tail catches it.
+        # ValueError covers an index read that hits an undecodable meta.
+        log.warning("  could not record transcript failure in %s (%s): %s", meta_path.name, exc, error)
         return
-    meta["last_error"] = error
-    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    if created:
+        _invalidate_video_id_cache(folder)
 
 
 def _record_concepts_error(meta_path: Path, video: dict, channel_dir: Path, error: str) -> None:
