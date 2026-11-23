@@ -238,8 +238,8 @@ class TestAssessment:
 
 
 _MISSING = object()
-UNKNOWN_DURATIONS = [_MISSING, 0, None, "1200", True]
-UNKNOWN_DURATION_IDS = ["missing", "zero", "none", "string", "bool"]
+UNKNOWN_DURATIONS = [_MISSING, 0, None, "1200", True, 12.5, 1200.0, -5]
+UNKNOWN_DURATION_IDS = ["missing", "zero", "none", "string", "bool", "float", "whole-float", "negative"]
 
 
 def _no_duration_meta(duration=_MISSING, **extra):
@@ -340,7 +340,10 @@ class TestUnknownDurationIsUnassessable:
         summary = next(m for m in messages if m.startswith("assess-transcripts: candidates="))
         assert "unassessable=2" in summary
         hint = next(m for m in messages if "were not judged" in m)
-        assert "2 transcript(s)" in hint and "duration_seconds" in hint
+        assert hint == (
+            "2 transcript(s) have no usable `duration_seconds` (a positive whole number of seconds) and were not "
+            "judged; store one in their meta.json and re-run."
+        )
 
     def test_no_unknown_duration_prints_no_hint(self, tmp_path, corpus, caplog):
         caplog.set_level(logging.INFO, logger=vi.log.name)
@@ -528,9 +531,8 @@ class TestParserUsesTheSharedBoundaryPattern:
 
 
 # Issue #274: "is this stored duration usable" has ONE definition,
-# `known_duration_seconds`. `_captions_assessment_window` is a transcript-writer
-# helper, out of #274's scope, and is named here so the residual stays visible.
-_DURATION_TEST_ALLOWED = {"known_duration_seconds", "_captions_assessment_window"}
+# `known_duration_seconds`.
+_DURATION_TEST_ALLOWED = {"known_duration_seconds"}
 _SCRIPTS = Path(vi.__file__).resolve().parent
 
 

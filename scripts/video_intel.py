@@ -7077,7 +7077,7 @@ def _captions_assessment_window(
     if start_offset is None and end_offset is None:
         return None
     lo = start_offset if start_offset is not None else 0
-    known_duration = duration_seconds if isinstance(duration_seconds, int) and duration_seconds > 0 else None
+    known_duration = known_duration_seconds(duration_seconds)
     hi = end_offset if end_offset is not None else known_duration
     if hi is None:
         return None
@@ -14157,8 +14157,8 @@ def cmd_assess_transcripts(args, config):
     )
     if counts["unassessable"]:
         log.info(
-            "%d transcript(s) have no stored duration and were not judged; store `duration_seconds` in their "
-            "meta.json and re-run.",
+            "%d transcript(s) have no usable `duration_seconds` (a positive whole number of seconds) and were not "
+            "judged; store one in their meta.json and re-run.",
             counts["unassessable"],
         )
     return counts
