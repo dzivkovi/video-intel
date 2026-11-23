@@ -2881,6 +2881,23 @@ def _parse_iso8601_duration(iso: str | None) -> int | None:
     return hours * 3600 + minutes * 60 + seconds
 
 
+def _video_duration_seconds(video: dict) -> int | None:
+    """The duration this video dict knows, in seconds, or None (issue #275).
+
+    The one definition every meta writer uses. A manual ``--url`` path that
+    looked the duration up puts it on the dict as ``duration_seconds``; the
+    scan's dict carries YouTube's ``duration_iso``. A bool, zero, negative or
+    non-int ``duration_seconds`` is ignored, never persisted.
+    """
+    seconds = video.get("duration_seconds")
+    if isinstance(seconds, int) and not isinstance(seconds, bool) and seconds > 0:
+        return seconds
+    parsed = _parse_iso8601_duration(video.get("duration_iso"))
+    if parsed is not None and parsed > 0:
+        return parsed
+    return None
+
+
 # Issue #42: ceiling on transcript duration. Above this, the structured-JSON
 # response truncates and the bounded retry / salvage cannot recover. Log the
 # manual-clipping recipe instead and let the mindmap path proceed.
@@ -5669,7 +5686,8 @@ def process_mindmap(
         # Forward-fix: persist duration_seconds when scan-time enrichment supplied it,
         # so future prune-shorts runs avoid re-fetching from YouTube. Optional —
         # legacy metas without this field still classify via on-demand fallback.
-        duration_seconds = _parse_iso8601_duration(video.get("duration_iso"))
+        # Issue #275: also when a manual --url path looked it up.
+        duration_seconds = _video_duration_seconds(video)
         if duration_seconds is not None:
             meta_fields["duration_seconds"] = duration_seconds
         update_meta(meta_path, meta_fields, "scan")
@@ -6583,6 +6601,9 @@ def _transcript_identity_fields(video: dict, channel_dir: Path | None, *, channe
         # description, or a manual run that never called the API, must never
         # clobber a description already on disk.
         "description": video.get("description"),
+        # Issue #275: same seam, same reason. An unknown duration (None) is
+        # dropped below, so it never clobbers a value already on disk.
+        "duration_seconds": _video_duration_seconds(video),
     }
     # Drop falsy values so a re-stamp can only ADD identity, never downgrade a
     # previously-good field to None/"" - e.g. local-file flows where video["url"]
@@ -9145,6 +9166,9 @@ def _cmd_mindmap_impl(args, config):
         # Issue #50 Gate-1 finding: Gemini caps at 10800 frames per request.
         # Preserved here only - text input has no frame cap.
         duration_seconds = _lookup_video_duration_seconds(video_id)
+        # Issue #275: the writer seam persists it; never a second lookup.
+        if duration_seconds:
+            video["duration_seconds"] = duration_seconds
         mindmap_fps: float | None = None
         if duration_seconds and duration_seconds > 10000:
             mindmap_fps = 0.5
@@ -9495,6 +9519,9 @@ def _cmd_transcript_impl(args, config):
 
     if use_chunking:
         duration_seconds = _lookup_video_duration_seconds(video["video_id"])
+        # Issue #275: the writer seam persists it; never a second lookup.
+        if duration_seconds:
+            video["duration_seconds"] = duration_seconds
         if duration_seconds and duration_seconds > chunk_minutes * 60:
             # Issue #120: captions-first for a completed livestream VOD, before
             # any Gemini video call. The single-shot path gets this inside
@@ -9824,6 +9851,9 @@ def _cmd_process_url(args, config):
         sys.exit(1)
 
     duration_seconds = _lookup_video_duration_seconds(video_id)
+    # Issue #275: the writer seam persists it; never a second lookup.
+    if duration_seconds:
+        video["duration_seconds"] = duration_seconds
     transcript_path = channel_dir / f"{prefix}.transcript.md"
     # Issue #120: classify this one id (1 quota unit) so the manual --url path
     # routes a completed livestream VOD the same way the scan does. Gated on the
