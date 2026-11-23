@@ -43,18 +43,21 @@ def test_explicit_head_stub_overrides_the_pin(monkeypatch):
     assert vi._is_youtube_short_url("pin279-explicit") is True
 
 
-class TestThePinDoesNotLeakAcrossTests:
-    """The probe memoises per id for the life of the process. These two tests
-    share one id on purpose and run in file order: the first caches the pinned
-    answer, the second stubs its own. Without the pin's cache clear the second
-    would be handed the first one's cached False."""
+def test_the_pin_clears_the_probe_cache_between_lifecycles(shorts_probe_pin):
+    """The probe memoises per id for the life of the process. Two pin lifecycles
+    run here back to back on one id: the first caches the pinned answer, the
+    second stubs its own. Without the pin's cache clears the second would be
+    handed the first one's cached False. One test, so the proof does not depend
+    on test order or on which worker runs what."""
+    video_id = "pin279-shared-id"
 
-    VIDEO_ID = "pin279-shared-id"
+    with shorts_probe_pin():
+        first = vi._is_youtube_short_url(video_id)
 
-    def test_first_caches_the_pinned_answer(self):
-        assert vi._is_youtube_short_url(self.VIDEO_ID) is False
+    with shorts_probe_pin():
+        vi.httpx.head = lambda _url, **_kwargs: httpx.Response(200)
+        second = vi._is_youtube_short_url(video_id)
 
-    def test_second_sees_its_own_stub_not_the_cached_answer(self, monkeypatch):
-        monkeypatch.setattr(vi.httpx, "head", lambda _url, **_kwargs: httpx.Response(200))
-
-        assert vi._is_youtube_short_url(self.VIDEO_ID) is True
+    assert first is False
+    assert second is True
+    assert vi.httpx.head(SHORTS_URL).status_code == 303

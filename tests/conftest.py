@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -99,25 +100,13 @@ def no_premiere_probe():
     vi._PREMIERE_PROBE_EXE_MEMO, vi._PREMIERE_PROBE_RESULTS = saved_exe, saved_results
 
 
-@pytest.fixture(autouse=True)
-def no_shorts_probe():
-    """Pin the Shorts HEAD probe OFF for every test (issue #279).
+@contextlib.contextmanager
+def pinned_shorts_probe():
+    """One lifecycle of the Shorts probe pin: install, yield, restore.
 
-    `is_short` falls back to `_is_youtube_short_url`, which sends a real
-    `httpx.head` to youtube.com/shorts/<id> for any video it cannot classify
-    from duration. Each test file that reached scan used to stub the probe
-    itself, and a new test that forgot made a network call. This stub answers
-    every HEAD with the 303 YouTube sends for long-form (or the 200 that
-    redirect leads to, if asked to follow it), so an unstubbed test sees
-    "not a Short", the same answer the per-file stubs gave. Tests of the
-    probe itself patch `vi.httpx.head`, `is_short` or `_is_youtube_short_url`
-    explicitly, and that patch wins over this pin.
-
-    The probe memoises per video id for the life of the process, so its cache
-    is cleared on both sides: a pinned answer must not leak into a test that
-    stubs its own response for the same id, and the reverse.
-
-    Like `no_premiere_probe`, deliberately does NOT request `monkeypatch`.
+    Split out of `no_shorts_probe` so a single test can run two lifecycles back
+    to back and prove the cache does not leak between them, whatever order or
+    worker the rest of the suite runs on.
     """
     import httpx
 
@@ -137,9 +126,41 @@ def no_shorts_probe():
     # Cleared before the swap: if this raised, the stub would stay installed.
     real_probe.cache_clear()
     vi.httpx.head = _long_form_head
-    yield
-    vi.httpx.head = saved_head
-    real_probe.cache_clear()
+    try:
+        yield
+    finally:
+        vi.httpx.head = saved_head
+        real_probe.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def no_shorts_probe():
+    """Pin the Shorts HEAD probe OFF for every test (issue #279).
+
+    `is_short` falls back to `_is_youtube_short_url`, which sends a real
+    `httpx.head` to youtube.com/shorts/<id> for any video it cannot classify
+    from duration. Each test file that reached scan used to stub the probe
+    itself, and a new test that forgot made a network call. The pin answers
+    every HEAD with the 303 YouTube sends for long-form (or the 200 that
+    redirect leads to, if asked to follow it), so an unstubbed test sees
+    "not a Short", the same answer the per-file stubs gave. Tests of the
+    probe itself patch `vi.httpx.head`, `is_short` or `_is_youtube_short_url`
+    explicitly, and that patch wins over this pin.
+
+    The probe memoises per video id for the life of the process, so its cache
+    is cleared on both sides: a pinned answer must not leak into a test that
+    stubs its own response for the same id, and the reverse.
+
+    Like `no_premiere_probe`, deliberately does NOT request `monkeypatch`.
+    """
+    with pinned_shorts_probe():
+        yield
+
+
+@pytest.fixture
+def shorts_probe_pin():
+    """The pin's context manager, for the test that runs two lifecycles."""
+    return pinned_shorts_probe
 
 
 @pytest.fixture
