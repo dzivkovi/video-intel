@@ -20,12 +20,15 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 import video_intel as vi
 from video_intel import (
     KNOB_CONSEQUENCE_SKIPS_CHANNEL,
+    channel_is_selective,
     resolve_selective_since,
     selective_since_misuse,
+    selective_since_opted_out,
     validate_channel_knobs,
 )
 
@@ -75,6 +78,24 @@ class TestResolveSelectiveSincePrecedence:
     def test_resolve_selective_since_opt_out_ignores_case_and_whitespace(self, raw):
         assert resolve_selective_since({"since": raw}, {"default_since": "10d"}, None) is None
 
+    @pytest.mark.parametrize("raw", ["false", "False", "FALSE", "  false ", "False "])
+    def test_resolve_selective_since_quoted_false_string_is_an_opt_out(self, raw):
+        """The docs advertise `false`; a quoted "false" must not reach parse_since."""
+        assert selective_since_opted_out({"since": raw}) is True
+        assert resolve_selective_since({"since": raw}, {"default_since": "10d"}, None) is None
+
+    @pytest.mark.parametrize("raw", ["no", "off", "No", "OFF"])
+    def test_resolve_selective_since_no_and_off_strings_keep_todays_behavior(self, raw):
+        """Only `none`/`false` strings opt out; other strings still reach
+        parse_since, which exits on an unparseable value exactly as before."""
+        assert selective_since_opted_out({"since": raw}) is False
+        with pytest.raises(SystemExit):
+            resolve_selective_since({"since": raw}, {"default_since": "10d"}, None)
+
+    def test_resolve_selective_since_integer_zero_falls_through_to_default_since(self):
+        assert selective_since_opted_out({"since": 0}) is False
+        _assert_window_is_days_ago(resolve_selective_since({"since": 0}, {"default_since": "10d"}, None), 10)
+
     def test_resolve_selective_since_channel_value_beats_default_since(self):
         result = resolve_selective_since({"since": "5d"}, {"default_since": "10d"}, None)
 
@@ -114,6 +135,18 @@ class TestSelectiveSinceMisusePredicate:
         assert selective_since_misuse({"since": "10d"}, None) is False
         assert selective_since_misuse({}, None) is False
 
+    @pytest.mark.parametrize(
+        "empty_lists",
+        [{"playlists": []}, {"keywords": []}, {"playlists": [], "keywords": []}],
+        ids=["playlists", "keywords", "both"],
+    )
+    def test_misuse_empty_playlists_or_keywords_are_non_selective(self, empty_lists):
+        assert channel_is_selective(empty_lists) is False
+        assert selective_since_misuse({"since": "none", **empty_lists}, None) is True
+
+    def test_misuse_quoted_false_string_on_non_selective_channel_is_misuse(self):
+        assert selective_since_misuse({"since": "false"}, None) is True
+
 
 # ---------------------------------------------------------------------------
 # Preflight: validate_channel_knobs reports the misuse, never a false alarm
@@ -135,6 +168,16 @@ class TestValidateChannelKnobsSinceOptOut:
 
     def test_validate_non_selective_opt_out_under_cli_since_reports_nothing(self):
         assert validate_channel_knobs({"since": "none"}, {}, cli_since="30d") == []
+
+    @pytest.mark.parametrize(
+        "empty_lists",
+        [{"playlists": []}, {"keywords": []}, {"playlists": [], "keywords": []}],
+        ids=["playlists", "keywords", "both"],
+    )
+    def test_validate_opt_out_with_empty_lists_reports_skips_channel(self, empty_lists):
+        problems = validate_channel_knobs({"since": "none", **empty_lists}, {})
+
+        assert [(p[0], p[2]) for p in problems] == [("since", KNOB_CONSEQUENCE_SKIPS_CHANNEL)]
 
 
 # ---------------------------------------------------------------------------
@@ -269,11 +312,26 @@ class TestCmdScanNonSelectiveOptOutIsRejected:
     def _healthy(self):
         return {"name": "healthy", "url": "https://example.com/healthy"}
 
-    def test_scan_non_selective_opt_out_skips_channel_and_reports_failure(self, monkeypatch, tmp_path, caplog):
+    @pytest.mark.parametrize(
+        "opt_out",
+        [
+            {"since": "none"},
+            {"since": "false"},
+            # Delta (a): YAML `false` (and its YAML 1.1 spellings) used to fall
+            # through to default_since and scan; parsed here the way config.yaml is.
+            yaml.safe_load("since: false"),
+            yaml.safe_load("since: no"),
+            yaml.safe_load("since: off"),
+            # Empty lists do not make a channel selective.
+            {"since": "none", "playlists": [], "keywords": []},
+        ],
+        ids=["none", "quoted-false", "yaml-false", "yaml-no", "yaml-off", "empty-lists"],
+    )
+    def test_scan_non_selective_opt_out_skips_channel_and_reports_failure(self, monkeypatch, tmp_path, caplog, opt_out):
         harness = _ScanHarness(monkeypatch, tmp_path)
 
         with caplog.at_level("INFO"):
-            vi.cmd_scan(_scan_args(), harness.config(self._plain(since="none"), self._healthy()))
+            vi.cmd_scan(_scan_args(), harness.config(self._plain(**opt_out), self._healthy()))
 
         # No fetch for the rejected channel after the rejection point.
         assert "https://example.com/plain" not in harness.channel_id_calls
@@ -320,8 +378,15 @@ class TestCmdScanNonSelectiveOptOutIsRejected:
             and r.message.endswith(KNOB_CONSEQUENCE_SKIPS_CHANNEL)
         ]
         assert len(preflight) == 1, preflight
+        runtime = [
+            r.message for r in caplog.records if r.levelname == "ERROR" and "skipping entire channel" in r.message
+        ]
+        assert len(runtime) == 1, runtime
         assert "https://example.com/plain" not in harness.channel_id_calls
         assert any("Healthy channel video" in r.message for r in caplog.records)
+        # A preview never ends in a FAILED block whose retry/skip advice cannot apply.
+        assert not [r for r in caplog.records if "FAILED ---" in r.message]
+        assert caplog.records[-1].message == "Done."
 
     @pytest.mark.parametrize(
         ("channel", "cli_since"),

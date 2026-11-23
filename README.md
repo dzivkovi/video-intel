@@ -367,10 +367,12 @@ Two things that surprise people: `GEMINI_API_KEY` must still be set even at the 
 Seven of these are validated at `scan --dry-run` - `prompt`, `transcript_source`,
 `chunk_minutes`, `captions_over_duration_seconds`,
 `transcript_max_duration_seconds`, `transcript_timeout_seconds`
-and `mindmap_source`, plus `since: none` on a channel with no `playlists` or `keywords` - which reports a typo'd knob with the consequence it would
+and `mindmap_source` - which reports a typo'd knob with the consequence it would
 have (whole scan aborted, channel skipped, or just that stage failing) before
 spending any quota. The rest are not preflighted: a bad `skip_shorts`,
 `enabled`, or `min_duration_seconds` surfaces only when the scan reaches it.
+The preflight also reports a channel with no `playlists` or `keywords` that sets
+`since: none` or `false`, which a real run skips because it would fetch nothing.
 
 ### Selective Mode
 

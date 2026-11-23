@@ -1848,15 +1848,16 @@ def channel_is_selective(channel_config: dict) -> bool:
 def selective_since_opted_out(channel_config: dict) -> bool:
     """True when the channel's own `since` says "no recent-uploads window" (issue #293).
 
-    The opt-out is the string `none` (case-insensitive, whitespace ignored) or the
-    YAML boolean `false`. An absent key, a YAML null and an empty string are NOT
-    opt-outs (they fall through to `default_since`), and boolean `true` is given
-    no meaning here.
+    The opt-out is the string `none` or `false` (case-insensitive, whitespace
+    ignored) or the YAML boolean `false`. An absent key, a YAML null and an empty
+    string are NOT opt-outs (they fall through to `default_since`), the strings
+    `no`/`off` and the integer `0` keep their old meaning, and boolean `true` is
+    given no meaning here.
     """
     raw = channel_config.get("since")
     if raw is False:
         return True
-    return isinstance(raw, str) and raw.strip().lower() == "none"
+    return isinstance(raw, str) and raw.strip().lower() in ("none", "false")
 
 
 def selective_since_misuse(channel_config: dict, cli_since: str | None) -> bool:
@@ -8112,7 +8113,10 @@ def cmd_scan(args, config):
         # with the channel silently dropped (the issue #135 rule).
         if selective_since_misuse(ch, args.since):
             log.error("[%s] invalid since (%s); skipping entire channel", ch_name, SINCE_OPT_OUT_MISUSE_MESSAGE)
-            errors.append((ch_name, ch_name, f"error: {SINCE_OPT_OUT_MISUSE_MESSAGE}"))
+            # A dry run is a preview: no FAILED block whose "retry"/"skip" advice
+            # does not apply to it. The ERROR and the skip happen in both modes.
+            if not args.dry_run:
+                errors.append((ch_name, ch_name, f"error: {SINCE_OPT_OUT_MISUSE_MESSAGE}"))
             continue
 
         # Resolve channel
@@ -8143,6 +8147,7 @@ def cmd_scan(args, config):
             selective_since = resolve_selective_since(ch, config, args.since)
             videos = fetch_selective_videos(youtube, channel_id, ch, since_dt=selective_since)
         else:
+            # Relies on the issue #293 misuse rejection above: the opt-out value never reaches parse_since here.
             since_str = args.since or ch.get("since") or config.get("default_since", "10d")
             since_dt = parse_since(since_str)
             log.info("  Looking back to %s", since_dt.strftime("%Y-%m-%d"))
