@@ -507,3 +507,73 @@ class TestErrorStatusDoesNotAccumulate:
 
         assert call_count["n"] == 2
         assert "ai.should_not_accumulate" not in seen_taxonomies[1].get("concepts", {})
+
+
+# ---------------------------------------------------------------------------
+# 6. Issue #287: each candidate carries its OWN recorded prompt into
+#    process_concepts, not whatever the collection loop parsed last.
+# ---------------------------------------------------------------------------
+
+
+class TestScanConceptsSourcePrompt:
+    @staticmethod
+    def _seed_two_videos(tmp_path, channel, second_meta_extra):
+        channel_dir = tmp_path / channel
+        channel_dir.mkdir(parents=True, exist_ok=True)
+        for prefix, extra in (
+            ("2026-08-01-aaa-first", {"prompt": "mindmap-from-transcript"}),
+            ("2026-08-02-bbb-second", second_meta_extra),
+        ):
+            (channel_dir / f"{prefix}.mindmap.md").write_text("# mindmap\n", encoding="utf-8")
+            (channel_dir / f"{prefix}.meta.json").write_text(
+                json.dumps(
+                    {
+                        "video_id": prefix[-5:],
+                        "video_url": f"https://www.youtube.com/watch?v={prefix[-5:]}",
+                        "title": prefix,
+                        "published": "2026-08-01",
+                        "channel": channel,
+                        "modes_completed": ["scan", "mindmap"],
+                        **extra,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+    @staticmethod
+    def _run_scan(tmp_path, monkeypatch, channel):
+        _stub_scan_env(monkeypatch, tmp_path, {})
+        recorded: dict[str, object] = {}
+
+        def fake_process_concepts(*args, **kwargs):
+            prefix = kwargs["prefix"]
+            assert prefix not in recorded, "each video must be extracted exactly once"
+            recorded[prefix] = kwargs["source_prompt"]
+            return prefix, "done"
+
+        monkeypatch.setattr(video_intel, "process_concepts", fake_process_concepts)
+        config = {
+            "channels": [{"name": channel, "url": f"https://youtube.com/@{channel}", "auto_concepts": True}],
+            "output_dir": str(tmp_path),
+            "auto_concepts": True,
+        }
+        cmd_scan(_scan_args(channel=channel), config)
+        return recorded
+
+    def test_scan_concepts_loop_passes_each_videos_own_prompt(self, tmp_path, monkeypatch):
+        self._seed_two_videos(tmp_path, "chan", {"prompt": "mindmap-knowledge"})
+
+        recorded = self._run_scan(tmp_path, monkeypatch, "chan")
+
+        assert recorded == {
+            "2026-08-01-aaa-first": "mindmap-from-transcript",
+            "2026-08-02-bbb-second": "mindmap-knowledge",
+        }
+
+    def test_scan_concepts_loop_passes_none_when_a_video_records_no_prompt(self, tmp_path, monkeypatch):
+        self._seed_two_videos(tmp_path, "chan", {})
+
+        recorded = self._run_scan(tmp_path, monkeypatch, "chan")
+
+        assert recorded["2026-08-01-aaa-first"] == "mindmap-from-transcript"
+        assert recorded["2026-08-02-bbb-second"] is None
