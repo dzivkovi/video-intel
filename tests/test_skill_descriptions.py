@@ -89,6 +89,10 @@ CURATE_TRIGGERS = [
     # it stays with curate even though its read-side sibling moved to search.
     "set up my profile",
     "persist my profile",
+    # backfill-durations (issue #294): fills a missing video length, which is
+    # not the same intent as judging a transcript (assess-transcripts).
+    "backfill durations",
+    "fill in missing video durations",
 ]
 
 

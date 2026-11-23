@@ -105,8 +105,14 @@ def youtube(monkeypatch):
     return install
 
 
-def _snapshot(root: Path) -> dict[str, bytes]:
-    return {str(p.relative_to(root)): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+def _snapshot(root: Path) -> tuple[dict[str, tuple[bytes, int]], set[str]]:
+    """Every file's bytes AND mtime, plus the directory set: a dry run that
+    rewrites identical bytes or creates a folder is caught too."""
+    files = {
+        str(p.relative_to(root)): (p.read_bytes(), p.stat().st_mtime_ns) for p in sorted(root.rglob("*")) if p.is_file()
+    }
+    dirs = {str(p.relative_to(root)) for p in root.rglob("*") if p.is_dir()}
+    return files, dirs
 
 
 class TestApplyWritesOnlyTheDuration:
@@ -261,7 +267,8 @@ class TestSkipBuckets:
         _write_meta(chan / "gone.meta.json", {"video_id": _vid(2)})
         _write_meta(chan / "live.meta.json", {"video_id": _vid(3)})
         _write_meta(chan / "nofield.meta.json", {"video_id": _vid(4)})
-        youtube({_vid(1): "PT1M", _vid(3): "P0D", _vid(4): None})
+        _write_meta(chan / "zero.meta.json", {"video_id": _vid(5)})
+        youtube({_vid(1): "PT1M", _vid(3): "P0D", _vid(4): None, _vid(5): "PT0S"})
 
         # Act
         counts = vi.cmd_backfill_durations(_args(apply=True), {})
@@ -270,15 +277,20 @@ class TestSkipBuckets:
         assert counts["has_duration"] == 1
         assert counts["no_youtube_id"] == 1
         assert counts["unreadable"] == 1
-        assert counts["candidates"] == 4
+        assert counts["candidates"] == 5
         assert counts["written"] == 1
         assert counts["not_found"] == 2  # no item, and an item with no duration field
-        assert counts["no_duration"] == 1
+        assert counts["no_duration"] == 2  # P0D and PT0S
         assert counts["changed_since_walk"] == 0
+        assert counts["write_failed"] == 0
         walked = len(list(chan.glob("*.meta.json")))
         assert counts["has_duration"] + counts["no_youtube_id"] + counts["unreadable"] + counts["candidates"] == walked
         assert (
-            counts["written"] + counts["not_found"] + counts["no_duration"] + counts["changed_since_walk"]
+            counts["written"]
+            + counts["not_found"]
+            + counts["no_duration"]
+            + counts["changed_since_walk"]
+            + counts["write_failed"]
             == counts["candidates"]
         )
         assert "duration_seconds" not in _read(chan / "live.meta.json")
@@ -353,6 +365,7 @@ class TestFailureAndContinue:
         assert len(written) == 50
         assert "50 meta(s) written so far" in caplog.text
         assert "Re-run the same command to continue" in caplog.text
+        assert "assess-transcripts --force" in caplog.text, "an early stop that wrote must still print the recipe"
 
         # Act again: the re-run fetches only what is left.
         fake = youtube(durations)
@@ -491,3 +504,89 @@ class TestCommandRegistration:
 
         assert len(seen) == 1
         assert seen[0].apply is True and seen[0].channel == "chan"
+
+
+class TestFailuresAreCountedNotTracebacks:
+    def test_write_failure_is_counted_others_written_exit_one(self, corpus, youtube, monkeypatch, caplog):
+        # Arrange: three candidates; replacing the middle one fails like a locked file.
+        for n in range(3):
+            _write_meta(corpus / "chan" / f"m{n}.meta.json", {"video_id": _vid(n)})
+        youtube({_vid(n): "PT2M" for n in range(3)})
+        real_replace = vi.os.replace
+
+        def locked(src, dst):
+            if Path(dst).name == "m1.meta.json":
+                raise PermissionError("locked by another process")
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(vi.os, "replace", locked)
+
+        # Act
+        with caplog.at_level("INFO", logger=vi.log.name), pytest.raises(SystemExit) as exc:
+            vi.cmd_backfill_durations(_args(apply=True), {})
+
+        # Assert
+        assert exc.value.code == 1
+        assert "duration_seconds" in _read(corpus / "chan" / "m0.meta.json")
+        assert "duration_seconds" not in _read(corpus / "chan" / "m1.meta.json")
+        assert "duration_seconds" in _read(corpus / "chan" / "m2.meta.json")
+        assert "write_failed=1" in caplog.text
+        assert "Re-run the same command to continue" in caplog.text
+        assert "assess-transcripts --force" in caplog.text
+        assert not list((corpus / "chan").glob("*.tmp"))
+
+    def test_walk_read_error_propagates_without_any_write(self, corpus, youtube, monkeypatch):
+        _write_meta(corpus / "chan" / "a.meta.json", {"video_id": _vid(1)})
+        _write_meta(corpus / "chan" / "b.meta.json", {"video_id": _vid(2)})
+        youtube({_vid(1): "PT1M", _vid(2): "PT1M"})
+        real_read_bytes = Path.read_bytes
+
+        def locked(self):
+            if self.name == "b.meta.json":
+                raise PermissionError("locked")
+            return real_read_bytes(self)
+
+        monkeypatch.setattr(Path, "read_bytes", locked)
+
+        with pytest.raises(PermissionError):
+            vi.cmd_backfill_durations(_args(apply=True), {})
+
+        assert youtube.built == []
+        assert "duration_seconds" not in _read(corpus / "chan" / "a.meta.json")
+
+    def test_apply_without_api_key_exits_one(self, corpus, monkeypatch):
+        _write_meta(corpus / "chan" / "a.meta.json", {"video_id": _vid(1)})
+        monkeypatch.delenv("YOUTUBE_API_KEY", raising=False)
+
+        with pytest.raises(SystemExit) as exc:
+            vi.cmd_backfill_durations(_args(apply=True), {})
+
+        assert exc.value.code == 1
+
+
+class TestChannelThatSelectsNothing:
+    def test_existing_folder_with_no_meta_warns(self, corpus, youtube, caplog):
+        _write_meta(corpus / "chan" / "a.meta.json", {"video_id": _vid(1)})
+        (corpus / "empty").mkdir()
+        youtube({})
+
+        with caplog.at_level("WARNING", logger=vi.log.name):
+            counts = vi.cmd_backfill_durations(_args(apply=False, channel="empty"), {})
+
+        assert counts["candidates"] == 0
+        assert "selected no meta.json" in caplog.text
+
+
+class TestBareInvocationIsADryRun:
+    def test_main_without_flags_parses_apply_false(self, tmp_path, monkeypatch):
+        seen = []
+        monkeypatch.setattr(vi, "load_config", lambda: {"output_dir": str(tmp_path)})
+        monkeypatch.setattr(vi, "backup_config_if_changed", lambda *_a, **_k: None)
+        monkeypatch.setattr(vi, "cmd_backfill_durations", lambda args, config: seen.append(args))
+        monkeypatch.setattr(sys, "argv", ["video_intel.py", "backfill-durations"])
+
+        vi.main()
+
+        assert len(seen) == 1
+        assert seen[0].apply is False
+        assert seen[0].channel is None

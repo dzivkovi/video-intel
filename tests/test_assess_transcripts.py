@@ -12,6 +12,8 @@ import csv
 import inspect
 import json
 import logging
+import random
+import shlex
 import sys
 import textwrap
 import types as _types
@@ -342,8 +344,40 @@ class TestUnknownDurationIsUnassessable:
         hint = next(m for m in messages if "were not judged" in m)
         assert hint == (
             "2 transcript(s) have no usable `duration_seconds` (a positive whole number of seconds) and were not "
-            "judged; store one in their meta.json and re-run."
+            "judged. Fill the durations in, dry run first:"
         )
+        commands = [m.strip() for m in messages if m.strip().startswith("python scripts/video_intel.py ")]
+        assert commands == [
+            "python scripts/video_intel.py backfill-durations",
+            "python scripts/video_intel.py backfill-durations --apply",
+            "python scripts/video_intel.py assess-transcripts --force",
+        ]
+
+    def test_unassessable_hint_commands_parse_through_the_real_parser(self, tmp_path, corpus, caplog, monkeypatch):
+        # Arrange: a narrowed run, so the hint carries --channel.
+        caplog.set_level(logging.INFO, logger=vi.log.name)
+        _write(corpus / "chan", "d-unknown", _no_duration_meta(), _md(_healthy_body(1200)))
+        _run(tmp_path, channel="chan")
+        lines = [r.getMessage().strip() for r in caplog.records]
+        commands = [shlex.split(m.split("video_intel.py ", 1)[1]) for m in lines if m.startswith("python scripts/")]
+        seen = []
+        monkeypatch.setattr(vi, "load_config", lambda: {"output_dir": str(tmp_path)})
+        monkeypatch.setattr(vi, "backup_config_if_changed", lambda *_a, **_k: None)
+        monkeypatch.setattr(vi, "cmd_backfill_durations", lambda args, config: seen.append(args))
+        monkeypatch.setattr(vi, "cmd_assess_transcripts", lambda args, config: seen.append(args))
+
+        # Act
+        for argv in commands:
+            monkeypatch.setattr(sys, "argv", ["video_intel.py", *argv])
+            vi.main()
+
+        # Assert
+        assert [(a.command, a.apply, a.channel) for a in seen] == [
+            ("backfill-durations", False, "chan"),
+            ("backfill-durations", True, "chan"),
+            ("assess-transcripts", False, "chan"),
+        ]
+        assert seen[2].force is True
 
     def test_no_unknown_duration_prints_no_hint(self, tmp_path, corpus, caplog):
         caplog.set_level(logging.INFO, logger=vi.log.name)
@@ -611,3 +645,163 @@ class TestOneDurationPredicate:
             and node.func.attr == "known_duration_seconds"
         ]
         assert calls, "remediation_sweep no longer calls vi.known_duration_seconds"
+
+
+def _stamp(secs: int) -> str:
+    hours, rem = divmod(secs, 3600)
+    minutes, seconds = divmod(rem, 60)
+    return f"[{hours}:{minutes:02d}:{seconds:02d}]" if hours else f"[{minutes:02d}:{seconds:02d}]"
+
+
+def _sorted_markdown(seconds: list[int]) -> str:
+    return _md([f'{_stamp(s)} Host: "line"' for s in sorted(seconds)])
+
+
+def _random_sorted_case(rng: random.Random) -> tuple[str, int, bool]:
+    """One whole-video transcript in the shape the writers put on disk: sorted."""
+    duration = rng.choice([400, 900, 1800, 3600, 7200])
+    if rng.random() < 0.1:
+        stamps = sorted(rng.randrange(0, duration) for _ in range(rng.randint(1, 3)))
+    else:
+        start = rng.choice([0, 0, rng.randrange(0, duration // 2)])
+        end = int(duration * rng.choice([0.3, 0.6, 0.95, 1.0, 1.1, 1.5, 3.0]))
+        mean_step = rng.choice([5, 20, 60, 200, 300, 500])
+        stamps, secs = [], start
+        while secs < end:
+            stamps.append(secs)
+            secs += int(rng.expovariate(1 / mean_step)) + 1
+            if rng.random() < 0.02:
+                secs += rng.randint(600, 3000)
+    return _sorted_markdown(stamps), duration, rng.random() < 0.5
+
+
+class TestForcedReassessmentKeepsWriterOnlyFlags:
+    """Issue #294 review: the Markdown on disk is sorted and whole, so a forced
+    re-assessment can recompute neither `backward_jump_*` (emission order) nor
+    `chunk_window_mismatch_*` (the per-chunk merge). Replacing the stored list
+    used to erase them and read the transcript as clean."""
+
+    @pytest.mark.parametrize("apply", [False, True], ids=["dry-run", "apply"])
+    def test_stored_backward_jump_survives_force_and_stays_severe(self, tmp_path, corpus, apply):
+        # Arrange: the writer saw a clock slip; the sorted Markdown looks clean.
+        meta = _meta(transcript_quality_flags=[vi.QUALITY_FLAG_BACKWARD_JUMP_SEVERE], transcript_status="partial")
+        meta_path = _write(corpus / "chan", "v", meta, _md(_healthy_body(1200)))
+        before = meta_path.read_bytes()
+
+        # Act
+        counts = _run(tmp_path, force=True, apply=apply, backup_dir=str(tmp_path / "bk") if apply else None)
+
+        # Assert
+        assert counts["severe"] == 1
+        assert counts["clean"] == 0
+        stored = json.loads(meta_path.read_text(encoding="utf-8"))
+        if apply:
+            assert stored["transcript_quality_flags"] == [vi.QUALITY_FLAG_BACKWARD_JUMP_SEVERE]
+            assert stored["transcript_status"] == "partial"
+        else:
+            assert meta_path.read_bytes() == before
+
+    def test_kept_severe_flag_demotes_a_healthy_status(self, tmp_path, corpus):
+        meta = _meta(transcript_quality_flags=[vi.QUALITY_FLAG_BACKWARD_JUMP_SEVERE], transcript_status="complete")
+        meta_path = _write(corpus / "chan", "v", meta, _md(_healthy_body(1200)))
+
+        counts = _run(tmp_path, force=True, apply=True, backup_dir=str(tmp_path / "bk"))
+
+        stored = json.loads(meta_path.read_text(encoding="utf-8"))
+        assert stored["transcript_status"] == "partial"
+        assert counts["demoted"] == 1
+
+    def test_recomputable_flag_is_replaced_and_writer_only_flag_kept(self, tmp_path, corpus):
+        stored_flags = [vi.QUALITY_FLAG_CHUNK_WINDOW_MISMATCH_MILD, vi.QUALITY_FLAG_MONOLITHIC_SEVERE]
+        meta_path = _write(
+            corpus / "chan",
+            "v",
+            _meta(transcript_quality_flags=stored_flags, transcript_status="partial"),
+            _md(_healthy_body(1200)),
+        )
+
+        counts = _run(tmp_path, force=True, apply=True, backup_dir=str(tmp_path / "bk"))
+
+        stored = json.loads(meta_path.read_text(encoding="utf-8"))
+        assert stored["transcript_quality_flags"] == [vi.QUALITY_FLAG_CHUNK_WINDOW_MISMATCH_MILD]
+        assert counts["mild"] == 1
+
+    def test_recomputable_mild_flag_that_no_longer_applies_is_dropped(self, tmp_path, corpus):
+        meta_path = _write(
+            corpus / "chan",
+            "v",
+            _meta(transcript_quality_flags=[vi.QUALITY_FLAG_DENSITY_MILD]),
+            _md(_healthy_body(1200)),
+        )
+
+        counts = _run(tmp_path, force=True, apply=True, backup_dir=str(tmp_path / "bk"))
+
+        assert json.loads(meta_path.read_text(encoding="utf-8"))["transcript_quality_flags"] == []
+        assert counts["clean"] == 1
+
+    def test_a_backward_jump_in_the_file_joins_the_union(self, tmp_path, corpus):
+        body = _healthy_body(1200) + ['[08:00] Host: "rewind"']
+        meta_path = _write(
+            corpus / "chan",
+            "v",
+            _meta(transcript_quality_flags=[vi.QUALITY_FLAG_CHUNK_WINDOW_MISMATCH_MILD]),
+            _md(body),
+        )
+
+        _run(tmp_path, force=True, apply=True, backup_dir=str(tmp_path / "bk"))
+
+        assert json.loads(meta_path.read_text(encoding="utf-8"))["transcript_quality_flags"] == sorted(
+            [vi.QUALITY_FLAG_BACKWARD_JUMP_SEVERE, vi.QUALITY_FLAG_CHUNK_WINDOW_MISMATCH_MILD]
+        )
+
+
+class TestMergeReassessedQualityFlags:
+    def test_merge_keeps_only_writer_only_entries_of_the_old_list(self):
+        old = [vi.QUALITY_FLAG_BACKWARD_JUMP_MILD, vi.QUALITY_FLAG_BLIND_GAP_SEVERE, "stale"]
+        assert vi.merge_reassessed_quality_flags(old, [vi.QUALITY_FLAG_DENSITY_MILD]) == sorted(
+            [vi.QUALITY_FLAG_BACKWARD_JUMP_MILD, vi.QUALITY_FLAG_DENSITY_MILD]
+        )
+
+    @pytest.mark.parametrize(
+        "old",
+        [None, 7, "backward_jump_severe", {"backward_jump_severe": True}, [], [{"x": 1}, 3]],
+        ids=["none", "int", "bare-string", "dict", "empty", "non-string-entries"],
+    )
+    def test_merge_malformed_old_flags_keep_nothing(self, old):
+        assert vi.merge_reassessed_quality_flags(old, ["density_mild"]) == ["density_mild"]
+
+    def test_merge_tolerates_a_non_string_entry_beside_a_real_flag(self):
+        old = [{"x": 1}, vi.QUALITY_FLAG_CHUNK_WINDOW_MISMATCH_SEVERE]
+        assert vi.merge_reassessed_quality_flags(old, []) == [vi.QUALITY_FLAG_CHUNK_WINDOW_MISMATCH_SEVERE]
+
+
+class TestWriterOnlyFlagsDriftGuard:
+    """The constant must name exactly the flags a re-assessment of a sorted,
+    whole-video Markdown can never produce. Established two ways: every OTHER
+    quality flag is produced by some sorted Markdown through the real
+    recompute path (`assess_transcript_markdown`), and no member of the
+    constant is produced across the same sample. The structural reason sits
+    beside it: `chunk_window_mismatch_*` is never named by the recompute path
+    at all, and `backward_jump_*` needs a stamp lower than an earlier one."""
+
+    UNIVERSE = frozenset(v for k, v in vars(vi).items() if k.startswith("QUALITY_FLAG_"))
+
+    def test_universe_is_not_vacuous(self):
+        assert len(self.UNIVERSE) >= 10
+        assert vi.WRITER_ONLY_QUALITY_FLAGS <= self.UNIVERSE
+
+    def test_sorted_markdown_produces_exactly_the_non_writer_only_flags(self):
+        rng = random.Random(294)
+        emitted: set[str] = set()
+        for _ in range(500):
+            text, duration, captions = _random_sorted_case(rng)
+            _, flags = vi.assess_transcript_markdown(text, duration, captions=captions)
+            emitted |= set(flags)
+        assert emitted == self.UNIVERSE - vi.WRITER_ONLY_QUALITY_FLAGS
+
+    def test_recompute_path_never_names_the_chunk_window_flags(self):
+        names = {"QUALITY_FLAG_CHUNK_WINDOW_MISMATCH_SEVERE", "QUALITY_FLAG_CHUNK_WINDOW_MISMATCH_MILD"}
+        for func in (vi.assess_transcript_markdown, vi.assess_transcript_artifact, vi._demote_captions_leading_gap):
+            tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+            used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+            assert not (used & names), func.__name__
