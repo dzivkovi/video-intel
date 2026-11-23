@@ -653,8 +653,11 @@ def _stamp(secs: int) -> str:
     return f"[{hours}:{minutes:02d}:{seconds:02d}]" if hours else f"[{minutes:02d}:{seconds:02d}]"
 
 
-def _sorted_markdown(seconds: list[int]) -> str:
-    return _md([f'{_stamp(s)} Host: "line"' for s in sorted(seconds)])
+def _sorted_markdown(seconds: list[int], screens: list[tuple[int, int]] = ()) -> str:
+    """Dialogue lines plus SCREEN lines, one list sorted by start (as rendered)."""
+    lines = [(s, f'{_stamp(s)} Host: "line"') for s in seconds]
+    lines += [(s, f"  SCREEN [{_stamp(s)[1:-1]}-{_stamp(e)[1:-1]}] [slide]: s") for s, e in screens]
+    return _md([line for _, line in sorted(lines, key=lambda x: x[0])])
 
 
 def _random_sorted_case(rng: random.Random) -> tuple[str, int, bool]:
@@ -672,7 +675,14 @@ def _random_sorted_case(rng: random.Random) -> tuple[str, int, bool]:
             secs += int(rng.expovariate(1 / mean_step)) + 1
             if rng.random() < 0.02:
                 secs += rng.randint(600, 3000)
-    return _sorted_markdown(stamps), duration, rng.random() < 0.5
+    captions = rng.random() < 0.5
+    screens: list[tuple[int, int]] = []
+    if not captions and rng.random() < 0.5:
+        # SCREEN blocks (issue #278): spread or crowded, overlapping or not.
+        at = rng.choice([0, rng.randrange(0, duration)])
+        step, length = rng.choice([1, 10, 60]), rng.choice([1, 20])
+        screens = [(at + i * step, at + i * step + length) for i in range(rng.randint(1, 8))]
+    return _sorted_markdown(stamps, screens), duration, captions
 
 
 class TestForcedReassessmentKeepsWriterOnlyFlags:
