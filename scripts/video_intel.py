@@ -14702,6 +14702,10 @@ REPAIR_FAILURE_EVIDENCE_FIELDS = (
 #: anomaly; 5% lets a stray trailing cue through and stops a systematic overrun
 #: (a re-upload one minute longer than a 14-minute talk is about 7%).
 REPAIR_MAX_CUES_PAST_DURATION_SHARE = 0.05
+#: Why an entry followed by an ambiguous SCREEN block stays whole.
+AMBIGUOUS_SCREEN_REASON = (
+    "a SCREEN block after this entry contains a line shaped like a timestamped entry; the structure is ambiguous"
+)
 #: A continuation line that opens like a stamp the entry pattern does not
 #: recognize (``[07:40.500] Guest: ...``) may be another speaker's line, and a
 #: split would relabel it with this entry's speaker.
@@ -14797,6 +14801,7 @@ class TranscriptRepair:
     text: str
     candidates: list[RepairCandidate]
     overall_coverage: float
+    planned: TranscriptBody | None = None
 
     @property
     def repaired(self) -> list[RepairCandidate]:
@@ -14876,7 +14881,13 @@ def plan_transcript_repair(
         )
         if not plan.candidate:
             continue
-        reason = _unsplittable_reason(entry, parts) if plan.repairable else None
+        reason = None
+        if plan.repairable:
+            # Pieces cannot be placed safely around a block that may hide a
+            # real entry, so such an entry is never split (the bound is a belt).
+            reason = _unsplittable_reason(entry, parts) or (
+                AMBIGUOUS_SCREEN_REASON if id(entry) in hidden_bound else None
+            )
         if reason is not None:
             plan = dataclasses.replace(plan, pieces=plan.pieces[:1], reason=reason)
         stamps = [entry.stamp] + [_repair_stamp(p.stamp_seconds, entry.stamp) for p in plan.pieces[1:]]
@@ -14895,10 +14906,14 @@ def plan_transcript_repair(
         for k, (piece, stamp) in enumerate(zip(plan.pieces, stamps, strict=True)):
             last = k == len(plan.pieces) - 1
             piece_parts = parts
-            if not last and not parts.line_ending:
-                # The entry ended the file without a newline; only the final
-                # piece may keep that shape.
-                piece_parts = dataclasses.replace(parts, line_ending=newline)
+            if not last and (not parts.line_ending or not parts.trailing):
+                # Every piece but the last is followed by the writer's
+                # separator (a line ending, then a blank line), so the next
+                # piece or SCREEN block is never fused to it; the last piece
+                # keeps the entry's own ending and trailing lines.
+                piece_parts = dataclasses.replace(
+                    parts, line_ending=parts.line_ending or newline, trailing=parts.trailing or [newline]
+                )
             lines = render_dialogue_piece(stamp, piece_parts, piece.text)
             pieces.append(TranscriptBodyEntry(kind=TRANSCRIPT_ENTRY_DIALOGUE, stamp=stamp, lines=lines))
         replacements[id(entry)] = pieces
@@ -14919,8 +14934,28 @@ def plan_transcript_repair(
             j += 1
         entries.extend(_splice_pieces(pieces, body.entries[i + 1 : j]))
         i = j
-    repaired = TranscriptBody(header=body.header, entries=entries, trailer=body.trailer).render()
-    return TranscriptRepair(text=repaired, candidates=candidates, overall_coverage=overall)
+    planned = TranscriptBody(header=body.header, entries=entries, trailer=body.trailer)
+    return TranscriptRepair(text=planned.render(), candidates=candidates, overall_coverage=overall, planned=planned)
+
+
+def repair_reparses_to_plan(repair: TranscriptRepair) -> bool:
+    """True when the repaired bytes, parsed again, give exactly the planned entries.
+
+    Same header and trailer, and the same entries in the same order with the
+    same kinds, stamps and lines (so every line has the same owner). A repair
+    that would not read back as planned is never written: a re-read would
+    otherwise fuse a piece into a neighbouring block.
+    """
+    if repair.planned is None:
+        return True
+    parsed = parse_transcript_body(repair.text)
+    planned = repair.planned
+    return (
+        parsed.header == planned.header
+        and parsed.trailer == planned.trailer
+        and [(e.kind, e.stamp, e.lines) for e in parsed.entries]
+        == [(e.kind, e.stamp, e.lines) for e in planned.entries]
+    )
 
 
 def _coverage_table_shows_failed_chunk(header: str) -> bool:
@@ -15306,6 +15341,14 @@ def cmd_repair_timestamps(args, config):
         return {"outcome": "nothing", "repair": repair}
     if not repair.repaired:
         log.warning("repair-timestamps: declined, no candidate entry is repairable; transcript unchanged")
+        sys.exit(EXIT_PARTIAL)
+    if not repair_reparses_to_plan(repair):
+        log.warning(
+            "repair-timestamps: declined, the repaired transcript would not read back as planned (%d entries "
+            "planned, %d parsed); nothing changed",
+            len(repair.planned.entries),
+            len(parse_transcript_body(repair.text).entries),
+        )
         sys.exit(EXIT_PARTIAL)
 
     coverage = repair.repaired_coverage

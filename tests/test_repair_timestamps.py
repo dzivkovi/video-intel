@@ -1699,3 +1699,137 @@ class TestHiddenEntryStampsBoundTheSplit:
         assert any(c.stamp == "00:12" for c in repair.candidates)  # it was a candidate
         assert _screens(vi.parse_transcript_body(repair.text)) == _screens(vi.parse_transcript_body(text))
         assert vi.parse_transcript_body(text).render() == text
+
+
+# ---------------------------------------------------------------------------
+# Final round: ambiguous SCREEN blocks are never split around; repairs re-parse
+# ---------------------------------------------------------------------------
+
+
+def _wall_then_screen(screen_tail: str) -> tuple[str, list]:
+    """A Host wall spanning 00:00 to about 01:20, then a SCREEN block stamped [00:10]."""
+    sentences, cues = _talk(n=8, first=0.0, step=11.0)
+    md = (
+        "# Transcript: T\n\n**Status:** Complete\n\n---\n\n"
+        f'[00:00] Host: "{" ".join(sentences)}"\n\n'
+        f"  SCREEN [00:10] [slide]: a slide\n{screen_tail}"
+        '[02:00] Host: "Later."\n'
+    )
+    return md, cues
+
+
+AMBIGUOUS_TAIL = '[01:30] Guest: "a run-on line inside the block"\n\n'
+CLEAN_TAIL = "\n"
+
+
+class TestAmbiguousScreenBlocks:
+    def test_a_wall_before_a_block_hiding_an_entry_shaped_line_is_not_split(self):
+        text, raw = _wall_then_screen(AMBIGUOUS_TAIL)
+
+        repair = vi.plan_transcript_repair(text, _cue_records(raw))
+
+        assert repair.text == text
+        wall = next(c for c in repair.candidates if c.stamp == "00:00")
+        assert not wall.plan.repairable
+        assert wall.plan.reason == vi.AMBIGUOUS_SCREEN_REASON
+
+    def test_no_host_speech_ever_follows_the_hidden_guest_line(self):
+        # Dialogue order, counting the run-on line the block hides: every line of
+        # the Host's wall must stay before the Guest line it preceded.
+        text, raw = _wall_then_screen(AMBIGUOUS_TAIL)
+
+        repaired = vi.plan_transcript_repair(text, _cue_records(raw)).text
+
+        guest_at = repaired.index("[01:30] Guest:")
+        host_lines = [i for i, line in enumerate(repaired.splitlines(keepends=True)) if "] Host: " in line]
+        offsets = [sum(len(x) for x in repaired.splitlines(keepends=True)[:i]) for i in host_lines]
+        assert all(o < guest_at for o in offsets[:-1])  # the last Host line is the later [02:00] entry
+
+    def test_through_apply_it_declines_with_exit_3_and_names_the_ambiguity(self, corpus, monkeypatch, caplog):
+        text, raw = _wall_then_screen(AMBIGUOUS_TAIL)
+        p = _paths(corpus)
+        p.transcript.write_text(text, encoding="utf-8")
+        p.meta.write_text(json.dumps(_meta(duration_seconds=180)), encoding="utf-8")
+        _stub_captions(monkeypatch, raw)
+        before = _snapshot(corpus)
+
+        with caplog.at_level(logging.INFO, logger="video_intel"):
+            assert _exit_code(corpus, apply=True) == 3
+        assert _snapshot(corpus) == before
+        assert "the structure is ambiguous" in caplog.text
+
+    def test_the_same_wall_before_a_clean_block_still_splits_and_interleaves(self):
+        text, raw = _wall_then_screen(CLEAN_TAIL)
+
+        repair = vi.plan_transcript_repair(text, _cue_records(raw))
+
+        assert repair.repaired
+        kinds = [(e.kind, e.stamp) for e in vi.parse_transcript_body(repair.text).entries]
+        screen_at = kinds.index((vi.TRANSCRIPT_ENTRY_SCREEN, "00:10"))
+        assert kinds[0] == (vi.TRANSCRIPT_ENTRY_DIALOGUE, "00:00")
+        assert screen_at == 1  # the block's 00:10 sits before every later piece
+        assert kinds[-1] == (vi.TRANSCRIPT_ENTRY_DIALOGUE, "02:00")
+        assert vi.repair_reparses_to_plan(repair)
+
+
+class TestRepairsReadBackAsPlanned:
+    @pytest.mark.parametrize("name", ORDER_SHAPES)
+    def test_the_repaired_bytes_parse_back_to_the_plan_and_a_second_pass_changes_nothing(self, tmp_path, name):
+        text, raw = _order_shape(name, tmp_path)
+        cues = _cue_records(raw)
+
+        repair = vi.plan_transcript_repair(text, cues)
+
+        assert repair.repaired and vi.repair_reparses_to_plan(repair)
+        parsed = vi.parse_transcript_body(repair.text)
+        assert [(e.kind, e.stamp, e.lines) for e in parsed.entries] == [
+            (e.kind, e.stamp, e.lines) for e in repair.planned.entries
+        ]
+        assert vi.plan_transcript_repair(repair.text, cues).text == repair.text
+
+    def test_a_repair_that_would_not_read_back_declines_without_writing(self, corpus, monkeypatch, caplog):
+        _write_corpus(corpus)
+        _stub_captions(monkeypatch, _talk()[1])
+        real_render = vi.render_dialogue_piece
+
+        def fused(stamp, parts, text):
+            # Drop the separator: the next piece would run on to this line.
+            return [real_render(stamp, parts, text)[0].rstrip("\r\n")]
+
+        monkeypatch.setattr(vi, "render_dialogue_piece", fused)
+        before = _snapshot(corpus)
+
+        with caplog.at_level(logging.INFO, logger="video_intel"):
+            assert _exit_code(corpus, apply=True) == 3
+        assert _snapshot(corpus) == before
+        assert "would not read back as planned" in caplog.text
+
+    def test_a_piece_whose_entry_had_no_blank_line_after_it_still_gets_the_separator(self):
+        sentences, cues = _talk()
+        text = (
+            "# Transcript: T\n\n---\n\n"
+            + f'[00:12] Host: "{" ".join(sentences)}"\n'
+            + "  SCREEN [05:00] [slide]: s\n\n"
+        )
+
+        repair = vi.plan_transcript_repair(text, _cue_records(cues))
+
+        assert repair.repaired and vi.repair_reparses_to_plan(repair)
+        pieces = repair.repaired[0].plan.pieces
+        dialogue = _dialogue(vi.parse_transcript_body(repair.text))
+        assert len(dialogue) == len(pieces)
+        # The writer's separator: every piece but the last is followed by a blank line.
+        assert all(not entry.lines[-1].strip() for entry, _ in dialogue[:-1])
+
+    def test_a_screen_block_without_its_closing_blank_line_makes_the_plan_fail_the_read_back(self):
+        # A piece placed after this block would be read as the block's content,
+        # and the block's bytes are never changed, so this plan must not be written.
+        sentences, cues = _talk()
+        text = (
+            "# Transcript: T\n\n---\n\n" + f'[00:12] Host: "{" ".join(sentences)}"\n' + "  SCREEN [05:00] [slide]: s\n"
+        )
+
+        repair = vi.plan_transcript_repair(text, _cue_records(cues))
+
+        assert repair.repaired
+        assert not vi.repair_reparses_to_plan(repair)
