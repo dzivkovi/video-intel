@@ -442,3 +442,54 @@ def test_index_rebuilt_after_title_rotation_write_warns_once_per_damaged_file(tm
     healthy = json.loads((channel_dir / f"{HEALTHY_PREFIX}.meta.json").read_text(encoding="utf-8"))
     assert healthy["alt_titles"] == ["A rotated title"]
     assert len(_warnings_naming(caplog, damaged)) == 1
+
+
+# ---------------------------------------------------------------------------
+# is_skipped resolves the meta through the index, like is_processed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("force", [False, True], ids=["plain", "force"])
+@pytest.mark.parametrize("mindmap_source", ["auto", "transcript"])
+@pytest.mark.parametrize("shape", ["torn", "list"])
+def test_cmd_scan_when_rotated_title_damaged_meta_and_no_mindmap_leaves_it_alone(
+    scan_env, caplog, shape, mindmap_source, force
+):
+    # Arrange: the transcript exists under the old prefix, the mind map does not.
+    corpus, calls = scan_env
+    channel_dir = corpus / "chan"
+    damaged = _seed_own_damaged(channel_dir, shape, with_transcript=True)
+    calls["fetched"][:] = [_fetched(DAMAGED_VID, "A rotated damaged title", "2026-10-02")]
+    assert video_intel.video_file_prefix(calls["fetched"][0]) != DAMAGED_PREFIX
+    metas_before = sorted(p.name for p in channel_dir.glob("*.meta.json"))
+    config = _scan_config()
+    config["channels"][0]["mindmap_source"] = mindmap_source
+
+    # Act
+    with caplog.at_level(logging.WARNING, logger="video_intel"):
+        video_intel.cmd_scan(_scan_args(force=force), config)
+
+    # Assert: no paid call, no second meta, and no failure recorded under the new title's prefix.
+    _assert_left_alone(channel_dir, damaged, shape, calls, metas_before)
+    new_prefix = video_intel.video_file_prefix(calls["fetched"][0])
+    assert new_prefix not in caplog.text
+
+
+def test_cmd_scan_when_rotated_title_healthy_meta_has_skip_modes_honors_them(scan_env):
+    """The intended side effect: skip_modes on a rotated-title meta now applies under the new title too."""
+    # Arrange
+    corpus, calls = scan_env
+    channel_dir = corpus / "chan"
+    channel_dir.mkdir(parents=True)
+    meta = _healthy_meta(skip_modes=["mindmap", "transcript"], skip_reason="operator choice")
+    (channel_dir / f"{HEALTHY_PREFIX}.meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    meta_bytes = (channel_dir / f"{HEALTHY_PREFIX}.meta.json").read_bytes()
+
+    # Act (the fixture fetches vid001 under a rotated title)
+    video_intel.cmd_scan(_scan_args(), _scan_config())
+
+    # Assert
+    assert calls["transcribe"] == []
+    assert calls["mindmap"] == []
+    assert (channel_dir / f"{HEALTHY_PREFIX}.meta.json").read_bytes() == meta_bytes
+    assert sorted(p.name for p in channel_dir.glob("*.meta.json")) == [f"{HEALTHY_PREFIX}.meta.json"]

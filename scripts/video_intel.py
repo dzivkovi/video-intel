@@ -4823,16 +4823,22 @@ def is_processed(
     missing meta.json and for genuinely new videos.
     """
     channel_dir = output_dir / channel_name
+    prefix = resolve_video_prefix(channel_dir, video)
+    return _mode_artifact_present(channel_dir, prefix, mode, any_variant=any_variant)
 
+
+def resolve_video_prefix(channel_dir: Path, video: dict) -> str:
+    """The on-disk prefix for ``video``: the video-id index first, the title-computed prefix as fallback.
+
+    The ONE resolution rule shared by ``is_processed`` and ``is_skipped``
+    (issue #313), so a rotated title finds the same meta in both.
+    """
     vid = video.get("video_id")
     if vid:
-        index = _load_video_id_index(channel_dir)
-        existing_prefix = index.get(vid)
+        existing_prefix = _load_video_id_index(channel_dir).get(vid)
         if existing_prefix:
-            return _mode_artifact_present(channel_dir, existing_prefix, mode, any_variant=any_variant)
-
-    prefix = video_file_prefix(video)
-    return _mode_artifact_present(channel_dir, prefix, mode, any_variant=any_variant)
+            return existing_prefix
+    return video_file_prefix(video)
 
 
 #: Modes `_mode_artifact_present` knows how to resolve to a file. "scan" and
@@ -4961,8 +4967,10 @@ def is_skipped(output_dir, channel_name, video, mode: str | None = None) -> bool
     Backward compatible: callers without `mode=` get "any skip" semantics
     (the pre-issue-42 behavior).
     """
-    prefix = video_file_prefix(video)
-    meta_path = output_dir / channel_name / f"{prefix}.meta.json"
+    # Same resolution as is_processed (issue #313): a rotated title reads the
+    # meta the index already knows, not a file named after the new title.
+    channel_dir = output_dir / channel_name
+    meta_path = channel_dir / f"{resolve_video_prefix(channel_dir, video)}.meta.json"
     if not meta_path.exists():
         return False
     # A damaged meta skips EVERY mode (issue #313): the paid step's writer
