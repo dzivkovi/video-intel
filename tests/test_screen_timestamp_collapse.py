@@ -802,3 +802,167 @@ class TestRepairTimestampsJudgesScreenStampsLikeAssessTranscripts:
         assert FLAG in meta["transcript_quality_flags"]
         assert meta["transcript_status"] == "complete"
         vi._invalidate_video_id_cache()
+
+
+# --- review round 3: never raise, and the writer and the Markdown agree ---------
+
+
+def _fmt(secs: int, frac: str = "") -> str:
+    """A stamp the way Gemini writes one: MM:SS under an hour, H:MM:SS above."""
+    hours, rem = divmod(secs, 3600)
+    minutes, seconds = divmod(rem, 60)
+    return (f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}") + frac
+
+
+class TestSafeTimestampNeverRaises:
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("00:1e999", None),
+            ("00:inf", None),
+            ("00:nan", None),
+            ("", None),
+            (None, None),
+            (5, None),
+            (["00:01"], None),
+            ("00:05.5", 5),
+            ("-1:00", -60),
+        ],
+        ids=["huge-exponent", "inf", "nan", "empty", "none", "number", "list", "fractional", "negative-parses"],
+    )
+    def test_shapes(self, value, expected):
+        assert vi._safe_timestamp_to_seconds(value) == expected
+
+
+BAD_END = {"start": "00:01", "end": "00:1e999", "type": "slide", "description": "bad end"}
+
+
+class TestAMalformedScreenEndNeverAbortsAWrite:
+    def test_single_shot_writer(self, tmp_path, monkeypatch):
+        screens = [BAD_END, *_screen([(s, s + 10) for s in range(60, DURATION, 120)])]
+        status, meta = _run_single(tmp_path, monkeypatch, screen_content=screens)
+        assert status == "done"
+        assert meta["transcript_status"] == "complete"
+        assert FLAG not in meta["transcript_quality_flags"]
+        assert "SCREEN [00:01-00:1e999]" in (tmp_path / f"{PREFIX}.transcript.md").read_text(encoding="utf-8")
+
+    def test_chunked_writer(self, tmp_path, monkeypatch):
+        bad = {**BAD_END, "start": "30:01", "end": "30:1e999"}
+        chunk2 = _chunk_response(1800, 3600, _healthy_spans(1800, 3600))
+        chunk2["screen_content"].insert(0, bad)
+        responses = [
+            _chunk_response(0, 1800, _healthy_spans(0, 1800)),
+            chunk2,
+            _chunk_response(3600, 5400, _healthy_spans(3600, 5400)),
+        ]
+        status, meta, transcript = _run_chunked(tmp_path, monkeypatch, responses, THREE_CHUNKS, 5400)
+        assert status == "done"
+        assert meta["transcript_status"] == "ok"
+        assert FLAG not in meta["transcript_quality_flags"]
+        assert "SCREEN [30:01-30:1e999]" in transcript.read_text(encoding="utf-8")
+
+
+class TestTheScreenCheckIsFailSafe:
+    """Any unexpected exception in the SCREEN check logs one WARNING and yields no flag."""
+
+    def _boom(self, *_a, **_kw):
+        raise RuntimeError("boom")
+
+    def test_assessor(self, monkeypatch, caplog):
+        monkeypatch.setattr(vi, "screen_timestamp_collapse", self._boom)
+        metrics = vi.assess_transcript_artifact(ISSUE_DIALOGUE, DURATION, screen_entries=ISSUE_SCREEN)
+        assert FLAG not in _flags(metrics)
+        assert "SCREEN timestamp check skipped (assessor)" in caplog.text
+
+    def test_markdown_reassessment(self, monkeypatch, caplog):
+        monkeypatch.setattr(vi, "screen_entries_from_transcript_markdown", self._boom)
+        md = _md(_body(range(0, DURATION, 20), _collapsed(8, at=1, length=20)))
+        fields, flags = vi.assess_transcript_markdown(md, DURATION, captions=False)
+        assert FLAG not in flags
+        assert fields["transcript_dialogue_entries"] == DURATION // 20
+        assert "SCREEN timestamp check skipped (Markdown re-assessment)" in caplog.text
+
+    def test_chunk_relativization(self, monkeypatch, caplog):
+        real = vi._relativize_chunk_entries
+
+        def relativize(entries, *a, drop_unplaceable=False, **kw):
+            if drop_unplaceable:
+                raise RuntimeError("boom")
+            return real(entries, *a, drop_unplaceable=drop_unplaceable, **kw)
+
+        monkeypatch.setattr(vi, "_relativize_chunk_entries", relativize)
+        parsed = {"transcripts": _dialogue(1800, 3600), "screen_content": _screen(_collapsed(8, at=1801))}
+        verdict, metrics = vi._assess_chunk_coverage(parsed, 1800, 3600, 5400, 2)
+        assert verdict == "ok"
+        assert FLAG not in _flags(metrics)
+        assert "SCREEN timestamp check skipped (chunk 2 SCREEN stamps)" in caplog.text
+
+
+def _shape_entries(lo: int, shape: str) -> list[dict]:
+    """SCREEN entries crowded at ``lo`` (a window start), in one end shape each."""
+    starts = range(lo + 1, lo + 1 + MIN_ENTRIES + 1)
+    far = lo + 4200  # beyond any window here
+    ends = {
+        "integer": lambda s: _fmt(s + 25),
+        "fractional": lambda s: _fmt(s + 25, ".5"),
+        "end_beyond_window": lambda s: _fmt(far),
+        "end_missing": lambda s: None,
+        "end_before_start": lambda s: _fmt(max(lo, s - 1)),
+        "malformed_end": lambda s: _fmt(s)[:-1] + "1e999",
+    }[shape]
+    out = []
+    for s in starts:
+        entry = {"start": _fmt(s, ".5" if shape == "fractional" else ""), "type": "slide", "description": shape}
+        end = ends(s)
+        if end is not None:
+            entry["end"] = end
+        out.append(entry)
+    return out
+
+
+SHAPES = ["integer", "fractional", "end_beyond_window", "end_missing", "end_before_start", "malformed_end"]
+
+
+class TestTheWriterAndTheMarkdownAgree:
+    """For each end shape, the flag a real writer records equals the flag
+    `assess_transcript_markdown` computes from the file that writer wrote."""
+
+    @pytest.mark.parametrize("shape", SHAPES)
+    def test_single_shot(self, tmp_path, monkeypatch, shape):
+        _, meta = _run_single(tmp_path, monkeypatch, screen_content=_shape_entries(0, shape))
+        text = (tmp_path / f"{PREFIX}.transcript.md").read_text(encoding="utf-8")
+        _, reassessed = vi.assess_transcript_markdown(text, DURATION, captions=False)
+        assert (FLAG in meta["transcript_quality_flags"]) == (FLAG in reassessed)
+
+    @pytest.mark.parametrize("shape", SHAPES)
+    def test_chunked(self, tmp_path, monkeypatch, shape):
+        chunk2 = _chunk_response(1800, 3600, [])
+        chunk2["screen_content"] = _shape_entries(1800, shape)
+        responses = [
+            _chunk_response(0, 1800, _healthy_spans(0, 1800)),
+            chunk2,
+            _chunk_response(3600, 5400, _healthy_spans(3600, 5400)),
+        ]
+        _, meta, transcript = _run_chunked(tmp_path, monkeypatch, responses, THREE_CHUNKS, 5400)
+        _, reassessed = vi.assess_transcript_markdown(transcript.read_text(encoding="utf-8"), 5400, captions=False)
+        assert (FLAG in meta["transcript_quality_flags"]) == (FLAG in reassessed)
+
+    def test_the_shapes_are_not_vacuous(self, tmp_path, monkeypatch):
+        flagged = {}
+        for shape in SHAPES:
+            run_dir = tmp_path / shape
+            run_dir.mkdir()
+            _, meta = _run_single(run_dir, monkeypatch, screen_content=_shape_entries(0, shape))
+            flagged[shape] = FLAG in meta["transcript_quality_flags"]
+        assert flagged == {
+            "integer": True,
+            "fractional": True,
+            "end_beyond_window": True,
+            "end_missing": False,
+            "end_before_start": False,
+            "malformed_end": False,
+        }
+
+    def test_fractional_range_reads_back_its_end(self):
+        text = _md(["  SCREEN [00:01.5-00:30.5] [slide]: s", '[00:40] Host: "x"'])
+        assert vi.screen_entries_from_transcript_markdown(text) == [{"start": "00:01", "end": "00:30"}]

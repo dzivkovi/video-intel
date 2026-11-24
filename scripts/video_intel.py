@@ -3608,14 +3608,21 @@ def _safe_timestamp_to_seconds(ts: str) -> int | None:
     pass for chunk 1 (whose window does include 0) - two different wrong
     answers depending on which chunk emitted the garbage. Callers must gate
     on `is None` and count the stamp separately, never substitute a default.
+
+    Issue #278 review: a non-finite seconds field is unparseable too. A
+    huge exponent (``"00:1e999"``) or ``inf`` reaches ``int(float(...))`` as
+    infinity and raises ``OverflowError``, and a non-string ``ts`` has no
+    ``split``; both used to escape this helper and abort the paid call that
+    was being assessed. A negative field still parses (it is finite, and every
+    caller already treats a value outside its window as such).
     """
-    parts = ts.split(":")
     try:
+        parts = ts.split(":")
         if len(parts) == 2:
             return int(parts[0]) * 60 + int(float(parts[1]))
         if len(parts) == 3:
             return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(float(parts[2]))
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError, AttributeError):
         return None
     return None
 
@@ -5307,6 +5314,21 @@ def screen_timestamp_collapse(
     return most >= SCREEN_COLLAPSE_MIN_CONCURRENT
 
 
+def _screen_check_fail_safe(compute: Callable[[], Any], *, where: str, fallback: Any) -> Any:
+    """Run one step of the issue #278 SCREEN check and never let it raise.
+
+    The check is label-only: it must never abort the paid call being
+    assessed, nor change what gets written. An unexpected exception logs ONE
+    WARNING naming the step and yields ``fallback`` (no flag, or "not
+    examined").
+    """
+    try:
+        return compute()
+    except Exception as exc:
+        log.warning("SCREEN timestamp check skipped (%s): %r", where, exc)
+        return fallback
+
+
 def assess_transcript_artifact(
     transcripts: list[dict],
     duration_seconds: int | None,
@@ -5517,7 +5539,11 @@ def assess_transcript_artifact(
     if (
         screen_entries is not None
         and span_seconds is not None
-        and screen_timestamp_collapse(screen_entries, transcripts, window_start, window_end)
+        and _screen_check_fail_safe(
+            lambda: screen_timestamp_collapse(screen_entries, transcripts, window_start, window_end),
+            where="assessor",
+            fallback=False,
+        )
     ):
         mild.append(QUALITY_FLAG_SCREEN_TIMESTAMP_COLLAPSE_MILD)
 
@@ -5576,8 +5602,11 @@ def _relativize_chunk_entries(
     (``_safe_timestamp_to_seconds``), is not before the chunk start, and lies
     inside the chunk by the classifier's own boundary
     (``classify_timestamp_placement``); otherwise an unplaceable ``start``
-    skips the entry and an unplaceable other key is dropped from it. The
-    default keeps the dialogue output byte-identical.
+    skips the entry and an unplaceable other key is dropped from it, except
+    that a key past the chunk's end (parsed, not before the start) is CLAMPED
+    to the chunk's end: the merger keeps such an end in the Markdown and a
+    re-assessment reads it as running past the window, so both views agree.
+    The default keeps the dialogue output byte-identical.
     """
     # Issue #161 review (P1): same shared predicate as assess_transcript_artifact
     # and merge_transcript_json - see the comment there. entry["start"] is
@@ -5596,18 +5625,27 @@ def _relativize_chunk_entries(
             absolute_ts = _classify_and_offset_timestamp(entry[key], start_secs, allotted_span)
             if drop_unplaceable:
                 absolute = _safe_timestamp_to_seconds(absolute_ts)
-                if (
-                    absolute is None
-                    or absolute < start_secs
-                    or classify_timestamp_placement(absolute - start_secs, 0, allotted_span)
+                beyond = (
+                    absolute is not None
+                    and absolute >= start_secs
+                    and classify_timestamp_placement(absolute - start_secs, 0, allotted_span)
                     == TIMESTAMP_PLACEMENT_IMPLAUSIBLE
-                ):
+                )
+                if key != "start" and beyond:
+                    # An end past the chunk is kept, clamped to the chunk's
+                    # end: the merger writes it to the Markdown as it came,
+                    # and a re-assessment reads it there as running past the
+                    # window (issue #278 review). Either way the screen stays
+                    # on to the window's end.
+                    secs = allotted_span
+                elif absolute is None or absolute < start_secs or beyond:
                     if key == "start":
                         placed = False
                         break
                     rewritten.pop(key, None)
                     continue
-                secs = absolute - start_secs
+                else:
+                    secs = absolute - start_secs
             else:
                 secs = max(0, timestamp_to_seconds(absolute_ts) - start_secs)
             rewritten[key] = f"{secs // 3600}:{(secs % 3600) // 60:02d}:{secs % 60:02d}"
@@ -5694,8 +5732,12 @@ def _assess_chunk_coverage(
     else:
         allotted_span = max(1, end_secs - start_secs)
         relativized = _relativize_chunk_entries(transcripts, start_secs, allotted_span)
-        relativized_screen = _relativize_chunk_entries(
-            screen, start_secs, allotted_span, keys=("start", "end"), drop_unplaceable=True
+        relativized_screen = _screen_check_fail_safe(
+            lambda: _relativize_chunk_entries(
+                screen, start_secs, allotted_span, keys=("start", "end"), drop_unplaceable=True
+            ),
+            where=f"chunk {chunk_idx} SCREEN stamps",
+            fallback=None,
         )
         metrics = dict(
             assess_transcript_artifact(
@@ -11590,9 +11632,14 @@ TRANSCRIPT_ENTRY_DIALOGUE = "dialogue"
 TRANSCRIPT_ENTRY_SCREEN = "screen"
 _DIALOGUE_LINE_RE = re.compile(rf"^\[({ENTRY_TIMESTAMP_PATTERN})\]")
 # The SCREEN boundary `chunk_transcript` uses; the stamp is the range's start.
-# Group 2 is the range's end when the line has one (issue #278 reads it); it is
-# optional, so the set of lines this matches is unchanged.
-_SCREEN_LINE_RE = re.compile(rf"^\s+SCREEN \[({ENTRY_TIMESTAMP_PATTERN})(?:-({ENTRY_TIMESTAMP_PATTERN}))?")
+# Group 2 is the range's end when the line has one (issue #278 reads it); a
+# fractional seconds part on either stamp is skipped, so a fractional range
+# still yields its end (truncated, like `_safe_timestamp_to_seconds`). Every
+# added part is optional and follows group 1, so the set of lines this matches
+# and its group 1 are unchanged.
+_SCREEN_LINE_RE = re.compile(
+    rf"^\s+SCREEN \[({ENTRY_TIMESTAMP_PATTERN})(?:\.\d+)?(?:-({ENTRY_TIMESTAMP_PATTERN})(?:\.\d+)?)?"
+)
 # A Gemini dialogue entry is `[stamp] Label: "text"`, a captions one `[stamp] "text"`.
 # Matched over the WHOLE entry (continuation lines included), so a text with
 # embedded newlines still parses; the label never starts with a quote.
@@ -14677,9 +14724,13 @@ def assess_transcript_markdown(text: str, duration_seconds: int | None, *, capti
     else:
         severe, mild = metrics["severe"], metrics["mild"]
     if duration_seconds is not None and duration_seconds > 0:
-        screen = screen_entries_from_transcript_markdown(text)
-        windows = chunk_windows_from_transcript_markdown(text) or [(0, duration_seconds)]
-        if any(screen_timestamp_collapse(screen, entries, lo, hi) for lo, hi in windows):
+
+        def _collapsed() -> bool:
+            screen = screen_entries_from_transcript_markdown(text)
+            windows = chunk_windows_from_transcript_markdown(text) or [(0, duration_seconds)]
+            return any(screen_timestamp_collapse(screen, entries, lo, hi) for lo, hi in windows)
+
+        if _screen_check_fail_safe(_collapsed, where="Markdown re-assessment", fallback=False):
             mild = [*mild, QUALITY_FLAG_SCREEN_TIMESTAMP_COLLAPSE_MILD]
     flags = sorted(set(severe) | set(mild))
     fields = {
