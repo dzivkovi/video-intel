@@ -11,22 +11,22 @@ Always dry-run first. The dry run prints the arms, the call count (fixtures x ar
 ## A new model arrived
 
 ```bash
-python scripts/model_eval.py --candidate <new-model> --rolls 3 --dry-run
-python scripts/model_eval.py --candidate <new-model> --rolls 3
+python scripts/model_eval.py --candidate <new-model> --rolls 3 --out tests/evals/model-cards/<new-model>.md --dry-run
+python scripts/model_eval.py --candidate <new-model> --rolls 3 --out tests/evals/model-cards/<new-model>.md
 ```
 
 With no `--incumbent`, the incumbent is the default model in `scripts/video_intel.py` (`DEFAULT_MODEL`) with the bundled prompt, so the run has two arms. Name another incumbent with `--incumbent <model>`.
 
-Read `tests/evals/model-cards/<new-model>.md`, the "Decision rule" section first.
+Read `tests/evals/model-cards/<new-model>.md` (and its `.json` sidecar), the "Decision rule" section first. The card is written to `--out`, and a card already at that path is overwritten: for a model that already has a tracked card, pick a new name such as `<new-model>-rerun.md`. A model you adopt needs its card under its own name, because `tests/test_model_scorecard_gate.py` reads `<model>.json`.
 
 ## A prompt candidate
 
 ```bash
-python scripts/model_eval.py --candidate <current-default> --candidate-prompt path/to/candidate-transcript.md --incumbent bundled --rolls 3 --dry-run
-python scripts/model_eval.py --candidate <current-default> --candidate-prompt path/to/candidate-transcript.md --incumbent bundled --rolls 3
+python scripts/model_eval.py --candidate <current-default> --candidate-prompt path/to/candidate-transcript.md --incumbent bundled --rolls 3 --out tests/evals/model-cards/prompt-candidate.md --dry-run
+python scripts/model_eval.py --candidate <current-default> --candidate-prompt path/to/candidate-transcript.md --incumbent bundled --rolls 3 --out tests/evals/model-cards/prompt-candidate.md
 ```
 
-`--incumbent bundled` compares the candidate prompt with the bundled prompt on the same model. The candidate arm is labelled `candidate:<first 8 hex of the file's sha256>`, and the card's "Prompts per arm" section records each arm's full hash and source. Read the same card, the same section.
+`--incumbent bundled` compares the candidate prompt with the bundled prompt on the same model. Without `--out`, the card would go to `<current-default>.md` and overwrite the tracked scorecard of the default model, so always name a new card. The prompt file is read the way the bundled prompt is (UTF-8 text, so a CRLF copy and an LF copy are the same prompt). The candidate arm is labelled `candidate:<first 8 hex of the sha256 of that text>`, and the card's "Prompts per arm" section records each arm's full hash and source. Read `tests/evals/model-cards/prompt-candidate.md`, the "Decision rule" section first. `--incumbent bundled` with no `--candidate-prompt` has nothing to compare: the card says there is no candidate arm.
 
 ## The decision rule in plain words
 
@@ -48,8 +48,9 @@ Each rule prints PASS, FAIL or NOT EVALUATED, and an overall line follows. Overa
 | the candidate has no caption offset, or only N entries aligned | no caption track, or fewer than 5 dialogue entries matched a caption cue | the "Caption alignment" section names the reason; a refused request is YouTube refusing this IP, not a video without captions |
 | no incumbent rolls for this fixture | the incumbent arm has no cell for that fixture | run both arms on the same fixtures |
 | both arms were served by one model | two model names were requested but the provider reported the same model for both | the comparison measures one model against itself; pick a different incumbent |
+| served model unknown | two model names were requested and a counted roll has no recorded served model, so nothing shows that two different models answered | re-run those cells (delete their pair of files under `_raw/`); a prompt comparison on one model is not affected |
 
-A `legacy-cache roll(s) excluded` note means a cell came from a cache entry written before the cache key existed. Its prompt is unverified, so the rule leaves it out. Delete that pair of files under `tests/evals/model-cards/_raw/` to measure it again.
+A `legacy-cache roll(s) excluded` note means a cell came from a cache entry written before the cache key existed. Its prompt is unverified, so the rule leaves it out, and so do the medians table, the cost rule and the mean line. Delete that pair of files under `tests/evals/model-cards/_raw/` to measure it again.
 
 A FAIL on R1 caused only by `generation_failed` with a transport error (a timeout, a 429) is an infrastructure failure, not a model verdict. Re-run; failed rolls are never cached.
 
@@ -59,7 +60,7 @@ The dry run prices every arm as fixtures x rolls x segment minutes at the transc
 
 ## Caching
 
-Every roll is cached under `tests/evals/model-cards/_raw/` (gitignored), keyed on the model, the fixture and its window, the prompt's content hash, the thinking level and the roll number. A re-run replays what is cached and calls Gemini only for the rest; when everything is cached, no API key is needed. Captions are fetched once per fixture and cached in the same folder.
+Every roll is cached under `tests/evals/model-cards/_raw/` (gitignored), keyed on the model, the fixture and its window, the prompt's content hash, the thinking config, media resolution and output-token cap actually sent, and the roll number. A re-run replays what is cached and calls Gemini only for the rest; when everything is cached, no API key is needed. Captions are fetched once per fixture and cached in the same folder, but a run in which every cell is cached makes no network call at all: an uncached caption track is fetched only when the run makes a live call, or when you pass `--fetch-captions`.
 
 ## What the harness does not measure
 
@@ -67,3 +68,5 @@ Every roll is cached under `tests/evals/model-cards/_raw/` (gitignored), keyed o
 - Long videos. Chunked behavior near the output cap is not exercised by a single short segment.
 - Non-English and heavily accented speech, unless your fixtures include them.
 - Transcript completeness or quality of the text itself, beyond the hard fails.
+- Offset bias. Rolling auto-caption cues overlap the next cue, and an entry at a window edge can align to a cue just outside it; both can shift the offset a little.
+- A bare `--candidate X` with no `--incumbent` also runs the default model, so it costs two arms; the dry run shows it.

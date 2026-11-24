@@ -15,7 +15,9 @@ the boundary, and the manifest is synthetic under `tmp_path` [core: real-caller]
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
+import os
 import shlex
 from pathlib import Path
 from types import SimpleNamespace
@@ -66,15 +68,26 @@ def _response(text: str, served: str | None = None, *, prompt: int = 5000) -> Si
 
 
 class FakeClient:
-    """Fakes ``client.models.generate_content``; returns queued texts in order, then repeats the last."""
+    """Fakes ``client.models.generate_content``; returns queued texts in order, then repeats the last.
+
+    Records what each call was SENT - the prompt text, the thinking config and
+    the media resolution - so a regression that sends the wrong prompt or drops
+    a setting cannot ship green [core: real-caller].
+    """
 
     def __init__(self, *texts: str) -> None:
         self._texts = list(texts)
         self.calls: list[str] = []
+        self.sent: list[dict] = []
         self.models = SimpleNamespace(generate_content=self._generate)
 
     def _generate(self, model, contents, config):
         self.calls.append(model)
+        prompt = next(p.text for p in contents.parts if getattr(p, "text", None))
+        thinking = config.thinking_config.model_dump(mode="json", exclude_none=True) if config.thinking_config else None
+        self.sent.append(
+            {"model": model, "prompt": prompt, "thinking": thinking, "media": str(config.media_resolution)}
+        )
         text = self._texts.pop(0) if len(self._texts) > 1 else self._texts[0]
         return _response(text, served=model)
 
@@ -784,7 +797,7 @@ class TestCli:
         assert inc == (model_eval.v.DEFAULT_MODEL, "bundled")
         assert (model_eval.v.DEFAULT_MODEL, "bundled") in [(m, p.label) for m, p in arms]
 
-    def test_candidate_prompt_hash_is_the_files_sha256(self, tmp_path, no_override):
+    def test_candidate_prompt_hash_is_the_sha256_of_the_text_sent(self, tmp_path, no_override):
         import hashlib
 
         cand = _candidate_arm(tmp_path, "exact bytes\n")
@@ -927,6 +940,391 @@ class TestRunbook:
         assert any("--candidate-prompt" in c for c in commands)
         assert any("--rolls" in c for c in commands)
 
+    def test_runbook_commands_name_a_new_card_and_never_a_tracked_one(self):
+        """Without `--out` the prompt recipe would overwrite the default model's tracked scorecard."""
+        parser = model_eval.build_parser()
+
+        for argv in self._commands():
+            args = parser.parse_args(argv)
+            assert args.out, f"runbook command without --out: {argv}"
+            assert not (ROOT / args.out).exists(), f"{args.out} would overwrite a tracked card"
+            if args.candidate_prompt:
+                assert Path(args.out).stem != args.candidate, "a prompt run must not write the model's own card"
+
     def test_runbook_is_linked_from_testing_and_the_rule_file(self):
         assert "model-benchmark-runbook.md" in (ROOT / "docs" / "testing.md").read_text(encoding="utf-8")
         assert "model-benchmark-runbook.md" in (ROOT / ".claude" / "rules" / "evals.md").read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Review round: excluded rolls, production task counts, the served model, the
+# offline replay, the resolved cache key, prompt reading and atomic writes
+# ---------------------------------------------------------------------------
+
+
+class TestExcludedRollsStayExcludedEverywhere:
+    """The medians table, the cost rule and the mean line count the rolls the decision rule counts."""
+
+    def test_medians_table_leaves_out_window_missed_and_legacy_rolls(self):
+        rows = [
+            _r(NEW, 1, 50, 2.0),
+            _r(NEW, 2, 52, 2.0),
+            _r(NEW, 3, 500, 9.0, window_exceeded=True),
+            _r(NEW, 4, 900, 9.0, cache="legacy"),
+        ]
+
+        card = model_eval.render(rows, [NEW], MANIFEST, None)
+
+        medians = card.split("## Medians across rolls", 1)[1]
+        line = next(x for x in medians.splitlines() if x.startswith(f"| fx1 | {NEW} | bundled | 4 |"))
+        assert line == f"| fx1 | {NEW} | bundled | 4 | 0 | 2 | 51 (2) | 2 (0) | 2 (0) | 0.3 |"
+
+    def test_cost_rule_leaves_out_a_window_missed_roll(self):
+        rows = _incumbent_rolls() + [
+            _r(NEW, 1, 50, 2.0, cost_per_video_hour=0.3),
+            _r(NEW, 2, 50, 2.0, cost_per_video_hour=0.9, window_exceeded=True),
+        ]
+
+        status, detail = _verdict(rows)["rules"]["R4"]
+
+        assert status == "PASS"
+        assert "median $0.3/video-hour" in detail
+        assert "1 roll(s) excluded" in detail
+
+    def test_cost_rule_is_not_evaluated_when_every_cost_is_excluded(self):
+        rows = _incumbent_rolls() + [_r(NEW, 1, 50, 2.0, cache="legacy")]
+
+        assert _verdict(rows)["rules"]["R4"][0] == "NOT EVALUATED"
+
+    def test_mean_line_leaves_out_legacy_cells(self):
+        rows = [_r(NEW, 1, 40, 2.0), _r(NEW, 2, 400, 2.0, cache="legacy"), _r(OLD, 1, 50, 2.0)]
+
+        card = model_eval.render(rows, [NEW, OLD], MANIFEST, OLD)
+
+        assert "mean max_gap **40.0s** vs 50.0s" in card
+        assert "1 legacy-cache cell(s) excluded" in card
+
+
+class TestTaskCountsFollowProduction:
+    """`speakers` and `screen_content` count what production would render, not `len()` of anything."""
+
+    @pytest.mark.parametrize(
+        ("speakers", "screen"),
+        [
+            ("Host", "slide text"),
+            (["Host"], ["slide"]),
+            ([{"name": "Host"}, {"voice": {"id": 1}}], [{"text": "slide"}, {"start": "  ", "text": "x"}]),
+        ],
+        ids=["string_task_value", "non_dict_entries", "unusable_fields"],
+    )
+    def test_unrenderable_tasks_count_as_missing(self, speakers, screen):
+        raw = json.dumps(
+            {
+                "transcripts": [{"start": _mmss(START), "voice": 1, "text": "hello"}],
+                "speakers": speakers,
+                "screen_content": screen,
+            }
+        )
+
+        row = _score(raw)
+
+        assert (row["speakers"], row["screen_content"]) == (0, 0)
+        assert model_eval.hard_fails(row, FX) == [
+            model_eval.HARD_FAIL_MISSING_SPEAKERS,
+            model_eval.HARD_FAIL_MISSING_SCREEN,
+        ]
+
+    def test_usable_entries_still_count(self):
+        row = _score(_envelope([START, START + 30]))
+
+        assert (row["speakers"], row["screen_content"]) == (1, 1)
+
+
+class TestReviewRoundDecisionRule:
+    def test_one_none_candidate_roll_is_dropped_and_not_evaluated(self):
+        rows = _incumbent_rolls() + [_r(NEW, 1, 50, 2.0), _r(NEW, 2, None, None), _r(NEW, 3, 50, 2.0)]
+
+        verdict = _verdict(rows)
+
+        assert verdict["rules"]["R2"][0] == "NOT EVALUATED"
+        assert "1 candidate roll(s)" in verdict["rules"]["R2"][1]
+        assert verdict["rules"]["R3"][0] == "NOT EVALUATED"
+
+    @pytest.mark.parametrize("side", ["candidate", "incumbent"])
+    def test_model_comparison_with_an_unrecorded_served_model_is_not_evaluated(self, side):
+        inc = _incumbent_rolls()
+        cand = [_r(NEW, r, 50, 2.0) for r in (1, 2, 3)]
+        (cand if side == "candidate" else inc)[1]["model_served"] = None
+
+        verdict = _verdict(inc + cand)
+
+        for rid in ("R2", "R3"):
+            assert verdict["rules"][rid][0] == "NOT EVALUATED"
+            assert "served model unknown" in verdict["rules"][rid][1]
+
+    def test_prompt_comparison_is_not_affected_by_an_unrecorded_served_model(self):
+        bundled = [_r(NEW, r, g, 2.0, model_served=None) for r, g in ((1, 40), (2, 50), (3, 60))]
+        cand = [_r(NEW, r, 45, 2.0, label="candidate:abcd1234", model_served=None) for r in (1, 2, 3)]
+
+        verdict = model_eval.decision_rule(bundled + cand, MANIFEST, (NEW, "bundled"))
+
+        assert verdict["candidates"][(NEW, "candidate:abcd1234")]["overall"] == "PASS"
+
+    def test_cost_detail_says_it_is_priced_at_the_requested_rate(self):
+        rows = _incumbent_rolls() + [{**_r(NEW, r, 50, 2.0), "model_served": "gemini-3.9-flash"} for r in (1, 2, 3)]
+
+        detail = _verdict(rows)["rules"]["R4"][1]
+
+        assert "priced at the requested model's rate" in detail
+        assert "gemini-3.9-flash" in detail
+
+
+class TestWhatEachCallIsSent:
+    def test_candidate_prompt_run_sends_each_arm_its_own_prompt_then_replays(self, harness, tmp_path):
+        cand = tmp_path / "cand.md"
+        cand.write_bytes(b"CANDIDATE PROMPT TEXT\n")
+        argv = ["--candidate", NEW, "--incumbent", OLD, "--candidate-prompt", str(cand), "--rolls", "2"]
+        argv += ["--fixtures", "fx1"]
+
+        assert model_eval.main(argv) == 0
+        bundled = model_eval.bundled_prompt().text
+        sent = [(s["model"], s["prompt"]) for s in harness.client.sent]
+        assert sent == [(NEW, bundled)] * 2 + [(OLD, bundled)] * 2 + [(NEW, "CANDIDATE PROMPT TEXT\n")] * 2
+
+        harness.client.sent.clear()
+        assert model_eval.main(argv) == 0
+        assert harness.client.sent == [], "a second identical run is served from the cache"
+
+    def test_thinking_flag_reaches_the_call(self, harness):
+        model_eval.main(["--candidate", NEW, "--incumbent", OLD, "--fixtures", "fx1", "--thinking", "medium"])
+
+        assert harness.client.sent
+        assert all(s["thinking"]["thinking_level"].lower() == "medium" for s in harness.client.sent)
+
+    def test_run_one_stamps_the_prompt_hash_and_source_and_sends_that_text(self, tmp_path, no_override):
+        cand = _candidate_arm(tmp_path, "My candidate prompt.\n")
+        client = FakeClient(_envelope([START, START + 30]))
+        scratch = tmp_path / "raw"
+        scratch.mkdir()
+
+        row = model_eval.run_one(client, genai_types, FX, NEW, None, SEG, scratch, prompt=cand)
+
+        assert row["prompt_sha256"] == cand.sha256
+        assert row["prompt_source"] == "candidate-transcript.md"
+        assert client.sent[0]["prompt"] == "My candidate prompt.\n"
+
+    def test_every_candidate_roll_failed_still_renders_with_r1_fail(self, harness, tmp_path, monkeypatch):
+        real = model_eval.v.call_gemini
+
+        def failing_for_the_candidate(client, types, uri, prompt, model, *args, **kwargs):
+            if model == NEW:
+                raise TimeoutError("slow")
+            return real(client, types, uri, prompt, model, *args, **kwargs)
+
+        monkeypatch.setattr(model_eval.v, "call_gemini", failing_for_the_candidate)
+
+        code = model_eval.main(["--candidate", NEW, "--incumbent", OLD, "--rolls", "2", "--fixtures", "fx1"])
+
+        assert code == 0
+        rows = json.loads((tmp_path / "cards" / f"{NEW}.json").read_text(encoding="utf-8"))
+        assert [r.get("error", "").split(":")[0] for r in rows if r["model"] == NEW] == ["TimeoutError"] * 2
+        card = (tmp_path / "cards" / f"{NEW}.md").read_text(encoding="utf-8")
+        assert "- R1 no hard fail in any roll: FAIL" in card
+        assert "Overall: **FAIL**" in card
+
+
+class TestCacheKeyIdentityAndSettings:
+    @pytest.mark.parametrize("change", ["url", "start", "segment_seconds"])
+    def test_a_different_video_or_window_is_a_miss(self, tmp_path, no_override, change):
+        client = FakeClient(_envelope([START, START + 30]))
+        scratch = tmp_path / "raw"
+        scratch.mkdir()
+        model_eval.run_one(client, genai_types, FX, NEW, None, SEG, scratch)
+        fx, seg = dict(FX), SEG
+        if change == "url":
+            fx["url"] = "https://www.youtube.com/watch?v=vid00000002"
+        elif change == "start":
+            fx["start"] = START + 60
+        else:
+            seg = SEG + 60
+
+        model_eval.run_one(client, genai_types, fx, NEW, None, seg, scratch)
+
+        assert len(client.calls) == 2
+
+    def test_media_resolution_change_is_a_miss_and_reaches_the_call(self, tmp_path, no_override, monkeypatch):
+        client = FakeClient(_envelope([START, START + 30]))
+        scratch = tmp_path / "raw"
+        scratch.mkdir()
+        model_eval.run_one(client, genai_types, FX, NEW, None, SEG, scratch)
+        monkeypatch.setattr(model_eval, "MEDIA_RESOLUTION", "MEDIA_RESOLUTION_HIGH")
+
+        model_eval.run_one(client, genai_types, FX, NEW, None, SEG, scratch)
+
+        assert len(client.calls) == 2
+        assert "HIGH" in client.sent[1]["media"]
+
+    def test_output_token_cap_change_is_a_miss(self, tmp_path, no_override, monkeypatch):
+        client = FakeClient(_envelope([START, START + 30]))
+        scratch = tmp_path / "raw"
+        scratch.mkdir()
+        model_eval.run_one(client, genai_types, FX, NEW, None, SEG, scratch)
+        monkeypatch.setattr(model_eval.v, "MAX_OUTPUT_TOKENS", 1024)
+
+        model_eval.run_one(client, genai_types, FX, NEW, None, SEG, scratch)
+
+        assert len(client.calls) == 2
+
+    def test_the_key_records_the_thinking_config_the_helper_resolved(self, tmp_path, no_override, monkeypatch):
+        model = "gemini-2.5-flash"
+        client = FakeClient(_envelope([START, START + 30]))
+        scratch = tmp_path / "raw"
+        scratch.mkdir()
+        model_eval.run_one(client, genai_types, FX, model, None, SEG, scratch)
+        stored = json.loads((scratch / f"fx1__{model}.usage.json").read_text(encoding="utf-8"))
+        monkeypatch.setattr(
+            model_eval.v, "_make_thinking_config_for_transcript", lambda t, m: t.ThinkingConfig(thinking_budget=128)
+        )
+
+        model_eval.run_one(client, genai_types, FX, model, None, SEG, scratch)
+
+        assert stored[model_eval.CACHE_KEY_FIELD]["thinking"] == {"thinking_budget": 0}
+        assert len(client.calls) == 2, "a change in what the helper resolves must not replay a stale response"
+
+
+class TestCachedReplayTouchesNoNetwork:
+    ARGV = ("--candidate", NEW, "--incumbent", OLD)
+
+    @staticmethod
+    def _forget_captions(tmp_path: Path) -> None:
+        for path in (tmp_path / "cards" / "_raw").glob("*__captions.json"):
+            path.unlink()
+
+    def test_fully_cached_replay_fetches_no_captions(self, harness, tmp_path):
+        model_eval.main(list(self.ARGV))
+        self._forget_captions(tmp_path)
+        harness.fetches.clear()
+
+        code = model_eval.main(list(self.ARGV))
+
+        assert code == 0
+        assert harness.fetches == []
+        rows = json.loads((tmp_path / "cards" / f"{NEW}.json").read_text(encoding="utf-8"))
+        assert all("--fetch-captions" in r["caption_reason"] for r in rows)
+
+    def test_one_live_cell_fetches_once_per_fixture(self, harness, tmp_path):
+        model_eval.main(list(self.ARGV))
+        self._forget_captions(tmp_path)
+        for suffix in (".json", ".usage.json"):
+            (tmp_path / "cards" / "_raw" / f"fx1__{NEW}{suffix}").unlink()
+        harness.fetches.clear()
+
+        model_eval.main(list(self.ARGV))
+
+        assert harness.fetches == [VID, VID]
+
+    def test_fetch_captions_flag_fetches_on_a_cached_replay(self, harness, tmp_path):
+        model_eval.main(list(self.ARGV))
+        self._forget_captions(tmp_path)
+        harness.fetches.clear()
+
+        model_eval.main([*self.ARGV, "--fetch-captions"])
+
+        assert harness.fetches == [VID, VID]
+
+
+class TestCandidatePromptReadLikeLoadPrompt:
+    def test_lf_and_crlf_copies_hash_and_send_the_same_text(self, tmp_path):
+        lf = tmp_path / "lf.md"
+        crlf = tmp_path / "crlf.md"
+        lf.write_bytes(b"line one\nline two\n")
+        crlf.write_bytes(b"line one\r\nline two\r\n")
+
+        a, b = model_eval.candidate_prompt_arm(lf), model_eval.candidate_prompt_arm(crlf)
+
+        assert a.text == b.text == "line one\nline two\n"
+        assert a.sha256 == b.sha256 == hashlib.sha256(b"line one\nline two\n").hexdigest()
+
+    def test_non_utf8_candidate_prompt_is_refused_before_any_call(self, harness, tmp_path):
+        bad = tmp_path / "bad.md"
+        bad.write_bytes(b"\xff\xfe\xfa not utf-8")
+
+        code = model_eval.main(["--candidate", NEW, "--candidate-prompt", str(bad)])
+
+        assert code == 2
+        assert harness.clients == [] and harness.fetches == [] and harness.client.calls == []
+
+    def test_estimate_cost_scales_with_fixtures(self):
+        one, _ = model_eval.estimate_cost([NEW], 1, 1, SEG)
+        two, _ = model_eval.estimate_cost([NEW], 2, 1, SEG)
+
+        assert one > 0
+        assert two == pytest.approx(2 * one)
+
+
+class TestP90AtSmallCounts:
+    @pytest.mark.parametrize(("n", "median", "p90"), [(5, 2, 5), (7, 2, 5)])
+    def test_nearest_rank_p90_by_hand(self, n, median, p90):
+        """n=5: |shifts| 0 1 2 3 5, rank ceil(4.5)=5 -> 5 (interpolation would give 4.2).
+        n=7: 0 1 1 2 2 3 5, rank ceil(6.3)=7 -> 5 (interpolation would give 3.8)."""
+        row = _score(_aligned_transcript(n), caption_track=_track())
+
+        assert row["caption_offset_median_s"] == median
+        assert row["caption_offset_p90_s"] == p90
+
+
+class TestCacheWritesAreAtomic:
+    @staticmethod
+    def _crash_on_usage(monkeypatch):
+        real = os.replace
+
+        def crash(src, dst):
+            if str(dst).endswith(".usage.json"):
+                raise OSError("simulated crash")
+            return real(src, dst)
+
+        monkeypatch.setattr(model_eval.os, "replace", crash)
+        return real
+
+    def test_crash_before_the_usage_file_leaves_a_miss(self, tmp_path, no_override, monkeypatch):
+        scratch = tmp_path / "raw"
+        scratch.mkdir()
+        real = self._crash_on_usage(monkeypatch)
+        with pytest.raises(OSError):
+            model_eval.run_one(FakeClient(_envelope([START, START + 30])), genai_types, FX, NEW, None, SEG, scratch)
+        monkeypatch.setattr(model_eval.os, "replace", real)
+        client = FakeClient(_envelope([START, START + 30]))
+
+        model_eval.run_one(client, genai_types, FX, NEW, None, SEG, scratch)
+
+        assert client.calls == [NEW]
+
+    def test_a_crash_replacing_an_entry_never_serves_the_new_raw_under_the_old_key(
+        self, tmp_path, no_override, monkeypatch
+    ):
+        scratch = tmp_path / "raw"
+        scratch.mkdir()
+        bundled = model_eval.bundled_prompt()
+        changed = model_eval.PromptArm(model_eval.BUNDLED, "another prompt", "0" * 64, "other")
+        model_eval.run_one(FakeClient(_envelope([START, START + 30])), genai_types, FX, NEW, None, SEG, scratch)
+        real = self._crash_on_usage(monkeypatch)
+        with pytest.raises(OSError):
+            other = FakeClient(_envelope([START + 300, START + 330]))
+            model_eval.run_one(other, genai_types, FX, NEW, None, SEG, scratch, prompt=changed)
+        monkeypatch.setattr(model_eval.os, "replace", real)
+        client = FakeClient(_envelope([START, START + 30]))
+
+        model_eval.run_one(client, genai_types, FX, NEW, None, SEG, scratch, prompt=bundled)
+
+        assert client.calls == [NEW]
+
+    def test_a_raw_file_that_does_not_match_its_usage_hash_is_a_miss(self, tmp_path, no_override):
+        scratch = tmp_path / "raw"
+        scratch.mkdir()
+        model_eval.run_one(FakeClient(_envelope([START, START + 30])), genai_types, FX, NEW, None, SEG, scratch)
+        (scratch / f"fx1__{NEW}.json").write_text(_envelope([START + 300]), encoding="utf-8")
+        client = FakeClient(_envelope([START, START + 30]))
+
+        model_eval.run_one(client, genai_types, FX, NEW, None, SEG, scratch)
+
+        assert client.calls == [NEW]
