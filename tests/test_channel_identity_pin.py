@@ -433,6 +433,49 @@ def test_cmd_scan_renamed_entry_keeps_pin_through_url_and_records_known_id_under
     assert data["old"] == _learned(UC_A, "Original Creator", url=HANDLE_URL)
     assert data["chan"]["channel_id"] == UC_A
     assert data["chan"]["url"] == HANDLE_URL
+    carried = [m for m in _messages(caplog, logging.INFO) if "pin carried over from entry 'old' (same url)" in m]
+    assert len(carried) == 1 and UC_A in carried[0]
+
+
+def test_cmd_scan_reused_url_under_a_still_configured_name_is_not_a_rename(scan_env, caplog):
+    # Arrange: creator A was learned at the handle and moved; the operator pointed A's entry at A's
+    # new url and added creator B, who now owns the old handle, under another name.
+    _seed_ids(scan_env.corpus, {"creator_a": _learned(UC_A, "Creator A", url=HANDLE_URL)})
+    scan_env.youtube = FakeYouTube({"creator": UC_B, "a_new": UC_A})
+    config = {
+        "channels": [
+            {"name": "creator_a", "url": "https://www.youtube.com/@a_new"},
+            {"name": "creator_b", "url": HANDLE_URL},
+        ]
+    }
+
+    # Act
+    with caplog.at_level(logging.INFO, logger="video_intel"):
+        vi.cmd_scan(_scan_args(), config)
+
+    # Assert
+    assert scan_env.youtube.playlists_fetched == [_uploads(UC_A), _uploads(UC_B)]
+    assert FakeYouTube.video_of(UC_B) in _written_ids(scan_env)
+    data = json.loads(_ids_path(scan_env.corpus).read_text(encoding="utf-8"))
+    assert data["creator_a"] == _learned(UC_A, "Creator A", url=HANDLE_URL)
+    assert data["creator_b"]["channel_id"] == UC_B
+    assert not [w for w in _warnings(caplog) if "creator_b" in w and "changed owner" in w]
+    assert not [m for m in _messages(caplog, logging.INFO) if "carried over" in m]
+
+
+def test_resolve_channel_identity_without_configured_names_makes_no_url_fallback(tmp_path):
+    # Arrange: a renamed-looking entry, but the caller did not say which names are configured.
+    _seed_ids(tmp_path, {"old": _learned(UC_A, url=HANDLE_URL)})
+    youtube = FakeYouTube({"creator": UC_B})
+
+    # Act
+    channel_id, _ = vi.resolve_channel_identity(youtube, {"name": "chan", "url": HANDLE_URL}, tmp_path, dry_run=False)
+
+    # Assert
+    assert channel_id == UC_B
+    data = json.loads(_ids_path(tmp_path).read_text(encoding="utf-8"))
+    assert data["chan"]["channel_id"] == UC_B
+    assert data["old"] == _learned(UC_A, url=HANDLE_URL)
 
 
 def test_cmd_scan_renamed_entry_on_dry_run_records_nothing(scan_env):
