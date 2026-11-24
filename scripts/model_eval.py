@@ -107,6 +107,8 @@ OFFSET_MIN_ALIGNED_ENTRIES = 5
 #: docs/cost-model.md. Used only for the dry-run estimate.
 EST_INPUT_TOKENS_PER_VIDEO_MINUTE = 5500
 EST_OUTPUT_TOKENS_PER_VIDEO_MINUTE = 450
+#: Prompt-size heuristic for the dry-run estimate: about this many characters per token.
+EST_CHARS_PER_TOKEN = 4
 #: Where a cached cell's full key is stored inside its `.usage.json`.
 CACHE_KEY_FIELD = "_cache_key"
 #: The sha256 of the raw file the usage file belongs to; a mismatch makes the entry a miss.
@@ -163,6 +165,12 @@ def _secs(stamp: str) -> int | None:
     if len(parts) == 3:
         return parts[0] * 3600 + parts[1] * 60 + parts[2]
     return None
+
+
+def _token_count(usage: dict, key: str) -> int | None:
+    """A token count from the usage capture, or None when it is missing or not a non-negative int."""
+    value = usage.get(key)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
 def score(
@@ -222,10 +230,13 @@ def score(
         window_exceeded = bool(span_end > seg_secs + tol or abs(first_stamp_offset) > tol)
 
     pin, pout, promo = PRICING.get(model, (None, None, None))
-    itok = usage.get("prompt") or 0
-    otok = usage.get("candidates") or 0
-    think = usage.get("thoughts") or 0
-    cost_seg = (itok / 1e6 * pin + (otok + think) / 1e6 * pout) if pin else None
+    # Unknown usage stays unknown (issue #292 review): `log_usage_metadata`
+    # returns None for a count the SDK did not report readably, and a response
+    # with no usage metadata leaves the keys out. A cost built from a 0 put in
+    # their place would be a fabricated measurement.
+    itok, otok, think = (_token_count(usage, k) for k in ("prompt", "candidates", "thoughts"))
+    measured = itok is not None and otok is not None and think is not None
+    cost_seg = (itok / 1e6 * pin + (otok + think) / 1e6 * pout) if pin and measured else None
 
     return {
         "model": model,
@@ -494,8 +505,12 @@ def run_one(
     roll: int = 1,
     prompt: PromptArm | None = None,
     caption_track: CaptionTrack | None = None,
+    refresh: bool = False,
 ) -> dict:
-    """One roll of one (fixture, model, prompt) cell. Cached on disk so a re-run costs nothing."""
+    """One roll of one (fixture, model, prompt) cell. Cached on disk so a re-run costs nothing.
+
+    ``refresh`` generates the cell again and replaces its cache entry.
+    """
     # Resolved BEFORE the cache check: a card re-rendered from a warm cache must
     # still say which prompt is active, or a cached rerun under an override
     # would be labelled as measuring the bundled template.
@@ -505,7 +520,7 @@ def run_one(
     key = cache_key(fx, model, prompt, roll, seg, request_settings(types, model, thinking))
     wall = None
     arm_fields = {"prompt_label": prompt.label, "roll": roll}
-    hit = cached_cell(scratch, stem, key, prompt.label, roll)
+    hit = None if refresh else cached_cell(scratch, stem, key, prompt.label, roll)
     if hit:
         raw, usage, cache_state = hit
         print(f"  [cached] {stem}")
@@ -725,58 +740,72 @@ def contributing_rows(rows: list[dict], metric: str | None = None) -> tuple[list
     return kept, excluded
 
 
-def _contributing(rows: list[dict], metric: str) -> tuple[list, int, int]:
-    """(values, dropped, legacy): the rolls a median may use, and the ones it may not."""
-    reasons = [roll_exclusion(r, metric) for r in rows]
-    values = [r[metric] for r, why in zip(rows, reasons, strict=True) if why is None]
-    dropped = sum(1 for why in reasons if why in ("missed_window", "no_value"))
-    return values, dropped, reasons.count("legacy")
+def requested_rolls(rows: list[dict]) -> int:
+    """The roll count a run asked for, read back from its rows (a row without ``roll`` is roll 1)."""
+    return max((r.get("roll") or 1 for r in rows), default=1)
 
 
-def _rule_within_spread(mine: list[dict], theirs: list[dict], metric: str) -> tuple[str, str]:
-    """The candidate median against the incumbent median plus the incumbent's own spread."""
+def roll_set_gap(rows: list[dict], metric: str, rolls: int) -> str | None:
+    """Why one arm lacks a usable ``metric`` on some requested roll, or None when every roll 1..rolls has one.
+
+    The completeness rule R2, R3 and R4 share (issue #292 review): a missing,
+    failed, legacy-cache, window-missed or None roll leaves the arm incomplete,
+    so medians are only ever compared on equal, complete roll sets.
+    """
+    by_roll: dict[int, dict] = {}
+    for r in rows:
+        by_roll.setdefault(r.get("roll") or 1, r)
+    problems = []
+    for n in range(1, rolls + 1):
+        row = by_roll.get(n)
+        why = "missing" if row is None else roll_exclusion(row, metric)
+        if why:
+            problems.append(f"roll {n} {why.replace('_', ' ')}")
+    return ", ".join(problems) or None
+
+
+def _rule_within_spread(mine: list[dict], theirs: list[dict], metric: str, rolls: int) -> tuple[str, str]:
+    """The candidate median against the incumbent median plus the incumbent's own spread, on complete roll sets."""
     if not theirs:
         return NOT_EVALUATED, "no incumbent rolls for this fixture"
-    cand, cand_dropped, cand_legacy = _contributing(mine, metric)
-    inc, inc_dropped, inc_legacy = _contributing(theirs, metric)
-    notes = []
-    if cand_legacy or inc_legacy:
-        notes.append(f"{cand_legacy + inc_legacy} legacy-cache roll(s) excluded")
-    if inc_dropped:
-        notes.append(f"{inc_dropped} incumbent roll(s) without a usable value")
-    suffix = f" [{'; '.join(notes)}]" if notes else ""
-    if cand_dropped:
-        # A dropped bad roll must never flatter the candidate (the issue #228 lesson).
-        return (
-            NOT_EVALUATED,
-            f"{cand_dropped} candidate roll(s) gave no usable {metric} (missed window or None){suffix}",
-        )
-    if not cand:
-        return NOT_EVALUATED, f"the candidate has no {metric}{suffix}"
-    if len(inc) < 2:
-        return (
-            NOT_EVALUATED,
-            f"needs --rolls >= 2: the incumbent has {len(inc)} roll(s) with a value, so its spread is unknown{suffix}",
-        )
+    if rolls < 2:
+        return NOT_EVALUATED, "needs --rolls >= 2: with one roll per arm the incumbent's spread is unknown"
+    gaps = [
+        f"{side} arm incomplete for {metric}: {gap}"
+        for side, arm_rows in (("candidate", mine), ("incumbent", theirs))
+        if (gap := roll_set_gap(arm_rows, metric, rolls))
+    ]
+    if gaps:
+        # An incomplete roll set never reaches a comparison: dropping a bad
+        # roll could flatter either side (the issue #228 lesson).
+        return NOT_EVALUATED, "; ".join(gaps)
+    cand = [r[metric] for r in contributing_rows(mine, metric)[0]]
+    inc = [r[metric] for r in contributing_rows(theirs, metric)[0]]
     inc_median, spread = roll_stats(inc)
     cand_median, _ = roll_stats(cand)
-    detail = f"candidate {_num(cand_median)} vs incumbent {_num(inc_median)}, tolerance {_num(spread)}{suffix}"
+    detail = f"candidate {_num(cand_median)} vs incumbent {_num(inc_median)}, tolerance {_num(spread)}"
     return (PASS if cand_median <= inc_median + spread else FAIL), detail
 
 
-def _rule_cost_stated(mine: list[dict], theirs: list[dict]) -> tuple[str, str]:
-    """R4 over the rolls that contribute: a cost from a missed window or a legacy entry is not a cost figure."""
+def _rule_cost_stated(mine: list[dict], theirs: list[dict], rolls: int) -> tuple[str, str]:
+    """R4: a measured cost on every requested roll of the candidate arm.
+
+    A model with no ``PRICING`` entry can never state a cost (FAIL). A roll
+    whose cost is unknown (no usable token counts), failed, legacy or
+    window-missed leaves the cost not measured (NOT EVALUATED, never PASS).
+    """
     metric = "cost_per_video_hour"
-    kept, excluded = contributing_rows(mine, metric)
-    theirs_kept, _ = contributing_rows(theirs, metric)
-    note = f" [{excluded} roll(s) excluded: legacy cache or missed window]" if excluded else ""
-    if not kept:
-        if any(r.get(metric) is not None for r in mine if roll_exclusion(r) in ("legacy", "missed_window")):
-            return NOT_EVALUATED, f"every cost figure came from an excluded roll{note}"
-        return FAIL, f"no cost figure (is the model in PRICING?){note}"
+    unpriced = sorted({r["model"] for r in mine if r.get("model") not in PRICING})
+    if unpriced:
+        return FAIL, f"no PRICING entry for {', '.join(unpriced)}: its cost cannot be stated"
+    gap = roll_set_gap(mine, metric, rolls)
+    if gap:
+        return NOT_EVALUATED, f"cost not measured on every roll: {gap}"
+    kept = contributing_rows(mine, metric)[0]
+    theirs_kept = contributing_rows(theirs, metric)[0]
     detail = (
         f"median ${_num(roll_stats([r[metric] for r in kept])[0])}/video-hour vs "
-        f"${_num(roll_stats([r[metric] for r in theirs_kept])[0])}{note}"
+        f"${_num(roll_stats([r[metric] for r in theirs_kept])[0])}"
     )
     served = sorted({r["model_served"] for r in kept if reported_name_differs(r["model"], r.get("model_served"))})
     if served:
@@ -785,38 +814,50 @@ def _rule_cost_stated(mine: list[dict], theirs: list[dict]) -> tuple[str, str]:
 
 
 def _served_model_verdict(mine: list[dict], theirs: list[dict], cand_model: str, inc_model: str) -> str | None:
-    """Why R2/R3 cannot compare two models (issue #295), or None when they can.
+    """Why R2/R3 cannot attribute a difference to the thing being compared (issue #295), or None.
 
-    Only for a MODEL comparison (two requested names); a prompt comparison is
-    one model by design. A contributing roll with no recorded ``model_served``
-    cannot show that a different model answered: None is not False.
+    Over the contributing rolls of each arm: every roll must record a served
+    model (None is not False), every roll of one arm must record the SAME one,
+    and the two arms' served models must be IDENTICAL in a prompt comparison
+    (one requested model) and DIFFERENT in a model comparison. "Same" is the
+    strict ``reported_name_differs`` rule, where a version suffix counts.
     """
-    if cand_model == inc_model:
-        return None
-    rolls = contributing_rows(mine)[0] + contributing_rows(theirs)[0]
-    if any(not r.get("model_served") for r in rolls):
+    arms = (("candidate", contributing_rows(mine)[0]), ("incumbent", contributing_rows(theirs)[0]))
+    if any(not r.get("model_served") for _, rolls in arms for r in rolls):
         return "served model unknown: a contributing roll has no recorded model_served"
-    mine_names = [r["model_served"] for r in contributing_rows(mine)[0]]
-    their_names = [r["model_served"] for r in contributing_rows(theirs)[0]]
-    if not mine_names or not their_names:
+    served: dict[str, str] = {}
+    for side, rolls in arms:
+        names = sorted({r["model_served"] for r in rolls})
+        if any(reported_name_differs(names[0], n) for n in names[1:]):
+            return f"mixed served models in the {side} arm ({', '.join(names)})"
+        if names:
+            served[side] = names[0]
+    if len(served) < 2:
         return None
-    first = mine_names[0]
-    if all(not reported_name_differs(first, n) for n in mine_names + their_names):
-        return f"both arms were served by {first}: this compares one model with itself"
+    same = not reported_name_differs(served["candidate"], served["incumbent"])
+    if cand_model == inc_model and not same:
+        return (
+            f"a prompt comparison served by two models ({served['candidate']} vs {served['incumbent']}): "
+            "a model change would be credited to the prompt"
+        )
+    if cand_model != inc_model and same:
+        return f"both arms were served by {served['candidate']}: this compares one model with itself"
     return None
 
 
-def decision_rule(rows: list[dict], manifest: dict, incumbent_arm: tuple[str, str]) -> dict:
+def decision_rule(rows: list[dict], manifest: dict, incumbent_arm: tuple[str, str], rolls: int | None = None) -> dict:
     """The ONE decision rule (issue #292): per candidate arm, per fixture and overall, each rule's verdict.
 
     R1 no hard fail in any candidate roll. R2 / R3: the candidate's median
     ``max_gap_s`` / caption offset is no worse than the incumbent's median by
     more than the incumbent's own roll-to-roll spread - a measured tolerance,
-    not a chosen constant. R4 a cost figure exists. A rule that cannot be judged
-    (unknown spread, a None metric, a dropped candidate roll, an unknown or
-    shared served model) is NOT EVALUATED, never PASS. Combine order: FAIL,
-    then NOT EVALUATED, then PASS.
+    not a chosen constant - judged only when both arms have a usable value on
+    every requested roll and the served models allow the comparison. R4 a
+    measured cost on every requested roll. A rule that cannot be judged is NOT
+    EVALUATED, never PASS. Combine order: FAIL, then NOT EVALUATED, then PASS.
+    ``rolls`` is the run's ``--rolls``; omitted, it is read back from the rows.
     """
+    rolls = rolls or requested_rolls(rows)
     by_id = {f["id"]: f for f in manifest.get("fixtures", [])}
     result: dict = {"incumbent": incumbent_arm, "candidates": {}}
     for arm in dict.fromkeys(arm_of(r) for r in rows):
@@ -828,9 +869,9 @@ def decision_rule(rows: list[dict], manifest: dict, incumbent_arm: tuple[str, st
             theirs = [r for r in rows if arm_of(r) == incumbent_arm and r["fixture"] == fid]
             rules = {
                 "R1": _rule_no_hard_fail(mine, theirs, by_id.get(fid, {})),
-                "R2": _rule_within_spread(mine, theirs, "max_gap_s"),
-                "R3": _rule_within_spread(mine, theirs, "caption_offset_median_s"),
-                "R4": _rule_cost_stated(mine, theirs),
+                "R2": _rule_within_spread(mine, theirs, "max_gap_s", rolls),
+                "R3": _rule_within_spread(mine, theirs, "caption_offset_median_s", rolls),
+                "R4": _rule_cost_stated(mine, theirs, rolls),
             }
             served = _served_model_verdict(mine, theirs, arm[0], incumbent_arm[0])
             if served:
@@ -852,7 +893,13 @@ def decision_rule(rows: list[dict], manifest: dict, incumbent_arm: tuple[str, st
     return result
 
 
-def render(rows: list[dict], models: list[str], manifest: dict, incumbent: str | tuple[str, str] | None) -> str:
+def render(
+    rows: list[dict],
+    models: list[str],
+    manifest: dict,
+    incumbent: str | tuple[str, str] | None,
+    rolls: int | None = None,
+) -> str:
     stamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
     out = [f"# Model scorecard - {', '.join(models)}", "", f"Generated {stamp} by `scripts/model_eval.py`.", ""]
     out += [
@@ -920,6 +967,9 @@ def render(rows: list[dict], models: list[str], manifest: dict, incumbent: str |
         )
         r["prompt_label"], r["roll"] = label, roll
         r["offset_median"] = _num(r.get("caption_offset_median_s"))
+        # Unknown usage renders as not measured ("-"), never as 0 (issue #292 review).
+        r["thinking_tok"] = _num(r.get("thinking_tok"))
+        r["cost_per_video_hour"] = _num(r.get("cost_per_video_hour"))
         r["offset_p90"] = _num(r.get("caption_offset_p90_s"))
         r["hard_fail"] = ", ".join(hard_fails(r, by_id.get(r["fixture"]))) or "-"
         # Issue #295: name the model that answered when it is not the one asked for.
@@ -1027,7 +1077,7 @@ def render(rows: list[dict], models: list[str], manifest: dict, incumbent: str |
                 f"**{am(g_new)}s** vs {am(g_old)}s; mean cost/video-hour "
                 f"**${am(c_new)}** vs ${am(c_old)}."
             )
-        out += _render_decision(rows, manifest, incumbent_arm)
+        out += _render_decision(rows, manifest, incumbent_arm, rolls)
     max_roll = max((r.get("roll") or 1 for r in rows), default=1)
     out += [
         "",
@@ -1043,7 +1093,9 @@ def render(rows: list[dict], models: list[str], manifest: dict, incumbent: str |
     return "\n".join(out)
 
 
-def _render_decision(rows: list[dict], manifest: dict, incumbent_arm: tuple[str, str]) -> list[str]:
+def _render_decision(
+    rows: list[dict], manifest: dict, incumbent_arm: tuple[str, str], rolls: int | None = None
+) -> list[str]:
     """The decision block: each rule's PASS / FAIL / NOT EVALUATED and the overall line (issue #292)."""
     out = [
         "",
@@ -1055,7 +1107,7 @@ def _render_decision(rows: list[dict], manifest: dict, incumbent_arm: tuple[str,
         "transcript completeness: read the medians table for those.",
         "",
     ]
-    decision = decision_rule(rows, manifest, incumbent_arm)
+    decision = decision_rule(rows, manifest, incumbent_arm, rolls)
     if not decision["candidates"]:
         out.append("No candidate arm differs from the incumbent arm, so there is nothing to compare.")
     for arm, verdict in decision["candidates"].items():
@@ -1099,6 +1151,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fetch uncached caption tracks even when every cell is cached (otherwise a cached replay "
         "touches no network).",
     )
+    ap.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Generate every cell again and replace its cache entry (a cached outcome otherwise replays forever).",
+    )
     ap.add_argument("--out", help="Scorecard path (default: tests/evals/model-cards/<candidate>.md).")
     ap.add_argument("--dry-run", action="store_true", help="Print the plan and the cost estimate; call nothing.")
     return ap
@@ -1121,19 +1178,28 @@ def resolve_arms(
     return arms, (inc_model, BUNDLED)
 
 
-def estimate_cost(models: list[str], fixtures: int, rolls: int, seg: int) -> tuple[float, list[str]]:
-    """Dry-run estimate in dollars for one arm per entry of ``models``, and the models with no pricing."""
+def prompt_tokens_estimate(text: str) -> int:
+    """Estimated input tokens of a prompt: characters divided by ``EST_CHARS_PER_TOKEN``."""
+    return math.ceil(len(text) / EST_CHARS_PER_TOKEN)
+
+
+def estimate_cost(arms: list[tuple[str, int]], fixtures: int, rolls: int, seg: int) -> tuple[float, list[str]]:
+    """Dry-run estimate in dollars for ``(model, prompt tokens)`` arms, and the models with no pricing.
+
+    Each call pays for the video segment at the measured per-minute rates plus
+    the prompt's estimated tokens at the arm's input rate.
+    """
     total = 0.0
     unknown: list[str] = []
-    for model in models:
+    for model, prompt_tokens in arms:
         pin, pout, _ = PRICING.get(model, (None, None, None))
         if pin is None:
             if model not in unknown:
                 unknown.append(model)
             continue
-        per_cell = (
-            seg / 60 * (EST_INPUT_TOKENS_PER_VIDEO_MINUTE * pin + EST_OUTPUT_TOKENS_PER_VIDEO_MINUTE * pout) / 1e6
-        )
+        video_in = seg / 60 * EST_INPUT_TOKENS_PER_VIDEO_MINUTE
+        video_out = seg / 60 * EST_OUTPUT_TOKENS_PER_VIDEO_MINUTE
+        per_cell = ((video_in + prompt_tokens) * pin + video_out * pout) / 1e6
         total += per_cell * fixtures * rolls
     return total, unknown
 
@@ -1184,11 +1250,16 @@ def main(argv: list[str] | None = None) -> int:
     for m in models:
         if m not in PRICING:
             print(f"  WARNING: no pricing for {m}; cost columns will be blank.")
-    total, unknown = estimate_cost([m for m, _ in arms], len(fixtures), args.rolls, seg)
+    prompt_tokens = {p.label: prompt_tokens_estimate(p.text) for _, p in arms}
+    total, unknown = estimate_cost([(m, prompt_tokens[p.label]) for m, p in arms], len(fixtures), args.rolls, seg)
     print(
         f"Estimated cost: ${total:.4f} for {calls} call(s), at about {EST_INPUT_TOKENS_PER_VIDEO_MINUTE} input and "
-        f"{EST_OUTPUT_TOKENS_PER_VIDEO_MINUTE} output tokens per video-minute (docs/cost-model.md). An estimate from "
-        "average measured rates that ignores cached cells; output-heavy models can exceed it."
+        f"{EST_OUTPUT_TOKENS_PER_VIDEO_MINUTE} output tokens per video-minute (docs/cost-model.md), plus each "
+        f"call's prompt at about {EST_CHARS_PER_TOKEN} characters per token ("
+        + ", ".join(f"{label}: {n} tokens" for label, n in prompt_tokens.items())
+        + "). An estimate from average measured rates"
+        + (", with every cell generated again (--refresh)" if args.refresh else " that ignores cached cells")
+        + "; output-heavy models can exceed it."
         + (f" Not priced: {', '.join(unknown)}." if unknown else "")
     )
     if args.dry_run:
@@ -1216,6 +1287,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         is None
     )
+    if args.refresh:
+        # Issue #292 review: a cached outcome (a missed window, a metric that
+        # could not be computed) replays forever; --refresh generates it again.
+        misses = len(plan)
     # Issue #292: the client is built only when a cell needs a live call, so a
     # full cache replay needs no key and constructs nothing.
     client = None
@@ -1242,13 +1317,23 @@ def main(argv: list[str] | None = None) -> int:
             for roll in range(1, args.rolls + 1):
                 rows.append(
                     run_one(
-                        client, types, fx, m, args.thinking, seg, scratch, roll=roll, prompt=prompt, caption_track=track
+                        client,
+                        types,
+                        fx,
+                        m,
+                        args.thinking,
+                        seg,
+                        scratch,
+                        roll=roll,
+                        prompt=prompt,
+                        caption_track=track,
+                        refresh=args.refresh,
                     )
                 )
 
     CARDS.mkdir(parents=True, exist_ok=True)
     out_path = Path(args.out) if args.out else CARDS / f"{args.candidate}.md"
-    out_path.write_text(render(rows, models, manifest, incumbent_arm), encoding="utf-8")
+    out_path.write_text(render(rows, models, manifest, incumbent_arm, args.rolls), encoding="utf-8")
     (out_path.with_suffix(".json")).write_text(json.dumps(rows, indent=2), encoding="utf-8")
     print(f"\nScorecard: {out_path}")
     errs = [r for r in rows if r.get("error")]

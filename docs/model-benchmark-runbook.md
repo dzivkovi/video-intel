@@ -15,6 +15,12 @@ python scripts/model_eval.py --candidate <new-model> --rolls 3 --out tests/evals
 python scripts/model_eval.py --candidate <new-model> --rolls 3 --out tests/evals/model-cards/<new-model>.md
 ```
 
+To generate every cell again instead of replaying the cache (see "Caching"):
+
+```bash
+python scripts/model_eval.py --candidate <new-model> --rolls 3 --out tests/evals/model-cards/<new-model>.md --refresh
+```
+
 With no `--incumbent`, the incumbent is the default model in `scripts/video_intel.py` (`DEFAULT_MODEL`) with the bundled prompt, so the run has two arms. Name another incumbent with `--incumbent <model>`.
 
 Read `tests/evals/model-cards/<new-model>.md` (and its `.json` sidecar), the "Decision rule" section first. The card is written to `--out`, and a card already at that path is overwritten: for a model that already has a tracked card, pick a new name such as `<new-model>-rerun.md`. A model you adopt needs its card under its own name, because `tests/test_model_scorecard_gate.py` reads `<model>.json`.
@@ -33,9 +39,9 @@ python scripts/model_eval.py --candidate <current-default> --candidate-prompt pa
 A candidate arm is adopted only if all four hold on every fixture:
 
 - R1: no roll of the candidate is a hard fail. A hard fail is a response that is not the transcript envelope after the production parser, a missing `speakers` or `screen_content` task the fixture expects, or a roll whose generation failed.
-- R2: the candidate's median `max_gap_s` (the worst-case deep-link error) is no worse than the incumbent's median by more than the incumbent's own roll-to-roll spread (max minus min).
+- R2: the candidate's median `max_gap_s` (the worst-case deep-link error) is no worse than the incumbent's median by more than the incumbent's own roll-to-roll spread (max minus min). It is judged only when both arms have a usable value on every requested roll, and only when the served models allow the comparison (below).
 - R3: the same comparison for the median caption offset.
-- R4: a cost figure exists for the candidate.
+- R4: a measured cost on every requested roll of the candidate. A roll whose token counts were missing or unreadable has no cost; it is never counted as $0.
 
 Each rule prints PASS, FAIL or NOT EVALUATED, and an overall line follows. Overall is PASS only when every rule passes on every fixture. PASS does not compare cost or transcript completeness: read the medians table for those.
 
@@ -43,24 +49,27 @@ Each rule prints PASS, FAIL or NOT EVALUATED, and an overall line follows. Overa
 
 | Message | Meaning | How to clear it |
 |---|---|---|
-| needs --rolls >= 2 | the incumbent has fewer than 2 rolls with a value, so its spread is unknown | re-run with `--rolls 3` |
-| candidate roll(s) gave no usable value | a candidate roll missed its window or produced no value, and dropping it could flatter the candidate | read the roll table; fix the fixture window or re-run |
+| needs --rolls >= 2 | with one roll per arm the incumbent's spread is unknown | run with `--rolls 3` |
+| candidate arm incomplete / incumbent arm incomplete (roll N missing, failed, legacy, missed window, no value) | that arm lacks a usable value on some requested roll, and comparing unequal or partial roll sets could flatter either side | read the roll table; fix the fixture window if a roll missed it, then run with `--refresh` (a successful response is cached before it is scored, so a plain re-run replays the same outcome) |
 | the candidate has no caption offset, or only N entries aligned | no caption track, or fewer than 5 dialogue entries matched a caption cue | the "Caption alignment" section names the reason; a refused request is YouTube refusing this IP, not a video without captions |
 | no incumbent rolls for this fixture | the incumbent arm has no cell for that fixture | run both arms on the same fixtures |
 | both arms were served by one model | two model names were requested but the provider reported the same model for both | the comparison measures one model against itself; pick a different incumbent |
-| served model unknown | two model names were requested and a counted roll has no recorded served model, so nothing shows that two different models answered | re-run those cells (delete their pair of files under `_raw/`); a prompt comparison on one model is not affected |
+| a prompt comparison served by two models | one model was requested for both prompts, but the provider reported different models (a version suffix counts), so a model change would be credited to the prompt | run with `--refresh` so both arms are generated in one run |
+| mixed served models in an arm | the rolls of one arm were answered by more than one model | run with `--refresh` |
+| served model unknown | a counted roll has no recorded served model, in a model or a prompt comparison, so nothing shows which model answered | run with `--refresh` |
+| cost not measured on every roll | a candidate roll has no usable token counts, failed, came from a legacy entry or missed its window | run with `--refresh`; a model with no `PRICING` entry is a FAIL instead |
 
-A `legacy-cache roll(s) excluded` note means a cell came from a cache entry written before the cache key existed. Its prompt is unverified, so the rule leaves it out, and so do the medians table, the cost rule and the mean line. Delete that pair of files under `tests/evals/model-cards/_raw/` to measure it again.
+A `legacy-cache roll(s) excluded` note means a cell came from a cache entry written before the cache key existed. Its prompt is unverified, so the rule leaves it out, and so do the medians table, the cost rule and the mean line. Run with `--refresh` to measure it again.
 
 A FAIL on R1 caused only by `generation_failed` with a transport error (a timeout, a 429) is an infrastructure failure, not a model verdict. Re-run; failed rolls are never cached.
 
 ## The cost line
 
-The dry run prices every arm as fixtures x rolls x segment minutes at the transcript token rates in `docs/cost-model.md` (about 5,500 input and 450 output tokens per video-minute at low media resolution) times the model's rate in `PRICING`. It is an estimate from average measured rates. It ignores cells already cached (those cost nothing), and a model that emits more output tokens can exceed it. A model missing from `PRICING` is named as not priced and adds nothing to the estimate.
+The dry run prices every arm as fixtures x rolls x segment minutes at the transcript token rates in `docs/cost-model.md` (about 5,500 input and 450 output tokens per video-minute at low media resolution) times the model's rate in `PRICING`, plus each call's prompt at about 4 characters per token at the arm's input rate (the line prints each prompt's estimated tokens, so a long candidate prompt shows up). It is an estimate from average measured rates. It ignores cells already cached (those cost nothing) unless `--refresh` is given, and a model that emits more output tokens can exceed it. A model missing from `PRICING` is named as not priced and adds nothing to the estimate.
 
 ## Caching
 
-Every roll is cached under `tests/evals/model-cards/_raw/` (gitignored), keyed on the model, the fixture and its window, the prompt's content hash, the thinking config, media resolution and output-token cap actually sent, and the roll number. A re-run replays what is cached and calls Gemini only for the rest; when everything is cached, no API key is needed. Captions are fetched once per fixture and cached in the same folder, but a run in which every cell is cached makes no network call at all: an uncached caption track is fetched only when the run makes a live call, or when you pass `--fetch-captions`.
+Every roll is cached under `tests/evals/model-cards/_raw/` (gitignored), keyed on the model, the fixture and its window, the prompt's content hash, the thinking config, media resolution and output-token cap actually sent, and the roll number. A re-run replays what is cached and calls Gemini only for the rest; when everything is cached, no API key is needed. A successful response is cached before it is scored, so a re-run replays a missed window or an unmeasured metric exactly as before: `--refresh` generates every cell of the run again and replaces its entry. Captions are fetched once per fixture and cached in the same folder, but a run in which every cell is cached makes no network call at all: an uncached caption track is fetched only when the run makes a live call, or when you pass `--fetch-captions`.
 
 ## What the harness does not measure
 

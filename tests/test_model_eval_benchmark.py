@@ -542,13 +542,24 @@ class TestDecisionRule:
         assert verdict["rules"]["R3"][0] == "FAIL"
         assert verdict["rules"]["R2"][0] == "PASS"
 
-    def test_decision_rule_no_cost_figure_fails_r4(self):
+    def test_decision_rule_unpriced_model_fails_r4(self):
+        unpriced = "not-a-priced-model"
+        rows = _incumbent_rolls() + [_r(unpriced, r, 50, 2.0, cost_per_video_hour=None) for r in (1, 2, 3)]
+
+        verdict = _verdict(rows, arm=(unpriced, "bundled"))
+
+        assert verdict["rules"]["R4"][0] == "FAIL"
+        assert "PRICING" in verdict["rules"]["R4"][1]
+        assert verdict["overall"] == "FAIL"
+
+    def test_decision_rule_unmeasured_cost_is_not_evaluated_never_pass(self):
         rows = _incumbent_rolls() + [_r(NEW, r, 50, 2.0, cost_per_video_hour=None) for r in (1, 2, 3)]
 
         verdict = _verdict(rows)
 
-        assert verdict["rules"]["R4"][0] == "FAIL"
-        assert verdict["overall"] == "FAIL"
+        assert verdict["rules"]["R4"][0] == "NOT EVALUATED"
+        assert "cost not measured" in verdict["rules"]["R4"][1]
+        assert verdict["overall"] != "PASS"
 
     def test_decision_rule_one_incumbent_roll_is_not_evaluated(self):
         rows = [_r(OLD, 1, 50, 2.0), _r(NEW, 1, 50, 2.0)]
@@ -598,8 +609,9 @@ class TestDecisionRule:
 
         verdict = _verdict(rows)
 
-        assert verdict["rules"]["R2"][0] == "FAIL", "a stale legacy roll must not loosen the tolerance"
-        assert "legacy" in verdict["rules"]["R2"][1]
+        assert verdict["rules"]["R2"][0] == "NOT EVALUATED", "a stale legacy roll must never feed a comparison"
+        assert "incumbent arm incomplete" in verdict["rules"]["R2"][1]
+        assert "roll 1 legacy" in verdict["rules"]["R2"][1]
 
     def test_decision_rule_two_names_served_by_one_model_is_not_evaluated(self):
         inc = [{**row, "model_served": NEW} for row in _incumbent_rolls()]
@@ -817,19 +829,20 @@ class TestCli:
         model_eval.main(["--candidate", NEW, "--incumbent", OLD, "--rolls", "3", "--dry-run"])
         out3 = capsys.readouterr().out
         cand = tmp_path / "c.md"
-        cand.write_text("prompt", encoding="utf-8")
+        cand.write_bytes(b"prompt")
         model_eval.main(["--candidate", NEW, "--incumbent", OLD, "--candidate-prompt", str(cand), "--dry-run"])
         with_prompt = _estimate(capsys.readouterr().out)
+        candidate_arm, _ = model_eval.estimate_cost([(NEW, model_eval.prompt_tokens_estimate("prompt"))], 2, 1, SEG)
 
         assert one > 0
         assert _estimate(out3) == pytest.approx(3 * one, rel=1e-3)
         assert "x 3 roll(s) = 12 calls" in out3
-        assert with_prompt == pytest.approx(one * 1.5, rel=1e-3), "the candidate arm costs one more model arm"
+        assert with_prompt == pytest.approx(one + candidate_arm, abs=2e-4), "the candidate arm adds one arm"
         assert harness.clients == [] and harness.fetches == [] and harness.client.calls == []
         assert not (tmp_path / "cards").exists()
 
     def test_estimate_cost_unknown_model_is_reported(self):
-        total, unknown = model_eval.estimate_cost(["not-a-priced-model"], 2, 3, SEG)
+        total, unknown = model_eval.estimate_cost([("not-a-priced-model", 100)], 2, 3, SEG)
 
         assert total == 0
         assert unknown == ["not-a-priced-model"]
@@ -987,9 +1000,8 @@ class TestExcludedRollsStayExcludedEverywhere:
 
         status, detail = _verdict(rows)["rules"]["R4"]
 
-        assert status == "PASS"
-        assert "median $0.3/video-hour" in detail
-        assert "1 roll(s) excluded" in detail
+        assert status == "NOT EVALUATED", "a cost from a window-missed roll is not a measured cost"
+        assert "roll 2 missed window" in detail
 
     def test_cost_rule_is_not_evaluated_when_every_cost_is_excluded(self):
         rows = _incumbent_rolls() + [_r(NEW, 1, 50, 2.0, cache="legacy")]
@@ -1047,7 +1059,7 @@ class TestReviewRoundDecisionRule:
         verdict = _verdict(rows)
 
         assert verdict["rules"]["R2"][0] == "NOT EVALUATED"
-        assert "1 candidate roll(s)" in verdict["rules"]["R2"][1]
+        assert "candidate arm incomplete for max_gap_s: roll 2 no value" in verdict["rules"]["R2"][1]
         assert verdict["rules"]["R3"][0] == "NOT EVALUATED"
 
     @pytest.mark.parametrize("side", ["candidate", "incumbent"])
@@ -1062,13 +1074,15 @@ class TestReviewRoundDecisionRule:
             assert verdict["rules"][rid][0] == "NOT EVALUATED"
             assert "served model unknown" in verdict["rules"][rid][1]
 
-    def test_prompt_comparison_is_not_affected_by_an_unrecorded_served_model(self):
+    def test_prompt_comparison_with_an_unrecorded_served_model_is_not_evaluated(self):
         bundled = [_r(NEW, r, g, 2.0, model_served=None) for r, g in ((1, 40), (2, 50), (3, 60))]
         cand = [_r(NEW, r, 45, 2.0, label="candidate:abcd1234", model_served=None) for r in (1, 2, 3)]
 
         verdict = model_eval.decision_rule(bundled + cand, MANIFEST, (NEW, "bundled"))
 
-        assert verdict["candidates"][(NEW, "candidate:abcd1234")]["overall"] == "PASS"
+        rules = verdict["candidates"][(NEW, "candidate:abcd1234")]["rules"]
+        assert rules["R2"][0] == rules["R3"][0] == "NOT EVALUATED"
+        assert "served model unknown" in rules["R2"][1]
 
     def test_cost_detail_says_it_is_priced_at_the_requested_rate(self):
         rows = _incumbent_rolls() + [{**_r(NEW, r, 50, 2.0), "model_served": "gemini-3.9-flash"} for r in (1, 2, 3)]
@@ -1255,8 +1269,8 @@ class TestCandidatePromptReadLikeLoadPrompt:
         assert harness.clients == [] and harness.fetches == [] and harness.client.calls == []
 
     def test_estimate_cost_scales_with_fixtures(self):
-        one, _ = model_eval.estimate_cost([NEW], 1, 1, SEG)
-        two, _ = model_eval.estimate_cost([NEW], 2, 1, SEG)
+        one, _ = model_eval.estimate_cost([(NEW, 1000)], 1, 1, SEG)
+        two, _ = model_eval.estimate_cost([(NEW, 1000)], 2, 1, SEG)
 
         assert one > 0
         assert two == pytest.approx(2 * one)
@@ -1328,3 +1342,210 @@ class TestCacheWritesAreAtomic:
         model_eval.run_one(client, genai_types, FX, NEW, None, SEG, scratch)
 
         assert client.calls == [NEW]
+
+
+# ---------------------------------------------------------------------------
+# Peer-review round: confounded comparisons, incomplete roll sets, unknown
+# usage, the prompt's share of the estimate, and --refresh
+# ---------------------------------------------------------------------------
+
+
+class TestServedModelsMustAllowTheComparison:
+    def test_prompt_comparison_served_by_two_model_versions_is_not_evaluated(self):
+        """Codex shape (a): cached bundled rolls served by one version, live candidate rolls by another."""
+        bundled = [_r(NEW, r, g, 2.0) for r, g in ((1, 40), (2, 50), (3, 60))]
+        cand = [_r(NEW, r, 45, 2.0, label="candidate:abcd1234", model_served=f"{NEW}-002") for r in (1, 2, 3)]
+
+        verdict = model_eval.decision_rule(bundled + cand, MANIFEST, (NEW, "bundled"))
+
+        rules = verdict["candidates"][(NEW, "candidate:abcd1234")]["rules"]
+        assert rules["R2"][0] == rules["R3"][0] == "NOT EVALUATED"
+        assert "prompt comparison served by two models" in rules["R2"][1]
+        assert verdict["candidates"][(NEW, "candidate:abcd1234")]["overall"] != "PASS"
+
+    def test_model_comparison_with_a_mixed_candidate_arm_is_not_evaluated(self):
+        """Codex shape (b): the real candidate regressed on its one roll; two rolls were the incumbent."""
+        inc = [_r(OLD, r, 50, 2.0) for r in (1, 2, 3)]
+        cand = [
+            _r(NEW, 1, 120, 2.0),
+            _r(NEW, 2, 50, 2.0, model_served=OLD),
+            _r(NEW, 3, 50, 2.0, model_served=OLD),
+        ]
+
+        verdict = _verdict(inc + cand)
+
+        for rid in ("R2", "R3"):
+            assert verdict["rules"][rid][0] == "NOT EVALUATED"
+            assert "mixed served models in the candidate arm" in verdict["rules"][rid][1]
+
+    def test_model_comparison_with_a_mixed_incumbent_arm_is_not_evaluated(self):
+        inc = _incumbent_rolls()
+        inc[2]["model_served"] = f"{OLD}-001"
+        cand = [_r(NEW, r, 50, 2.0) for r in (1, 2, 3)]
+
+        verdict = _verdict(inc + cand)
+
+        assert verdict["rules"]["R2"][0] == "NOT EVALUATED"
+        assert "mixed served models in the incumbent arm" in verdict["rules"]["R2"][1]
+
+    def test_prompt_comparison_on_one_served_model_is_judged(self):
+        bundled = [_r(NEW, r, g, 2.0) for r, g in ((1, 40), (2, 50), (3, 60))]
+        cand = [_r(NEW, r, 45, 2.0, label="candidate:abcd1234") for r in (1, 2, 3)]
+
+        verdict = model_eval.decision_rule(bundled + cand, MANIFEST, (NEW, "bundled"))
+
+        assert verdict["candidates"][(NEW, "candidate:abcd1234")]["overall"] == "PASS"
+
+
+class TestOnlyCompleteRollSetsAreCompared:
+    def test_an_incumbent_roll_with_no_value_is_not_evaluated(self):
+        """Codex shape: incumbent [40, 60, None] against candidate [65, 65, 65] used to PASS."""
+        inc = [_r(OLD, 1, 40, 2.0), _r(OLD, 2, 60, 2.0), _r(OLD, 3, None, 2.0)]
+        cand = [_r(NEW, r, 65, 2.0) for r in (1, 2, 3)]
+
+        status, detail = _verdict(inc + cand)["rules"]["R2"]
+
+        assert status == "NOT EVALUATED"
+        assert "incumbent arm incomplete for max_gap_s: roll 3 no value" in detail
+
+    def test_a_legacy_candidate_roll_is_not_evaluated(self):
+        """Codex shape: a legacy roll 1 plus two real rolls compared on unequal sample counts."""
+        cand = [_r(NEW, 1, 50, 2.0, cache="legacy"), _r(NEW, 2, 50, 2.0), _r(NEW, 3, 50, 2.0)]
+
+        status, detail = _verdict(_incumbent_rolls() + cand)["rules"]["R2"]
+
+        assert status == "NOT EVALUATED"
+        assert "candidate arm incomplete for max_gap_s: roll 1 legacy" in detail
+
+    @pytest.mark.parametrize("side", ["candidate", "incumbent"])
+    def test_a_missing_roll_on_either_side_is_not_evaluated(self, side):
+        inc = _incumbent_rolls()
+        cand = [_r(NEW, r, 50, 2.0) for r in (1, 2, 3)]
+        (cand if side == "candidate" else inc).pop()
+
+        status, detail = model_eval.decision_rule(inc + cand, MANIFEST, INC, rolls=3)["candidates"][CAND]["rules"]["R2"]
+
+        assert status == "NOT EVALUATED"
+        assert f"{side} arm incomplete for max_gap_s: roll 3 missing" in detail
+
+    def test_a_window_missed_incumbent_roll_is_not_evaluated(self):
+        inc = _incumbent_rolls()
+        inc[0]["window_exceeded"] = True
+        cand = [_r(NEW, r, 50, 2.0) for r in (1, 2, 3)]
+
+        status, detail = _verdict(inc + cand)["rules"]["R2"]
+
+        assert status == "NOT EVALUATED"
+        assert "incumbent arm incomplete for max_gap_s: roll 1 missed window" in detail
+
+    def test_the_requested_roll_count_comes_from_the_run(self):
+        rows = _incumbent_rolls() + [_r(NEW, r, 50, 2.0) for r in (1, 2, 3)]
+
+        verdict = model_eval.decision_rule(rows, MANIFEST, INC, rolls=4)["candidates"][CAND]
+
+        assert verdict["rules"]["R2"][0] == "NOT EVALUATED"
+        assert "roll 4 missing" in verdict["rules"]["R2"][1]
+
+    def test_a_hard_failed_candidate_roll_still_fails_r1_on_an_incomplete_set(self):
+        cand = [_r(NEW, 1, 50, 2.0, speakers=0), _r(NEW, 2, 50, 2.0, cache="legacy")]
+
+        verdict = _verdict(_incumbent_rolls() + cand)
+
+        assert verdict["rules"]["R1"][0] == "FAIL"
+        assert verdict["overall"] == "FAIL"
+
+
+class NoUsageClient(FakeClient):
+    """A valid response that carries no usage metadata at all."""
+
+    def _generate(self, model, contents, config):
+        super()._generate(model, contents, config)
+        return SimpleNamespace(text=self._texts[0], candidates=None, model_version=model, usage_metadata=None)
+
+
+class TestUnknownUsageStaysUnknown:
+    def test_no_usage_metadata_gives_no_cost(self):
+        row = model_eval.score(_envelope([START, START + 30]), {}, NEW, SEG, None, start_secs=START)
+
+        assert row["cost_per_video_hour"] is None
+        assert row["in_tok"] is None
+
+    def test_an_unreadable_thinking_count_gives_no_cost(self):
+        usage = {"prompt": 1000, "candidates": 100, "thoughts": None}
+
+        row = model_eval.score(_envelope([START, START + 30]), usage, NEW, SEG, None, start_secs=START)
+
+        assert row["cost_per_video_hour"] is None
+
+    def test_real_counts_price_exactly_as_before(self):
+        usage = {"prompt": 1000, "candidates": 100, "thoughts": 0}
+
+        row = model_eval.score(_envelope([START, START + 30]), usage, NEW, SEG, None, start_secs=START)
+
+        per_segment = 1000 / 1e6 * 0.75 + 100 / 1e6 * 3.75
+        assert row["cost_per_video_hour"] == round(per_segment * 3600 / SEG, 3)
+
+    def test_a_run_without_usage_metadata_is_not_a_cost_pass(self, harness, tmp_path, monkeypatch):
+        client = NoUsageClient(_aligned_transcript())
+        monkeypatch.setattr(model_eval.v, "create_client", lambda key: client)
+
+        model_eval.main(["--candidate", NEW, "--incumbent", OLD, "--rolls", "2", "--fixtures", "fx1"])
+
+        card = (tmp_path / "cards" / f"{NEW}.md").read_text(encoding="utf-8")
+        r4 = next(x for x in card.splitlines() if x.startswith("- R4 "))
+        assert "NOT EVALUATED" in r4 and "cost not measured" in r4
+        assert "$0/video-hour" not in card
+        roll_lines = [x for x in card.split("## Medians across rolls", 1)[0].splitlines() if x.startswith("| fx1 |")]
+        assert roll_lines and all(x.split(" | ")[12] == "-" for x in roll_lines), "unknown cost renders as -"
+
+
+class TestTheEstimateIncludesThePrompt:
+    def test_prompt_tokens_add_at_the_input_rate_per_call(self):
+        with_prompt, _ = model_eval.estimate_cost([(NEW, 1000)], 2, 3, SEG)
+        without, _ = model_eval.estimate_cost([(NEW, 0)], 2, 3, SEG)
+
+        assert with_prompt - without == pytest.approx(2 * 3 * 1000 * 0.75 / 1e6)
+
+    def test_prompt_tokens_estimate_is_characters_over_four(self):
+        assert model_eval.prompt_tokens_estimate("x" * 4000) == 1000
+        assert model_eval.prompt_tokens_estimate("x" * 4001) == 1001
+
+    def test_a_larger_candidate_prompt_raises_the_dry_run_estimate(self, harness, tmp_path, capsys):
+        small, large = tmp_path / "small.md", tmp_path / "large.md"
+        small.write_bytes(b"x" * 400)
+        large.write_bytes(b"x" * 40000)
+        base = ["--candidate", NEW, "--incumbent", OLD, "--dry-run", "--candidate-prompt"]
+
+        model_eval.main([*base, str(small)])
+        small_out = capsys.readouterr().out
+        model_eval.main([*base, str(large)])
+        large_out = capsys.readouterr().out
+
+        expected = 2 * 1 * (10000 - 100) * 0.75 / 1e6
+        assert _estimate(large_out) - _estimate(small_out) == pytest.approx(expected, abs=2e-4)
+        assert "10000 tokens" in large_out and "characters per token" in large_out
+
+
+class TestRefresh:
+    ARGV = ("--candidate", NEW, "--incumbent", OLD, "--fixtures", "fx1")
+
+    def test_refresh_generates_every_cell_again_and_replaces_its_entry(self, harness, tmp_path):
+        model_eval.main(list(self.ARGV))
+        harness.client.calls.clear()
+        model_eval.main(list(self.ARGV))
+        assert harness.client.calls == [], "a normal re-run replays the cache"
+        fresh = _envelope([START, START + 20, START + 40])
+        harness.client._texts = [fresh]
+
+        model_eval.main([*self.ARGV, "--refresh"])
+
+        assert sorted(harness.client.calls) == sorted([NEW, OLD])
+        raw = tmp_path / "cards" / "_raw" / f"fx1__{NEW}.json"
+        assert raw.read_text(encoding="utf-8") == fresh
+
+    def test_refresh_dry_run_prices_every_cell_and_calls_nothing(self, harness, capsys):
+        model_eval.main([*self.ARGV, "--refresh", "--dry-run"])
+
+        out = capsys.readouterr().out
+        assert "--refresh" in out
+        assert harness.client.calls == [] and harness.clients == []
