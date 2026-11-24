@@ -755,3 +755,50 @@ class TestAssessTranscriptsFromMarkdown:
         _run(tmp_path, force=True, apply=True, backup_dir=str(tmp_path / "bk"))
 
         assert json.loads(meta_path.read_text(encoding="utf-8"))["transcript_quality_flags"] == []
+
+
+class TestTheSharedBodyParserOwnsScreenBlocks:
+    def test_a_screen_shaped_line_inside_a_block_is_that_blocks_content(self):
+        # An on-screen quote that itself holds a SCREEN-looking line belongs to
+        # its block (the body parser's rule), so it is not a second entry.
+        text = _md(
+            [
+                '[00:00] Host (Speaker): "line 0"',
+                '  SCREEN [00:05-00:20] [slide]: a slide\n  On-screen text: "first line\n  SCREEN [00:06-00:21] [slide]: quoted\nlast line"',
+                '[00:30] Host (Speaker): "line 30"',
+            ]
+        )
+        assert vi.screen_entries_from_transcript_markdown(text) == [{"start": "00:05", "end": "00:20"}]
+
+
+class TestRepairTimestampsJudgesScreenStampsLikeAssessTranscripts:
+    """`repair-timestamps` re-assesses the file it wrote through
+    `assess_transcript_markdown`, the function `assess-transcripts` calls, so
+    the two judge SCREEN stamps the same way. The mild flag never blocks the
+    repair or the status promotion."""
+
+    def test_repair_records_the_flag_and_still_promotes_the_status(self, tmp_path, monkeypatch):
+        # Arrange: the repair suite's monolithic single-shot shape, with its
+        # SCREEN blocks collapsed into the first seconds.
+        import test_repair_timestamps as rt
+
+        monkeypatch.setattr(rt, "SCREENS", _screen(_collapsed(8, at=1, length=20)))
+        corpus_root = tmp_path / "corpus"
+        (corpus_root / "chan").mkdir(parents=True)
+        p = rt._write_corpus(corpus_root)
+        rt._stub_captions(monkeypatch, rt._talk()[1])
+        vi._invalidate_video_id_cache()
+
+        # Act
+        result = rt._run(corpus_root, apply=True)
+
+        # Assert
+        assert result["outcome"] == "repaired"
+        meta = json.loads(p.meta.read_text(encoding="utf-8"))
+        written = p.transcript.read_bytes().decode("utf-8")
+        fields, flags = vi.assess_transcript_markdown(written, 600, captions=False)
+        assert FLAG in flags
+        assert meta["transcript_quality_flags"] == fields["transcript_quality_flags"]
+        assert FLAG in meta["transcript_quality_flags"]
+        assert meta["transcript_status"] == "complete"
+        vi._invalidate_video_id_cache()

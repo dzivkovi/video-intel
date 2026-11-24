@@ -11590,7 +11590,9 @@ TRANSCRIPT_ENTRY_DIALOGUE = "dialogue"
 TRANSCRIPT_ENTRY_SCREEN = "screen"
 _DIALOGUE_LINE_RE = re.compile(rf"^\[({ENTRY_TIMESTAMP_PATTERN})\]")
 # The SCREEN boundary `chunk_transcript` uses; the stamp is the range's start.
-_SCREEN_LINE_RE = re.compile(rf"^\s+SCREEN \[({ENTRY_TIMESTAMP_PATTERN})")
+# Group 2 is the range's end when the line has one (issue #278 reads it); it is
+# optional, so the set of lines this matches is unchanged.
+_SCREEN_LINE_RE = re.compile(rf"^\s+SCREEN \[({ENTRY_TIMESTAMP_PATTERN})(?:-({ENTRY_TIMESTAMP_PATTERN}))?")
 # A Gemini dialogue entry is `[stamp] Label: "text"`, a captions one `[stamp] "text"`.
 # Matched over the WHOLE entry (continuation lines included), so a text with
 # embedded newlines still parses; the label never starts with a quote.
@@ -11742,35 +11744,22 @@ def render_dialogue_piece(stamp: str, parts: DialogueEntryParts, text: str) -> l
 def screen_entries_from_transcript_markdown(text: str) -> list[dict]:
     """SCREEN entries of a rendered ``.transcript.md``, in FILE order (issue #278).
 
-    One ``{"start": ..., "end": ...}`` per body line that opens (after
-    indentation) with ``SCREEN [<stamp>]`` or ``SCREEN [<stamp>-<stamp>]``, the
-    shape ``merge_transcript_json`` renders; ``end`` is present only when the
-    line has one. Stamps are matched by ``ENTRY_TIMESTAMP_PATTERN`` and the
-    header is skipped by the same rule ``dialogue_entries_from_transcript_markdown``
-    uses (everything up to the first ``---`` after the ``# Transcript:`` title).
-    That rule is repeated here ON PURPOSE for now, so the dialogue reader stays
-    untouched; it is meant to be replaced by one shared body reader.
+    One ``{"start": ..., "end": ...}`` per SCREEN entry that
+    ``parse_transcript_body`` finds, so the header, the body and what belongs
+    to a SCREEN block (a stamp-like line inside one stays its content) are read
+    by the ONE body parser [core: one-definition]. ``start`` is the entry's
+    stamp; ``end`` comes from the same ``_SCREEN_LINE_RE`` match of the entry's
+    first line and is present only when the line has a range.
     """
-    screen_line = re.compile(rf"^\s*SCREEN \[({ENTRY_TIMESTAMP_PATTERN})(?:-({ENTRY_TIMESTAMP_PATTERN}))?\]")
-    lines = text.splitlines()
-    body_start = 0
-    for i, line in enumerate(lines):
-        if line.startswith("# Transcript:"):
-            for j in range(i + 1, len(lines)):
-                if lines[j].strip() == "---":
-                    body_start = j + 1
-                    break
-            else:
-                return []
-            break
     entries = []
-    for line in lines[body_start:]:
-        match = screen_line.match(line)
-        if match:
-            entry = {"start": match.group(1)}
-            if match.group(2):
-                entry["end"] = match.group(2)
-            entries.append(entry)
+    for entry in parse_transcript_body(text).entries:
+        if entry.kind != TRANSCRIPT_ENTRY_SCREEN:
+            continue
+        screen = {"start": entry.stamp}
+        match = _SCREEN_LINE_RE.match(_line_content(entry.lines[0]))
+        if match and match.group(2):
+            screen["end"] = match.group(2)
+        entries.append(screen)
     return entries
 
 
@@ -11778,19 +11767,17 @@ def chunk_windows_from_transcript_markdown(text: str) -> list[tuple[int, int]] |
     """The chunk windows a stitched ``.transcript.md`` records in its coverage table.
 
     Reads the ``| <n> | <start> - <end> | <status> | <speakers> |`` rows that
-    ``_build_chunked_transcript_coverage_block`` writes above the first entry
-    line, as ``(start_seconds, end_seconds)``. ``None`` when there is no such
-    table, or when any segment row does not parse or the windows are not in
-    order: issue #278 then judges the transcript as one whole-video window.
+    ``_build_chunked_transcript_coverage_block`` writes into the header
+    (everything ``parse_transcript_body`` places before the first entry), as
+    ``(start_seconds, end_seconds)``. ``None`` when there is no such table, or
+    when any segment row does not parse or the windows are not in order: issue
+    #278 then judges the transcript as one whole-video window.
     """
     stamp = ENTRY_TIMESTAMP_PATTERN
     row = re.compile(rf"^\|\s*\d+\s*\|\s*({stamp})\s*-\s*({stamp})\s*\|")
     segment_row = re.compile(r"^\|\s*\d+\s*\|")
-    entry_line = re.compile(rf"^(?:\[{stamp}\]|\s*SCREEN \[)")
     windows: list[tuple[int, int]] = []
-    for line in text.splitlines():
-        if entry_line.match(line):
-            break
+    for line in parse_transcript_body(text).header.splitlines():
         if not segment_row.match(line):
             continue
         match = row.match(line)
