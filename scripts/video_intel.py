@@ -37,6 +37,7 @@ from html import unescape
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
+from urllib.parse import urlsplit
 
 import caption_align
 import httpx
@@ -1990,12 +1991,57 @@ def _is_quota_exceeded(error: HttpError) -> bool:
     "quotaExceeded" can both miss adjacent quota reasons (dailyLimitExceeded,
     userRateLimitExceeded) and false-positive on unrelated debug strings.
     """
+    return bool(set(_http_error_reasons(error)) & _QUOTA_EXCEEDED_REASONS)
+
+
+def _http_error_reasons(error: HttpError) -> list[str]:
+    """The ``error.errors[*].reason`` values from an HttpError's JSON body, in order.
+
+    The ONE parser of the YouTube error body (issue #311): `_is_quota_exceeded`
+    and `describe_http_error` both read it. Never raises; a body that is not the
+    expected JSON shape yields an empty list.
+    """
     try:
         body = json.loads(error.content.decode("utf-8"))
-    except (json.JSONDecodeError, AttributeError, UnicodeDecodeError):
-        return False
-    reasons = {item.get("reason") for item in body.get("error", {}).get("errors", []) if isinstance(item, dict)}
-    return bool(reasons & _QUOTA_EXCEEDED_REASONS)
+        errors = body.get("error", {}).get("errors", [])
+        return [item["reason"] for item in errors if isinstance(item, dict) and isinstance(item.get("reason"), str)]
+    except (ValueError, AttributeError, TypeError):
+        return []
+
+
+_API_KEY_PARAM_RE = re.compile(r"\bkey=[^&\s'\"<>]+", re.IGNORECASE)
+
+
+def redact_api_key(text: str) -> str:
+    """Mask any ``key=<value>`` query parameter in a log message (issue #311).
+
+    The YouTube client is built with ``developerKey``, so every request URL it
+    reports carries the API key as ``key=...``.
+    """
+    return _API_KEY_PARAM_RE.sub("key=REDACTED", text)
+
+
+def describe_http_error(error: HttpError) -> str:
+    """A log-safe description of an HttpError: status, API reason, request path (issue #311).
+
+    Log this, never ``str(e)``: googleapiclient's string form embeds the full
+    request URL, whose query string holds the API key. The whole query string is
+    dropped. Never raises; a malformed error degrades to a generic description.
+    """
+    try:
+        status = getattr(getattr(error, "resp", None), "status", None)
+        parts = [f"HTTP {status}" if status is not None else "HTTP error"]
+        reasons = _http_error_reasons(error)
+        if reasons:
+            parts.append(f"reason={reasons[0]}")
+        uri = getattr(error, "uri", None)
+        if isinstance(uri, str) and uri:
+            path = urlsplit(uri).path
+            if path:
+                parts.append(f"path={path}")
+        return redact_api_key(" ".join(parts))
+    except Exception:
+        return "HTTP error (details unavailable)"
 
 
 def enrich_with_durations(youtube, video_ids: list[str]) -> dict[str, str | None]:
@@ -9570,7 +9616,11 @@ def cmd_scan(args, config):
         try:
             render_headline_digest(youtube, config, output_dir, dry_run=args.dry_run)
         except Exception as e:  # non-fatal: never let peripheral work fail a scan
-            log.warning("Headline digest failed (non-fatal): %s", e)
+            # Issue #311: never str(e) - an HttpError's string form holds the API key.
+            detail = (
+                describe_http_error(e) if isinstance(e, HttpError) else f"{type(e).__name__}: {redact_api_key(str(e))}"
+            )
+            log.warning("Headline digest failed (non-fatal): %s", detail)
 
     log.info("Done.")
 
@@ -16618,6 +16668,25 @@ def _select_headline_items(ranked: list[dict]) -> tuple[list[dict], list[dict]]:
     return positive, zero
 
 
+def _warn_headline_channel_failed(channel: dict, error: HttpError) -> None:
+    """One WARNING for a headline channel skipped on a non-quota HttpError (issue #311).
+
+    Carries the channel's config name and URL plus `describe_http_error`, never
+    `str(error)`: the request URL in that string holds the API key.
+    """
+    if "playlistNotFound" in _http_error_reasons(error):
+        hint = "channel has no public uploads (playlistNotFound); check its URL in config.yaml"
+    else:
+        hint = "skipped this run"
+    log.warning(
+        "Headline digest: channel %s (%s): %s [%s]",
+        channel.get("name"),
+        channel.get("url"),
+        hint,
+        describe_http_error(error),
+    )
+
+
 def render_headline_digest(youtube, config: dict, output_dir: Path, *, dry_run: bool) -> list[dict]:
     """Fetch, rank, and render the headline digest; advance the seen-set after render.
 
@@ -16661,7 +16730,9 @@ def render_headline_digest(youtube, config: dict, output_dir: Path, *, dry_run: 
             if e.resp.status == 403 and _is_quota_exceeded(e):
                 log.warning("Headline digest: YouTube quota exhausted; stopping digest early.")
                 break
-            raise
+            # Issue #311: one failing channel never costs the others.
+            _warn_headline_channel_failed(channel, e)
+            continue
         if not channel_id:
             log.warning("Headline digest: channel not found: %s", channel.get("url"))
             continue
@@ -16671,7 +16742,8 @@ def render_headline_digest(youtube, config: dict, output_dir: Path, *, dry_run: 
             if e.resp.status == 403 and _is_quota_exceeded(e):
                 log.warning("Headline digest: YouTube quota exhausted; stopping digest early.")
                 break
-            raise
+            _warn_headline_channel_failed(channel, e)
+            continue
         for v in videos:
             if v.get("video_id") in seen:
                 continue
@@ -16697,7 +16769,12 @@ def render_headline_digest(youtube, config: dict, output_dir: Path, *, dry_run: 
             log.warning("Headline digest: quota exhausted during Shorts check; keeping items unfiltered.")
             quota_degraded = True
         else:
-            raise
+            # Issue #311: a non-quota error degrades the same way, logged without the key.
+            log.warning(
+                "Headline digest: video durations could not be fetched (%s); keeping items unfiltered.",
+                describe_http_error(e),
+            )
+            quota_degraded = True
     if not quota_degraded:
         for v in collected:
             v["duration_iso"] = durations.get(v["video_id"])
