@@ -27,27 +27,42 @@ timestamps. That is the worst-case error of a ``&t=<seconds>`` deep link, which
 is what this corpus is FOR. Two models can emit identical text and identical
 token counts while differing 5x on this number.
 
+Issue #292 made it the repeatable benchmark for models AND prompts: every
+(fixture x arm) cell runs ``--rolls`` times, a hard fail is detected through the
+production parser, the timestamp offset against the caption track is measured
+at cue level through ``caption_align.entry_offsets``, ``--candidate-prompt``
+adds a prompt arm, and ``decision_rule`` prints PASS / FAIL / NOT EVALUATED per
+written rule. ``docs/model-benchmark-runbook.md`` says what to run and read.
+
 Usage
 -----
     python scripts/model_eval.py --candidate gemini-3.7-flash --incumbent gemini-3.5-flash
     python scripts/model_eval.py --candidate gemini-3.7-flash --fixtures screenshare-demo
     python scripts/model_eval.py --candidate X --thinking low --dry-run
+    python scripts/model_eval.py --candidate X --rolls 3 --candidate-prompt my-prompt.md --incumbent bundled
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import itertools
 import json
+import math
 import os
+import re
+import statistics
 import sys
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import caption_align
 import yaml
+from youtube_captions import CaptionsResult, captions_failure_is_refusal
 
 import video_intel as v
 from gemini_common import reported_name_differs, served_model_from_response
@@ -84,6 +99,61 @@ PRICING = {
 # it; sending it there is a hard 400. None means "let the helper decide".
 DEFAULT_THINKING = {"gemini-3.7-flash": "low", "gemini-3.8-flash": "low"}
 
+#: The prompt label of the bundled transcript prompt (or its issue #221 override).
+BUNDLED = "bundled"
+#: Below this many aligned dialogue entries the caption offset is "not measured" (None), never 0.
+OFFSET_MIN_ALIGNED_ENTRIES = 5
+#: Transcript token rates per video-minute at MEDIA_RESOLUTION_LOW, measured in
+#: docs/cost-model.md. Used only for the dry-run estimate.
+EST_INPUT_TOKENS_PER_VIDEO_MINUTE = 5500
+EST_OUTPUT_TOKENS_PER_VIDEO_MINUTE = 450
+#: Prompt-size heuristic for the dry-run estimate: about this many characters per token.
+EST_CHARS_PER_TOKEN = 4
+#: Where a cached cell's full key is stored inside its `.usage.json`.
+CACHE_KEY_FIELD = "_cache_key"
+#: The sha256 of the raw file the usage file belongs to; a mismatch makes the entry a miss.
+CACHE_RAW_SHA_FIELD = "_raw_sha256"
+#: The media resolution every cell requests (resolved through the SDK enum and recorded in the cache key).
+MEDIA_RESOLUTION = "MEDIA_RESOLUTION_LOW"
+
+HARD_FAIL_GENERATION = "generation_failed"
+HARD_FAIL_NOT_ENVELOPE = "not_envelope"
+HARD_FAIL_MISSING_SPEAKERS = "missing_speakers"
+HARD_FAIL_MISSING_SCREEN = "missing_screen_content"
+
+PASS, FAIL, NOT_EVALUATED = "PASS", "FAIL", "NOT EVALUATED"
+#: The decision rules, labelled as issue #292 writes them.
+RULES = (
+    ("R1", "no hard fail in any roll"),
+    ("R2", "median max_gap_s no worse than the incumbent's beyond its roll-to-roll spread"),
+    ("R3", "median caption offset no worse than the incumbent's beyond its roll-to-roll spread"),
+    ("R4", "cost stated"),
+)
+RULE_IDS = tuple(rid for rid, _ in RULES)
+
+# The identity readers' pattern in video_intel.py (11 id characters with a right
+# boundary); there is no shared URL-to-id helper to call.
+_YOUTUBE_VIDEO_ID = re.compile(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])")
+
+
+@dataclass(frozen=True)
+class PromptArm:
+    """The prompt one arm sends: its label, text, content hash and where it came from."""
+
+    label: str
+    text: str
+    sha256: str
+    source: str
+    override: str | None = None
+
+
+@dataclass(frozen=True)
+class CaptionTrack:
+    """A fixture's caption cues, or None with the reason they are unavailable."""
+
+    cues: list[caption_align.Cue] | None
+    reason: str | None = None
+
 
 def _secs(stamp: str) -> int | None:
     try:
@@ -97,6 +167,12 @@ def _secs(stamp: str) -> int | None:
     return None
 
 
+def _token_count(usage: dict, key: str) -> int | None:
+    """A token count from the usage capture, or None when it is missing or not a non-negative int."""
+    value = usage.get(key)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
 def score(
     raw: str,
     usage: dict,
@@ -104,12 +180,15 @@ def score(
     seg_secs: int,
     wall: float | None,
     start_secs: int | None = None,
+    caption_track: CaptionTrack | None = None,
 ) -> dict:
     """Score one run. Every field here is a dimension a model can regress on.
 
     ``start_secs`` (issue #219) is the fixture's requested ``start`` offset. It
     is what lets a cell state whether it actually measured the window it asked
     for. Default ``None`` keeps every pre-#219 caller scoring exactly as before.
+    ``caption_track`` (issue #292) feeds the cue-level caption offset; omitted,
+    the offset fields are None with a reason.
     """
     parsed, err = v.try_parse_transcript_json(raw)
     # A top-level list is Gemini returning the envelope wrapped in an array. The
@@ -117,6 +196,9 @@ def score(
     # it is a worse citizen than one that does not - so it is scored, not hidden.
     shape = "dict" if isinstance(parsed, dict) else ("list-wrapped" if isinstance(parsed, list) else "unparsed")
     env = parsed[0] if isinstance(parsed, list) and parsed else parsed
+    # Issue #292: the envelope production accepts (merge_transcript_json takes
+    # parsed[0] of a list-wrapped response), judged before the {} fallback.
+    envelope_ok = isinstance(env, dict) and isinstance(env.get("transcripts"), list)
     env = env if isinstance(env, dict) else {}
 
     tr = env.get("transcripts") or []
@@ -148,10 +230,13 @@ def score(
         window_exceeded = bool(span_end > seg_secs + tol or abs(first_stamp_offset) > tol)
 
     pin, pout, promo = PRICING.get(model, (None, None, None))
-    itok = usage.get("prompt") or 0
-    otok = usage.get("candidates") or 0
-    think = usage.get("thoughts") or 0
-    cost_seg = (itok / 1e6 * pin + (otok + think) / 1e6 * pout) if pin else None
+    # Unknown usage stays unknown (issue #292 review): `log_usage_metadata`
+    # returns None for a count the SDK did not report readably, and a response
+    # with no usage metadata leaves the keys out. A cost built from a 0 put in
+    # their place would be a fabricated measurement.
+    itok, otok, think = (_token_count(usage, k) for k in ("prompt", "candidates", "thoughts"))
+    measured = itok is not None and otok is not None and think is not None
+    cost_seg = (itok / 1e6 * pin + (otok + think) / 1e6 * pout) if pin and measured else None
 
     return {
         "model": model,
@@ -169,8 +254,14 @@ def score(
         "window_exceeded": window_exceeded,
         "first_stamp_offset_s": first_stamp_offset,
         "chars": chars,
-        "screen_content": len(env.get("screen_content") or []),
-        "speakers": len(env.get("speakers") or []),
+        # Counted the way production renders them (issue #292 review): a task
+        # value that is not a list, a non-dict entry, a speaker without a usable
+        # voice id or a screen entry without a usable start renders nothing, so
+        # it must not count as present [core: one-definition].
+        "screen_content": sum(
+            1 for sc in v._usable_task_list(env, "screen_content", []) if v._usable_timestamp(sc, "start")
+        ),
+        "speakers": sum(1 for s in v._usable_task_list(env, "speakers", []) if v._usable_voice_id(s)),
         "in_tok": itok,
         "out_tok": otok,
         "thinking_tok": think,
@@ -182,7 +273,83 @@ def score(
         # by another model, so `model` alone does not say what was measured.
         # None when unreadable, or for a cell cached before this field existed.
         "model_served": usage.get(v.SERVED_MODEL_CAPTURE_KEY),
+        "envelope_ok": envelope_ok,
+        **caption_offset_metric(tr, caption_track, start_secs, seg_secs),
     }
+
+
+def caption_offset_metric(transcripts: list, track: CaptionTrack | None, start_secs: int | None, seg_secs: int) -> dict:
+    """Median and p90 of |entry stamp - start of the cue holding its first words| (issue #292).
+
+    Cue level, never word level: the time compared is a real cue's start. The
+    alignment is ``caption_align.entry_offsets`` and nothing else
+    [core: one-definition]. Stamps are read as absolute video time, the same
+    reading the issue #219 window check uses. Only cues whose start lies inside
+    the requested window are used. Unaligned entries are counted and excluded;
+    fewer than ``OFFSET_MIN_ALIGNED_ENTRIES`` aligned makes the metric None.
+    """
+    out = {
+        "caption_offset_median_s": None,
+        "caption_offset_p90_s": None,
+        "caption_aligned": None,
+        "caption_unaligned": None,
+        "caption_reason": None,
+    }
+    if track is None:
+        out["caption_reason"] = "no caption track supplied"
+        return out
+    if track.cues is None:
+        out["caption_reason"] = track.reason
+        return out
+    entries: list[tuple[float, str]] = []
+    for e in transcripts:
+        if not isinstance(e, dict):
+            continue
+        stamp = _secs(e.get("start"))
+        text = str(e.get("text") or "").strip()
+        if stamp is not None and text:
+            entries.append((float(stamp), text))
+    cues = track.cues
+    if start_secs is not None:
+        cues = [c for c in cues if start_secs <= c.start < start_secs + seg_secs]
+    if not entries or not cues:
+        out["caption_reason"] = "no dialogue entries" if not entries else "no caption cues inside the window"
+        return out
+    offsets = caption_align.entry_offsets(entries, cues)
+    aligned = sorted(abs(o.offset_seconds) for o in offsets if o.offset_seconds is not None)
+    out["caption_aligned"] = len(aligned)
+    out["caption_unaligned"] = len(offsets) - len(aligned)
+    if len(aligned) < OFFSET_MIN_ALIGNED_ENTRIES:
+        out["caption_reason"] = (
+            f"only {len(aligned)} of {len(offsets)} entries aligned (needs {OFFSET_MIN_ALIGNED_ENTRIES})"
+        )
+        return out
+    out["caption_offset_median_s"] = round(statistics.median(aligned), 2)
+    # Nearest rank: always an observed offset.
+    out["caption_offset_p90_s"] = round(aligned[math.ceil(0.9 * len(aligned)) - 1], 2)
+    return out
+
+
+def hard_fails(row: dict, fixture: dict | None = None) -> list[str]:
+    """The hard fails of one roll (issue #292), named; empty when there are none.
+
+    Read from fields ``score()`` computed through the production parser
+    (``try_parse_transcript_json`` and its wrapper normalization). A missing task
+    and an empty one are the same fail: the normalization turns a missing task
+    into ``[]``. A row without ``envelope_ok`` was written before this field
+    existed and makes no claim, like ``cell_measured_its_window``.
+    """
+    if row.get("error"):
+        return [HARD_FAIL_GENERATION]
+    if row.get("envelope_ok") is False:
+        return [HARD_FAIL_NOT_ENVELOPE]
+    fixture = fixture or {}
+    fails = []
+    if fixture.get("expects_speakers", True) and row.get("speakers") == 0:
+        fails.append(HARD_FAIL_MISSING_SPEAKERS)
+    if fixture.get("expects_screen", True) and row.get("screen_content") == 0:
+        fails.append(HARD_FAIL_MISSING_SCREEN)
+    return fails
 
 
 def prompt_override(prompt_name: str) -> str | None:
@@ -203,26 +370,172 @@ def prompt_override(prompt_name: str) -> str | None:
     return None
 
 
-def run_one(client, types, fx: dict, model: str, thinking: str | None, seg: int, scratch: Path) -> dict:
-    """One (fixture, model) call. Cached on disk so a re-run costs nothing."""
-    tag = f"{fx['id']}__{model}"
-    raw_p, use_p = scratch / f"{tag}.json", scratch / f"{tag}.usage.json"
-    wall = None
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def bundled_prompt() -> PromptArm:
+    """The transcript prompt production would send, labelled ``bundled``.
+
+    Resolved through ``load_prompt``, so an issue #221 override is what is sent,
+    hashed and recorded.
+    """
+    override = prompt_override("transcript")
+    text = v.load_prompt("transcript")
+    return PromptArm(BUNDLED, text, _sha256(text.encode("utf-8")), override or "prompts/transcript.md", override)
+
+
+def candidate_prompt_arm(path: Path) -> PromptArm:
+    """A ``--candidate-prompt`` file as an arm, labelled by the first 8 hex of the sha256 of its text.
+
+    Read the way ``load_prompt`` reads the bundled prompt (UTF-8 text, newlines
+    normalized), and the hash is of the text actually sent, so a CRLF copy and
+    an LF copy of one prompt are one arm. A file that is not UTF-8 raises
+    ``UnicodeDecodeError``, a ``ValueError``.
+    """
+    text = path.read_text(encoding="utf-8")
+    digest = _sha256(text.encode("utf-8"))
+    return PromptArm(f"candidate:{digest[:8]}", text, digest, path.name)
+
+
+def thinking_config(types, model: str, thinking: str | None):
+    """The ThinkingConfig the call sends: ``--thinking``, else ``DEFAULT_THINKING``, else the production helper."""
+    level = thinking or DEFAULT_THINKING.get(model)
+    return types.ThinkingConfig(thinking_level=level) if level else v._make_thinking_config_for_transcript(types, model)
+
+
+def request_settings(types, model: str, thinking: str | None) -> dict:
+    """The RESOLVED request settings that change a response, for the cache key (the issue #228 lesson).
+
+    The thinking config actually sent (not the flag that produced it), the media
+    resolution and the output-token cap ``call_gemini`` applies.
+    """
+    tc = thinking_config(types, model, thinking)
+    media = types.MediaResolution(MEDIA_RESOLUTION)
+    return {
+        "thinking": tc.model_dump(mode="json", exclude_none=True) if tc is not None else None,
+        "media_resolution": str(getattr(media, "value", media)),
+        "max_output_tokens": v.MAX_OUTPUT_TOKENS,
+    }
+
+
+def cache_stem(fixture_id: str, model: str, label: str, roll: int) -> str:
+    """Roll 1 of the bundled arm keeps the pre-#292 stem, so existing caches still load."""
+    if label == BUNDLED and roll == 1:
+        return f"{fixture_id}__{model}"
+    return f"{fixture_id}__{model}__{label.replace(':', '-')}__r{roll}"
+
+
+def cache_key(fx: dict, model: str, prompt: PromptArm, roll: int, seg: int, settings: dict) -> dict:
+    """Everything that changes the response; a cell is replayed only under an equal key.
+
+    ``settings`` is ``request_settings`` for this model, so the key holds the
+    resolved values the call sends, never the flags that produced them.
+    """
+    return {
+        "fixture": fx["id"],
+        "url": fx["url"],
+        "start": fx["start"],
+        "segment_seconds": seg,
+        "model": model,
+        "prompt_sha256": prompt.sha256,
+        **settings,
+        "roll": roll,
+    }
+
+
+def cached_cell(scratch: Path, stem: str, key: dict, label: str, roll: int) -> tuple[str, dict, str] | None:
+    """``(raw, usage, cache_state)`` when the cache may serve this cell, else None.
+
+    The ONE lookup both ``main``'s hit planning and ``run_one`` use. A stored key
+    must equal ``key`` and the stored raw hash must match the raw file, so a
+    half-written entry is a miss. An entry with no stored key predates issue #292
+    and is served, marked ``legacy``, only as roll 1 of the bundled arm.
+    """
+    raw_p, use_p = scratch / f"{stem}.json", scratch / f"{stem}.usage.json"
+    if not (raw_p.exists() and use_p.exists()):
+        return None
+    try:
+        raw_bytes = raw_p.read_bytes()
+        raw = raw_bytes.decode("utf-8")
+        usage = json.loads(use_p.read_bytes().decode("utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(usage, dict):
+        return None
+    stored = usage.get(CACHE_KEY_FIELD)
+    if stored is None:
+        return (raw, usage, "legacy") if label == BUNDLED and roll == 1 else None
+    if stored != key or usage.get(CACHE_RAW_SHA_FIELD) != _sha256(raw_bytes):
+        return None
+    return raw, usage, "hit"
+
+
+def _write_atomic(path: Path, data: bytes) -> None:
+    """Write to a sibling temp file, then replace: a reader sees the old file or the new one, never a torn one."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
+def invalidate_cached_cell(scratch: Path, stem: str) -> None:
+    """Remove one cell's cache entry, usage file first (a raw file without its usage file is a miss)."""
+    for suffix in (".usage.json", ".json"):
+        (scratch / f"{stem}{suffix}").unlink(missing_ok=True)
+
+
+def write_cached_cell(scratch: Path, stem: str, raw: str, usage: dict, key: dict) -> None:
+    """Store one cell so a crash at any point leaves the old entry, or a miss, never a mix (issue #292 review).
+
+    Each file is replaced atomically, the raw file first, and the usage file,
+    carrying the key and the raw file's sha256, last. A crash between the two
+    leaves an old usage file whose hash no longer matches the raw file, which
+    ``cached_cell`` treats as a miss.
+    """
+    raw_p, use_p = scratch / f"{stem}.json", scratch / f"{stem}.usage.json"
+    raw_bytes = raw.encode("utf-8")
+    _write_atomic(raw_p, raw_bytes)
+    stored = {**usage, CACHE_KEY_FIELD: key, CACHE_RAW_SHA_FIELD: _sha256(raw_bytes)}
+    _write_atomic(use_p, json.dumps(stored).encode("utf-8"))
+
+
+def run_one(
+    client,
+    types,
+    fx: dict,
+    model: str,
+    thinking: str | None,
+    seg: int,
+    scratch: Path,
+    *,
+    roll: int = 1,
+    prompt: PromptArm | None = None,
+    caption_track: CaptionTrack | None = None,
+    refresh: bool = False,
+) -> dict:
+    """One roll of one (fixture, model, prompt) cell. Cached on disk so a re-run costs nothing.
+
+    ``refresh`` removes the cell's cache entry first, then generates it again,
+    so after a refresh run every cell is freshly cached or absent, never stale.
+    """
     # Resolved BEFORE the cache check: a card re-rendered from a warm cache must
     # still say which prompt is active, or a cached rerun under an override
     # would be labelled as measuring the bundled template.
-    override = prompt_override("transcript")
-    if raw_p.exists() and use_p.exists():
-        raw = raw_p.read_text(encoding="utf-8")
-        usage = json.loads(use_p.read_text(encoding="utf-8"))
-        print(f"  [cached] {tag}")
+    prompt = prompt or bundled_prompt()
+    override = prompt.override
+    stem = cache_stem(fx["id"], model, prompt.label, roll)
+    key = cache_key(fx, model, prompt, roll, seg, request_settings(types, model, thinking))
+    wall = None
+    arm_fields = {"prompt_label": prompt.label, "roll": roll}
+    if refresh:
+        # Invalidated BEFORE the attempt: a refresh that fails must leave the
+        # cell absent, never the older roll a later plain run would replay.
+        invalidate_cached_cell(scratch, stem)
+    hit = None if refresh else cached_cell(scratch, stem, key, prompt.label, roll)
+    if hit:
+        raw, usage, cache_state = hit
+        print(f"  [cached] {stem}")
     else:
-        level = thinking or DEFAULT_THINKING.get(model)
-        tc = (
-            types.ThinkingConfig(thinking_level=level)
-            if level
-            else v._make_thinking_config_for_transcript(types, model)
-        )
         usage: dict = {}
         if override:
             v.log.warning(
@@ -237,13 +550,13 @@ def run_one(client, types, fx: dict, model: str, thinking: str | None, seg: int,
                 client,
                 types,
                 fx["url"],
-                v.load_prompt("transcript"),
+                prompt.text,
                 model,
                 response_json=True,
                 start_offset=fx["start"],
                 end_offset=fx["start"] + seg,
-                thinking_config=tc,
-                media_resolution=types.MediaResolution.MEDIA_RESOLUTION_LOW,
+                thinking_config=thinking_config(types, model, thinking),
+                media_resolution=types.MediaResolution(MEDIA_RESOLUTION),
                 on_response=lambda r, c=usage, m=model: c.update(
                     v.log_usage_metadata(r, m) or {},
                     # Issue #295: cached with the counts, so a warm re-render keeps it.
@@ -251,16 +564,88 @@ def run_one(client, types, fx: dict, model: str, thinking: str | None, seg: int,
                 ),
             )
         except Exception as e:
-            print(f"  [FAIL]   {tag}: {type(e).__name__}: {str(e)[:140]}")
-            return {"model": model, "fixture": fx["id"], "error": f"{type(e).__name__}: {str(e)[:160]}"}
+            print(f"  [FAIL]   {stem}: {type(e).__name__}: {str(e)[:140]}")
+            # Issue #292: a failed roll is a row, counted, never dropped.
+            return {
+                "model": model,
+                "fixture": fx["id"],
+                "error": f"{type(e).__name__}: {str(e)[:160]}",
+                **arm_fields,
+            }
         wall = time.time() - t0
-        raw_p.write_text(raw, encoding="utf-8")
-        use_p.write_text(json.dumps(usage), encoding="utf-8")
-        print(f"  [live]   {tag}  {wall:.1f}s")
-    row = score(raw, usage, model, seg, wall, start_secs=fx.get("start"))
+        write_cached_cell(scratch, stem, raw, usage, key)
+        cache_state = "live"
+        print(f"  [live]   {stem}  {wall:.1f}s")
+    row = score(raw, usage, model, seg, wall, start_secs=fx.get("start"), caption_track=caption_track)
     row["fixture"] = fx["id"]
     row["prompt_override"] = override
+    row.update(arm_fields, prompt_sha256=prompt.sha256, prompt_source=prompt.source, cache=cache_state)
     return row
+
+
+def fixture_caption_track(fx: dict, scratch: Path, *, fetch: bool = True) -> CaptionTrack:
+    """The fixture's caption cues, fetched once and cached in ``scratch`` (issue #292).
+
+    Only through ``fetch_english_captions`` (issue #231's one fetcher, with a
+    fresh reason sink) and the issue #289 adapter ``caption_cues_from_captions``.
+    A refused, absent or failed fetch gives None with its reason and never fails
+    the run; only a successful track is cached. With ``fetch`` false (a run of
+    cache hits only, without ``--fetch-captions``) an uncached track is None
+    with that reason and nothing touches the network.
+    """
+    match = _YOUTUBE_VIDEO_ID.search(str(fx.get("url") or ""))
+    if not match:
+        return CaptionTrack(None, "no YouTube video id in the fixture URL")
+    video_id = match.group(1)
+    cache_p = scratch / f"{fx['id']}__captions.json"
+    cached = _read_caption_cache(cache_p, video_id)
+    if cached is not None:
+        return CaptionTrack(v.caption_cues_from_captions(cached))
+    if not fetch:
+        return CaptionTrack(
+            None, "caption track not cached, and a run of cached cells fetches nothing (pass --fetch-captions)"
+        )
+    reason: dict = {}
+    try:
+        captions = v.fetch_english_captions(video_id, reason_sink=reason)
+    except Exception as e:
+        return CaptionTrack(None, f"caption fetch failed ({type(e).__name__})")
+    if captions is None:
+        if captions_failure_is_refusal(reason.get("kind")):
+            return CaptionTrack(
+                None,
+                f"caption request refused ({reason.get('exception') or 'blocked'}); says nothing about the video",
+            )
+        return CaptionTrack(None, f"no English caption track ({reason.get('kind') or 'absent'})")
+    payload = {
+        "video_id": video_id,
+        "snippets": [[start, text] for start, text in captions.snippets],
+        "durations": list(captions.durations),
+        "is_generated": captions.is_generated,
+        "language": captions.language,
+    }
+    try:
+        cache_p.write_text(json.dumps(payload), encoding="utf-8")
+    except OSError as e:
+        print(f"  WARNING: caption cache not written ({e}); the next run fetches again.")
+    return CaptionTrack(v.caption_cues_from_captions(captions))
+
+
+def _read_caption_cache(path: Path, video_id: str) -> CaptionsResult | None:
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_bytes().decode("utf-8"))
+        if data.get("video_id") != video_id:
+            return None
+        return CaptionsResult(
+            snippets=[(float(start), str(text)) for start, text in data["snippets"]],
+            is_generated=bool(data.get("is_generated")),
+            language=str(data.get("language") or "en"),
+            durations=tuple(float(d) for d in data.get("durations") or ()),
+        )
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
 
 
 def cell_measured_its_window(row: dict) -> bool:
@@ -290,7 +675,242 @@ def served_label(model: str, rows: list[dict]) -> str:
     return f"`{model}` (served {', '.join(served)})" if served else f"`{model}`"
 
 
-def render(rows: list[dict], models: list[str], manifest: dict, incumbent: str | None) -> str:
+def arm_of(row: dict) -> tuple[str, str]:
+    """A row's arm: (model, prompt label); a row written before issue #292 is the bundled arm."""
+    return (row.get("model"), row.get("prompt_label") or BUNDLED)
+
+
+def _arm_text(arm: tuple[str, str], rows: list[dict]) -> str:
+    model, label = arm
+    text = served_label(model, rows)
+    return text if label == BUNDLED else f"{text} [prompt {label}]"
+
+
+def _num(x) -> str:
+    if x is None:
+        return "-"
+    return f"{x:g}" if isinstance(x, float) else str(x)
+
+
+def roll_stats(values: list) -> tuple:
+    """(median, spread) over the rolls that produced a value; one value has spread None, never 0."""
+    vals = [x for x in values if x is not None]
+    if not vals:
+        return None, None
+    return statistics.median(vals), (max(vals) - min(vals) if len(vals) >= 2 else None)
+
+
+def _combine(statuses) -> str:
+    statuses = list(statuses)
+    if FAIL in statuses:
+        return FAIL
+    if not statuses or NOT_EVALUATED in statuses:
+        return NOT_EVALUATED
+    return PASS
+
+
+def _rule_no_hard_fail(mine: list[dict], theirs: list[dict], fixture: dict) -> tuple[str, str]:
+    found = []
+    for r in mine:
+        fails = hard_fails(r, fixture)
+        if fails:
+            what = ", ".join(fails)
+            if r.get("error"):
+                what += f" ({str(r['error']).split(':', 1)[0]})"
+            found.append(f"roll {r.get('roll') or 1}: {what}")
+    hard = sum(1 for r in theirs if hard_fails(r, fixture))
+    note = f"incumbent: {hard} of {len(theirs)} roll(s) hard-failed" if theirs else "no incumbent rolls"
+    if found:
+        return FAIL, "; ".join(found) + f" ({note})"
+    return PASS, f"{len(mine)} roll(s) without a hard fail ({note})"
+
+
+def roll_exclusion(row: dict, metric: str | None = None) -> str | None:
+    """Why a roll does not feed a median, or None when it does (issue #292).
+
+    ``failed`` (no response), ``legacy`` (a pre-key cache entry whose prompt is
+    unverified), ``missed_window`` (issue #219), or ``no_value`` (``metric``
+    given and None). The ONE definition the decision rule, the medians table,
+    the cost rule and the kept mean line all read [core: one-definition].
+    """
+    if row.get("error"):
+        return "failed"
+    if row.get("cache") == "legacy":
+        return "legacy"
+    if not cell_measured_its_window(row):
+        return "missed_window"
+    if metric is not None and row.get(metric) is None:
+        return "no_value"
+    return None
+
+
+def contributing_rows(rows: list[dict], metric: str | None = None) -> tuple[list[dict], int]:
+    """(rows that feed a median, rows excluded as legacy or as having missed their window)."""
+    kept = [r for r in rows if roll_exclusion(r, metric) is None]
+    excluded = sum(1 for r in rows if roll_exclusion(r) in ("legacy", "missed_window"))
+    return kept, excluded
+
+
+def requested_rolls(rows: list[dict]) -> int:
+    """The roll count a run asked for, read back from its rows (a row without ``roll`` is roll 1)."""
+    return max((r.get("roll") or 1 for r in rows), default=1)
+
+
+def roll_set_gap(rows: list[dict], metric: str, rolls: int) -> str | None:
+    """Why one arm lacks a usable ``metric`` on some requested roll, or None when every roll 1..rolls has one.
+
+    The completeness rule R2, R3 and R4 share (issue #292 review): a missing,
+    failed, legacy-cache, window-missed or None roll leaves the arm incomplete,
+    so medians are only ever compared on equal, complete roll sets.
+    """
+    by_roll: dict[int, dict] = {}
+    for r in rows:
+        by_roll.setdefault(r.get("roll") or 1, r)
+    problems = []
+    for n in range(1, rolls + 1):
+        row = by_roll.get(n)
+        why = "missing" if row is None else roll_exclusion(row, metric)
+        if why:
+            problems.append(f"roll {n} {why.replace('_', ' ')}")
+    return ", ".join(problems) or None
+
+
+def _rule_within_spread(mine: list[dict], theirs: list[dict], metric: str, rolls: int) -> tuple[str, str]:
+    """The candidate median against the incumbent median plus the incumbent's own spread, on complete roll sets."""
+    if not theirs:
+        return NOT_EVALUATED, "no incumbent rolls for this fixture"
+    if rolls < 2:
+        return NOT_EVALUATED, "needs --rolls >= 2: with one roll per arm the incumbent's spread is unknown"
+    gaps = [
+        f"{side} arm incomplete for {metric}: {gap}"
+        for side, arm_rows in (("candidate", mine), ("incumbent", theirs))
+        if (gap := roll_set_gap(arm_rows, metric, rolls))
+    ]
+    if gaps:
+        # An incomplete roll set never reaches a comparison: dropping a bad
+        # roll could flatter either side (the issue #228 lesson).
+        return NOT_EVALUATED, "; ".join(gaps)
+    cand = [r[metric] for r in contributing_rows(mine, metric)[0]]
+    inc = [r[metric] for r in contributing_rows(theirs, metric)[0]]
+    inc_median, spread = roll_stats(inc)
+    cand_median, _ = roll_stats(cand)
+    detail = f"candidate {_num(cand_median)} vs incumbent {_num(inc_median)}, tolerance {_num(spread)}"
+    return (PASS if cand_median <= inc_median + spread else FAIL), detail
+
+
+def _rule_cost_stated(mine: list[dict], theirs: list[dict], rolls: int) -> tuple[str, str]:
+    """R4: a measured cost on every requested roll of the candidate arm.
+
+    A model with no ``PRICING`` entry can never state a cost (FAIL). A roll
+    whose cost is unknown (no usable token counts), failed, legacy or
+    window-missed leaves the cost not measured (NOT EVALUATED, never PASS).
+    """
+    metric = "cost_per_video_hour"
+    unpriced = sorted({r["model"] for r in mine if r.get("model") not in PRICING})
+    if unpriced:
+        return FAIL, f"no PRICING entry for {', '.join(unpriced)}: its cost cannot be stated"
+    gap = roll_set_gap(mine, metric, rolls)
+    if gap:
+        return NOT_EVALUATED, f"cost not measured on every roll: {gap}"
+    kept = contributing_rows(mine, metric)[0]
+    theirs_kept = contributing_rows(theirs, metric)[0]
+    detail = (
+        f"median ${_num(roll_stats([r[metric] for r in kept])[0])}/video-hour vs "
+        f"${_num(roll_stats([r[metric] for r in theirs_kept])[0])}"
+    )
+    served = sorted({r["model_served"] for r in kept if reported_name_differs(r["model"], r.get("model_served"))})
+    if served:
+        detail += f"; priced at the requested model's rate, though served by {', '.join(served)}"
+    return PASS, detail
+
+
+def _served_model_verdict(mine: list[dict], theirs: list[dict], cand_model: str, inc_model: str) -> str | None:
+    """Why R2/R3 cannot attribute a difference to the thing being compared (issue #295), or None.
+
+    Over the contributing rolls of each arm: every roll must record a served
+    model (None is not False), every roll of one arm must record the SAME one,
+    and the two arms' served models must be IDENTICAL in a prompt comparison
+    (one requested model) and DIFFERENT in a model comparison. "Same" is the
+    strict ``reported_name_differs`` rule, where a version suffix counts.
+    """
+    arms = (("candidate", contributing_rows(mine)[0]), ("incumbent", contributing_rows(theirs)[0]))
+    if any(not r.get("model_served") for _, rolls in arms for r in rolls):
+        return "served model unknown: a contributing roll has no recorded model_served"
+    served: dict[str, str] = {}
+    for side, rolls in arms:
+        names = sorted({r["model_served"] for r in rolls})
+        if any(reported_name_differs(names[0], n) for n in names[1:]):
+            return f"mixed served models in the {side} arm ({', '.join(names)})"
+        if names:
+            served[side] = names[0]
+    if len(served) < 2:
+        return None
+    same = not reported_name_differs(served["candidate"], served["incumbent"])
+    if cand_model == inc_model and not same:
+        return (
+            f"a prompt comparison served by two models ({served['candidate']} vs {served['incumbent']}): "
+            "a model change would be credited to the prompt"
+        )
+    if cand_model != inc_model and same:
+        return f"both arms were served by {served['candidate']}: this compares one model with itself"
+    return None
+
+
+def decision_rule(rows: list[dict], manifest: dict, incumbent_arm: tuple[str, str], rolls: int | None = None) -> dict:
+    """The ONE decision rule (issue #292): per candidate arm, per fixture and overall, each rule's verdict.
+
+    R1 no hard fail in any candidate roll. R2 / R3: the candidate's median
+    ``max_gap_s`` / caption offset is no worse than the incumbent's median by
+    more than the incumbent's own roll-to-roll spread - a measured tolerance,
+    not a chosen constant - judged only when both arms have a usable value on
+    every requested roll and the served models allow the comparison. R4 a
+    measured cost on every requested roll. A rule that cannot be judged is NOT
+    EVALUATED, never PASS. Combine order: FAIL, then NOT EVALUATED, then PASS.
+    ``rolls`` is the run's ``--rolls``; omitted, it is read back from the rows.
+    """
+    rolls = rolls or requested_rolls(rows)
+    by_id = {f["id"]: f for f in manifest.get("fixtures", [])}
+    result: dict = {"incumbent": incumbent_arm, "candidates": {}}
+    for arm in dict.fromkeys(arm_of(r) for r in rows):
+        if arm == incumbent_arm:
+            continue
+        fixtures: dict = {}
+        for fid in dict.fromkeys(r["fixture"] for r in rows if arm_of(r) == arm):
+            mine = [r for r in rows if arm_of(r) == arm and r["fixture"] == fid]
+            theirs = [r for r in rows if arm_of(r) == incumbent_arm and r["fixture"] == fid]
+            rules = {
+                "R1": _rule_no_hard_fail(mine, theirs, by_id.get(fid, {})),
+                "R2": _rule_within_spread(mine, theirs, "max_gap_s", rolls),
+                "R3": _rule_within_spread(mine, theirs, "caption_offset_median_s", rolls),
+                "R4": _rule_cost_stated(mine, theirs, rolls),
+            }
+            served = _served_model_verdict(mine, theirs, arm[0], incumbent_arm[0])
+            if served:
+                for rid in ("R2", "R3"):
+                    rules[rid] = (NOT_EVALUATED, served)
+            fixtures[fid] = rules
+        summary = {
+            rid: (
+                _combine(f[rid][0] for f in fixtures.values()),
+                "; ".join(f"{fid}: {f[rid][1]}" if len(fixtures) > 1 else f[rid][1] for fid, f in fixtures.items()),
+            )
+            for rid in RULE_IDS
+        }
+        result["candidates"][arm] = {
+            "fixtures": fixtures,
+            "rules": summary,
+            "overall": _combine(status for status, _ in summary.values()),
+        }
+    return result
+
+
+def render(
+    rows: list[dict],
+    models: list[str],
+    manifest: dict,
+    incumbent: str | tuple[str, str] | None,
+    rolls: int | None = None,
+) -> str:
     stamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
     out = [f"# Model scorecard - {', '.join(models)}", "", f"Generated {stamp} by `scripts/model_eval.py`.", ""]
     out += [
@@ -309,12 +929,25 @@ def render(rows: list[dict], models: list[str], manifest: dict, incumbent: str |
             "against the shipped template.",
             "",
         ]
+    legacy = sum(1 for r in rows if r.get("cache") == "legacy")
+    if legacy:
+        out += [
+            f"**{legacy} cell(s) replayed from a cache entry written before the cache key existed.** Their prompt, "
+            "window and thinking level are unverified, so the decision rule leaves them out of its medians.",
+            "",
+        ]
+    by_id = {f["id"]: f for f in manifest["fixtures"]}
     cols = [
         ("fixture", "fixture", 22),
         ("model", "model", 22),
+        # Issue #292: one line per roll of each (model, prompt) arm, generated, never hand-written.
+        ("prompt", "prompt_label", 10),
+        ("roll", "roll", 4),
         ("shape", "envelope_shape", 13),
         ("segs", "segments", 5),
         ("max_gap_s", "max_gap_s", 10),
+        ("off_med", "offset_median", 7),
+        ("off_p90", "offset_p90", 7),
         ("scr", "screen_content", 4),
         ("spk", "speakers", 4),
         ("think", "thinking_tok", 6),
@@ -323,47 +956,127 @@ def render(rows: list[dict], models: list[str], manifest: dict, incumbent: str |
         # cell did not measure its own window. Without this column the flag
         # existed only in the JSON sidecar, which nothing read.
         ("window", "window_ok", 8),
+        ("hard_fail", "hard_fail", 10),
     ]
     out.append("| " + " | ".join(c[0] for c in cols) + " |")
     out.append("|" + "|".join("---" for _ in cols) + "|")
     for r in rows:
+        label, roll = arm_of(r)[1], r.get("roll") or 1
         if r.get("error"):
-            out.append(f"| {r['fixture']} | {r['model']} | **ERROR** | | | | | | | |")
-            out.append(f"| | | `{r['error']}` | | | | | | | |")
+            pad = [""] * (len(cols) - 6)
+            out.append(
+                "| "
+                + " | ".join([r["fixture"], r["model"], label, str(roll), "**ERROR**", *pad, HARD_FAIL_GENERATION])
+                + " |"
+            )
+            out.append("| " + " | ".join(["", "", "", "", f"`{r['error']}`", *pad, ""]) + " |")
             continue
         # Rendered, not just stored: "WINDOW MISSED" is what a human sees.
         r = dict(r)
         r["window_ok"] = (
             "**MISSED**" if r.get("window_exceeded") is True else ("ok" if r.get("window_exceeded") is False else "-")
         )
+        r["prompt_label"], r["roll"] = label, roll
+        r["offset_median"] = _num(r.get("caption_offset_median_s"))
+        # Unknown usage renders as not measured ("-"), never as 0 (issue #292 review).
+        r["thinking_tok"] = _num(r.get("thinking_tok"))
+        r["cost_per_video_hour"] = _num(r.get("cost_per_video_hour"))
+        r["offset_p90"] = _num(r.get("caption_offset_p90_s"))
+        r["hard_fail"] = ", ".join(hard_fails(r, by_id.get(r["fixture"]))) or "-"
         # Issue #295: name the model that answered when it is not the one asked for.
         if reported_name_differs(r["model"], r.get("model_served")):
             r["model"] = f"{r['model']} (served {r['model_served']})"
         out.append("| " + " | ".join(str(r.get(c[1], "")) for c in cols) + " |")
+    out += [
+        "",
+        "## Medians across rolls",
+        "",
+        "Median (spread) over the rolls the decision rule counts: a failed roll, a legacy-cache roll and a roll "
+        "that missed its window are left out (`excluded` counts the last two). Spread is `-` with one value, never 0.",
+        "",
+        "| fixture | model | prompt | rolls | failed | excluded | max_gap_s | off_med | off_p90 | $/vid-hr |",
+        "|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for fid, arm in dict.fromkeys((r["fixture"], arm_of(r)) for r in rows):
+        group = [r for r in rows if r["fixture"] == fid and arm_of(r) == arm]
+        excluded = contributing_rows(group)[1]
+        cells = []
+        for metric in ("max_gap_s", "caption_offset_median_s", "caption_offset_p90_s", "cost_per_video_hour"):
+            median, spread = roll_stats([r[metric] for r in contributing_rows(group, metric)[0]])
+            cells.append(f"{_num(median)} ({_num(spread)})" if metric != "cost_per_video_hour" else _num(median))
+        failed = sum(1 for r in group if r.get("error"))
+        out.append(f"| {fid} | {arm[0]} | {arm[1]} | {len(group)} | {failed} | {excluded} | {' | '.join(cells)} |")
+    out += ["", "## Prompts per arm", ""]
+    for arm in dict.fromkeys(arm_of(r) for r in rows):
+        recorded = next((r for r in rows if arm_of(r) == arm and r.get("prompt_sha256")), None)
+        if recorded:
+            out.append(
+                f"- `{arm[0]}` / `{arm[1]}`: `{recorded.get('prompt_source')}`, sha256 `{recorded['prompt_sha256']}`"
+            )
+        else:
+            out.append(f"- `{arm[0]}` / `{arm[1]}`: not recorded (cells cached before prompts were hashed)")
+    out += [
+        "",
+        "## Caption alignment",
+        "",
+        "The offset is the absolute difference between a dialogue entry's stamp and the start of the caption cue "
+        "holding its first words, at cue level, never word level, computed by `caption_align.entry_offsets`. "
+        f"Fewer than {OFFSET_MIN_ALIGNED_ENTRIES} aligned entries leaves it unmeasured.",
+        "",
+    ]
+    for fid in dict.fromkeys(r["fixture"] for r in rows):
+        ok = [r for r in rows if r["fixture"] == fid and not r.get("error")]
+        reasons = sorted({r["caption_reason"] for r in ok if r.get("caption_reason")})
+        counts = [
+            f"{r['caption_aligned']}/{r['caption_aligned'] + r['caption_unaligned']}"
+            for r in ok
+            if r.get("caption_aligned") is not None
+        ]
+        parts = []
+        if counts:
+            parts.append("aligned entries per roll: " + ", ".join(counts))
+        if reasons:
+            parts.append("not measured: " + "; ".join(reasons))
+        out.append(f"- **{fid}** - {'; '.join(parts) or 'no caption data'}")
     out += ["", "## Per-facet notes", ""]
-    by_id = {f["id"]: f for f in manifest["fixtures"]}
     for fid in dict.fromkeys(r["fixture"] for r in rows):
         out.append(f"- **{fid}** - {' '.join((by_id.get(fid, {}).get('facet') or '').split())}")
     if incumbent:
-        out += ["", "## Verdict", "", f"Incumbent: `{incumbent}`.", ""]
+        incumbent_arm = (incumbent, BUNDLED) if isinstance(incumbent, str) else tuple(incumbent)
+        inc_model = incumbent_arm[0]
+        out += ["", "## Verdict", "", f"Incumbent: `{inc_model}`.", ""]
+        # The mean line compares bundled arms only: a prompt run must never
+        # average two prompts into one figure (issue #292).
+        bundled_rows = [r for r in rows if arm_of(r)[1] == BUNDLED]
         for m in models:
-            if m == incumbent:
+            if m == inc_model:
                 continue
             # Issue #219: a cell that did not measure its own window must not
             # feed the comparison that decides a model swap. Its max_gap_s can
             # look healthy (see the test contract) and its cost is derived from
             # tokens billed for a window it did not get.
-            mine = [r for r in rows if r["model"] == m and not r.get("error") and cell_measured_its_window(r)]
-            theirs = [r for r in rows if r["model"] == incumbent and not r.get("error") and cell_measured_its_window(r)]
-            excluded = sum(1 for r in rows if r["model"] in (m, incumbent) and r.get("window_exceeded") is True)
+            # Issue #292 review: the same rolls the decision rule counts, so a
+            # legacy-cache cell is left out here too.
+            pair = [r for r in bundled_rows if r["model"] in (m, inc_model)]
+            mine = contributing_rows([r for r in pair if r["model"] == m])[0]
+            theirs = contributing_rows([r for r in pair if r["model"] == inc_model])[0]
+            excluded = sum(1 for r in pair if roll_exclusion(r) == "missed_window")
             if excluded:
                 out.append(
                     f"- **{excluded} cell(s) excluded from this comparison: the returned span "
                     f"did not match the requested window.** Their numbers describe a different "
                     f"segment than the fixture asked for."
                 )
+            legacy = sum(1 for r in pair if roll_exclusion(r) == "legacy")
+            if legacy:
+                out.append(
+                    f"- {legacy} legacy-cache cell(s) excluded from this comparison: their prompt is unverified."
+                )
             if not mine or not theirs:
-                out.append(f"- `{m}`: insufficient data (a run errored, or every cell missed its window).")
+                out.append(
+                    f"- `{m}`: insufficient data (a run errored, or every cell missed its window or came from a "
+                    "legacy cache entry)."
+                )
                 continue
             g_new = [r["max_gap_s"] for r in mine if r["max_gap_s"] is not None]
             g_old = [r["max_gap_s"] for r in theirs if r["max_gap_s"] is not None]
@@ -371,34 +1084,139 @@ def render(rows: list[dict], models: list[str], manifest: dict, incumbent: str |
             c_old = [r["cost_per_video_hour"] for r in theirs if r["cost_per_video_hour"]]
             am = lambda xs: round(sum(xs) / len(xs), 3) if xs else None  # noqa: E731
             out.append(
-                f"- {served_label(m, rows)} vs {served_label(incumbent, rows)}: mean max_gap "
+                f"- {served_label(m, rows)} vs {served_label(inc_model, rows)}: mean max_gap "
                 f"**{am(g_new)}s** vs {am(g_old)}s; mean cost/video-hour "
                 f"**${am(c_new)}** vs ${am(c_old)}."
             )
+        out += _render_decision(rows, manifest, incumbent_arm, rolls)
+    max_roll = max((r.get("roll") or 1 for r in rows), default=1)
     out += [
         "",
         "## Not measured here",
         "",
-        "State this every time. Timestamp *drift* (do stamps match the actual",
-        "audio) is unverified - only granularity is. Chunked long-video behavior",
-        "near the 64k output cap is not exercised by a single short segment.",
-        "Non-English and heavily accented speech are not represented in the",
-        "current fixture set. Each run is a single sample per cell.",
+        "State this every time. Timestamp offset is measured at cue level against the caption track only: word-level "
+        "drift is not measured, and on an auto-generated track the ruler is itself speech-recognition timing. "
+        "Chunked long-video behavior near the 64k output cap is not exercised by a single short segment. "
+        "Non-English and heavily accented speech are not represented in the current fixture set. "
+        f"Each cell ran {max_roll} roll(s).",
         "",
     ]
     return "\n".join(out)
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="Non-destructive Gemini model A/B for the transcript step.")
+def _render_decision(
+    rows: list[dict], manifest: dict, incumbent_arm: tuple[str, str], rolls: int | None = None
+) -> list[str]:
+    """The decision block: each rule's PASS / FAIL / NOT EVALUATED and the overall line (issue #292)."""
+    out = [
+        "",
+        "## Decision rule",
+        "",
+        "Adopt a candidate arm only if it has no hard fail in any roll, its median max_gap_s and median caption "
+        "offset are no worse than the incumbent's by more than the incumbent's own roll-to-roll spread, and its "
+        "cost is stated. A rule that cannot be judged is NOT EVALUATED, never PASS. PASS does not compare cost or "
+        "transcript completeness: read the medians table for those.",
+        "",
+    ]
+    decision = decision_rule(rows, manifest, incumbent_arm, rolls)
+    if not decision["candidates"]:
+        out.append("No candidate arm differs from the incumbent arm, so there is nothing to compare.")
+    for arm, verdict in decision["candidates"].items():
+        out += [f"### {_arm_text(arm, rows)} vs {_arm_text(incumbent_arm, rows)}", ""]
+        for rid, description in RULES:
+            status, detail = verdict["rules"][rid]
+            out.append(f"- {rid} {description}: {status} - {detail}")
+        out += ["", f"Overall: **{verdict['overall']}**", ""]
+    return out
+
+
+def _positive_int(value: str) -> int:
+    try:
+        n = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{value!r} is not an integer") from exc
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"--rolls must be at least 1, got {n}")
+    return n
+
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(description="Non-destructive Gemini model and prompt A/B for the transcript step.")
     ap.add_argument("--candidate", required=True, help="Model to evaluate.")
-    ap.add_argument("--incumbent", help="Model to compare against (the one in use today).")
+    ap.add_argument(
+        "--incumbent",
+        help="Model to compare against, or 'bundled' for the candidate model's bundled prompt "
+        f"(default: {v.DEFAULT_MODEL}, the model in use today).",
+    )
     ap.add_argument("--thinking", help="Force a thinking_level for ALL models (default: per-model correct value).")
     ap.add_argument("--fixtures", help="Comma-separated fixture ids (default: all).")
     ap.add_argument("--segment-seconds", type=int, help="Override segment length.")
+    ap.add_argument("--rolls", type=_positive_int, default=1, help="Runs per (fixture x arm) cell (default: 1).")
+    ap.add_argument(
+        "--candidate-prompt",
+        help="A transcript prompt file to run as a second arm for the candidate model, next to the bundled prompt.",
+    )
+    ap.add_argument(
+        "--fetch-captions",
+        action="store_true",
+        help="Fetch uncached caption tracks even when every cell is cached (otherwise a cached replay "
+        "touches no network).",
+    )
+    ap.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Generate every cell again and replace its cache entry (a cached outcome otherwise replays forever).",
+    )
     ap.add_argument("--out", help="Scorecard path (default: tests/evals/model-cards/<candidate>.md).")
-    ap.add_argument("--dry-run", action="store_true", help="Print the plan and cost shape; call nothing.")
-    args = ap.parse_args()
+    ap.add_argument("--dry-run", action="store_true", help="Print the plan and the cost estimate; call nothing.")
+    return ap
+
+
+def resolve_arms(
+    candidate: str, incumbent: str | None, bundled: PromptArm, candidate_prompt: PromptArm | None
+) -> tuple[list[tuple[str, PromptArm]], tuple[str, str]]:
+    """The arms to run and the incumbent arm (issue #292).
+
+    ``--incumbent bundled`` is the candidate model's bundled-prompt arm; a model
+    name is that model's bundled arm; omitted is ``DEFAULT_MODEL`` with the
+    bundled prompt. A candidate prompt adds one arm for the candidate model.
+    """
+    inc_model = candidate if incumbent == BUNDLED else (incumbent or v.DEFAULT_MODEL)
+    models = [candidate] + ([inc_model] if inc_model != candidate else [])
+    arms = [(m, bundled) for m in models]
+    if candidate_prompt is not None:
+        arms.append((candidate, candidate_prompt))
+    return arms, (inc_model, BUNDLED)
+
+
+def prompt_tokens_estimate(text: str) -> int:
+    """Estimated input tokens of a prompt: characters divided by ``EST_CHARS_PER_TOKEN``."""
+    return math.ceil(len(text) / EST_CHARS_PER_TOKEN)
+
+
+def estimate_cost(arms: list[tuple[str, int]], fixtures: int, rolls: int, seg: int) -> tuple[float, list[str]]:
+    """Dry-run estimate in dollars for ``(model, prompt tokens)`` arms, and the models with no pricing.
+
+    Each call pays for the video segment at the measured per-minute rates plus
+    the prompt's estimated tokens at the arm's input rate.
+    """
+    total = 0.0
+    unknown: list[str] = []
+    for model, prompt_tokens in arms:
+        pin, pout, _ = PRICING.get(model, (None, None, None))
+        if pin is None:
+            if model not in unknown:
+                unknown.append(model)
+            continue
+        video_in = seg / 60 * EST_INPUT_TOKENS_PER_VIDEO_MINUTE
+        video_out = seg / 60 * EST_OUTPUT_TOKENS_PER_VIDEO_MINUTE
+        per_cell = ((video_in + prompt_tokens) * pin + video_out * pout) / 1e6
+        total += per_cell * fixtures * rolls
+    return total, unknown
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
 
     manifest = yaml.safe_load(FIXTURES.read_text(encoding="utf-8"))
     if FIXTURES == _FIXTURES_TEMPLATE:
@@ -419,38 +1237,114 @@ def main() -> int:
         if not fixtures:
             print(f"No fixture matched {sorted(want)}. Available: {[f['id'] for f in manifest['fixtures']]}")
             return 2
-    models = [args.candidate] + ([args.incumbent] if args.incumbent and args.incumbent != args.candidate else [])
+    # Probe before paying [core: probe-before-pay]: the candidate prompt is read
+    # before any client, fetch or call, and before the dry run prints a plan.
+    candidate_prompt = None
+    if args.candidate_prompt:
+        path = Path(args.candidate_prompt)
+        if not path.is_file():
+            print(f"--candidate-prompt {path} is not a file; nothing was called.")
+            return 2
+        try:
+            candidate_prompt = candidate_prompt_arm(path)
+        except (OSError, ValueError) as exc:
+            print(f"--candidate-prompt {path} cannot be read as UTF-8 text ({exc}); nothing was called.")
+            return 2
+    arms, incumbent_arm = resolve_arms(args.candidate, args.incumbent, bundled_prompt(), candidate_prompt)
+    models = list(dict.fromkeys(m for m, _ in arms))
 
-    print(f"{len(fixtures)} fixture(s) x {len(models)} model(s) = {len(fixtures) * len(models)} calls, {seg}s each")
+    calls = len(fixtures) * len(arms) * args.rolls
+    print(f"{len(fixtures)} fixture(s) x {len(arms)} arm(s) x {args.rolls} roll(s) = {calls} calls, {seg}s each")
+    for model, prompt in arms:
+        print(f"  arm: {model} / {prompt.label}")
+    print(f"  incumbent: {incumbent_arm[0]} / {incumbent_arm[1]}")
     for m in models:
         if m not in PRICING:
             print(f"  WARNING: no pricing for {m}; cost columns will be blank.")
+    prompt_tokens = {p.label: prompt_tokens_estimate(p.text) for _, p in arms}
+    total, unknown = estimate_cost([(m, prompt_tokens[p.label]) for m, p in arms], len(fixtures), args.rolls, seg)
+    print(
+        f"Estimated cost: ${total:.4f} for {calls} call(s), at about {EST_INPUT_TOKENS_PER_VIDEO_MINUTE} input and "
+        f"{EST_OUTPUT_TOKENS_PER_VIDEO_MINUTE} output tokens per video-minute (docs/cost-model.md), plus each "
+        f"call's prompt at about {EST_CHARS_PER_TOKEN} characters per token ("
+        + ", ".join(f"{label}: {n} tokens" for label, n in prompt_tokens.items())
+        + "). An estimate from average measured rates"
+        + (", with every cell generated again (--refresh)" if args.refresh else " that ignores cached cells")
+        + "; output-heavy models can exceed it."
+        + (f" Not priced: {', '.join(unknown)}." if unknown else "")
+    )
     if args.dry_run:
         for f in fixtures:
             print(f"  {f['id']:24} {f['url']}  start={f['start']}s")
         print("\nDry run: nothing called, nothing written.")
         return 0
 
-    key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if not key:
-        print("GEMINI_API_KEY not set.")
-        return 1
+    scratch = CARDS / "_raw"
+    # The SDK types resolve the settings the cache key records (thinking config,
+    # media resolution); importing them builds no client and calls nothing.
     v.require_gemini()
     from google.genai import types
 
-    client = v.create_client(key)
-    scratch = CARDS / "_raw"
+    plan = [(fx, m, p, roll) for fx in fixtures for m, p in arms for roll in range(1, args.rolls + 1)]
+    misses = sum(
+        1
+        for fx, m, p, roll in plan
+        if cached_cell(
+            scratch,
+            cache_stem(fx["id"], m, p.label, roll),
+            cache_key(fx, m, p, roll, seg, request_settings(types, m, args.thinking)),
+            p.label,
+            roll,
+        )
+        is None
+    )
+    if args.refresh:
+        # Issue #292 review: a cached outcome (a missed window, a metric that
+        # could not be computed) replays forever; --refresh generates it again.
+        misses = len(plan)
+    # Issue #292: the client is built only when a cell needs a live call, so a
+    # full cache replay needs no key and constructs nothing.
+    client = None
+    if misses:
+        key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if not key:
+            print(f"GEMINI_API_KEY not set, and {misses} cell(s) need a live call.")
+            return 1
+        client = v.create_client(key)
+    else:
+        print("Every cell is cached: no Gemini client is built.")
+    # A run of cache hits only makes no network call of any kind: an uncached
+    # caption track is fetched only alongside a live call, or on request.
+    fetch_captions = bool(misses) or args.fetch_captions
     scratch.mkdir(parents=True, exist_ok=True)
 
     rows = []
     for fx in fixtures:
         print(f"\n{fx['id']}:")
-        for m in models:
-            rows.append(run_one(client, types, fx, m, args.thinking, seg, scratch))
+        track = fixture_caption_track(fx, scratch, fetch=fetch_captions)
+        if track.cues is None:
+            print(f"  captions: {track.reason}")
+        for m, prompt in arms:
+            for roll in range(1, args.rolls + 1):
+                rows.append(
+                    run_one(
+                        client,
+                        types,
+                        fx,
+                        m,
+                        args.thinking,
+                        seg,
+                        scratch,
+                        roll=roll,
+                        prompt=prompt,
+                        caption_track=track,
+                        refresh=args.refresh,
+                    )
+                )
 
     CARDS.mkdir(parents=True, exist_ok=True)
     out_path = Path(args.out) if args.out else CARDS / f"{args.candidate}.md"
-    out_path.write_text(render(rows, models, manifest, args.incumbent), encoding="utf-8")
+    out_path.write_text(render(rows, models, manifest, incumbent_arm, args.rolls), encoding="utf-8")
     (out_path.with_suffix(".json")).write_text(json.dumps(rows, indent=2), encoding="utf-8")
     print(f"\nScorecard: {out_path}")
     errs = [r for r in rows if r.get("error")]

@@ -1,0 +1,81 @@
+# Model and prompt benchmark runbook
+
+One page for the two questions this repo keeps asking: a new Gemini model arrived, or a transcript prompt candidate exists. Both use one harness, `scripts/model_eval.py`, and end with a verdict per written rule instead of a fresh judgment call. Why it works this way: `.claude/rules/evals.md` (the issue #292 entry).
+
+## Before the first run
+
+Copy `tests/evals/model_fixtures.yaml.example` to `tests/evals/model_fixtures.yaml` (gitignored) and point each fixture at a real video. A fixture can set `expects_speakers: false` or `expects_screen: false`; both default to true. Set `expects_screen: false` on a fixture with little or nothing on screen, or every roll of it is a hard fail for a correct empty `screen_content`.
+
+Always dry-run first. The dry run prints the arms, the call count (fixtures x arms x rolls) and the cost estimate, and calls nothing: no Gemini client and no caption fetch.
+
+## A new model arrived
+
+```bash
+python scripts/model_eval.py --candidate <new-model> --rolls 3 --out tests/evals/model-cards/<new-model>.md --dry-run
+python scripts/model_eval.py --candidate <new-model> --rolls 3 --out tests/evals/model-cards/<new-model>.md
+```
+
+To generate every cell again instead of replaying the cache (see "Caching"):
+
+```bash
+python scripts/model_eval.py --candidate <new-model> --rolls 3 --out tests/evals/model-cards/<new-model>.md --refresh
+```
+
+With no `--incumbent`, the incumbent is the default model in `scripts/video_intel.py` (`DEFAULT_MODEL`) with the bundled prompt, so the run has two arms. Name another incumbent with `--incumbent <model>`.
+
+Read `tests/evals/model-cards/<new-model>.md` (and its `.json` sidecar), the "Decision rule" section first. The card is written to `--out`, and a card already at that path is overwritten: for a model that already has a tracked card, pick a new name such as `<new-model>-rerun.md`. A model you adopt needs its card under its own name, because `tests/test_model_scorecard_gate.py` reads `<model>.json`.
+
+## A prompt candidate
+
+```bash
+python scripts/model_eval.py --candidate <current-default> --candidate-prompt path/to/candidate-transcript.md --incumbent bundled --rolls 3 --out tests/evals/model-cards/prompt-candidate.md --dry-run
+python scripts/model_eval.py --candidate <current-default> --candidate-prompt path/to/candidate-transcript.md --incumbent bundled --rolls 3 --out tests/evals/model-cards/prompt-candidate.md
+```
+
+`--incumbent bundled` compares the candidate prompt with the bundled prompt on the same model. Without `--out`, the card would go to `<current-default>.md` and overwrite the tracked scorecard of the default model, so always name a new card. The prompt file is read the way the bundled prompt is (UTF-8 text, so a CRLF copy and an LF copy are the same prompt). The candidate arm is labelled `candidate:<first 8 hex of the sha256 of that text>`, and the card's "Prompts per arm" section records each arm's full hash and source. Read `tests/evals/model-cards/prompt-candidate.md`, the "Decision rule" section first. `--incumbent bundled` with no `--candidate-prompt` has nothing to compare: the card says there is no candidate arm.
+
+## The decision rule in plain words
+
+A candidate arm is adopted only if all four hold on every fixture:
+
+- R1: no roll of the candidate is a hard fail. A hard fail is a response that is not the transcript envelope after the production parser, a missing `speakers` or `screen_content` task the fixture expects, or a roll whose generation failed.
+- R2: the candidate's median `max_gap_s` (the worst-case deep-link error) is no worse than the incumbent's median by more than the incumbent's own roll-to-roll spread (max minus min). It is judged only when both arms have a usable value on every requested roll, and only when the served models allow the comparison (below).
+- R3: the same comparison for the median caption offset.
+- R4: a measured cost on every requested roll of the candidate. A roll whose token counts were missing or unreadable has no cost; it is never counted as $0.
+
+Each rule prints PASS, FAIL or NOT EVALUATED, and an overall line follows. Overall is PASS only when every rule passes on every fixture. PASS does not compare cost or transcript completeness: read the medians table for those.
+
+## What each NOT EVALUATED means
+
+| Message | Meaning | How to clear it |
+|---|---|---|
+| needs --rolls >= 2 | with one roll per arm the incumbent's spread is unknown | run with `--rolls 3` |
+| candidate arm incomplete / incumbent arm incomplete (roll N missing, failed, legacy, missed window, no value) | that arm lacks a usable value on some requested roll, and comparing unequal or partial roll sets could flatter either side | read the roll table; fix the fixture window if a roll missed it, then run with `--refresh` (a successful response is cached before it is scored, so a plain re-run replays the same outcome) |
+| the candidate has no caption offset, or only N entries aligned | no caption track, or fewer than 5 dialogue entries matched a caption cue | the "Caption alignment" section names the reason; a refused request is YouTube refusing this IP, not a video without captions |
+| no incumbent rolls for this fixture | the incumbent arm has no cell for that fixture | run both arms on the same fixtures |
+| both arms were served by one model | two model names were requested but the provider reported the same model for both | the comparison measures one model against itself; pick a different incumbent |
+| a prompt comparison served by two models | one model was requested for both prompts, but the provider reported different models (a version suffix counts), so a model change would be credited to the prompt | run with `--refresh` so both arms are generated in one run |
+| mixed served models in an arm | the rolls of one arm were answered by more than one model | run with `--refresh` |
+| served model unknown | a counted roll has no recorded served model, in a model or a prompt comparison, so nothing shows which model answered | run with `--refresh` |
+| cost not measured on every roll | a candidate roll has no usable token counts, failed, came from a legacy entry or missed its window | run with `--refresh`; a model with no `PRICING` entry is a FAIL instead |
+
+A `legacy-cache roll(s) excluded` note means a cell came from a cache entry written before the cache key existed. Its prompt is unverified, so the rule leaves it out, and so do the medians table, the cost rule and the mean line. Run with `--refresh` to measure it again.
+
+A FAIL on R1 caused only by `generation_failed` with a transport error (a timeout, a 429) is an infrastructure failure, not a model verdict. Re-run; failed rolls are never cached.
+
+## The cost line
+
+The dry run prices every arm as fixtures x rolls x segment minutes at the transcript token rates in `docs/cost-model.md` (about 5,500 input and 450 output tokens per video-minute at low media resolution) times the model's rate in `PRICING`, plus each call's prompt at about 4 characters per token at the arm's input rate (the line prints each prompt's estimated tokens, so a long candidate prompt shows up). It is an estimate from average measured rates. It ignores cells already cached (those cost nothing) unless `--refresh` is given, and a model that emits more output tokens can exceed it. A model missing from `PRICING` is named as not priced and adds nothing to the estimate.
+
+## Caching
+
+Every roll is cached under `tests/evals/model-cards/_raw/` (gitignored), keyed on the model, the fixture and its window, the prompt's content hash, the thinking config, media resolution and output-token cap actually sent, and the roll number. A re-run replays what is cached and calls Gemini only for the rest; when everything is cached, no API key is needed. A successful response is cached before it is scored, so a re-run replays a missed window or an unmeasured metric exactly as before: `--refresh` generates every cell of the run again and replaces its entry. It removes each cell's entry before the attempt, so a cell whose regeneration fails is left absent (a later plain run generates it) rather than replaying the older roll; cached caption tracks are not refreshed, since a caption track does not depend on the model or the prompt. Captions are fetched once per fixture and cached in the same folder, but a run in which every cell is cached makes no network call at all: an uncached caption track is fetched only when the run makes a live call, or when you pass `--fetch-captions`.
+
+## What the harness does not measure
+
+- Word-level timing. The offset is cue level: a dialogue entry's stamp against the start of the caption cue holding its first words. On an auto-generated track, the ruler is itself speech-recognition timing. Measured once on one real video: about 99% of entries aligned, the median offset was about +1 second (stamps slightly late) and the 90th percentile of the absolute offset about 3 seconds.
+- Long videos. Chunked behavior near the output cap is not exercised by a single short segment.
+- Non-English and heavily accented speech, unless your fixtures include them.
+- Transcript completeness or quality of the text itself, beyond the hard fails.
+- Offset bias. Rolling auto-caption cues overlap the next cue, and an entry at a window edge can align to a cue just outside it; both can shift the offset a little.
+- A bare `--candidate X` with no `--incumbent` also runs the default model, so it costs two arms; the dry run shows it.
