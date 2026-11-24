@@ -127,6 +127,12 @@ transcript_timeout_seconds: 600
 channels:
   - name: example_creator
     url: https://youtube.com/@example
+    # channel_id (optional) pins the channel by its UC... id. Without it, the
+    # first id the handle resolves to is remembered in <output_dir>/_channels/ids.json
+    # and kept if the handle later points at a different channel (a released
+    # handle can be re-registered by anyone); the scan then logs a WARNING.
+    # Set it when a creator really moved to a new channel.
+    # channel_id: UCxxxxxxxxxxxxxxxxxxxxxx
     auto_transcript: all
     since: 90d
     # transcript_source controls how the transcript step gets its text.

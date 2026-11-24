@@ -963,6 +963,8 @@ To temporarily bulk-scan such a creator, remove the flag rather than
 overriding it on the command line. The flag's purpose is durable
 manual-only routing, not advisory exclusion.
 
+**Channel identity (`channel_id:`):** A channel is followed by its `UC...` id, not its handle. The first time a handle resolves, its id is recorded in `<output_dir>/_channels/ids.json` (keyed by the channel `name`). If the handle later resolves to a different channel (a creator renamed it and someone else registered it), `scan` and the headline digest keep the known id and log one WARNING naming both ids: nothing from the other channel is fetched, sent to Gemini or written. If the creator really moved, set `channel_id: UC...` on the entry (an explicit pin wins and makes no handle lookup) or update `url`; to accept the new channel instead, delete that channel's entry from `_channels/ids.json`. `scan --dry-run` logs the warning but writes nothing. Manual `--url` routing reads known ids without an API call.
+
 **Headline digest (`headline_digest: true`):** Peripheral vision over YouTube
 creators you do NOT actively follow. Add `headline_digest: true` alongside
 `enabled: false` and a full `scan` ends with an "Other headlines - new in

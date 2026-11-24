@@ -12,6 +12,7 @@ Prerequisites:
 """
 
 import argparse
+import contextlib
 import csv
 import dataclasses
 import functools
@@ -1926,6 +1927,196 @@ def get_channel_id(youtube, channel_url):
         return ch["id"], ch["snippet"]["title"]
 
     return None, None
+
+
+# Issue #312: a channel's identity is its `UC...` id; the handle is decoration.
+# A released handle can be re-registered by anyone, so the first id a handle
+# resolved to is remembered here, keyed by the channel's config `name`, and a
+# later run that sees the handle answer with a different id keeps the known id.
+CHANNEL_IDS_DIR_NAME = "_channels"
+CHANNEL_IDS_FILENAME = "ids.json"
+# One WARNING per unusable state file (or entry) per process, not one per channel.
+_CHANNEL_IDS_WARNED: set[str] = set()
+
+
+def _channel_ids_path(output_dir: Path) -> Path:
+    return Path(output_dir) / CHANNEL_IDS_DIR_NAME / CHANNEL_IDS_FILENAME
+
+
+def _warn_channel_ids_once(path: Path, key: str, message: str, *fmt_args) -> None:
+    marker = f"{path}|{key}"
+    if marker in _CHANNEL_IDS_WARNED:
+        return
+    _CHANNEL_IDS_WARNED.add(marker)
+    log.warning(message, *fmt_args)
+
+
+def load_learned_channel_ids(output_dir: Path) -> dict | None:
+    """The learned channel ids in `<output_dir>/_channels/ids.json` (issue #312).
+
+    `{}` when the file does not exist. `None` when it exists but cannot be used
+    (unreadable, not UTF-8 JSON, or not a JSON object): ONE WARNING, and callers
+    behave as if no id were learned. `None` is distinct from `{}` so the writer
+    refuses to overwrite a file whose contents might still be recoverable.
+    Reads bytes, then decodes and parses, under `(ValueError, OSError)`
+    [core: #124 read-guard].
+    """
+    path = _channel_ids_path(output_dir)
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return {}
+    except OSError as e:
+        _warn_channel_ids_once(
+            path, "", "Channel id state %s is unreadable (%s); learned ids ignored this run.", path, e
+        )
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except ValueError as e:
+        _warn_channel_ids_once(
+            path,
+            "",
+            "Channel id state %s is not valid JSON (%s); learned ids ignored this run and the file is left as is.",
+            path,
+            type(e).__name__,
+        )
+        return None
+    if not isinstance(data, dict):
+        _warn_channel_ids_once(
+            path,
+            "",
+            "Channel id state %s is not a JSON object; learned ids ignored this run and the file is left as is.",
+            path,
+        )
+        return None
+    return data
+
+
+def _record_learned_channel_id(output_dir: Path, name: str, channel_id: str, title: str | None) -> None:
+    """Add one learned entry; never change or delete an existing one, never overwrite an unusable file.
+
+    Re-reads the file first so an entry another writer added is kept. The write
+    is atomic (temp file in the same folder, then `os.replace`). A failed write
+    is one WARNING, never an abort: the pin is protection, not a prerequisite.
+    """
+    current = load_learned_channel_ids(output_dir)
+    if current is None or name in current:
+        return
+    current[name] = {"channel_id": channel_id, "title": title, "first_seen": datetime.now(UTC).strftime("%Y-%m-%d")}
+    path = _channel_ids_path(output_dir)
+    tmp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(tmp_path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(json.dumps(current, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+        os.replace(tmp_path, path)
+    except OSError as e:
+        log.warning("[%s] Could not record channel id %s in %s (%s).", name, channel_id, path, e)
+        with contextlib.suppress(OSError):
+            tmp_path.unlink(missing_ok=True)
+
+
+def resolve_channel_identity(
+    youtube, channel_cfg: dict, output_dir: Path | None, *, dry_run: bool, detect_drift: bool = True
+) -> tuple[str | None, str | None]:
+    """The ONE answer to "which channel id does this config entry fetch" (issue #312).
+
+    Precedence: an explicit `channel_id:`, then a bare `UC...` in `url`, then the
+    id learned in `_channels/ids.json`, then live handle resolution. An explicit
+    pin makes no lookup and never touches the state file. With a learned id the
+    live lookup still runs as the drift detector (`detect_drift=True`, the scan
+    and the headline digest): a different id is one WARNING and the KNOWN id is
+    returned, before any fetch [core: probe-before-pay]; a handle that no longer
+    resolves, or a non-quota error, is one WARNING and the known id. A quota
+    stop propagates. `detect_drift=False` (manual `--url` matching) returns a
+    learned id with no call at all. An id resolved live with none learned is
+    recorded unless `dry_run`. `output_dir=None` means no state file.
+    Returns `(channel_id, title)`; the title may be None.
+    """
+    name = channel_cfg.get("name")
+    url = channel_cfg.get("url")
+    explicit = channel_cfg.get("channel_id")
+    if explicit is not None:
+        if isinstance(explicit, str) and _UC_CHANNEL_ID_RE.match(explicit.strip()):
+            return explicit.strip(), None
+        log.error(
+            "[%s] channel_id %r is not a YouTube channel id (UC followed by 22 characters); skipping this channel. "
+            "Fix channel_id in config.yaml.",
+            name,
+            explicit,
+        )
+        return None, None
+    if isinstance(url, str) and _UC_CHANNEL_ID_RE.match(url.strip()):
+        return url.strip(), None
+
+    learned = None
+    if output_dir is not None:
+        ids = load_learned_channel_ids(output_dir)
+        entry = ids.get(name) if ids else None
+        if isinstance(entry, dict) and isinstance(entry.get("channel_id"), str) and entry["channel_id"]:
+            learned = entry
+        elif entry is not None:
+            _warn_channel_ids_once(
+                _channel_ids_path(output_dir),
+                str(name),
+                "[%s] The entry in %s has no usable channel_id; it is ignored and left as is.",
+                name,
+                _channel_ids_path(output_dir),
+            )
+
+    if learned is None:
+        live_id, live_title = get_channel_id(youtube, url)
+        if live_id and output_dir is not None and not dry_run:
+            _record_learned_channel_id(output_dir, name, live_id, live_title)
+        return live_id, live_title
+
+    known_id, known_title = learned["channel_id"], learned.get("title")
+    if not detect_drift:
+        return known_id, known_title
+    remedy = (
+        f"If the creator really moved, update url in config.yaml or set channel_id: explicitly; to accept the new "
+        f"channel, remove the '{name}' entry from {_channel_ids_path(output_dir)}."
+    )
+    try:
+        live_id, live_title = get_channel_id(youtube, url)
+    except Exception as e:
+        if _is_youtube_quota_stop(e):
+            raise
+        log.warning(
+            "[%s] The handle %s no longer resolves (%s); following the known channel %s (%s). %s",
+            name,
+            url,
+            describe_error_for_log(e),
+            known_id,
+            known_title,
+            remedy,
+        )
+        return known_id, known_title
+    if not live_id:
+        log.warning(
+            "[%s] The handle %s no longer resolves to any channel; following the known channel %s (%s). %s",
+            name,
+            url,
+            known_id,
+            known_title,
+            remedy,
+        )
+        return known_id, known_title
+    if live_id != known_id:
+        log.warning(
+            "[%s] The handle %s now resolves to %s (%s), but this channel is known as %s (%s). Keeping the known "
+            "channel: the handle has probably changed owner. %s",
+            name,
+            url,
+            live_id,
+            live_title,
+            known_id,
+            known_title,
+            remedy,
+        )
+        return known_id, known_title
+    return known_id, live_title or known_title
 
 
 def fetch_channel_videos(youtube, channel_id, since_dt):
@@ -8799,12 +8990,12 @@ def cmd_scan(args, config):
             continue
 
         # Resolve channel
-        channel_id, channel_title = get_channel_id(youtube, ch_url)
+        channel_id, channel_title = resolve_channel_identity(youtube, ch, output_dir, dry_run=args.dry_run)
         if not channel_id:
             log.warning("[%s] Channel not found: %s", ch_name, ch_url)
             continue
 
-        log.info("[%s] %s", ch_name, channel_title)
+        log.info("[%s] %s", ch_name, channel_title or ch_url)
 
         # Validate selective config fields
         skip_channel = False
@@ -9825,7 +10016,9 @@ def _cmd_mindmap_impl(args, config):
                 # any description already on disk untouched.
                 description = snippet.get("description") or None
                 if not channel_name:
-                    channel_name = match_configured_channel(youtube, config, snippet.get("channelId"))
+                    channel_name = match_configured_channel(
+                        youtube, config, snippet.get("channelId"), output_dir=output_dir
+                    )
                     if not channel_name:
                         channel_name = slugify(snippet["channelTitle"])
 
@@ -10138,7 +10331,9 @@ def _cmd_transcript_impl(args, config):
                     if not channel_name:
                         # Match against configured channels by channel ID.
                         # Issue #205: one shared, guarded, cached matcher.
-                        channel_name = match_configured_channel(youtube, config, snippet.get("channelId"))
+                        channel_name = match_configured_channel(
+                            youtube, config, snippet.get("channelId"), output_dir=output_dir
+                        )
                         if not channel_name:
                             channel_name = slugify(snippet["channelTitle"])
 
@@ -10551,7 +10746,7 @@ def _cmd_process_url(args, config):
                 # any description already on disk untouched.
                 description = snippet.get("description") or None
                 if not channel_name:
-                    channel_name = match_configured_channel(yt, config, snippet.get("channelId"))
+                    channel_name = match_configured_channel(yt, config, snippet.get("channelId"), output_dir=output_dir)
                     if not channel_name:
                         channel_name = slugify(snippet["channelTitle"])
     channel_name = channel_name or "_standalone"
@@ -16363,7 +16558,7 @@ def rank_unseen(unseen: list[dict], profile: dict | InterestModel) -> list[dict]
 # --- manual --url channel matching (issue #205) ----------------------------
 
 
-def _configured_channel_id(youtube, channel_config: dict, cache: dict) -> str | None:
+def _configured_channel_id(youtube, channel_config: dict, cache: dict, output_dir: Path | None = None) -> str | None:
     """Resolve one configured channel to its `UC...` id, or None.
 
     Three things this must keep doing:
@@ -16384,18 +16579,18 @@ def _configured_channel_id(youtube, channel_config: dict, cache: dict) -> str | 
       PER CONFIGURED CHANNEL on every manual run - roughly 75 units to answer
       "which channel is this video from", repeated for each of the three
       commands that asked.
+    * **A known id needs no call (issue #312).** `resolve_channel_identity` with
+      `detect_drift=False` answers an explicit `channel_id:` or an id learned in
+      `output_dir`'s `_channels/ids.json` without the API, and records an id it
+      had to resolve live. Drift comparison is the scan's and the digest's job.
     """
     url = channel_config.get("url")
     if not _is_youtube_channel_source(url):
         return None
     if url in cache:
         return cache[url]
-    # A bare `UC...` id in the config needs no lookup at all.
-    if _UC_CHANNEL_ID_RE.match(url.strip()):
-        cache[url] = url.strip()
-        return cache[url]
     try:
-        ch_id, _ = get_channel_id(youtube, url)
+        ch_id, _ = resolve_channel_identity(youtube, channel_config, output_dir, dry_run=False, detect_drift=False)
     except Exception as e:  # one bad channel must not kill the run
         log.warning("Could not resolve channel id for %s: %s", url, describe_error_for_log(e))
         # Record that identity could not be ESTABLISHED, which is not the
@@ -16411,7 +16606,9 @@ def _configured_channel_id(youtube, channel_config: dict, cache: dict) -> str | 
     return ch_id
 
 
-def match_configured_channel(youtube, config: dict, yt_channel_id: str | None) -> str | None:
+def match_configured_channel(
+    youtube, config: dict, yt_channel_id: str | None, *, output_dir: Path | None = None
+) -> str | None:
     """Name of the configured channel owning `yt_channel_id`, or None.
 
     ONE definition, three callers (`cmd_transcript`, `cmd_mindmap`,
@@ -16431,7 +16628,7 @@ def match_configured_channel(youtube, config: dict, yt_channel_id: str | None) -
     # convenience with `_standalone` always available, so one bad row must not
     # abort a run started to transcribe one video.
     for ch in configured_channels(config):
-        if _configured_channel_id(youtube, ch, cache) == yt_channel_id:
+        if _configured_channel_id(youtube, ch, cache, output_dir) == yt_channel_id:
             # The name is guaranteed usable by the accessor, so the old
             # nameless-match branch (a `return None` that hid a real match one
             # row below it) is gone rather than left unreachable: a nameless
@@ -16746,7 +16943,7 @@ def render_headline_digest(youtube, config: dict, output_dir: Path, *, dry_run: 
     for channel in headline_channels:
         attempted += 1
         try:
-            channel_id, channel_title = get_channel_id(youtube, channel["url"])
+            channel_id, channel_title = resolve_channel_identity(youtube, channel, output_dir, dry_run=dry_run)
         except Exception as e:
             # Symmetric with the fetch path below: a quota-exhaustion at channel
             # resolution stops the digest early rather than aborting the scan.
