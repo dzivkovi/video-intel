@@ -14762,11 +14762,32 @@ def _hidden_entry_stamps(entry: TranscriptBodyEntry) -> list[int]:
     return stamps
 
 
-def _splice_pieces(pieces: list[TranscriptBodyEntry], screens: list[TranscriptBodyEntry]) -> list[TranscriptBodyEntry]:
+def _with_separator(entry: TranscriptBodyEntry, newline: str) -> TranscriptBodyEntry:
+    """``entry`` ending in the writer's blank-line separator; its content lines are never changed.
+
+    A SCREEN block owns every line until a blank line, so an entry placed
+    after a block that does not end in one would be read as the block's
+    content. The writer leaves the file's LAST block without that blank line,
+    and a wall followed by blocks to the end of the file is exactly the shape
+    this command repairs, so the splice supplies the separator: whitespace
+    after the block, nothing inside it.
+    """
+    if entry.lines and not entry.lines[-1].strip():
+        return entry
+    lines = list(entry.lines)
+    if lines and not lines[-1].endswith(("\n", "\r")):
+        lines[-1] = lines[-1] + newline
+    return TranscriptBodyEntry(kind=entry.kind, stamp=entry.stamp, lines=[*lines, newline])
+
+
+def _splice_pieces(
+    pieces: list[TranscriptBodyEntry], screens: list[TranscriptBodyEntry], newline: str = "\n"
+) -> list[TranscriptBodyEntry]:
     """The first piece, then the other pieces and the entry's own SCREEN blocks merged by stamp.
 
     Both lists keep their own order; at an equal stamp the piece comes first,
-    as ``merge_transcript_json`` puts speech before a screen.
+    as ``merge_transcript_json`` puts speech before a screen. A piece placed
+    after a block gets the writer's separator in between (``_with_separator``).
     """
     out = [pieces[0]]
     rest, i, j = pieces[1:], 0, 0
@@ -14774,6 +14795,8 @@ def _splice_pieces(pieces: list[TranscriptBodyEntry], screens: list[TranscriptBo
         if j >= len(screens) or (
             i < len(rest) and timestamp_to_seconds(rest[i].stamp) <= timestamp_to_seconds(screens[j].stamp)
         ):
+            if out[-1].kind == TRANSCRIPT_ENTRY_SCREEN:
+                out[-1] = _with_separator(out[-1], newline)
             out.append(rest[i])
             i += 1
         else:
@@ -14932,8 +14955,23 @@ def plan_transcript_repair(
         j = i + 1
         while j < len(body.entries) and body.entries[j].kind != TRANSCRIPT_ENTRY_DIALOGUE:
             j += 1
-        entries.extend(_splice_pieces(pieces, body.entries[i + 1 : j]))
+        entries.extend(_splice_pieces(pieces, body.entries[i + 1 : j], newline))
         i = j
+    if entries[-1] is not body.entries[-1] and not body.trailer:
+        # The file ends the way it ended before: a piece that now closes the
+        # file takes the old last entry's tail (the writer's single final
+        # newline), never the blank lines it carried mid-file.
+        last = entries[-1]
+        content = list(last.lines)
+        while len(content) > 1 and not content[-1].strip():
+            content.pop()
+        old = body.entries[-1].lines
+        tail = []
+        for line in reversed(old[1:]):
+            if line.strip():
+                break
+            tail.insert(0, line)
+        entries[-1] = TranscriptBodyEntry(kind=last.kind, stamp=last.stamp, lines=[*content, *tail])
     planned = TranscriptBody(header=body.header, entries=entries, trailer=body.trailer)
     return TranscriptRepair(text=planned.render(), candidates=candidates, overall_coverage=overall, planned=planned)
 
@@ -14942,9 +14980,11 @@ def repair_reparses_to_plan(repair: TranscriptRepair) -> bool:
     """True when the repaired bytes, parsed again, give exactly the planned entries.
 
     Same header and trailer, and the same entries in the same order with the
-    same kinds, stamps and lines (so every line has the same owner). A repair
-    that would not read back as planned is never written: a re-read would
-    otherwise fuse a piece into a neighbouring block.
+    same kinds, stamps and text (so every line has the same owner). Each
+    entry is compared as its rendered text: a piece built from multi-line
+    text holds several physical lines in one element, which the parser
+    returns as several. A repair that would not read back as planned is never
+    written: a re-read would otherwise fuse a piece into a neighbouring block.
     """
     if repair.planned is None:
         return True
@@ -14953,8 +14993,8 @@ def repair_reparses_to_plan(repair: TranscriptRepair) -> bool:
     return (
         parsed.header == planned.header
         and parsed.trailer == planned.trailer
-        and [(e.kind, e.stamp, e.lines) for e in parsed.entries]
-        == [(e.kind, e.stamp, e.lines) for e in planned.entries]
+        and [(e.kind, e.stamp, "".join(e.lines)) for e in parsed.entries]
+        == [(e.kind, e.stamp, "".join(e.lines)) for e in planned.entries]
     )
 
 

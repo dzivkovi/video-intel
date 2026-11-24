@@ -1821,15 +1821,90 @@ class TestRepairsReadBackAsPlanned:
         # The writer's separator: every piece but the last is followed by a blank line.
         assert all(not entry.lines[-1].strip() for entry, _ in dialogue[:-1])
 
-    def test_a_screen_block_without_its_closing_blank_line_makes_the_plan_fail_the_read_back(self):
-        # A piece placed after this block would be read as the block's content,
-        # and the block's bytes are never changed, so this plan must not be written.
+    def test_a_screen_block_without_its_closing_blank_line_gets_the_separator_and_repairs(self):
+        # Hand-made: the block ends the file with no blank line after it. The
+        # splice adds the separator after it; its content lines are unchanged.
         sentences, cues = _talk()
-        text = (
-            "# Transcript: T\n\n---\n\n" + f'[00:12] Host: "{" ".join(sentences)}"\n' + "  SCREEN [05:00] [slide]: s\n"
-        )
+        block = "  SCREEN [05:00] [slide]: s\n"
+        text = "# Transcript: T\n\n---\n\n" + f'[00:12] Host: "{" ".join(sentences)}"\n' + block
 
         repair = vi.plan_transcript_repair(text, _cue_records(cues))
 
-        assert repair.repaired
-        assert not vi.repair_reparses_to_plan(repair)
+        assert repair.repaired and vi.repair_reparses_to_plan(repair)
+        screens = [e for e in vi.parse_transcript_body(repair.text).entries if e.kind == vi.TRANSCRIPT_ENTRY_SCREEN]
+        assert screens[0].lines[0] == block
+        assert all(not line.strip() for line in screens[0].lines[1:])  # only separator whitespace added
+        assert vi.plan_transcript_repair(repair.text, _cue_records(cues)).text == repair.text
+
+
+def _writer_markdown_without_notes(path: Path, wall_text: str) -> None:
+    """Real writer output with SCREEN blocks to the end of the file and no speaker notes.
+
+    Without notes ``merge_transcript_json`` ends the last SCREEN block with one
+    newline and no closing blank line.
+    """
+    raw = {
+        "transcripts": [{"start": "00:12", "voice": 1, "text": wall_text}],
+        "screen_content": SCREENS,
+        "speakers": [{"voice": 1, "name": "Host", "role": "Speaker"}],
+    }
+    vi._write_transcript_md(path, _video(), vi.merge_transcript_json(raw, {}), transcript_source="gemini")
+
+
+def _screen_content_lines(body) -> list[list[str]]:
+    """Each SCREEN block's lines without its trailing separator whitespace."""
+    out = []
+    for entry in body.entries:
+        if entry.kind != vi.TRANSCRIPT_ENTRY_SCREEN:
+            continue
+        lines = list(entry.lines)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        out.append(lines)
+    return out
+
+
+class TestNormalWriterShapesRepair:
+    def test_a_wall_followed_by_screen_blocks_to_the_end_of_the_file_repairs(self, corpus, monkeypatch):
+        sentences, cues = _talk()
+        p = _paths(corpus)
+        _writer_markdown_without_notes(p.transcript, " ".join(sentences))
+        p.meta.write_text(json.dumps(_meta()), encoding="utf-8")
+        before_text = p.transcript.read_bytes().decode("utf-8")
+        before_body = vi.parse_transcript_body(before_text)
+        assert before_body.trailer == "" and before_body.entries[-1].kind == vi.TRANSCRIPT_ENTRY_SCREEN
+        assert before_body.entries[-1].lines[-1].strip()  # the writer's last block: no closing blank line
+        _stub_captions(monkeypatch, cues)
+
+        assert _run(corpus)["outcome"] == "dry_run"
+        assert _run(corpus, apply=True)["outcome"] == "repaired"
+
+        after_text = p.transcript.read_bytes().decode("utf-8")
+        after_body = vi.parse_transcript_body(after_text)
+        assert _screen_content_lines(after_body) == _screen_content_lines(before_body)
+        assert after_body.entries[-1].kind == vi.TRANSCRIPT_ENTRY_DIALOGUE  # a piece now closes the file
+        assert after_text.endswith("\n") and not after_text.endswith(("\n\n", "\r\n\r\n"))
+        vi._invalidate_video_id_cache()
+        settled = _snapshot(corpus)
+        assert _run(corpus, apply=True)["outcome"] == "nothing"
+        assert _snapshot(corpus) == settled
+
+    def test_a_wall_with_newline_separated_sentences_repairs(self, corpus, monkeypatch):
+        sentences, cues = _talk()
+        p = _paths(corpus)
+        _writer_markdown_without_notes(p.transcript, "\n".join(sentences))
+        p.meta.write_text(json.dumps(_meta()), encoding="utf-8")
+        _stub_captions(monkeypatch, cues)
+
+        dry = _run(corpus)
+        assert dry["outcome"] == "dry_run" and vi.repair_reparses_to_plan(dry["repair"])
+        assert _run(corpus, apply=True)["outcome"] == "repaired"
+
+        body = _body(p.transcript)
+        dialogue = [e for e in body.entries if e.kind == vi.TRANSCRIPT_ENTRY_DIALOGUE]
+        assert len(dialogue) > 5
+        assert any("\n" in vi.split_dialogue_entry(e).text for e in dialogue)  # multi-line pieces
+        vi._invalidate_video_id_cache()
+        settled = _snapshot(corpus)
+        assert _run(corpus, apply=True)["outcome"] == "nothing"
+        assert _snapshot(corpus) == settled
