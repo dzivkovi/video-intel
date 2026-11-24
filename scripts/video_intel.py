@@ -3608,14 +3608,21 @@ def _safe_timestamp_to_seconds(ts: str) -> int | None:
     pass for chunk 1 (whose window does include 0) - two different wrong
     answers depending on which chunk emitted the garbage. Callers must gate
     on `is None` and count the stamp separately, never substitute a default.
+
+    Issue #278 review: a non-finite seconds field is unparseable too. A
+    huge exponent (``"00:1e999"``) or ``inf`` reaches ``int(float(...))`` as
+    infinity and raises ``OverflowError``, and a non-string ``ts`` has no
+    ``split``; both used to escape this helper and abort the paid call that
+    was being assessed. A negative field still parses (it is finite, and every
+    caller already treats a value outside its window as such).
     """
-    parts = ts.split(":")
     try:
+        parts = ts.split(":")
         if len(parts) == 2:
             return int(parts[0]) * 60 + int(float(parts[1]))
         if len(parts) == 3:
             return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(float(parts[2]))
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError, AttributeError):
         return None
     return None
 
@@ -5134,6 +5141,34 @@ CHUNK_WINDOW_MISMATCH_SEVERE_MIN_ENTRIES = 4
 #: unanimous shortcut.
 CHUNK_WINDOW_MISMATCH_UNANIMOUS_MIN_ENTRIES = 2
 
+#: Issue #278: a window's SCREEN stamps collapsed into its first seconds while
+#: its dialogue kept correct time. MILD only, never in `_SEVERE_QUALITY_FLAGS`:
+#: a severe flag would send `mindmap_source: auto` to a paid mindmap-from-video
+#: call, and the dialogue below is still sound. A COLLAPSE detector, never a gap
+#: detector - SCREEN content that simply stops (slides early, a talking head
+#: after) is healthy. Calibrated read-only on the on-disk corpus: a crowd at the
+#: window start alone also matches legitimate intros (kinetic captions, title
+#: cards, cold-open montages, which made up most of the crowded windows), but
+#: those show one or two screens at a time; the collapses showed five and more
+#: screens claiming the same instant, which no non-collapsed window at a window
+#: start reached. The setting below flagged under 0.1% of the judged
+#: transcripts, and every one read as a true collapse.
+QUALITY_FLAG_SCREEN_TIMESTAMP_COLLAPSE_MILD = "screen_timestamp_collapse_mild"
+#: A window shorter than this is never judged: a short clip can hold all its
+#: screens in its first two minutes legitimately.
+SCREEN_COLLAPSE_MIN_WINDOW_SECONDS = 600
+#: At least this many usable SCREEN entries inside the window.
+SCREEN_COLLAPSE_MIN_ENTRIES = 5
+#: Every one of them starts within this many seconds of the window start.
+SCREEN_COLLAPSE_CROWD_SECONDS = 120
+#: And at least this many are on screen at one instant (an entry with no usable
+#: end, or an end not after its start, counts as one second long). Crowded
+#: legitimate intros peaked at 2 in the calibration.
+SCREEN_COLLAPSE_MIN_CONCURRENT = 4
+#: The window's last dialogue stamp reaches at least this share of the window,
+#: so the dialogue covers it normally and only the SCREEN stamps collapsed.
+SCREEN_COLLAPSE_DIALOGUE_REACH = 0.8
+
 
 def _classify_chunk_window_violations(per_chunk_counts: list[dict]) -> dict:
     """Turn merge_chunked_transcripts' raw per-chunk out-of-window dialogue
@@ -5220,17 +5255,101 @@ def _transcript_quality_severe_from_meta(meta_path: Path) -> bool:
     return transcript_quality_flags_are_severe(flags)
 
 
+def screen_timestamp_collapse(
+    screen_entries: object,
+    dialogue_entries: object,
+    window_start: int,
+    window_end: int,
+) -> bool:
+    """True when a window's SCREEN stamps collapsed into its start (issue #278).
+
+    Pure and side-effect free. All of these must hold, judged inside the
+    half-open window ``[window_start, window_end)`` in the same coordinate
+    space as the stamps: the window is at least
+    ``SCREEN_COLLAPSE_MIN_WINDOW_SECONDS`` long; at least
+    ``SCREEN_COLLAPSE_MIN_ENTRIES`` usable SCREEN entries start inside it, all
+    within ``SCREEN_COLLAPSE_CROWD_SECONDS`` of its start; at least
+    ``SCREEN_COLLAPSE_MIN_CONCURRENT`` of them are on screen at one instant; and
+    the dialogue reaches ``SCREEN_COLLAPSE_DIALOGUE_REACH`` of the window, so
+    the window itself is sound. SCREEN content that stops early, is sparse, or
+    is spread out never qualifies.
+
+    A SCREEN entry counts only when it is a dict whose ``start`` is a non-blank
+    string that parses to seconds (``_usable_timestamp`` then
+    ``_safe_timestamp_to_seconds``); anything else is skipped, never an error. A
+    non-list value for either list judges nothing. Dialogue stamps are read the
+    way ``assess_transcript_artifact`` reads them.
+    """
+    if window_end - window_start < SCREEN_COLLAPSE_MIN_WINDOW_SECONDS:
+        return False
+    if not isinstance(screen_entries, list) or not isinstance(dialogue_entries, list):
+        return False
+    spans: list[tuple[int, int]] = []
+    for entry in screen_entries:
+        if not _usable_timestamp(entry, "start"):
+            continue
+        start = _safe_timestamp_to_seconds(entry["start"])
+        if start is None or not window_start <= start < window_end:
+            continue
+        end = _safe_timestamp_to_seconds(entry["end"]) if _usable_timestamp(entry, "end") else None
+        spans.append((start, end if end is not None and end > start else start + 1))
+    if len(spans) < SCREEN_COLLAPSE_MIN_ENTRIES:
+        return False
+    if max(start for start, _ in spans) - window_start > SCREEN_COLLAPSE_CROWD_SECONDS:
+        return False
+    dialogue = [
+        secs
+        for secs in (timestamp_to_seconds(e["start"]) for e in dialogue_entries if _usable_timestamp(e, "start"))
+        if window_start <= secs < window_end
+    ]
+    if not dialogue or (max(dialogue) - window_start) / (window_end - window_start) < SCREEN_COLLAPSE_DIALOGUE_REACH:
+        return False
+    # Most screens on at one instant: an end and a start at the same second do
+    # not overlap (ends sort first).
+    events = sorted([(start, 1) for start, _ in spans] + [(end, -1) for _, end in spans])
+    showing = most = 0
+    for _, delta in events:
+        showing += delta
+        most = max(most, showing)
+    return most >= SCREEN_COLLAPSE_MIN_CONCURRENT
+
+
+def _screen_check_fail_safe(compute: Callable[[], Any], *, where: str, fallback: Any) -> Any:
+    """Run one step of the issue #278 SCREEN check and never let it raise.
+
+    The check is label-only: it must never abort the paid call being
+    assessed, nor change what gets written. An unexpected exception logs ONE
+    WARNING naming the step and yields ``fallback`` (no flag, or "not
+    examined").
+    """
+    try:
+        return compute()
+    except Exception as exc:
+        log.warning("SCREEN timestamp check skipped (%s): %r", where, exc)
+        return fallback
+
+
 def assess_transcript_artifact(
     transcripts: list[dict],
     duration_seconds: int | None,
     window: tuple[int, int] | None = None,
+    *,
+    screen_entries: list | None = None,
 ) -> dict:
     """Pure, side-effect-free quality assessment of a dialogue entry list.
 
     `transcripts` is the raw ``transcripts`` array from a parsed Gemini
     transcript response (or the merged/sorted equivalent) - dicts with a
     ``"start"`` timestamp string. Screen content is not dialogue and is
-    never passed here.
+    never passed in ``transcripts``.
+
+    ``screen_entries`` (issue #278) is the raw ``screen_content`` list in the
+    same coordinate space, judged by ``screen_timestamp_collapse`` against the
+    same window as the gap and density checks; a collapse adds the MILD
+    ``screen_timestamp_collapse_mild`` and changes nothing else. ``None`` (the
+    default, and every caller that predates it) means "not examined", never
+    "clean", and the result is identical to a call without the keyword. An
+    unknown window records nothing.
 
     Backward-jump detection uses the entries in the ORDER GIVEN, never a
     sorted copy: the sort that both merge_chunked_transcripts() and
@@ -5417,6 +5536,17 @@ def assess_transcript_artifact(
             else QUALITY_FLAG_TIMESTAMP_OVERRUN_SYSTEMATIC_MILD
         )
 
+    if (
+        screen_entries is not None
+        and span_seconds is not None
+        and _screen_check_fail_safe(
+            lambda: screen_timestamp_collapse(screen_entries, transcripts, window_start, window_end),
+            where="assessor",
+            fallback=False,
+        )
+    ):
+        mild.append(QUALITY_FLAG_SCREEN_TIMESTAMP_COLLAPSE_MILD)
+
     return {
         "dialogue_entries": dialogue_entries,
         "density_per_min": density_per_min,
@@ -5432,9 +5562,17 @@ def assess_transcript_artifact(
     }
 
 
-def _relativize_chunk_entries(transcripts: list, start_secs: int, allotted_span: int) -> list[dict]:
-    """Rewrite each RAW per-chunk dialogue timestamp into the chunk's own
-    ``[0, allotted_span)`` frame, for gap/density assessment only.
+def _relativize_chunk_entries(
+    transcripts: list,
+    start_secs: int,
+    allotted_span: int,
+    keys: tuple[str, ...] = ("start",),
+    *,
+    drop_unplaceable: bool = False,
+) -> list[dict]:
+    """Rewrite each RAW per-chunk dialogue timestamp (and, on request, a SCREEN
+    entry's ``start`` and ``end``) into the chunk's own ``[0, allotted_span)``
+    frame, for assessment only.
 
     Gemini is inconsistent about whether a per-chunk timestamp is
     chunk-relative or absolute-to-the-video (see
@@ -5450,6 +5588,25 @@ def _relativize_chunk_entries(transcripts: list, start_secs: int, allotted_span:
     ``_assess_chunk_coverage``): classification can shift different entries
     by different amounts, which would blur the raw, as-emitted evidence a
     clock slip leaves behind.
+
+    ``keys`` names the stamps rewritten per entry; an entry without a usable
+    ``start`` is always skipped, and any other key is rewritten only when it
+    holds a usable stamp (issue #278 passes ``("start", "end")`` for SCREEN
+    entries, whose overlap is judged from both).
+
+    ``drop_unplaceable`` (SCREEN only, issue #278 review): the dialogue mode
+    clamps a stamp it cannot place to ``0:00:00`` (``max(0, ...)``), which
+    keeps the dialogue counts as they always were but would pile unplaceable
+    SCREEN stamps onto the chunk start and read as a collapse. In this mode a
+    stamp is placed only when the classified value parses
+    (``_safe_timestamp_to_seconds``), is not before the chunk start, and lies
+    inside the chunk by the classifier's own boundary
+    (``classify_timestamp_placement``); otherwise an unplaceable ``start``
+    skips the entry and an unplaceable other key is dropped from it, except
+    that a key past the chunk's end (parsed, not before the start) is CLAMPED
+    to the chunk's end: the merger keeps such an end in the Markdown and a
+    re-assessment reads it as running past the window, so both views agree.
+    The default keeps the dialogue output byte-identical.
     """
     # Issue #161 review (P1): same shared predicate as assess_transcript_artifact
     # and merge_transcript_json - see the comment there. entry["start"] is
@@ -5460,9 +5617,40 @@ def _relativize_chunk_entries(transcripts: list, start_secs: int, allotted_span:
     for entry in transcripts:
         if not _usable_timestamp(entry, "start"):
             continue
-        absolute_ts = _classify_and_offset_timestamp(entry["start"], start_secs, allotted_span)
-        secs = max(0, timestamp_to_seconds(absolute_ts) - start_secs)
-        relativized.append({**entry, "start": f"{secs // 3600}:{(secs % 3600) // 60:02d}:{secs % 60:02d}"})
+        rewritten = dict(entry)
+        placed = True
+        for key in keys:
+            if not _usable_timestamp(entry, key):
+                continue
+            absolute_ts = _classify_and_offset_timestamp(entry[key], start_secs, allotted_span)
+            if drop_unplaceable:
+                absolute = _safe_timestamp_to_seconds(absolute_ts)
+                beyond = (
+                    absolute is not None
+                    and absolute >= start_secs
+                    and classify_timestamp_placement(absolute - start_secs, 0, allotted_span)
+                    == TIMESTAMP_PLACEMENT_IMPLAUSIBLE
+                )
+                if key != "start" and beyond:
+                    # An end past the chunk is kept, clamped to the chunk's
+                    # end: the merger writes it to the Markdown as it came,
+                    # and a re-assessment reads it there as running past the
+                    # window (issue #278 review). Either way the screen stays
+                    # on to the window's end.
+                    secs = allotted_span
+                elif absolute is None or absolute < start_secs or beyond:
+                    if key == "start":
+                        placed = False
+                        break
+                    rewritten.pop(key, None)
+                    continue
+                else:
+                    secs = absolute - start_secs
+            else:
+                secs = max(0, timestamp_to_seconds(absolute_ts) - start_secs)
+            rewritten[key] = f"{secs // 3600}:{(secs % 3600) // 60:02d}:{secs % 60:02d}"
+        if placed:
+            relativized.append(rewritten)
     return relativized
 
 
@@ -5523,6 +5711,10 @@ def _assess_chunk_coverage(
     # one authoritative place that logs the warning for this exact value -
     # this call must stay silent to avoid double-reporting.
     transcripts = _usable_task_list(parsed, "transcripts", note_sink=[])
+    # Issue #278: SCREEN stamps are judged per chunk too, against the same
+    # window (the chunk's ACTUAL bounds, issue #158) as the dialogue checks.
+    # Silent for the same reason as the line above.
+    screen = _usable_task_list(parsed, "screen_content", note_sink=[])
     # Backward-jump evidence must come from RAW, pre-classification emission
     # order (issue #157 design decision). A duration=None/window=None probe
     # skips gap/density/monolithic entirely (span is unknowable) and reports
@@ -5536,11 +5728,22 @@ def _assess_chunk_coverage(
         # the raw list IS already in one coherent (absolute-from-zero) frame,
         # so no relativization step is needed and its own backward-jump
         # value already matches raw_backward_jump.
-        metrics = assess_transcript_artifact(transcripts, duration_seconds, window=None)
+        metrics = assess_transcript_artifact(transcripts, duration_seconds, window=None, screen_entries=screen)
     else:
         allotted_span = max(1, end_secs - start_secs)
         relativized = _relativize_chunk_entries(transcripts, start_secs, allotted_span)
-        metrics = dict(assess_transcript_artifact(relativized, allotted_span, window=(0, allotted_span)))
+        relativized_screen = _screen_check_fail_safe(
+            lambda: _relativize_chunk_entries(
+                screen, start_secs, allotted_span, keys=("start", "end"), drop_unplaceable=True
+            ),
+            where=f"chunk {chunk_idx} SCREEN stamps",
+            fallback=None,
+        )
+        metrics = dict(
+            assess_transcript_artifact(
+                relativized, allotted_span, window=(0, allotted_span), screen_entries=relativized_screen
+            )
+        )
         # Reconcile: gap/density/monolithic come from the relativized frame,
         # but backward-jump must reflect RAW emission order, not whatever
         # order relativization happened to leave entries in.
@@ -5997,11 +6200,19 @@ def _dialogue_entries_from_raw_json(raw_json) -> list[dict]:
     in the same code block, and that call already reports the same
     wrong-typed value through its own ``_usable_task_list`` call.
     """
+    return _raw_task_entries(raw_json, "transcripts")
+
+
+def _raw_task_entries(raw_json: Any, key: str) -> list:
+    """One task list (``transcripts`` or ``screen_content``) of a parsed
+    response, unwrapped and guarded exactly as ``_dialogue_entries_from_raw_json``
+    documents; issue #278 reads ``screen_content`` through it too. Silent: the
+    renderer already reported a wrong-typed value."""
     if isinstance(raw_json, list):
         raw_json = raw_json[0] if raw_json else {}
     if not isinstance(raw_json, dict):
         return []
-    return _usable_task_list(raw_json, "transcripts", note_sink=[])
+    return _usable_task_list(raw_json, key, note_sink=[])
 
 
 def _usable_timestamp(entry: Any, key: str) -> bool:
@@ -7605,7 +7816,10 @@ def process_transcript(
             # assesses against the real known duration; duration_seconds is
             # the caller's looked-up value, never a (0, 0) clipping stand-in.
             quality_metrics = assess_transcript_artifact(
-                _dialogue_entries_from_raw_json(raw_json), duration_seconds, window=None
+                _dialogue_entries_from_raw_json(raw_json),
+                duration_seconds,
+                window=None,
+                screen_entries=_raw_task_entries(raw_json, "screen_content"),
             )
             quality_flags = sorted(set(quality_metrics["severe"]) | set(quality_metrics["mild"]))
             quality_severe = transcript_quality_flags_are_severe(quality_flags)
@@ -7693,7 +7907,10 @@ def process_transcript(
             # ALSO be quality-flagged severe - false-alarming a working
             # recovery is the one thing this guard must never do.
             salvage_quality_metrics = assess_transcript_artifact(
-                salvaged.get("transcripts") or [], duration_seconds, window=None
+                salvaged.get("transcripts") or [],
+                duration_seconds,
+                window=None,
+                screen_entries=_raw_task_entries(salvaged, "screen_content"),
             )
             salvage_quality_flags = sorted(
                 set(salvage_quality_metrics["severe"]) | set(salvage_quality_metrics["mild"])
@@ -11415,7 +11632,14 @@ TRANSCRIPT_ENTRY_DIALOGUE = "dialogue"
 TRANSCRIPT_ENTRY_SCREEN = "screen"
 _DIALOGUE_LINE_RE = re.compile(rf"^\[({ENTRY_TIMESTAMP_PATTERN})\]")
 # The SCREEN boundary `chunk_transcript` uses; the stamp is the range's start.
-_SCREEN_LINE_RE = re.compile(rf"^\s+SCREEN \[({ENTRY_TIMESTAMP_PATTERN})")
+# Group 2 is the range's end when the line has one (issue #278 reads it); a
+# fractional seconds part on either stamp is skipped, so a fractional range
+# still yields its end (truncated, like `_safe_timestamp_to_seconds`). Every
+# added part is optional and follows group 1, so the set of lines this matches
+# and its group 1 are unchanged.
+_SCREEN_LINE_RE = re.compile(
+    rf"^\s+SCREEN \[({ENTRY_TIMESTAMP_PATTERN})(?:\.\d+)?(?:-({ENTRY_TIMESTAMP_PATTERN})(?:\.\d+)?)?"
+)
 # A Gemini dialogue entry is `[stamp] Label: "text"`, a captions one `[stamp] "text"`.
 # Matched over the WHOLE entry (continuation lines included), so a text with
 # embedded newlines still parses; the label never starts with a quote.
@@ -11562,6 +11786,55 @@ def render_dialogue_piece(stamp: str, parts: DialogueEntryParts, text: str) -> l
     """One dialogue entry in the writers' shape, formatted like the entry it came from."""
     label = f"{parts.label}: " if parts.label is not None else ""
     return [f'[{stamp}] {label}"{text}"{parts.line_ending}', *parts.trailing]
+
+
+def screen_entries_from_transcript_markdown(text: str) -> list[dict]:
+    """SCREEN entries of a rendered ``.transcript.md``, in FILE order (issue #278).
+
+    One ``{"start": ..., "end": ...}`` per SCREEN entry that
+    ``parse_transcript_body`` finds, so the header, the body and what belongs
+    to a SCREEN block (a stamp-like line inside one stays its content) are read
+    by the ONE body parser [core: one-definition]. ``start`` is the entry's
+    stamp; ``end`` comes from the same ``_SCREEN_LINE_RE`` match of the entry's
+    first line and is present only when the line has a range.
+    """
+    entries = []
+    for entry in parse_transcript_body(text).entries:
+        if entry.kind != TRANSCRIPT_ENTRY_SCREEN:
+            continue
+        screen = {"start": entry.stamp}
+        match = _SCREEN_LINE_RE.match(_line_content(entry.lines[0]))
+        if match and match.group(2):
+            screen["end"] = match.group(2)
+        entries.append(screen)
+    return entries
+
+
+def chunk_windows_from_transcript_markdown(text: str) -> list[tuple[int, int]] | None:
+    """The chunk windows a stitched ``.transcript.md`` records in its coverage table.
+
+    Reads the ``| <n> | <start> - <end> | <status> | <speakers> |`` rows that
+    ``_build_chunked_transcript_coverage_block`` writes into the header
+    (everything ``parse_transcript_body`` places before the first entry), as
+    ``(start_seconds, end_seconds)``. ``None`` when there is no such table, or
+    when any segment row does not parse or the windows are not in order: issue
+    #278 then judges the transcript as one whole-video window.
+    """
+    stamp = ENTRY_TIMESTAMP_PATTERN
+    row = re.compile(rf"^\|\s*\d+\s*\|\s*({stamp})\s*-\s*({stamp})\s*\|")
+    segment_row = re.compile(r"^\|\s*\d+\s*\|")
+    windows: list[tuple[int, int]] = []
+    for line in parse_transcript_body(text).header.splitlines():
+        if not segment_row.match(line):
+            continue
+        match = row.match(line)
+        if not match:
+            return None
+        lo, hi = _safe_timestamp_to_seconds(match.group(1)), _safe_timestamp_to_seconds(match.group(2))
+        if lo is None or hi is None or hi <= lo or (windows and lo < windows[-1][1]):
+            return None
+        windows.append((lo, hi))
+    return windows or None
 
 
 def _parse_timestamp_seconds(ts: str) -> int:
@@ -14439,12 +14712,26 @@ def assess_transcript_markdown(text: str, duration_seconds: int | None, *, capti
     reads. A captions transcript gets the captions writer's leading-gap
     demotion (issue #182 invariant 7): silence before the first cue is a
     pre-show, not lost content.
+
+    SCREEN stamps are judged too (issue #278): per chunk window when the file
+    carries a coverage table that parses (``chunk_windows_from_transcript_markdown``),
+    otherwise against the whole video, and only with a known duration.
     """
-    metrics = assess_transcript_artifact(dialogue_entries_from_transcript_markdown(text), duration_seconds)
+    entries = dialogue_entries_from_transcript_markdown(text)
+    metrics = assess_transcript_artifact(entries, duration_seconds)
     if captions:
         severe, mild = _demote_captions_leading_gap(metrics)
     else:
         severe, mild = metrics["severe"], metrics["mild"]
+    if duration_seconds is not None and duration_seconds > 0:
+
+        def _collapsed() -> bool:
+            screen = screen_entries_from_transcript_markdown(text)
+            windows = chunk_windows_from_transcript_markdown(text) or [(0, duration_seconds)]
+            return any(screen_timestamp_collapse(screen, entries, lo, hi) for lo, hi in windows)
+
+        if _screen_check_fail_safe(_collapsed, where="Markdown re-assessment", fallback=False):
+            mild = [*mild, QUALITY_FLAG_SCREEN_TIMESTAMP_COLLAPSE_MILD]
     flags = sorted(set(severe) | set(mild))
     fields = {
         "transcript_quality_flags": flags,
