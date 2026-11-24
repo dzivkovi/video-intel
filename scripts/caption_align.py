@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import difflib
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 #: A dialogue entry whose aligned words span more than this many seconds of
@@ -98,13 +99,40 @@ def normalize_words(text: str) -> list[str]:
     return _WORD.findall(_APOSTROPHES.sub("", text.lower()))
 
 
+#: A cue that opens with at least this many words repeating the end of the
+#: previous cue is a rolling repeat. A single shared word at a join is
+#: ordinary speech ("... and / and ..."), so it is not dropped.
+REPEAT_MIN_WORDS = 2
+
+
+def _leading_repeat(previous: list[str], current: list[str]) -> int:
+    """How many of ``current``'s first words repeat ``previous``'s last words (0 below ``REPEAT_MIN_WORDS``)."""
+    for n in range(min(len(previous), len(current)), REPEAT_MIN_WORDS - 1, -1):
+        if previous[-n:] == current[:n]:
+            return n
+    return 0
+
+
 def _caption_words(cues: list[Cue]) -> tuple[list[str], list[int]]:
+    """The track's word stream and, per word, the index of the cue it is FIRST shown in.
+
+    Some tracks repeat text across cues (each cue shows the previous line
+    again plus a new one). Matched against the concatenated text, a repeated
+    word could align to the LATER cue and stamp a piece late, so each cue
+    drops the leading words that repeat the tail of the previous cue's
+    ORIGINAL words (the full text it showed, so a cue that was itself mostly
+    a repeat still exposes its tail); a cue that is entirely a repeat
+    contributes no words. The remaining words keep their own cue's index.
+    """
     words: list[str] = []
     owner: list[int] = []
+    previous: list[str] = []
     for index, cue in enumerate(cues):
         cue_words = normalize_words(cue.text)
-        words.extend(cue_words)
-        owner.extend([index] * len(cue_words))
+        fresh = cue_words[_leading_repeat(previous, cue_words) :]
+        words.extend(fresh)
+        owner.extend([index] * len(fresh))
+        previous = cue_words
     return words, owner
 
 
@@ -202,6 +230,7 @@ def plan_entry_split(
     anchor_words: int = REPAIR_ANCHOR_WORDS,
     min_coverage: float = REPAIR_MIN_ENTRY_COVERAGE,
     max_stamp_exclusive: int | None = None,
+    usable_stamp: Callable[[int], bool] | None = None,
 ) -> SplitPlan:
     """The split plan for one dialogue entry.
 
@@ -219,6 +248,8 @@ def plan_entry_split(
     makes a boundary usable only when its stamp is strictly below it, so a
     piece can never be stamped at or after the entry that follows; the text
     past the last usable boundary stays with the last piece.
+    ``usable_stamp`` is a further veto on a boundary's stamp (the caller's
+    video-duration rule), with the same effect on the remaining text.
     """
     words = normalize_words(text)
     if word_cues is None:
@@ -255,6 +286,7 @@ def plan_entry_split(
             if b[0] > cur_k
             and int(b[2]) > cur_stamp
             and (max_stamp_exclusive is None or int(b[2]) < max_stamp_exclusive)
+            and (usable_stamp is None or usable_stamp(int(b[2])))
         ]
         crossing = next((i for i, b in enumerate(usable) if b[2] - cur_time >= target), None)
         if crossing is None:

@@ -11467,28 +11467,56 @@ def parse_transcript_body(text: str) -> TranscriptBody:
     block); the trailer starts at the first ``---`` line after the last entry
     starts (the speaker-evidence footer). Each entry owns its continuation
     lines and the blank lines after it.
+
+    A SCREEN block owns its lines whatever they look like. ``merge_transcript_json``
+    writes a block as its ``  SCREEN [...]`` line, the description (which may
+    run over several unindented lines), an optional fenced code block and an
+    optional ``On-screen text: "..."`` quote (which may also span lines),
+    then ONE blank line before whatever follows. So inside a SCREEN block a
+    line starts a new entry, or the trailer, only when the line before it is
+    blank and it is not inside the code fence or an open on-screen quote; a
+    stamp-like line or a ``---`` inside a description or quote stays the
+    block's content. (A description that itself holds a blank line followed
+    by a stamp-like line is indistinguishable from a new entry; accepted.)
     """
     lines = text.splitlines(keepends=True)
     body_start = _transcript_body_start(lines)
     starts: list[tuple[int, str, str]] = []
+    free_dashes: list[int] = []
     if body_start is not None:
+        in_screen = in_fence = in_quote = False
+        previous_blank = True
         for i in range(body_start, len(lines)):
             content = _line_content(lines[i])
-            if content.strip().startswith("SCREEN ["):
-                match = _SCREEN_LINE_RE.match(content)
-                if match:
-                    starts.append((i, TRANSCRIPT_ENTRY_SCREEN, match.group(1)))
-                continue
-            match = _DIALOGUE_LINE_RE.match(content)
-            if match:
-                starts.append((i, TRANSCRIPT_ENTRY_DIALOGUE, match.group(1)))
+            locked = in_screen and (in_fence or in_quote or not previous_blank)
+            started = False
+            if not locked:
+                if content.strip().startswith("SCREEN ["):
+                    match = _SCREEN_LINE_RE.match(content)
+                    if match:
+                        starts.append((i, TRANSCRIPT_ENTRY_SCREEN, match.group(1)))
+                        in_screen, in_fence, in_quote, started = True, False, False, True
+                else:
+                    match = _DIALOGUE_LINE_RE.match(content)
+                    if match:
+                        starts.append((i, TRANSCRIPT_ENTRY_DIALOGUE, match.group(1)))
+                        in_screen, in_fence, in_quote, started = False, False, False, True
+                if not started and content.strip() == "---":
+                    free_dashes.append(i)
+            if in_screen and not started:
+                stripped = content.strip()
+                if stripped == "```":
+                    in_fence = not in_fence
+                elif not in_fence:
+                    if in_quote:
+                        in_quote = not content.rstrip().endswith('"')
+                    elif stripped.startswith('On-screen text: "'):
+                        rest = stripped[len('On-screen text: "') :]
+                        in_quote = not rest.endswith('"')
+            previous_blank = not content.strip()
     if not starts:
         return TranscriptBody(header=text, entries=[], trailer="")
-    trailer_at = len(lines)
-    for i in range(starts[-1][0] + 1, len(lines)):
-        if lines[i].strip() == "---":
-            trailer_at = i
-            break
+    trailer_at = next((i for i in free_dashes if i > starts[-1][0]), len(lines))
     entries = []
     for n, (i, kind, stamp) in enumerate(starts):
         end = starts[n + 1][0] if n + 1 < len(starts) else trailer_at
@@ -14667,6 +14695,13 @@ REPAIR_FAILURE_EVIDENCE_FIELDS = (
     "transcript_recovery",
     "transcript_parse_error",
 )
+#: More than this share of caption cues starting beyond the video's plausible
+#: length means the track probably belongs to a different or re-uploaded
+#: video. A track fetched for the same video ends with it (the one real track
+#: measured: 0 of 1,391 cues past its duration), so any such cue is already an
+#: anomaly; 5% lets a stray trailing cue through and stops a systematic overrun
+#: (a re-upload one minute longer than a 14-minute talk is about 7%).
+REPAIR_MAX_CUES_PAST_DURATION_SHARE = 0.05
 #: A continuation line that opens like a stamp the entry pattern does not
 #: recognize (``[07:40.500] Guest: ...``) may be another speaker's line, and a
 #: split would relabel it with this entry's speaker.
@@ -14756,7 +14791,20 @@ class TranscriptRepair:
         return sum(c.matched for c in self.repaired) / words if words else 0.0
 
 
-def plan_transcript_repair(text: str, cues: list[caption_align.Cue]) -> TranscriptRepair:
+def stamp_fits_duration(seconds: int, duration_seconds: int | None) -> bool:
+    """True when a stamp is plausible for a video of this length (the issue #139 rule).
+
+    Asks ``classify_timestamp_placement`` the same question the assessor asks
+    of a whole video [core: one-definition]; an unknown duration bounds nothing.
+    """
+    if known_duration_seconds(duration_seconds) is None:
+        return True
+    return classify_timestamp_placement(seconds, 0, duration_seconds) != TIMESTAMP_PLACEMENT_IMPLAUSIBLE
+
+
+def plan_transcript_repair(
+    text: str, cues: list[caption_align.Cue], *, duration_seconds: int | None = None
+) -> TranscriptRepair:
     """Split every repairable wall-of-text entry; leave everything else byte for byte.
 
     One alignment of all dialogue entries against the track
@@ -14767,7 +14815,8 @@ def plan_transcript_repair(text: str, cues: list[caption_align.Cue]) -> Transcri
     the entry's own text cut at sentence boundaries. Dialogue file order is
     never changed: no other dialogue entry moves. Only the SCREEN blocks that
     sat between the split entry and the next dialogue entry are re-placed
-    among its pieces, by their own untouched stamps.
+    among its pieces, by their own untouched stamps. With ``duration_seconds``
+    no new stamp may be implausible for the video (``stamp_fits_duration``).
     """
     body = parse_transcript_body(text)
     dialogue = [(e, split_dialogue_entry(e)) for e in body.entries if e.kind == TRANSCRIPT_ENTRY_DIALOGUE]
@@ -14792,6 +14841,7 @@ def plan_transcript_repair(text: str, cues: list[caption_align.Cue]) -> Transcri
             original_seconds=timestamp_to_seconds(entry.stamp),
             word_cues=word_cues,
             max_stamp_exclusive=bound,
+            usable_stamp=lambda sec: stamp_fits_duration(sec, duration_seconds),
         )
         if not plan.candidate:
             continue
@@ -14992,23 +15042,50 @@ def _keep_pre_repair_copy(channel_dir: Path, prefix: str, original: bytes) -> Pa
     return sidecar
 
 
-def _undo_repair(transcript_path: Path, original: bytes, sidecar: Path, transcript_changed: bool, exc) -> None:
-    """Put the transcript back after a failure, saying truthfully what worked."""
-    if transcript_changed:
+def _undo_repair(
+    transcript_path: Path, original: bytes, meta_path: Path, original_meta: bytes, sidecar: Path, exc
+) -> None:
+    """Roll back from what is ON DISK, never from flags that may be stale.
+
+    An interrupt can land after an ``os.replace`` committed a file but before
+    any flag recording that was set, so each file is re-read and compared with
+    the bytes held since the start: (a) a transcript that differs (or cannot
+    be read) gets the original back; (b) the same for the meta; (c) the
+    sidecar is deleted only after the transcript on disk has been re-read and
+    verified equal to the original, otherwise it is kept and named as the
+    only copy. Each step has its own try and logs what it actually did.
+    """
+    log.error("repair-timestamps: stopped after the pre-repair copy was made (%r); rolling back", exc)
+    try:
+        transcript_now = transcript_path.read_bytes()
+    except OSError:
+        transcript_now = None
+    if transcript_now != original:
         try:
             _write_bytes_atomic(transcript_path, original)
+            log.error("repair-timestamps: restored the original transcript")
         except OSError as restore_exc:
-            log.error(
-                "repair-timestamps: failed after writing the transcript (%r) and could not restore it (%r); "
-                "the original bytes are in %s",
-                exc,
-                restore_exc,
-                sidecar,
-            )
-            return
-        log.error("repair-timestamps: failed after writing the transcript (%r); the original is restored", exc)
-    else:
-        log.error("repair-timestamps: failed before the transcript changed (%r); it is untouched", exc)
+            log.error("repair-timestamps: could not restore the original transcript (%r)", restore_exc)
+    try:
+        meta_now = meta_path.read_bytes()
+    except OSError:
+        meta_now = None
+    if meta_now != original_meta:
+        try:
+            _write_bytes_atomic(meta_path, original_meta)
+            log.error("repair-timestamps: restored the original meta")
+        except OSError as restore_exc:
+            log.error("repair-timestamps: could not restore the original meta (%r)", restore_exc)
+    try:
+        verified = transcript_path.read_bytes() == original
+    except OSError:
+        verified = False
+    if not verified:
+        log.error(
+            "repair-timestamps: the transcript on disk is not the original; the only copy of the original is %s",
+            sidecar,
+        )
+        return
     try:
         sidecar.unlink(missing_ok=True)
     except OSError as unlink_exc:
@@ -15088,7 +15165,8 @@ def cmd_repair_timestamps(args, config):
         sys.exit(1)
     meta_path = channel_dir / f"{prefix}.meta.json"
     try:
-        meta = json.loads(meta_path.read_bytes().decode("utf-8"))
+        original_meta = meta_path.read_bytes()
+        meta = json.loads(original_meta.decode("utf-8"))
     except (OSError, ValueError) as exc:
         log.error("repair-timestamps: %s is unreadable (%s)", meta_path.name, exc)
         sys.exit(1)
@@ -15127,7 +15205,19 @@ def cmd_repair_timestamps(args, config):
         log.warning("repair-timestamps: declined, %s", _captions_decline_message(reason))
         sys.exit(EXIT_PARTIAL)
 
-    repair = plan_transcript_repair(text, caption_cues_from_captions(captions))
+    cues = caption_cues_from_captions(captions)
+    past_end = sum(1 for c in cues if not stamp_fits_duration(int(c.start), duration))
+    if cues and past_end / len(cues) > REPAIR_MAX_CUES_PAST_DURATION_SHARE:
+        log.warning(
+            "repair-timestamps: declined, %d of %d caption cues (%.0f%%) start beyond this video's %ds duration: "
+            "the track probably belongs to a different or re-uploaded video; nothing changed.",
+            past_end,
+            len(cues),
+            100 * past_end / len(cues),
+            duration,
+        )
+        sys.exit(EXIT_PARTIAL)
+    repair = plan_transcript_repair(text, cues, duration_seconds=duration)
     log.info("repair-timestamps: %s/%s, overall alignment coverage %.3f", args.channel, prefix, repair.overall_coverage)
     for candidate in repair.candidates:
         plan = candidate.plan
@@ -15176,10 +15266,8 @@ def cmd_repair_timestamps(args, config):
     except OSError as exc:
         log.error("repair-timestamps: could not keep the original transcript aside (%s); nothing written", exc)
         sys.exit(1)
-    transcript_changed = False
     try:
         _write_bytes_atomic(transcript_path, repair.text.encode("utf-8"))
-        transcript_changed = True
         # [core: writer's-path] judge the file just written, not the plan in memory.
         written = transcript_path.read_bytes().decode("utf-8")
         new_meta, merged = _repaired_meta(meta, written, duration, coverage)
@@ -15187,33 +15275,32 @@ def cmd_repair_timestamps(args, config):
         if final_text != written:
             _write_bytes_atomic(transcript_path, final_text.encode("utf-8"))
         _write_meta_atomic(meta_path, new_meta)
+        log.info(
+            "repair-timestamps: repaired %d entr%s into %d; flags %s; transcript_status %s -> %s; original kept as %s",
+            len(repair.repaired),
+            "y" if len(repair.repaired) == 1 else "ies",
+            sum(len(c.plan.pieces) for c in repair.repaired),
+            ", ".join(merged) or "clean",
+            meta.get("transcript_status"),
+            new_meta.get("transcript_status"),
+            sidecar.name,
+        )
+        log.info("Search deep links come from the index; carry the repair into it with:")
+        for command in repair_follow_up_commands(args.channel):
+            log.info("  %s", command)
+        log.info(
+            "  (an index built before content hashes cannot see an edited transcript; "
+            "`index --channel %s` re-embeds the channel in that case)",
+            args.channel,
+        )
+        return {"outcome": "repaired", "repair": repair, "sidecar": sidecar}
     except BaseException as exc:
-        # An interrupt between the two writes would otherwise leave a repaired
-        # transcript beside a stale meta that a re-run can never fix.
-        _undo_repair(transcript_path, original, sidecar, transcript_changed, exc)
+        # Anything after the copy exists, an interrupt included and even one
+        # after both writes, is rolled back from what is on disk.
+        _undo_repair(transcript_path, original, meta_path, original_meta, sidecar, exc)
         if isinstance(exc, Exception):
             sys.exit(1)
         raise
-
-    log.info(
-        "repair-timestamps: repaired %d entr%s into %d; flags %s; transcript_status %s -> %s; original kept as %s",
-        len(repair.repaired),
-        "y" if len(repair.repaired) == 1 else "ies",
-        sum(len(c.plan.pieces) for c in repair.repaired),
-        ", ".join(merged) or "clean",
-        meta.get("transcript_status"),
-        new_meta.get("transcript_status"),
-        sidecar.name,
-    )
-    log.info("Search deep links come from the index; carry the repair into it with:")
-    for command in repair_follow_up_commands(args.channel):
-        log.info("  %s", command)
-    log.info(
-        "  (an index built before content hashes cannot see an edited transcript; "
-        "`index --channel %s` re-embeds the channel in that case)",
-        args.channel,
-    )
-    return {"outcome": "repaired", "repair": repair, "sidecar": sidecar}
 
 
 # ---------------------------------------------------------------------------

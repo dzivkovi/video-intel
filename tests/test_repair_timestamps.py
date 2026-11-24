@@ -1084,8 +1084,8 @@ class TestFailureHandling:
         with caplog.at_level(logging.INFO, logger="video_intel"):
             assert _exit_code(corpus, apply=True) == 1
         assert _snapshot(corpus) == before
-        assert "before the transcript changed" in caplog.text
-        assert "failed after writing" not in caplog.text
+        assert "restored the original transcript" not in caplog.text  # it never changed
+        assert "could not" not in caplog.text
 
     def test_a_sidecar_that_cannot_be_removed_is_named_and_not_called_a_failed_restore(
         self, corpus, monkeypatch, caplog
@@ -1109,7 +1109,7 @@ class TestFailureHandling:
         with caplog.at_level(logging.INFO, logger="video_intel"):
             assert _exit_code(corpus, apply=True) == 1
         assert p.transcript.read_bytes() == original
-        assert "the original is restored" in caplog.text
+        assert "restored the original transcript" in caplog.text
         assert "could not restore" not in caplog.text
         assert f"could not remove the pre-repair copy {p.sidecar}" in caplog.text
 
@@ -1257,7 +1257,8 @@ class TestSharedHelpers:
             "\tSCREEN [00:09] [slide]: tab indented",
         ]
         path = tmp_path / "s.md"
-        path.write_text("\n".join(f'[00:00] A: "open"\n{line}' for line in samples) + "\n", encoding="utf-8")
+        # The writer's layout: one blank line between entries.
+        path.write_text("\n\n".join(f'[00:00] A: "open"\n\n{line}' for line in samples) + "\n", encoding="utf-8")
         chunked = [c["text"].splitlines()[0] for c in vi.chunk_transcript(path, chunk_size=1)]
         mine = [
             "".join(e.lines).splitlines()[0] for e in vi.parse_transcript_body(path.read_text(encoding="utf-8")).entries
@@ -1276,3 +1277,276 @@ class TestSharedHelpers:
         with caplog.at_level(logging.INFO, logger="video_intel"):
             vi.plan_transcript_repair(text, _cue_records(raw))
         assert f"against {len(raw)} caption cues" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Peer-review round: on-disk rollback, repeated cue text, SCREEN ownership,
+# the duration bound
+# ---------------------------------------------------------------------------
+
+
+class TestRollbackFromDisk:
+    """Inject an interrupt at each point and require the start state, with no sidecar."""
+
+    def _interrupt_after_replace(self, monkeypatch, target_name: str):
+        real_replace = vi.os.replace
+        fired = []
+
+        def replace(src, dst):
+            real_replace(src, dst)
+            if not fired and Path(dst).name == target_name:
+                fired.append(dst)
+                raise KeyboardInterrupt
+
+        monkeypatch.setattr(vi.os, "replace", replace)
+        return fired
+
+    def test_interrupt_right_after_the_transcript_replace(self, corpus, monkeypatch):
+        p = _write_corpus(corpus)
+        _stub_captions(monkeypatch, _talk()[1])
+        before = _snapshot(corpus)
+        fired = self._interrupt_after_replace(monkeypatch, p.transcript.name)
+
+        with pytest.raises(KeyboardInterrupt):
+            _run(corpus, apply=True)
+        assert fired
+        assert _snapshot(corpus) == before
+
+    def test_interrupt_right_after_the_meta_replace(self, corpus, monkeypatch):
+        p = _write_corpus(corpus)
+        _stub_captions(monkeypatch, _talk()[1])
+        before = _snapshot(corpus)
+        fired = self._interrupt_after_replace(monkeypatch, p.meta.name)
+
+        with pytest.raises(KeyboardInterrupt):
+            _run(corpus, apply=True)
+        assert fired
+        assert _snapshot(corpus) == before
+
+    def test_interrupt_during_the_header_rewrite(self, corpus, monkeypatch):
+        _write_corpus(corpus)
+        _stub_captions(monkeypatch, _talk()[1])
+        before = _snapshot(corpus)
+
+        def interrupt(*_a, **_kw):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(vi, "rewrite_transcript_header", interrupt)
+
+        with pytest.raises(KeyboardInterrupt):
+            _run(corpus, apply=True)
+        assert _snapshot(corpus) == before
+
+    def test_interrupt_after_both_writes_before_return(self, corpus, monkeypatch):
+        _write_corpus(corpus)
+        _stub_captions(monkeypatch, _talk()[1])
+        before = _snapshot(corpus)
+
+        def interrupt(*_a, **_kw):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(vi, "repair_follow_up_commands", interrupt)
+
+        with pytest.raises(KeyboardInterrupt):
+            _run(corpus, apply=True)
+        assert _snapshot(corpus) == before
+
+    def test_a_failed_restore_keeps_the_sidecar_and_names_it(self, corpus, monkeypatch, caplog):
+        p = _write_corpus(corpus)
+        original = p.transcript.read_bytes()
+        _stub_captions(monkeypatch, _talk()[1])
+        real_write = vi._write_bytes_atomic
+
+        def no_restore(path, data):
+            if data == original:
+                raise OSError("read-only now")
+            real_write(path, data)
+
+        def boom(*_a, **_kw):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(vi, "_write_bytes_atomic", no_restore)
+        monkeypatch.setattr(vi, "_write_meta_atomic", boom)
+
+        with caplog.at_level(logging.INFO, logger="video_intel"):
+            assert _exit_code(corpus, apply=True) == 1
+        assert p.sidecar.read_bytes() == original
+        assert f"the only copy of the original is {p.sidecar}" in caplog.text
+        assert "could not restore the original transcript" in caplog.text
+
+
+def _rolling_track(n: int = 16, step: float = 5.0):
+    """Sixteen sentences spoken five seconds apart; each cue shows the previous sentence again plus the new one."""
+    sentences = [f"Sentence {WORDS[i]} number {i} says {WORDS[(i * 5 + 2) % len(WORDS)]} clearly." for i in range(n)]
+    cues = []
+    for i, sentence in enumerate(sentences):
+        shown = (sentences[i - 1] + " " if i else "") + sentence
+        cues.append(caption_align.Cue(start=i * step, duration=step, text=shown))
+    return sentences, cues
+
+
+class TestRepeatedCueText:
+    def test_a_rolling_track_stamps_each_sentence_at_the_cue_it_first_appears_in(self):
+        sentences, cues = _rolling_track()
+
+        plan = caption_align.plan_entry_split(" ".join(sentences), cues, original_seconds=0, target=25)
+
+        assert plan.repairable and plan.coverage == 1.0
+        for piece in plan.pieces[1:]:
+            spoken_at = 5 * next(i for i, s in enumerate(sentences) if piece.text.startswith(s))
+            assert piece.stamp_seconds == spoken_at, (piece.text[:30], piece.stamp_seconds)
+        assert len(plan.pieces) > 2
+
+    def test_entry_offsets_on_a_rolling_track_are_zero(self):
+        sentences, cues = _rolling_track()
+
+        offsets = caption_align.entry_offsets([(5 * i, s) for i, s in enumerate(sentences)], cues)
+
+        assert [o.offset_seconds for o in offsets] == [0.0] * len(sentences)
+
+    def test_a_track_without_repeats_aligns_exactly_as_before(self):
+        def old_caption_words(cue_list):
+            words, owner = [], []
+            for index, cue in enumerate(cue_list):
+                cue_words = caption_align.normalize_words(cue.text)
+                words.extend(cue_words)
+                owner.extend([index] * len(cue_words))
+            return words, owner
+
+        import difflib
+
+        for raw in (_talk()[1], _talk(n=20, first=700.0)[1]):
+            cues = [caption_align.Cue(s, 4.0, t) for s, t in raw]
+            words = caption_align.normalize_words(" ".join(t for _, t in raw[::3]))
+            caption, owner = old_caption_words(cues)
+            expected = [None] * len(words)
+            for a, b, size in difflib.SequenceMatcher(None, caption, words, autojunk=False).get_matching_blocks():
+                for k in range(size):
+                    expected[b + k] = owner[a + k]
+            assert caption_align.align_words_to_cues(words, cues) == expected
+
+    def test_a_cue_that_only_repeats_contributes_no_words(self):
+        cues = [
+            caption_align.Cue(0.0, 2.0, "alpha beta gamma delta"),
+            caption_align.Cue(2.0, 2.0, "gamma delta"),
+            caption_align.Cue(4.0, 2.0, "epsilon zeta"),
+        ]
+        assert caption_align.align_words_to_cues(["gamma", "delta", "epsilon"], cues) == [0, 0, 2]
+
+    def test_a_partial_overlap_drops_only_the_repeated_words_and_one_shared_word_is_kept(self):
+        cues = [
+            caption_align.Cue(0.0, 2.0, "alpha beta gamma delta"),
+            caption_align.Cue(2.0, 2.0, "gamma delta epsilon"),
+            caption_align.Cue(4.0, 2.0, "epsilon zeta"),  # one shared word: ordinary speech, kept
+        ]
+        words = ["gamma", "delta", "epsilon", "epsilon", "zeta"]
+        assert caption_align.align_words_to_cues(words, cues) == [0, 0, 1, 2, 2]
+
+
+def _screen_trap_markdown() -> str:
+    """Real writer output: a SCREEN block whose description and on-screen text hold entry-shaped lines and `---`."""
+    sentences, _ = _talk()
+    raw = {
+        "transcripts": [
+            {"start": "00:12", "voice": 1, "text": " ".join(sentences)},
+            {"start": "09:30", "voice": 1, "text": "Last words."},
+        ],
+        "screen_content": [
+            {
+                "start": "01:00",
+                "end": "01:30",
+                "type": "slide",
+                "description": 'A chat log:\n[00:00] Alice: "long quoted text on the slide"\n  SCREEN [00:05] [code]: nested\n---',
+                "transcribed_text": 'quote line\n[00:01] Bob: "more"\n---',
+            },
+            {"start": "02:00", "type": "code", "description": "code", "code": 'x = 1\n[00:02] Carol: "y"'},
+        ],
+        "speakers": [{"voice": 1, "name": "Host"}],
+    }
+    return "# Transcript: T\n\n**Status:** Complete\n\n---\n\n" + vi.merge_transcript_json(raw, {})
+
+
+class TestScreenOwnership:
+    def test_entry_shaped_lines_inside_a_screen_block_stay_its_content(self):
+        text = _screen_trap_markdown()
+
+        body = vi.parse_transcript_body(text)
+
+        assert body.render() == text
+        assert [(e.kind, e.stamp) for e in body.entries] == [
+            (vi.TRANSCRIPT_ENTRY_DIALOGUE, "00:12"),
+            (vi.TRANSCRIPT_ENTRY_SCREEN, "01:00"),
+            (vi.TRANSCRIPT_ENTRY_SCREEN, "02:00"),
+            (vi.TRANSCRIPT_ENTRY_DIALOGUE, "09:30"),
+        ]
+        assert body.trailer == ""
+        assert 'Alice: "long quoted text on the slide"' in "".join(body.entries[1].lines)
+
+    def test_a_trap_line_in_the_last_screen_block_is_not_the_trailer(self):
+        raw = {
+            "transcripts": [{"start": "00:12", "voice": 1, "text": "hello"}],
+            "screen_content": [{"start": "01:00", "type": "slide", "description": 'top\n---\n[00:00] Alice: "x"'}],
+            "speakers": [{"voice": 1, "name": "Host", "evidence": "named"}],
+        }
+        text = "# Transcript: T\n\n---\n\n" + vi.merge_transcript_json(raw, {})
+
+        body = vi.parse_transcript_body(text)
+
+        assert body.render() == text
+        assert len(body.entries) == 2
+        assert "Speaker Identification Evidence" in body.trailer
+        assert "top" in "".join(body.entries[1].lines)
+
+    def test_a_repair_never_touches_lines_inside_a_screen_block(self):
+        text = _screen_trap_markdown()
+        _, raw = _talk()
+
+        repaired = vi.plan_transcript_repair(text, [caption_align.Cue(s, 4.0, t) for s, t in raw]).text
+
+        before = _screens(vi.parse_transcript_body(text))
+        assert _screens(vi.parse_transcript_body(repaired)) == before
+        for screen in before:
+            assert screen in repaired
+
+    def test_the_dialogue_reader_still_counts_a_trap_line_as_dialogue(self):
+        # Documented, not fixed here: the assessor's reader reads lines, not entries.
+        stamps = [e["start"] for e in vi.dialogue_entries_from_transcript_markdown(_screen_trap_markdown())]
+        assert "00:00" in stamps
+
+
+class TestDurationBound:
+    def test_no_new_stamp_runs_past_the_video(self, corpus, monkeypatch):
+        # Duration 490 s allows stamps up to 539 s; the track's last cues start at
+        # about 551 and 556 s (4 of 100 cues, under the decline threshold), and
+        # without the bound the plan stamps a piece at 556 s.
+        sentences, cues = _talk()
+        cue_records = [caption_align.Cue(s, 4.0, t) for s, t in cues]
+        unbounded = caption_align.plan_entry_split(" ".join(sentences), cue_records, original_seconds=12)
+        assert not vi.stamp_fits_duration(unbounded.pieces[-1].stamp_seconds, 490)
+        p = _write_corpus(corpus, meta=_meta(duration_seconds=490))
+        _stub_captions(monkeypatch, cues)
+
+        result = _run(corpus, apply=True)
+
+        assert result["outcome"] == "repaired"
+        stamps = [vi.timestamp_to_seconds(e.stamp) for e in _body(p.transcript).entries if e.kind == "dialogue"]
+        assert len(stamps) > 10
+        assert all(vi.stamp_fits_duration(s, 490) for s in stamps), stamps
+        rejoined = " ".join(parts.text for _, parts in _dialogue(_body(p.transcript)))
+        assert " ".join(rejoined.split()) == " ".join(" ".join(sentences).split())
+
+    def test_stamp_fits_duration_follows_the_one_plausibility_rule(self):
+        tolerance = vi.timestamp_tolerance(100)
+        assert vi.stamp_fits_duration(100 + tolerance, 100)
+        assert not vi.stamp_fits_duration(101 + tolerance, 100)
+        assert vi.stamp_fits_duration(10**6, None)
+
+    def test_a_track_running_far_past_the_video_declines(self, corpus, monkeypatch, caplog):
+        _write_corpus(corpus, meta=_meta(duration_seconds=100))
+        _stub_captions(monkeypatch, _talk()[1])  # cues run to about 550 s
+        before = _snapshot(corpus)
+
+        with caplog.at_level(logging.INFO, logger="video_intel"):
+            assert _exit_code(corpus, apply=True) == 3
+        assert _snapshot(corpus) == before
+        assert "different or re-uploaded video" in caplog.text
