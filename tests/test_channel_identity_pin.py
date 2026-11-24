@@ -55,6 +55,7 @@ class FakeYouTube:
         self.handles = handles
         self.channel_lookups: list[dict] = []
         self.playlists_fetched: list[str] = []
+        self.dead: dict[str, Exception] = {}
         self.published = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     @staticmethod
@@ -77,6 +78,8 @@ class FakeYouTube:
     def playlistItems(self):
         def handler(part, playlistId, maxResults, pageToken):
             self.playlists_fetched.append(playlistId)
+            if playlistId in self.dead:
+                raise self.dead[playlistId]
             vid = self.video_of("UC" + playlistId[2:])
             return {
                 "items": [
@@ -110,8 +113,22 @@ def _seed_ids(corpus, entries: dict) -> None:
     path.write_text(json.dumps(entries), encoding="utf-8")
 
 
-def _learned(channel_id: str, title: str = "Known") -> dict:
-    return {"channel_id": channel_id, "title": title, "first_seen": "2026-01-01"}
+def _learned(channel_id: str, title: str = "Known", url: str | None = None) -> dict:
+    entry = {"channel_id": channel_id, "title": title, "first_seen": "2026-01-01"}
+    if url is not None:
+        entry["url"] = url
+    return entry
+
+
+@pytest.fixture(autouse=True)
+def _reset_warn_once():
+    vi._CHANNEL_IDS_WARNED.clear()
+    yield
+    vi._CHANNEL_IDS_WARNED.clear()
+
+
+def _messages(caplog, level) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno == level]
 
 
 def _warnings(caplog) -> list[str]:
@@ -213,7 +230,10 @@ def test_cmd_scan_first_run_records_id_and_second_run_with_same_id_is_silent(sca
     scan_env.youtube = FakeYouTube({"creator": UC_A})
 
     # Act: run 1 learns the id.
-    vi.cmd_scan(_scan_args(), _scan_config())
+    with caplog.at_level(logging.INFO, logger="video_intel"):
+        vi.cmd_scan(_scan_args(), _scan_config())
+    learn_lines = [m for m in _messages(caplog, logging.INFO) if "Learned channel id" in m]
+    caplog.clear()
     learned = json.loads(_ids_path(scan_env.corpus).read_text(encoding="utf-8"))
     with caplog.at_level(logging.INFO, logger="video_intel"):
         vi.cmd_scan(_scan_args(), _scan_config())
@@ -223,6 +243,9 @@ def test_cmd_scan_first_run_records_id_and_second_run_with_same_id_is_silent(sca
     assert learned["chan"]["title"] == "Title A"
     assert learned["chan"]["first_seen"] == datetime.now(UTC).strftime("%Y-%m-%d")
     assert not [w for w in _warnings(caplog) if UC_A in w]
+    assert learned["chan"]["url"] == HANDLE_URL
+    assert len(learn_lines) == 1
+    assert "chan" in learn_lines[0] and UC_A in learn_lines[0] and "Title A" in learn_lines[0]
 
 
 def test_cmd_scan_dry_run_writes_no_state_file(scan_env):
@@ -253,15 +276,10 @@ def test_cmd_scan_dry_run_still_warns_on_mismatch_and_leaves_state_file_untouche
     assert _ids_path(scan_env.corpus).read_bytes() == before
 
 
-@pytest.mark.parametrize(
-    "answer",
-    [None, vi.HttpError(MagicMock(status=404, reason="Not Found"), b"{}", uri="https://example.invalid/channels")],
-    ids=["no-items", "http-404"],
-)
-def test_cmd_scan_handle_gone_with_known_id_fetches_known_id_and_warns_once(scan_env, caplog, answer):
+def test_cmd_scan_handle_returns_no_channel_with_known_id_fetches_known_id_and_warns_with_remedy(scan_env, caplog):
     # Arrange
     _seed_ids(scan_env.corpus, {"chan": _learned(UC_A)})
-    scan_env.youtube = FakeYouTube({"creator": answer})
+    scan_env.youtube = FakeYouTube({"creator": None})
 
     # Act
     with caplog.at_level(logging.INFO, logger="video_intel"):
@@ -271,7 +289,33 @@ def test_cmd_scan_handle_gone_with_known_id_fetches_known_id_and_warns_once(scan
     assert scan_env.youtube.playlists_fetched == [_uploads(UC_A)]
     gone = [w for w in _warnings(caplog) if "no longer resolves" in w]
     assert len(gone) == 1
-    assert "chan" in gone[0] and UC_A in gone[0]
+    assert "chan" in gone[0] and UC_A in gone[0] and "channel_id" in gone[0]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        vi.HttpError(MagicMock(status=500, reason="Error"), b"{}", uri="https://example.invalid/channels"),
+        TimeoutError("read timed out"),
+    ],
+    ids=["http-500", "timeout"],
+)
+def test_cmd_scan_lookup_raises_with_known_id_fetches_known_id_and_says_could_not_check(scan_env, caplog, error):
+    # Arrange
+    _seed_ids(scan_env.corpus, {"chan": _learned(UC_A)})
+    scan_env.youtube = FakeYouTube({"creator": error})
+
+    # Act
+    with caplog.at_level(logging.INFO, logger="video_intel"):
+        vi.cmd_scan(_scan_args(), _scan_config())
+
+    # Assert
+    assert scan_env.youtube.playlists_fetched == [_uploads(UC_A)]
+    checked = [w for w in _warnings(caplog) if "could not be checked" in w]
+    assert len(checked) == 1
+    assert UC_A in checked[0]
+    assert "changed owner" not in checked[0] and "ids.json" not in checked[0]
+    assert not [w for w in _warnings(caplog) if "no longer resolves" in w]
 
 
 def test_cmd_scan_existing_learned_entry_is_never_rewritten(scan_env):
@@ -334,6 +378,210 @@ def test_cmd_scan_quota_stop_at_lookup_with_known_id_propagates(scan_env):
     assert scan_env.youtube.playlists_fetched == []
 
 
+def _http(status: int, reason: str | None = None) -> vi.HttpError:
+    body = {"error": {"errors": [{"reason": reason}]}} if reason else {}
+    return vi.HttpError(
+        MagicMock(status=status, reason="Error"), json.dumps(body).encode("utf-8"), uri="https://example.invalid/x"
+    )
+
+
+def test_cmd_scan_dead_known_id_warns_records_error_and_next_channel_is_processed(scan_env, caplog):
+    # Arrange: the known channel was deleted (its uploads playlist is gone); a healthy channel follows.
+    _seed_ids(scan_env.corpus, {"chan": _learned(UC_A)})
+    scan_env.youtube = FakeYouTube({"creator": None, "second": UC_C})
+    scan_env.youtube.dead[_uploads(UC_A)] = _http(404, "playlistNotFound")
+    config = {"channels": [{"name": "chan", "url": HANDLE_URL}, {"name": "two", "url": "https://youtube.com/@second"}]}
+
+    # Act
+    with caplog.at_level(logging.INFO, logger="video_intel"):
+        vi.cmd_scan(_scan_args(), config)
+
+    # Assert
+    assert scan_env.youtube.playlists_fetched == [_uploads(UC_A), _uploads(UC_C)]
+    assert FakeYouTube.video_of(UC_C) in _written_ids(scan_env)
+    fetch = [w for w in _warnings(caplog) if "Could not fetch videos" in w]
+    assert len(fetch) == 1
+    assert "chan" in fetch[0] and "playlistNotFound" in fetch[0] and "config.yaml" in fetch[0]
+    assert any(w.startswith("  [chan] chan: error: HTTP 404") for w in _warnings(caplog))
+    assert any(r.getMessage() == "Done." for r in caplog.records)
+
+
+def test_cmd_scan_quota_stop_at_fetch_still_propagates(scan_env):
+    # Arrange
+    scan_env.youtube = FakeYouTube({"creator": UC_A})
+    scan_env.youtube.dead[_uploads(UC_A)] = _http(403, "quotaExceeded")
+
+    # Act / Assert
+    with pytest.raises(vi.HttpError):
+        vi.cmd_scan(_scan_args(), _scan_config())
+
+
+def test_cmd_scan_renamed_entry_keeps_pin_through_url_and_records_known_id_under_new_name(scan_env, caplog):
+    # Arrange: the entry was learned as "old"; the config now calls it "chan"; the handle belongs to a stranger.
+    _seed_ids(scan_env.corpus, {"old": _learned(UC_A, "Original Creator", url=HANDLE_URL)})
+    scan_env.youtube = FakeYouTube({"creator": UC_B})
+
+    # Act
+    with caplog.at_level(logging.INFO, logger="video_intel"):
+        vi.cmd_scan(_scan_args(), _scan_config())
+
+    # Assert
+    assert scan_env.youtube.playlists_fetched == [_uploads(UC_A)]
+    assert FakeYouTube.video_of(UC_B) not in _written_ids(scan_env)
+    assert len([w for w in _warnings(caplog) if UC_B in w]) == 1
+    data = json.loads(_ids_path(scan_env.corpus).read_text(encoding="utf-8"))
+    assert data["old"] == _learned(UC_A, "Original Creator", url=HANDLE_URL)
+    assert data["chan"]["channel_id"] == UC_A
+    assert data["chan"]["url"] == HANDLE_URL
+
+
+def test_cmd_scan_renamed_entry_on_dry_run_records_nothing(scan_env):
+    # Arrange
+    _seed_ids(scan_env.corpus, {"old": _learned(UC_A, url=HANDLE_URL)})
+    before = _ids_path(scan_env.corpus).read_bytes()
+    scan_env.youtube = FakeYouTube({"creator": UC_A})
+
+    # Act
+    vi.cmd_scan(_scan_args(dry_run=True), _scan_config())
+
+    # Assert
+    assert _ids_path(scan_env.corpus).read_bytes() == before
+
+
+def test_cmd_scan_shared_name_skips_state_file_resolves_live_and_warns_once(scan_env, caplog):
+    # Arrange: two entries named "chan"; a learned id under that name must not be applied to either.
+    _seed_ids(scan_env.corpus, {"chan": _learned(UC_A)})
+    before = _ids_path(scan_env.corpus).read_bytes()
+    scan_env.youtube = FakeYouTube({"creator": UC_B, "second": UC_C})
+    config = {"channels": [{"name": "chan", "url": HANDLE_URL}, {"name": "chan", "url": "https://youtube.com/@second"}]}
+
+    # Act
+    with caplog.at_level(logging.INFO, logger="video_intel"):
+        vi.cmd_scan(_scan_args(), config)
+
+    # Assert
+    assert scan_env.youtube.playlists_fetched == [_uploads(UC_B), _uploads(UC_C)]
+    shared = [w for w in _warnings(caplog) if "share this name" in w]
+    assert len(shared) == 1
+    assert _ids_path(scan_env.corpus).read_bytes() == before
+
+
+@pytest.mark.parametrize("url", [UC_A, f"https://www.youtube.com/channel/{UC_A}", f"youtube.com/channel/{UC_A}/videos"])
+def test_cmd_scan_url_naming_a_channel_id_makes_no_lookup_and_no_state_access(scan_env, url):
+    # Arrange
+    scan_env.youtube = FakeYouTube({})
+
+    # Act
+    vi.cmd_scan(_scan_args(), {"channels": [{"name": "chan", "url": url}]})
+
+    # Assert
+    assert scan_env.youtube.channel_lookups == []
+    assert scan_env.youtube.playlists_fetched == [_uploads(UC_A)]
+    assert not _ids_path(scan_env.corpus).exists()
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [{"title": "x"}, UC_A, {"channel_id": "UCshort", "title": "x"}, {"channel_id": 123}],
+    ids=["no-id", "bare-string", "short-id", "int-id"],
+)
+def test_cmd_scan_unusable_learned_entry_warns_resolves_live_and_is_left_byte_identical(scan_env, caplog, entry):
+    # Arrange
+    _seed_ids(scan_env.corpus, {"chan": entry})
+    before = _ids_path(scan_env.corpus).read_bytes()
+    scan_env.youtube = FakeYouTube({"creator": UC_B})
+
+    # Act
+    with caplog.at_level(logging.INFO, logger="video_intel"):
+        vi.cmd_scan(_scan_args(), _scan_config())
+
+    # Assert
+    assert scan_env.youtube.playlists_fetched == [_uploads(UC_B)]
+    assert len([w for w in _warnings(caplog) if "no valid channel_id" in w]) == 1
+    assert _ids_path(scan_env.corpus).read_bytes() == before
+
+
+@pytest.mark.parametrize("bad", ["UCshort", 123], ids=["short", "int"])
+def test_cmd_scan_malformed_explicit_channel_id_makes_no_lookup_no_fetch_and_one_error(scan_env, caplog, bad):
+    # Arrange
+    scan_env.youtube = FakeYouTube({"creator": UC_A})
+
+    # Act
+    with caplog.at_level(logging.INFO, logger="video_intel"):
+        vi.cmd_scan(_scan_args(), _scan_config(channel_id=bad))
+
+    # Assert
+    assert scan_env.youtube.channel_lookups == []
+    assert scan_env.youtube.playlists_fetched == []
+    errors = [m for m in _messages(caplog, logging.ERROR) if "channel_id" in m]
+    assert len(errors) == 1
+    assert repr(bad) in errors[0]
+
+
+def test_cmd_scan_unreadable_state_file_warns_once_resolves_live_and_writes_nothing(scan_env, caplog):
+    # Arrange: a directory where the file should be makes the read raise OSError.
+    _ids_path(scan_env.corpus).mkdir(parents=True)
+    scan_env.youtube = FakeYouTube({"creator": UC_A})
+
+    # Act
+    with caplog.at_level(logging.INFO, logger="video_intel"):
+        vi.cmd_scan(_scan_args(), _scan_config())
+
+    # Assert
+    assert scan_env.youtube.playlists_fetched == [_uploads(UC_A)]
+    assert len([w for w in _warnings(caplog) if "Channel id state" in w and "is unreadable" in w]) == 1
+    assert not [w for w in _warnings(caplog) if "Could not record" in w]
+    assert _ids_path(scan_env.corpus).is_dir()
+
+
+def test_cmd_scan_failed_state_write_warns_continues_and_leaves_no_partial_file(scan_env, caplog, monkeypatch):
+    # Arrange
+    real_replace = vi.os.replace
+
+    def failing_replace(src, dst):
+        if str(dst).endswith("ids.json"):
+            raise OSError("disk full")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(vi.os, "replace", failing_replace)
+    scan_env.youtube = FakeYouTube({"creator": UC_A})
+
+    # Act
+    with caplog.at_level(logging.INFO, logger="video_intel"):
+        vi.cmd_scan(_scan_args(), _scan_config())
+
+    # Assert
+    assert scan_env.youtube.playlists_fetched == [_uploads(UC_A)]
+    assert len([w for w in _warnings(caplog) if "Could not record channel id" in w]) == 1
+    assert not _ids_path(scan_env.corpus).exists()
+    assert list(_ids_path(scan_env.corpus).parent.iterdir()) == []
+    assert any(r.getMessage() == "Done." for r in caplog.records)
+
+
+def test_cmd_scan_log_line_falls_back_to_url_when_no_title(scan_env, caplog):
+    # Arrange: an explicit pin makes no lookup, so there is no title.
+    scan_env.youtube = FakeYouTube({})
+
+    # Act
+    with caplog.at_level(logging.INFO, logger="video_intel"):
+        vi.cmd_scan(_scan_args(), _scan_config(channel_id=UC_A))
+
+    # Assert
+    assert f"[chan] {HANDLE_URL}" in _messages(caplog, logging.INFO)
+
+
+def test_record_learned_channel_id_never_rewrites_an_existing_entry(tmp_path):
+    # Arrange
+    _seed_ids(tmp_path, {"chan": _learned(UC_A)})
+    before = _ids_path(tmp_path).read_bytes()
+
+    # Act
+    vi._record_learned_channel_id(tmp_path, "chan", UC_B, "Stranger", HANDLE_URL)
+
+    # Assert
+    assert _ids_path(tmp_path).read_bytes() == before
+
+
 # ---------------------------------------------------------------------------
 # render_headline_digest
 # ---------------------------------------------------------------------------
@@ -376,7 +624,7 @@ def test_render_headline_digest_known_id_after_failed_lookup_is_not_a_failed_cha
     assert [v["video_id"] for v in rendered] == [FakeYouTube.video_of(UC_A)]
 
 
-def test_render_headline_digest_first_run_records_id_and_dry_run_does_not(monkeypatch, tmp_path):
+def test_render_headline_digest_first_run_records_id_and_dry_run_does_not(monkeypatch, tmp_path, caplog):
     # Arrange
     monkeypatch.setattr(vi, "_is_youtube_short_url", lambda _vid: False)
     youtube = FakeYouTube({"creator": UC_A})
@@ -384,10 +632,12 @@ def test_render_headline_digest_first_run_records_id_and_dry_run_does_not(monkey
     # Act
     vi.render_headline_digest(youtube, _digest_config(tmp_path), tmp_path, dry_run=True)
     after_dry_run = _ids_path(tmp_path).exists()
-    vi.render_headline_digest(youtube, _digest_config(tmp_path), tmp_path, dry_run=False)
+    with caplog.at_level(logging.INFO, logger="video_intel"):
+        vi.render_headline_digest(youtube, _digest_config(tmp_path), tmp_path, dry_run=False)
 
     # Assert
     assert after_dry_run is False
+    assert len([m for m in _messages(caplog, logging.INFO) if "Learned channel id" in m and UC_A in m]) == 1
     assert json.loads(_ids_path(tmp_path).read_text(encoding="utf-8"))["chan"]["channel_id"] == UC_A
 
 
@@ -418,17 +668,19 @@ def test_match_configured_channel_learned_ids_make_no_channel_lookup(tmp_path):
     assert youtube.channel_lookups == []
 
 
-def test_match_configured_channel_unknown_id_resolves_live_and_is_recorded(tmp_path):
+def test_match_configured_channel_unknown_id_resolves_live_and_is_recorded(tmp_path, caplog):
     # Arrange
     _seed_ids(tmp_path, {"first": _learned(UC_A)})
     youtube = FakeYouTube({"second": UC_B})
 
     # Act
-    name = vi.match_configured_channel(youtube, _matcher_config(), UC_B, output_dir=tmp_path)
+    with caplog.at_level(logging.INFO, logger="video_intel"):
+        name = vi.match_configured_channel(youtube, _matcher_config(), UC_B, output_dir=tmp_path)
 
     # Assert
     assert name == "second"
     assert [c["forHandle"] for c in youtube.channel_lookups] == ["second"]
+    assert len([m for m in _messages(caplog, logging.INFO) if "Learned channel id" in m and UC_B in m]) == 1
     assert json.loads(_ids_path(tmp_path).read_text(encoding="utf-8"))["second"]["channel_id"] == UC_B
 
 
@@ -444,6 +696,19 @@ def test_match_configured_channel_explicit_channel_id_needs_no_lookup(tmp_path):
     assert name == "first"
     assert youtube.channel_lookups == []
     assert not _ids_path(tmp_path).exists()
+
+
+def test_match_configured_channel_entries_sharing_a_url_but_pinned_differently_do_not_share_a_cache_slot():
+    # Arrange: the first entry is pinned to UC_A; the second (same url, no pin) resolves live to UC_C.
+    url = "https://youtube.com/@shared"
+    config = {"channels": [{"name": "pinned", "url": url, "channel_id": UC_A}, {"name": "live", "url": url}]}
+    youtube = FakeYouTube({"shared": UC_C})
+
+    # Act
+    name = vi.match_configured_channel(youtube, config, UC_C)
+
+    # Assert
+    assert name == "live"
 
 
 class _SnippetYouTube:
