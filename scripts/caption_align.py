@@ -103,6 +103,12 @@ def normalize_words(text: str) -> list[str]:
 #: previous cue is a rolling repeat. A single shared word at a join is
 #: ordinary speech ("... and / and ..."), so it is not dropped.
 REPEAT_MIN_WORDS = 2
+#: A rolling display repeats text only while the previous cue is still on
+#: screen, so a repeat is trimmed only when the cue starts before the
+#: previous cue's start plus its duration, plus this much slack (seconds) for
+#: rounding in exported tracks (SRT stores milliseconds). A phrase genuinely
+#: said again later, in a cue that does not overlap, keeps every word.
+ROLLING_OVERLAP_SLACK_SECONDS = 0.1
 
 
 def _leading_repeat(previous: list[str], current: list[str]) -> int:
@@ -123,16 +129,25 @@ def _caption_words(cues: list[Cue]) -> tuple[list[str], list[int]]:
     ORIGINAL words (the full text it showed, so a cue that was itself mostly
     a repeat still exposes its tail); a cue that is entirely a repeat
     contributes no words. The remaining words keep their own cue's index.
+    Only a cue that starts while the previous one is still showing (time
+    overlap, ``ROLLING_OVERLAP_SLACK_SECONDS``) is trimmed; a cue with no
+    duration never overlaps, so a track without durations is never trimmed.
     """
     words: list[str] = []
     owner: list[int] = []
     previous: list[str] = []
+    previous_cue: Cue | None = None
     for index, cue in enumerate(cues):
         cue_words = normalize_words(cue.text)
-        fresh = cue_words[_leading_repeat(previous, cue_words) :]
+        overlaps = (
+            previous_cue is not None
+            and previous_cue.duration > 0
+            and cue.start < previous_cue.start + previous_cue.duration + ROLLING_OVERLAP_SLACK_SECONDS
+        )
+        fresh = cue_words[_leading_repeat(previous, cue_words) :] if overlaps else cue_words
         words.extend(fresh)
         owner.extend([index] * len(fresh))
-        previous = cue_words
+        previous, previous_cue = cue_words, cue
     return words, owner
 
 

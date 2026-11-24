@@ -196,6 +196,18 @@ def _stub_no_captions(monkeypatch, kind, exception=None, calls=None):
     monkeypatch.setattr(vi, "fetch_english_captions", fake)
 
 
+def _fail_meta_write(monkeypatch, raiser) -> None:
+    """Make the meta write raise through ``raiser`` before anything is replaced."""
+    current = vi._write_bytes_atomic
+
+    def write(path, data):
+        if Path(path).name.endswith(".meta.json"):
+            raiser()
+        current(path, data)
+
+    monkeypatch.setattr(vi, "_write_bytes_atomic", write)
+
+
 def _run(corpus: Path, *, apply: bool = False, url: str = URL, channel: str = "chan"):
     args = _types.SimpleNamespace(url=url, channel=channel, apply=apply)
     return vi.cmd_repair_timestamps(args, {"output_dir": str(corpus)})
@@ -596,7 +608,7 @@ class TestApply:
         def boom(*_a, **_kw):
             raise OSError("disk full")
 
-        monkeypatch.setattr(vi, "_write_meta_atomic", boom)
+        _fail_meta_write(monkeypatch, boom)
 
         assert _exit_code(corpus, apply=True) == 1
         assert _snapshot(corpus) == before
@@ -1065,7 +1077,7 @@ class TestFailureHandling:
         def interrupt(*_a, **_kw):
             raise KeyboardInterrupt
 
-        monkeypatch.setattr(vi, "_write_meta_atomic", interrupt)
+        _fail_meta_write(monkeypatch, interrupt)
 
         with pytest.raises(KeyboardInterrupt):
             _run(corpus, apply=True)
@@ -1104,7 +1116,7 @@ class TestFailureHandling:
             raise OSError("disk full")
 
         monkeypatch.setattr(Path, "unlink", stubborn)
-        monkeypatch.setattr(vi, "_write_meta_atomic", boom)
+        _fail_meta_write(monkeypatch, boom)
 
         with caplog.at_level(logging.INFO, logger="video_intel"):
             assert _exit_code(corpus, apply=True) == 1
@@ -1112,37 +1124,6 @@ class TestFailureHandling:
         assert "restored the original transcript" in caplog.text
         assert "could not restore" not in caplog.text
         assert f"could not remove the pre-repair copy {p.sidecar}" in caplog.text
-
-    def test_the_meta_is_judged_from_the_file_on_disk_not_the_plan(self, corpus, monkeypatch):
-        p = _write_corpus(corpus)
-        _stub_captions(monkeypatch, _talk()[1])
-        real_write = vi._write_bytes_atomic
-        calls = []
-
-        def altering(path, data):
-            calls.append(path)
-            if len(calls) == 1:
-                # Land a file that differs from the plan: drop every second dialogue entry.
-                body = vi.parse_transcript_body(data.decode("utf-8"))
-                kept, drop = [], False
-                for entry in body.entries:
-                    if entry.kind == vi.TRANSCRIPT_ENTRY_DIALOGUE:
-                        drop = not drop
-                        if drop and len(kept) > 1:
-                            continue
-                    kept.append(entry)
-                data = vi.TranscriptBody(body.header, kept, body.trailer).render().encode("utf-8")
-            real_write(path, data)
-
-        monkeypatch.setattr(vi, "_write_bytes_atomic", altering)
-
-        result = _run(corpus, apply=True)
-
-        meta = json.loads(p.meta.read_text(encoding="utf-8"))
-        on_disk, _ = vi.assess_transcript_markdown(p.transcript.read_text(encoding="utf-8"), 600, captions=False)
-        assert meta["transcript_dialogue_entries"] == on_disk["transcript_dialogue_entries"]
-        planned = sum(len(c.plan.pieces) for c in result["repair"].repaired)
-        assert meta["transcript_dialogue_entries"] < planned
 
 
 class TestShapesThatStayWhole:
@@ -1366,12 +1347,12 @@ class TestRollbackFromDisk:
             raise OSError("disk full")
 
         monkeypatch.setattr(vi, "_write_bytes_atomic", no_restore)
-        monkeypatch.setattr(vi, "_write_meta_atomic", boom)
+        _fail_meta_write(monkeypatch, boom)
 
         with caplog.at_level(logging.INFO, logger="video_intel"):
             assert _exit_code(corpus, apply=True) == 1
         assert p.sidecar.read_bytes() == original
-        assert f"the only copy of the original is {p.sidecar}" in caplog.text
+        assert f"keeping {p.sidecar}" in caplog.text
         assert "could not restore the original transcript" in caplog.text
 
 
@@ -1550,3 +1531,171 @@ class TestDurationBound:
             assert _exit_code(corpus, apply=True) == 3
         assert _snapshot(corpus) == before
         assert "different or re-uploaded video" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Re-check round: ownership-exact rollback, time-overlap trimming, hidden stamps
+# ---------------------------------------------------------------------------
+
+
+class TestRollbackOwnsOnlyItsWrites:
+    def test_a_meta_changed_by_another_process_during_the_fetch_is_left_alone(self, corpus, monkeypatch):
+        p = _write_corpus(corpus)
+        snippets = list(_talk()[1])
+
+        def fetch_while_someone_edits_the_meta(video_id, *, reason_sink=None):
+            meta = json.loads(p.meta.read_text(encoding="utf-8"))
+            meta["skip_modes"] = ["concepts", "mindmap"]
+            p.meta.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            return CaptionsResult(snippets, True, "en", tuple(4.0 for _ in snippets))
+
+        def transcript_write_fails(path, data):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(vi, "fetch_english_captions", fetch_while_someone_edits_the_meta)
+        original = p.transcript.read_bytes()
+        monkeypatch.setattr(vi, "_write_bytes_atomic", transcript_write_fails)
+        assert _exit_code(corpus, apply=True) == 1
+
+        assert json.loads(p.meta.read_text(encoding="utf-8"))["skip_modes"] == ["concepts", "mindmap"]
+        assert p.transcript.read_bytes() == original
+        assert not p.sidecar.exists()
+
+    def test_a_successful_repair_keeps_a_key_another_writer_added_meanwhile(self, corpus, monkeypatch):
+        p = _write_corpus(corpus)
+        _stub_captions(monkeypatch, _talk()[1])
+        real_rewrite = vi.rewrite_transcript_header
+
+        def rewrite_while_someone_edits_the_meta(*args, **kwargs):
+            meta = json.loads(p.meta.read_text(encoding="utf-8"))
+            meta["added_meanwhile"] = "kept"
+            p.meta.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            return real_rewrite(*args, **kwargs)
+
+        monkeypatch.setattr(vi, "rewrite_transcript_header", rewrite_while_someone_edits_the_meta)
+
+        assert _run(corpus, apply=True)["outcome"] == "repaired"
+
+        meta = json.loads(p.meta.read_text(encoding="utf-8"))
+        assert meta["added_meanwhile"] == "kept"
+        assert meta["transcript_timestamp_repair"] == "caption_cues"
+        assert "monolithic_severe" not in meta["transcript_quality_flags"]
+
+    def test_a_transcript_another_writer_replaced_is_not_overwritten_and_the_sidecar_is_kept(
+        self, corpus, monkeypatch, caplog
+    ):
+        p = _write_corpus(corpus)
+        _stub_captions(monkeypatch, _talk()[1])
+        meta_before = p.meta.read_bytes()
+
+        def someone_rewrites_the_transcript(*args, **kwargs):
+            p.transcript.write_bytes(b"third-party transcript")
+            raise OSError("boom after the third-party write")
+
+        monkeypatch.setattr(vi, "_repaired_meta", someone_rewrites_the_transcript)
+
+        with caplog.at_level(logging.INFO, logger="video_intel"):
+            assert _exit_code(corpus, apply=True) == 1
+
+        assert p.transcript.read_bytes() == b"third-party transcript"
+        assert p.meta.read_bytes() == meta_before
+        assert p.sidecar.exists()
+        assert f"{p.transcript} was changed by another writer" in caplog.text
+        assert f"keeping {p.sidecar}" in caplog.text
+
+    def test_a_transcript_that_lands_different_from_the_plan_is_neither_judged_nor_overwritten(
+        self, corpus, monkeypatch
+    ):
+        p = _write_corpus(corpus)
+        _stub_captions(monkeypatch, _talk()[1])
+        meta_before = p.meta.read_bytes()
+        real_write = vi._write_bytes_atomic
+
+        def lands_altered(path, data):
+            real_write(path, data + b"\nsomeone else's line\n")
+
+        monkeypatch.setattr(vi, "_write_bytes_atomic", lands_altered)
+
+        assert _exit_code(corpus, apply=True) == 1
+        assert p.meta.read_bytes() == meta_before  # nothing judged from bytes this repair did not write
+        assert p.transcript.read_bytes().endswith(b"someone else's line\n")  # not ours: left alone
+        assert p.sidecar.exists()
+
+
+class TestRepeatTrimmingNeedsTimeOverlap:
+    def _phrase_track(self):
+        words = "the deployment pipeline needs a second reviewer before every release"
+        cues = [
+            caption_align.Cue(0.0, 4.0, "first we talk about the plan for this quarter"),
+            caption_align.Cue(25.0, 4.0, f"so {words}"),
+            caption_align.Cue(50.0, 4.0, f"{words} and that is the rule"),
+        ]
+        return words, cues
+
+    def test_a_phrase_spoken_twice_far_apart_keeps_both_stamps(self):
+        words, cues = self._phrase_track()
+        transcript = caption_align.normalize_words(
+            f"first we talk about the plan for this quarter so {words} {words} and that is the rule"
+        )
+
+        result = caption_align.align_words_to_cues(transcript, cues)
+
+        assert None not in result  # coverage 1.0
+        n = len(caption_align.normalize_words(words))
+        second = 9 + 1 + n  # index of the second occurrence's first word
+        assert result[second : second + n] == [2] * n
+        assert result[10 : 10 + n] == [1] * n
+
+    def test_the_rolling_shape_still_gets_the_cue_it_first_appears_in(self):
+        sentences, cues = _rolling_track()
+
+        plan = caption_align.plan_entry_split(" ".join(sentences), cues, original_seconds=0, target=25)
+
+        for piece in plan.pieces[1:]:
+            assert piece.stamp_seconds == 5 * next(i for i, s in enumerate(sentences) if piece.text.startswith(s))
+
+    def test_genuine_repetition_inside_overlapping_cues_is_at_worst_one_cue_early(self):
+        cues = [
+            caption_align.Cue(0.0, 3.0, "we need to ship it"),
+            caption_align.Cue(2.0, 3.0, "ship it now"),  # overlaps: "ship it" is read as a rolling repeat
+        ]
+        result = caption_align.align_words_to_cues(["we", "need", "to", "ship", "it", "ship", "it", "now"], cues)
+        assert result[:5] == [0, 0, 0, 0, 0]
+        assert result[-1] == 1  # "now" keeps its own cue
+        assert all(c in (0, 1, None) for c in result[5:7])  # the repeat maps to the earlier cue or none
+
+    def test_cues_without_durations_are_never_trimmed(self):
+        cues = [caption_align.Cue(0.0, 0.0, "alpha beta gamma"), caption_align.Cue(1.0, 0.0, "beta gamma delta")]
+        assert caption_align.align_words_to_cues(["beta", "gamma", "delta"], cues) == [1, 1, 1]
+
+
+class TestHiddenEntryStampsBoundTheSplit:
+    def test_a_run_on_guest_line_after_a_screen_line_bounds_the_wall_before_it(self):
+        sentences, cues = _talk()
+        guest = '[00:20] Guest: "a line the writer ran straight on"'
+        text = (
+            "# Transcript: T\n\n---\n\n"
+            f'[00:00] Host: "{" ".join(sentences)}"\n\n'
+            "  SCREEN [00:10] [slide]: a slide\n"
+            f"{guest}\n"
+        )
+
+        repair = vi.plan_transcript_repair(text, _cue_records(cues))
+
+        body = vi.parse_transcript_body(repair.text)
+        assert body.render() == repair.text and vi.parse_transcript_body(text).render() == text
+        stamps = [vi.timestamp_to_seconds(e.stamp) for e in body.entries if e.kind == vi.TRANSCRIPT_ENTRY_DIALOGUE]
+        assert all(s < 20 for s in stamps), stamps
+        assert repair.text.endswith(f"  SCREEN [00:10] [slide]: a slide\n{guest}\n")
+
+    def test_trap_lines_inside_a_screen_block_also_bound_the_preceding_split(self):
+        text = _screen_trap_markdown()
+        _, raw = _talk()
+
+        repair = vi.plan_transcript_repair(text, _cue_records(raw))
+
+        # The trap lines carry [00:00] to [00:05]: below the wall's own stamp, so it cannot split.
+        assert all(c.stamp != "00:12" for c in repair.repaired)
+        assert any(c.stamp == "00:12" for c in repair.candidates)  # it was a candidate
+        assert _screens(vi.parse_transcript_body(repair.text)) == _screens(vi.parse_transcript_body(text))
+        assert vi.parse_transcript_body(text).render() == text

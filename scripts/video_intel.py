@@ -14741,6 +14741,23 @@ def _unsplittable_reason(entry: TranscriptBodyEntry, parts: DialogueEntryParts |
     return None
 
 
+def _hidden_entry_stamps(entry: TranscriptBodyEntry) -> list[int]:
+    """Stamps of entry-shaped lines a SCREEN block owns (never edited, always a split bound).
+
+    Text cannot always tell a quoted line inside a description from a real
+    entry the writer ran on without a blank line, so both readings are made
+    safe: the line stays the block's content AND its stamp bounds the split
+    of the dialogue entry before the block, like a next-dialogue stamp.
+    """
+    stamps = []
+    for line in entry.lines[1:]:
+        content = _line_content(line)
+        match = _DIALOGUE_LINE_RE.match(content) or _SCREEN_LINE_RE.match(content)
+        if match:
+            stamps.append(timestamp_to_seconds(match.group(1)))
+    return stamps
+
+
 def _splice_pieces(pieces: list[TranscriptBodyEntry], screens: list[TranscriptBodyEntry]) -> list[TranscriptBodyEntry]:
     """The first piece, then the other pieces and the entry's own SCREEN blocks merged by stamp.
 
@@ -14831,10 +14848,24 @@ def plan_transcript_repair(
     overall = sum(1 for s in slices for c in s if c is not None) / total if total else 0.0
     newline = "\r\n" if "\r\n" in text else "\n"
 
+    # The lowest stamp of an entry-shaped line inside the SCREEN blocks that
+    # follow each dialogue entry (before the next one) bounds its split too.
+    hidden_bound: dict[int, int] = {}
+    owner: TranscriptBodyEntry | None = None
+    for item in body.entries:
+        if item.kind == TRANSCRIPT_ENTRY_DIALOGUE:
+            owner = item
+        elif owner is not None:
+            for sec in _hidden_entry_stamps(item):
+                hidden_bound[id(owner)] = min(hidden_bound.get(id(owner), sec), sec)
+
     candidates: list[RepairCandidate] = []
     replacements: dict[int, list[TranscriptBodyEntry]] = {}
     for n, ((entry, parts), entry_text, word_cues) in enumerate(zip(dialogue, texts, slices, strict=True)):
-        bound = timestamp_to_seconds(dialogue[n + 1][0].stamp) if n + 1 < len(dialogue) else None
+        limits = [timestamp_to_seconds(dialogue[n + 1][0].stamp)] if n + 1 < len(dialogue) else []
+        if id(entry) in hidden_bound:
+            limits.append(hidden_bound[id(entry)])
+        bound = min(limits) if limits else None
         plan = caption_align.plan_entry_split(
             entry_text,
             cues,
@@ -15010,6 +15041,14 @@ def _repaired_meta(meta: dict, written_text: str, duration: int, coverage: float
     return new_meta, merged
 
 
+def _meta_for_repair(raw: bytes, video_id: str) -> dict:
+    """The meta as it is on disk now, refused if it no longer describes this video."""
+    meta = json.loads(raw.decode("utf-8"))
+    if not isinstance(meta, dict) or meta.get("video_id") != video_id:
+        raise ValueError("the meta no longer describes this video")
+    return meta
+
+
 def _write_bytes_atomic(path: Path, data: bytes) -> None:
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
@@ -15042,49 +15081,69 @@ def _keep_pre_repair_copy(channel_dir: Path, prefix: str, original: bytes) -> Pa
     return sidecar
 
 
-def _undo_repair(
-    transcript_path: Path, original: bytes, meta_path: Path, original_meta: bytes, sidecar: Path, exc
-) -> None:
-    """Roll back from what is ON DISK, never from flags that may be stale.
+@dataclass
+class RepairWrites:
+    """What this repair wrote, recorded BEFORE each write so an interrupt can never leave it stale.
 
-    An interrupt can land after an ``os.replace`` committed a file but before
-    any flag recording that was set, so each file is re-read and compared with
-    the bytes held since the start: (a) a transcript that differs (or cannot
-    be read) gets the original back; (b) the same for the meta; (c) the
-    sidecar is deleted only after the transcript on disk has been re-read and
-    verified equal to the original, otherwise it is kept and named as the
-    only copy. Each step has its own try and logs what it actually did.
+    ``meta_before`` is the meta as read right before the meta write (the
+    restore point); it stays None until that read happens, which also means
+    the meta was never touched.
+    """
+
+    transcript_original: bytes
+    transcript_written: list[bytes] = dataclasses.field(default_factory=list)
+    meta_before: bytes | None = None
+    meta_written: bytes | None = None
+
+
+def _rollback_file(path: Path, before: bytes, written: list[bytes], what: str) -> bool:
+    """Undo only this repair's own write to ``path``; True when the file is now as it was before.
+
+    On-disk bytes equal to ``before``: nothing to do. Equal to bytes this
+    repair wrote: restore ``before`` atomically. Anything else (another
+    writer, or unreadable): leave it alone, log a WARNING naming the file.
+    """
+    try:
+        now = path.read_bytes()
+    except OSError as read_exc:
+        log.warning("repair-timestamps: could not read %s to roll it back (%r); left as it is", path, read_exc)
+        return False
+    if now == before:
+        return True
+    if now not in written:
+        log.warning("repair-timestamps: %s was changed by another writer during the repair; left as it is", path)
+        return False
+    try:
+        _write_bytes_atomic(path, before)
+    except OSError as restore_exc:
+        log.error("repair-timestamps: could not restore the original %s (%r)", what, restore_exc)
+        return False
+    log.error("repair-timestamps: restored the original %s", what)
+    return True
+
+
+def _undo_repair(transcript_path: Path, meta_path: Path, writes: RepairWrites, sidecar: Path, exc) -> None:
+    """Roll back exactly what this repair wrote, decided from what is ON DISK.
+
+    Each file is compared with the bytes it had before this repair touched
+    it and with the bytes this repair wrote (``RepairWrites``, recorded before
+    each write): only this repair's own write is undone; a file another
+    writer changed is left alone. A meta this repair never got to write is
+    not examined at all. The sidecar is deleted only when nothing was left
+    alone and the transcript, re-read, equals its original bytes; otherwise
+    it is kept and named as the only copy.
     """
     log.error("repair-timestamps: stopped after the pre-repair copy was made (%r); rolling back", exc)
+    clean = _rollback_file(transcript_path, writes.transcript_original, writes.transcript_written, "transcript")
+    if writes.meta_before is not None:
+        written = [writes.meta_written] if writes.meta_written is not None else []
+        clean = _rollback_file(meta_path, writes.meta_before, written, "meta") and clean
     try:
-        transcript_now = transcript_path.read_bytes()
-    except OSError:
-        transcript_now = None
-    if transcript_now != original:
-        try:
-            _write_bytes_atomic(transcript_path, original)
-            log.error("repair-timestamps: restored the original transcript")
-        except OSError as restore_exc:
-            log.error("repair-timestamps: could not restore the original transcript (%r)", restore_exc)
-    try:
-        meta_now = meta_path.read_bytes()
-    except OSError:
-        meta_now = None
-    if meta_now != original_meta:
-        try:
-            _write_bytes_atomic(meta_path, original_meta)
-            log.error("repair-timestamps: restored the original meta")
-        except OSError as restore_exc:
-            log.error("repair-timestamps: could not restore the original meta (%r)", restore_exc)
-    try:
-        verified = transcript_path.read_bytes() == original
+        verified = transcript_path.read_bytes() == writes.transcript_original
     except OSError:
         verified = False
-    if not verified:
-        log.error(
-            "repair-timestamps: the transcript on disk is not the original; the only copy of the original is %s",
-            sidecar,
-        )
+    if not (clean and verified):
+        log.error("repair-timestamps: keeping %s; it holds the transcript as it was before the repair", sidecar)
         return
     try:
         sidecar.unlink(missing_ok=True)
@@ -15266,15 +15325,32 @@ def cmd_repair_timestamps(args, config):
     except OSError as exc:
         log.error("repair-timestamps: could not keep the original transcript aside (%s); nothing written", exc)
         sys.exit(1)
+    writes = RepairWrites(transcript_original=original)
     try:
-        _write_bytes_atomic(transcript_path, repair.text.encode("utf-8"))
+        repaired_bytes = repair.text.encode("utf-8")
+        writes.transcript_written.append(repaired_bytes)
+        _write_bytes_atomic(transcript_path, repaired_bytes)
+        landed = transcript_path.read_bytes()
+        if landed != repaired_bytes:
+            raise OSError(f"{transcript_path.name} changed under the repair; another writer is active")
         # [core: writer's-path] judge the file just written, not the plan in memory.
-        written = transcript_path.read_bytes().decode("utf-8")
-        new_meta, merged = _repaired_meta(meta, written, duration, coverage)
-        final_text = rewrite_transcript_header(written, new_meta.get("transcript_status"), merged)
+        written = landed.decode("utf-8")
+        header_meta, merged = _repaired_meta(
+            _meta_for_repair(meta_path.read_bytes(), video_id), written, duration, coverage
+        )
+        final_text = rewrite_transcript_header(written, header_meta.get("transcript_status"), merged)
         if final_text != written:
-            _write_bytes_atomic(transcript_path, final_text.encode("utf-8"))
-        _write_meta_atomic(meta_path, new_meta)
+            final_bytes = final_text.encode("utf-8")
+            writes.transcript_written.append(final_bytes)
+            _write_bytes_atomic(transcript_path, final_bytes)
+        # Re-read the meta right before writing it and merge only this repair's
+        # keys onto that read, so a concurrent writer's keys survive.
+        writes.meta_before = meta_path.read_bytes()
+        new_meta, merged = _repaired_meta(_meta_for_repair(writes.meta_before, video_id), written, duration, coverage)
+        if new_meta.get("transcript_status") != header_meta.get("transcript_status"):
+            raise OSError(f"{meta_path.name} changed under the repair; another writer is active")
+        writes.meta_written = json.dumps(new_meta, indent=2).encode("utf-8")
+        _write_bytes_atomic(meta_path, writes.meta_written)
         log.info(
             "repair-timestamps: repaired %d entr%s into %d; flags %s; transcript_status %s -> %s; original kept as %s",
             len(repair.repaired),
@@ -15297,7 +15373,7 @@ def cmd_repair_timestamps(args, config):
     except BaseException as exc:
         # Anything after the copy exists, an interrupt included and even one
         # after both writes, is rolled back from what is on disk.
-        _undo_repair(transcript_path, original, meta_path, original_meta, sidecar, exc)
+        _undo_repair(transcript_path, meta_path, writes, sidecar, exc)
         if isinstance(exc, Exception):
             sys.exit(1)
         raise
