@@ -4,10 +4,10 @@ The real `render_headline_digest`, `get_channel_id`, `fetch_channel_videos` and
 `enrich_with_durations` run against a fake YouTube client; only the client (the
 paid boundary) and the /shorts HEAD probe (network) are stubbed.
 
-Falsification: put the bare `raise` back in either per-channel `except HttpError`
-block, or in the digest's enrich block, and the isolation tests fail; make `describe_http_error` return `str(e)`
-(or log `e` in the per-channel WARNING or cmd_scan's outer handler) and the
-redaction tests fail.
+Falsification: put the bare `raise` back in either per-channel block, or in the
+digest's enrich block, and the isolation tests fail; make `describe_http_error` or
+`describe_error_for_log` return `str(e)` and the redaction tests fail. Each test
+below names what it guards; the falsification table lives in the PR.
 """
 
 from __future__ import annotations
@@ -18,6 +18,8 @@ import logging
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+
+import pytest
 
 import video_intel as vi
 
@@ -233,11 +235,162 @@ def test_render_quota_on_middle_channel_still_stops_the_digest(monkeypatch, tmp_
     assert [v["video_id"] for v in rendered] == ["a1"]
 
 
-def _forbid_shorts_probe(monkeypatch):
-    def _fail(_vid):
-        raise AssertionError("a degraded enrich must skip the Shorts filter, as the quota path does")
+def test_render_quota_at_channel_resolution_still_stops_the_digest(monkeypatch, tmp_path):
+    # Arrange
+    _no_shorts_probe(monkeypatch)
+    err = _http_error(403, "quotaExceeded", "channels", "part=id%2Csnippet&forHandle=b")
+    youtube = FakeYouTube(fail={"b": ("channels", err)})
 
-    monkeypatch.setattr("video_intel._is_youtube_short_url", _fail)
+    # Act
+    rendered = vi.render_headline_digest(youtube, _config(tmp_path), tmp_path, dry_run=False)
+
+    # Assert
+    assert "c" not in youtube.handles_resolved
+    assert [v["video_id"] for v in rendered] == ["a1"]
+
+
+def test_render_rate_limit_429_stops_the_digest(monkeypatch, tmp_path):
+    # Arrange
+    _no_shorts_probe(monkeypatch)
+    err = _http_error(429, "rateLimitExceeded", "playlistItems", "playlistId=UUbbb")
+    youtube = FakeYouTube(fail={"b": ("playlist", err)})
+
+    # Act
+    rendered = vi.render_headline_digest(youtube, _config(tmp_path), tmp_path, dry_run=False)
+
+    # Assert
+    assert "c" not in youtube.handles_resolved
+    assert [v["video_id"] for v in rendered] == ["a1"]
+
+
+def test_render_transport_error_on_middle_channel_renders_others_without_key(monkeypatch, tmp_path, caplog, capsys):
+    # Arrange
+    _no_shorts_probe(monkeypatch)
+    err = ConnectionError(f"timed out requesting {API}/playlistItems?playlistId=UUbbb&key={SECRET}&alt=json")
+    youtube = FakeYouTube(fail={"b": ("playlist", err)})
+
+    # Act
+    with caplog.at_level(logging.INFO, logger="video_intel"):
+        rendered = vi.render_headline_digest(youtube, _config(tmp_path), tmp_path, dry_run=False)
+
+    # Assert
+    assert {v["video_id"] for v in rendered} == {"a1", "c1"}
+    warnings = _channel_warnings(caplog)
+    assert len(warnings) == 1
+    assert "ConnectionError" in warnings[0].getMessage()
+    _assert_secret_nowhere(caplog, capsys)
+
+
+def _all_invalid_key():
+    err = _http_error(400, "keyInvalid", "channels", "part=id%2Csnippet&forHandle=x")
+    return FakeYouTube(fail={h: ("channels", err) for h in "abc"})
+
+
+def _error_lines(caplog):
+    return [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+
+
+def test_render_all_channels_fail_logs_one_error_and_raises(monkeypatch, tmp_path, caplog, capsys):
+    # Arrange
+    youtube = _all_invalid_key()
+
+    # Act
+    with caplog.at_level(logging.INFO, logger="video_intel"), pytest.raises(vi.HeadlineDigestAllFailed):
+        vi.render_headline_digest(youtube, _config(tmp_path), tmp_path, dry_run=False)
+
+    # Assert
+    errors = _error_lines(caplog)
+    assert len(errors) == 1
+    assert "all 3 headline channels failed" in errors[0]
+    assert "keyInvalid" in errors[0] and "YOUTUBE_API_KEY" in errors[0]
+    assert "no new uploads" not in caplog.text
+    assert not (tmp_path / "_headlines" / "seen.json").exists()
+    _assert_secret_nowhere(caplog, capsys)
+
+
+def _headlines_env(monkeypatch, youtube):
+    monkeypatch.setattr("video_intel.require_youtube", lambda: lambda *_a, **_k: youtube)
+    monkeypatch.setenv("YOUTUBE_API_KEY", "fake")
+    monkeypatch.setattr("video_intel.backup_config_if_changed", lambda _out: None)
+
+
+def test_cmd_headlines_all_channels_fail_exits_1_without_key(monkeypatch, tmp_path, caplog, capsys):
+    # Arrange
+    _headlines_env(monkeypatch, _all_invalid_key())
+
+    # Act
+    with caplog.at_level(logging.INFO, logger="video_intel"), pytest.raises(SystemExit) as exc:
+        vi.cmd_headlines(SimpleNamespace(dry_run=False), _config(tmp_path))
+
+    # Assert
+    assert exc.value.code == 1
+    assert len(_error_lines(caplog)) == 1
+    _assert_secret_nowhere(caplog, capsys)
+
+
+def test_cmd_scan_all_headline_channels_fail_is_non_fatal_without_key(monkeypatch, tmp_path, caplog, capsys):
+    # Arrange: only headline channels, so the primary loop has nothing to fetch.
+    youtube = _all_invalid_key()
+    monkeypatch.setattr("video_intel.require_gemini", lambda: (MagicMock(), MagicMock()))
+    monkeypatch.setattr("video_intel.require_youtube", lambda: lambda *_a, **_k: youtube)
+    monkeypatch.setattr("video_intel.create_client", lambda _key: MagicMock())
+    monkeypatch.setenv("GEMINI_API_KEY", "fake")
+    monkeypatch.setenv("YOUTUBE_API_KEY", "fake")
+    monkeypatch.setattr("video_intel.resolve_output_dir", lambda _cfg: tmp_path)
+    args = argparse.Namespace(channel=None, since=None, dry_run=False, force=False, model=None)
+
+    # Act
+    with caplog.at_level(logging.INFO, logger="video_intel"):
+        vi.cmd_scan(args, _config(tmp_path))
+
+    # Assert
+    assert "all 3 headline channels failed" in _outer_warning(caplog)
+    assert any(r.getMessage() == "Done." for r in caplog.records)
+    _assert_secret_nowhere(caplog, capsys)
+
+
+def test_cmd_headlines_unexpected_exception_exits_1_without_key_or_traceback(monkeypatch, tmp_path, caplog, capsys):
+    # Arrange: a transport error from the enrich call, which only catches HttpError.
+    err = ConnectionError(f"reset requesting {API}/videos?id=a1&key={SECRET}&alt=json")
+    _headlines_env(monkeypatch, FakeYouTube(enrich_error=err))
+    _no_shorts_probe(monkeypatch)
+
+    # Act
+    with caplog.at_level(logging.INFO, logger="video_intel"), pytest.raises(SystemExit) as exc:
+        vi.cmd_headlines(SimpleNamespace(dry_run=False), _config(tmp_path))
+
+    # Assert
+    assert exc.value.code == 1
+    errors = _error_lines(caplog)
+    assert len(errors) == 1 and "ConnectionError" in errors[0]
+    assert "Traceback" not in caplog.text
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.out + captured.err
+    assert SECRET not in captured.out + captured.err
+    assert all(SECRET not in r.getMessage() for r in caplog.records)
+
+
+def test_match_configured_channel_http_error_logs_no_key(caplog, capsys):
+    # Arrange
+    err = _http_error(400, "keyInvalid", "channels", "part=id%2Csnippet&forHandle=a")
+    youtube = FakeYouTube(fail={"a": ("channels", err)})
+    config = {"channels": [{"name": "chan_a", "url": "https://youtube.com/@a"}]}
+
+    # Act
+    with caplog.at_level(logging.INFO, logger="video_intel"):
+        vi.match_configured_channel(youtube, config, "UCzzzzzzzzzzzzzzzzzzzzzz")
+
+    # Assert
+    resolve = [r.getMessage() for r in caplog.records if "Could not resolve channel id" in r.getMessage()]
+    assert len(resolve) == 1 and "keyInvalid" in resolve[0]
+    _assert_secret_nowhere(caplog, capsys)
+
+
+def _forbid_shorts_probe(monkeypatch):
+    def _fail(*_a, **_k):
+        pytest.fail("a degraded enrich must skip the Shorts filter, as the quota path does")
+
+    monkeypatch.setattr("video_intel.is_short", _fail)
 
 
 def _enrich_warnings(caplog):
@@ -412,3 +565,9 @@ def test_redact_api_key_masks_only_the_key_value():
     text = vi.redact_api_key(f"GET {API}/videos?part=id&key={SECRET}&alt=json")
     assert SECRET not in text
     assert "part=id" in text and "alt=json" in text
+
+
+@pytest.mark.parametrize("spelling", ["KEY", "Key", "kEy"])
+def test_redact_api_key_any_case_is_masked(spelling):
+    text = vi.redact_api_key(f"GET {API}/videos?part=id&{spelling}={SECRET}&alt=json")
+    assert SECRET not in text
