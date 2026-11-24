@@ -425,16 +425,21 @@ def test_enrich_quota_error_keeps_items_unfiltered(monkeypatch, tmp_path):
     assert [v["video_id"] for v in out] == ["v1"]
 
 
-def test_non_quota_http_error_propagates(monkeypatch, tmp_path):
-    """A non-quota 403 is a real error and must NOT be swallowed as quota degradation."""
+def test_non_quota_http_error_skips_the_channel_with_a_warning(monkeypatch, tmp_path, caplog):
+    """A non-quota 403 is a real error: it is NOT swallowed as quota degradation, it is
+    reported per channel and the channel is skipped (issue #311 replaced the re-raise;
+    the per-channel isolation contract lives in tests/test_headline_digest_isolation.py).
+    With the only channel failing, the digest reports that every channel failed."""
     monkeypatch.setattr("video_intel.get_channel_id", lambda _yt, _url: ("UCabcdefghijklmnopqrstuv", "Peripheral"))
 
     def _raise(*_a, **_k):
         raise _non_quota_http_error()
 
     monkeypatch.setattr("video_intel.fetch_channel_videos", _raise)
-    with pytest.raises(vi.HttpError):
+    with caplog.at_level("WARNING", logger="video_intel"), pytest.raises(vi.HeadlineDigestAllFailed):
         vi.render_headline_digest(MagicMock(), _headline_config(tmp_path), tmp_path, dry_run=False)
+    assert "quota exhausted" not in caplog.text
+    assert "peripheral" in caplog.text and "forbidden" in caplog.text
 
 
 def test_malformed_seen_json_degrades_to_resurface(monkeypatch, tmp_path):

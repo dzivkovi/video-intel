@@ -37,6 +37,7 @@ from html import unescape
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
+from urllib.parse import urlsplit
 
 import caption_align
 import httpx
@@ -1990,12 +1991,83 @@ def _is_quota_exceeded(error: HttpError) -> bool:
     "quotaExceeded" can both miss adjacent quota reasons (dailyLimitExceeded,
     userRateLimitExceeded) and false-positive on unrelated debug strings.
     """
+    return bool(set(_http_error_reasons(error)) & _QUOTA_EXCEEDED_REASONS)
+
+
+def _http_error_reasons(error: HttpError) -> list[str]:
+    """The ``error.errors[*].reason`` values from an HttpError's JSON body, in order.
+
+    The ONE parser of the YouTube error body (issue #311): `_is_quota_exceeded`
+    and `describe_http_error` both read it. Never raises; a body that is not the
+    expected JSON shape yields an empty list.
+    """
     try:
         body = json.loads(error.content.decode("utf-8"))
-    except (json.JSONDecodeError, AttributeError, UnicodeDecodeError):
+        errors = body.get("error", {}).get("errors", [])
+        return [item["reason"] for item in errors if isinstance(item, dict) and isinstance(item.get("reason"), str)]
+    except (ValueError, AttributeError, TypeError):
+        return []
+
+
+_API_KEY_PARAM_RE = re.compile(r"\bkey=[^&\s'\"<>]+", re.IGNORECASE)
+
+
+def redact_api_key(text: str) -> str:
+    """Mask any ``key=<value>`` query parameter in a log message (issue #311).
+
+    The YouTube client is built with ``developerKey``, so every request URL it
+    reports carries the API key as ``key=...``.
+    """
+    return _API_KEY_PARAM_RE.sub("key=REDACTED", text)
+
+
+def describe_http_error(error: HttpError) -> str:
+    """A log-safe description of an HttpError: status, API reason, request path (issue #311).
+
+    Log this, never ``str(e)``: googleapiclient's string form embeds the full
+    request URL, whose query string holds the API key. The whole query string is
+    dropped. Never raises; a malformed error degrades to a generic description.
+    """
+    try:
+        status = getattr(getattr(error, "resp", None), "status", None)
+        parts = [f"HTTP {status}" if status is not None else "HTTP error"]
+        reasons = _http_error_reasons(error)
+        if reasons:
+            parts.append(f"reason={reasons[0]}")
+        uri = getattr(error, "uri", None)
+        if isinstance(uri, str) and uri:
+            path = urlsplit(uri).path
+            if path:
+                parts.append(f"path={path}")
+        return redact_api_key(" ".join(parts))
+    except Exception:
+        return "HTTP error (details unavailable)"
+
+
+def describe_error_for_log(error: BaseException) -> str:
+    """The ONE log-safe text for any exception (issue #311): never a bare ``str(e)``.
+
+    An HttpError goes through `describe_http_error`; anything else is its type
+    name plus its message with `redact_api_key` applied, because a transport
+    error can embed the request URL too.
+    """
+    if isinstance(error, HttpError):
+        return describe_http_error(error)
+    try:
+        return f"{type(error).__name__}: {redact_api_key(str(error))}"
+    except Exception:
+        return type(error).__name__
+
+
+def _is_youtube_quota_stop(error: BaseException) -> bool:
+    """A quota or rate-limit HttpError (403 or 429 with a quota reason): the headline digest stops early."""
+    if not isinstance(error, HttpError):
         return False
-    reasons = {item.get("reason") for item in body.get("error", {}).get("errors", []) if isinstance(item, dict)}
-    return bool(reasons & _QUOTA_EXCEEDED_REASONS)
+    return getattr(getattr(error, "resp", None), "status", None) in (403, 429) and _is_quota_exceeded(error)
+
+
+class HeadlineDigestAllFailed(Exception):
+    """Every attempted headline channel failed (issue #311). The message is already log-safe."""
 
 
 def enrich_with_durations(youtube, video_ids: list[str]) -> dict[str, str | None]:
@@ -9570,7 +9642,8 @@ def cmd_scan(args, config):
         try:
             render_headline_digest(youtube, config, output_dir, dry_run=args.dry_run)
         except Exception as e:  # non-fatal: never let peripheral work fail a scan
-            log.warning("Headline digest failed (non-fatal): %s", e)
+            # Issue #311: never str(e) - an HttpError's string form holds the API key.
+            log.warning("Headline digest failed (non-fatal): %s", describe_error_for_log(e))
 
     log.info("Done.")
 
@@ -16324,7 +16397,7 @@ def _configured_channel_id(youtube, channel_config: dict, cache: dict) -> str | 
     try:
         ch_id, _ = get_channel_id(youtube, url)
     except Exception as e:  # one bad channel must not kill the run
-        log.warning("Could not resolve channel id for %s: %s", url, e)
+        log.warning("Could not resolve channel id for %s: %s", url, describe_error_for_log(e))
         # Record that identity could not be ESTABLISHED, which is not the
         # same claim as identity being ABSENT (Codex peer pass). A
         # request-wide failure - quotaExceeded, a bad key - makes every
@@ -16618,6 +16691,22 @@ def _select_headline_items(ranked: list[dict]) -> tuple[list[dict], list[dict]]:
     return positive, zero
 
 
+def _warn_headline_channel_failed(channel: dict, error: Exception) -> str:
+    """One WARNING for a headline channel skipped on any non-quota error (issue #311).
+
+    Carries the channel's config name and URL plus `describe_error_for_log`, never
+    `str(error)`: the request URL in an HttpError's string holds the API key.
+    Returns that log-safe description so the caller can report the last failure.
+    """
+    detail = describe_error_for_log(error)
+    if isinstance(error, HttpError) and "playlistNotFound" in _http_error_reasons(error):
+        hint = "channel has no public uploads (playlistNotFound); check its URL in config.yaml"
+    else:
+        hint = "skipped this run"
+    log.warning("Headline digest: channel %s (%s): %s [%s]", channel.get("name"), channel.get("url"), hint, detail)
+    return detail
+
+
 def render_headline_digest(youtube, config: dict, output_dir: Path, *, dry_run: bool) -> list[dict]:
     """Fetch, rank, and render the headline digest; advance the seen-set after render.
 
@@ -16652,32 +16741,48 @@ def render_headline_digest(youtube, config: dict, output_dir: Path, *, dry_run: 
     since_dt = datetime.now(UTC) - timedelta(days=HEADLINES_LOOKBACK_DAYS)
 
     collected: list[dict] = []
+    attempted = failed = 0
+    last_failure = ""
     for channel in headline_channels:
+        attempted += 1
         try:
             channel_id, channel_title = get_channel_id(youtube, channel["url"])
-        except HttpError as e:
+        except Exception as e:
             # Symmetric with the fetch path below: a quota-exhaustion at channel
             # resolution stops the digest early rather than aborting the scan.
-            if e.resp.status == 403 and _is_quota_exceeded(e):
+            if _is_youtube_quota_stop(e):
                 log.warning("Headline digest: YouTube quota exhausted; stopping digest early.")
                 break
-            raise
+            # Issue #311: one failing channel never costs the others.
+            last_failure = _warn_headline_channel_failed(channel, e)
+            failed += 1
+            continue
         if not channel_id:
             log.warning("Headline digest: channel not found: %s", channel.get("url"))
             continue
         try:
             videos = fetch_channel_videos(youtube, channel_id, since_dt)
-        except HttpError as e:
-            if e.resp.status == 403 and _is_quota_exceeded(e):
+        except Exception as e:
+            if _is_youtube_quota_stop(e):
                 log.warning("Headline digest: YouTube quota exhausted; stopping digest early.")
                 break
-            raise
+            last_failure = _warn_headline_channel_failed(channel, e)
+            failed += 1
+            continue
         for v in videos:
             if v.get("video_id") in seen:
                 continue
             v["channel"] = channel["name"]
             v["channel_title"] = channel_title or channel["name"]
             collected.append(v)
+
+    if attempted and failed == attempted:
+        # Issue #311: every channel failing is a broken setup (usually the key), not "nothing new".
+        message = (
+            f"all {attempted} headline channels failed ({last_failure}); check YOUTUBE_API_KEY and the channel URLs"
+        )
+        log.error("Headline digest: %s", message)
+        raise HeadlineDigestAllFailed(message)
 
     if not collected:
         log.info("Headline digest: no new uploads to surface.")
@@ -16693,11 +16798,16 @@ def render_headline_digest(youtube, config: dict, output_dir: Path, *, dry_run: 
     try:
         durations = enrich_with_durations(youtube, [v["video_id"] for v in collected])
     except HttpError as e:
-        if e.resp.status == 403 and _is_quota_exceeded(e):
+        if _is_youtube_quota_stop(e):
             log.warning("Headline digest: quota exhausted during Shorts check; keeping items unfiltered.")
             quota_degraded = True
         else:
-            raise
+            # Issue #311: a non-quota error degrades the same way, logged without the key.
+            log.warning(
+                "Headline digest: video durations could not be fetched (%s); keeping items unfiltered.",
+                describe_http_error(e),
+            )
+            quota_degraded = True
     if not quota_degraded:
         for v in collected:
             v["duration_iso"] = durations.get(v["video_id"])
@@ -16760,7 +16870,14 @@ def cmd_headlines(args, config):
     # Before the render, like scan: the seen-state this run advances is scan
     # state, and the channel list that produced it must be on record first.
     backup_config_if_changed(output_dir)
-    rendered = render_headline_digest(youtube, config, output_dir, dry_run=args.dry_run)
+    try:
+        rendered = render_headline_digest(youtube, config, output_dir, dry_run=args.dry_run)
+    except HeadlineDigestAllFailed:
+        sys.exit(1)  # already logged at ERROR by render_headline_digest
+    except Exception as e:
+        # Issue #311: no traceback - a request URL inside it would print the API key.
+        log.error("Headline digest failed: %s", describe_error_for_log(e))
+        sys.exit(1)
     if not rendered:
         log.info("Headline digest: nothing new to surface.")
     elif args.dry_run:
