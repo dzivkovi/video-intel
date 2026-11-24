@@ -328,6 +328,9 @@ EXPECTED_STRICTNESS = {
     "match_configured_channel": False,
     "infer_channel_from_file_path": False,
     "collect_headline_channels": False,
+    # Issue #312: the whole list, read only to detect a shared channel name for
+    # the state file; lenient like `collect_headline_channels` in the same digest.
+    "render_headline_digest": False,
     "_infer_profile": False,
     "_cmd_mindmap_impl": False,
     "_cmd_transcript_impl": False,

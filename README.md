@@ -330,6 +330,7 @@ The repo only changes the default `model` on a measured scorecard, never on a sp
 | ----- | -------- | ----------- |
 | name | Yes | Folder name and identifier |
 | url | Yes | YouTube channel URL. Optional on an `enabled: false` placeholder for a non-YouTube source |
+| channel_id | No | Pins the channel by its `UC...` id; fetching uses it whatever the handle resolves to (a `youtube.com/channel/UC...` url does the same). Without it, the first id the handle resolves to is recorded in `<output_dir>/_channels/ids.json` by the entry's `name` and kept, with one WARNING, if the handle later points elsewhere. Renaming the entry starts a new pin; set `channel_id:` to keep the old one |
 | prompt | No | Override `default_prompt` |
 | auto_transcript | No | `all` or `none` (default: `none`) |
 | since | No | Override default lookback window (additive in selective mode; `since: none` (or `false`) on a selective channel turns the recent-uploads window off, and `--since` still overrides it) |
