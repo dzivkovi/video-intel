@@ -486,7 +486,7 @@ See [`examples/nugget-lightrag-vs-openbrain-architectural-tension.md`](examples/
 
 ### Corpus maintenance
 
-Four commands repair a corpus rather than grow one. The first three are **dry-run by default** and print exactly what they would touch; nothing changes until you add `--apply`. All three also take `--channel` to scope the pass.
+Seven commands repair a corpus rather than grow one. The first six are **dry-run by default** and print exactly what they would touch; nothing changes until you add `--apply`. The first five also take `--channel` to scope the pass; `repair-timestamps` needs it to find the video.
 
 ```bash
 # Same video, two filenames, because the creator A/B-tested the title.
@@ -523,6 +523,15 @@ python scripts/video_intel.py backfill-descriptions --apply --channel thenextnew
 # --apply while no scan is active.
 python scripts/video_intel.py backfill-durations
 python scripts/video_intel.py backfill-durations --apply --channel mychannel
+
+# Re-stamp a transcript that collapsed into one long dialogue entry (every
+# search hit inside it jumped to the same moment). Splits the entry at its own
+# sentence ends, stamping each piece with the start of the YouTube caption cue
+# where its words begin; Gemini's text, speakers and SCREEN blocks are kept and
+# no timestamp is guessed. No Gemini call; declines when the alignment is not
+# confident. Then run the `index --incremental` line it prints.
+python scripts/video_intel.py repair-timestamps --url "URL" --channel NAME
+python scripts/video_intel.py repair-timestamps --url "URL" --channel NAME --apply
 
 # Stop re-attempting one stage on one video, without blocking the others.
 # --mode is repeatable; --reason is recorded in the meta for your future self.

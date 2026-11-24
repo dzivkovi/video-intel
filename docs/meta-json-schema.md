@@ -53,6 +53,8 @@ Every processed video has a `{date}-{slug}.meta.json` sidecar in its channel fol
 | `transcript_dialogue_entries` | int | quality guard (issue #157) | Count of dialogue entries `assess_transcript_artifact` assessed. |
 | `transcript_timestamp_overrun_entries` | int | quality guard (issue #139) | Count of dialogue stamps beyond the video's known duration plus the classifier tolerance (`0` when the duration was unknown: the check fails safe). Sweep: `> 0` finds every transcript whose deep-links can point past the end of the video. |
 | `transcript_chunk_window_violations` | int | chunked path (issue #158) | Raw count of classified dialogue entries, summed across every chunk, that landed outside their own emitting chunk's real window - independent of which severity bucket (if any) fired. See the CLAUDE.md issue #158 guardrail entry for the window rule, the severity split, and this detector's scope limits. |
+| `transcript_timestamp_repair` | str | `repair-timestamps --apply` (issue #289) | `caption_cues` when a wall-of-text transcript (one long dialogue entry) was split and re-stamped from the YouTube caption track's cue start times. Absent otherwise. A transcript-artifact field (`TRANSCRIPT_ARTIFACT_FIELDS`), so any later transcript writer retires it. |
+| `transcript_timestamp_repair_coverage` | float | `repair-timestamps --apply` (issue #289) | Matched words divided by total words across the entries the repair split, rounded to 3 places: how much of the re-stamped text the caption track confirmed. Each split entry passed the 0.6 per-entry threshold. Retired with the field above. |
 
 ### Concepts
 
