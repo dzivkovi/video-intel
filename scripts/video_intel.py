@@ -2009,19 +2009,6 @@ def channel_ids_dir_for(channel_cfg: dict, all_channels: list[dict], output_dir:
     return None
 
 
-def channel_ids_scope(
-    channel_cfg: dict, all_channels: list[dict], output_dir: Path | None
-) -> tuple[Path | None, frozenset[str]]:
-    """`(state dir, configured names)` for one entry: what every caller hands `resolve_channel_identity` (issue #312).
-
-    The state dir is `channel_ids_dir_for`'s answer (None for a shared name). The
-    configured names gate the url fallback: an entry learned under a name that is
-    still configured belongs to that channel, so its url is never borrowed.
-    """
-    names = frozenset(c.get("name") for c in all_channels if isinstance(c.get("name"), str))
-    return channel_ids_dir_for(channel_cfg, all_channels, output_dir), names
-
-
 def load_learned_channel_ids(output_dir: Path) -> dict | None:
     """The learned channel ids in `<output_dir>/_channels/ids.json` (issue #312).
 
@@ -2072,13 +2059,7 @@ def _usable_learned_entry(entry: object) -> dict | None:
 
 
 def _record_learned_channel_id(
-    output_dir: Path,
-    name: str,
-    channel_id: str,
-    title: str | None,
-    url: str | None,
-    *,
-    carried_from: str | None = None,
+    output_dir: Path, name: str, channel_id: str, title: str | None, url: str | None
 ) -> None:
     """Add one learned entry; never change or delete an existing one, never overwrite an unusable file.
 
@@ -2109,52 +2090,68 @@ def _record_learned_channel_id(
         with contextlib.suppress(OSError):
             tmp_path.unlink(missing_ok=True)
         return
-    if carried_from is not None:
-        log.info(
-            "[%s] Learned channel id %s (%s): pin carried over from entry '%s' (same url); recorded in %s.",
-            name,
-            channel_id,
-            title,
-            carried_from,
-            path,
-        )
-        return
     log.info("[%s] Learned channel id %s (%s); recorded in %s.", name, channel_id, title, path)
 
 
-def _find_learned_entry(
-    ids: dict, name: str, url: object, path: Path, configured_names: frozenset[str] | None
-) -> tuple[dict | None, str | None, bool]:
-    """`(entry, carried_from, name_present)` for this config entry.
+def _find_learned_entry(ids: dict, name: str, path: Path) -> tuple[dict | None, bool]:
+    """`(entry, name_present)`: a learned pin is found by config `name` only.
 
-    By name first. A name present with an unusable entry is one WARNING and no
-    entry (the entry is left as is). On a name miss, the first usable entry
-    whose stored `url` equals this entry's url (stripped) is used ONLY when it
-    was learned under a name that is no longer configured: that is a rename.
-    A name still in `configured_names` means the url was reused by a different
-    channel, so nothing is borrowed. `configured_names=None` (unknown) means no
-    url fallback at all. `carried_from` is the old entry's name.
+    A name present with an unusable entry is one WARNING and no entry (the entry
+    is left as is). There is no fallback by url: a url match cannot tell a
+    renamed entry from a handle reused by another creator, so it never assigns
+    an id; `_warn_learned_url_conflict` only reports it.
     """
-    if name in ids:
-        entry = _usable_learned_entry(ids[name])
-        if entry is None:
-            _warn_channel_ids_once(
-                path,
-                f"entry|{name}",
-                "[%s] The entry in %s has no valid channel_id; it is ignored and left as is, and this channel "
-                "resolves from its handle. Fix or delete the entry.",
-                name,
-                path,
-            )
-        return entry, None, True
-    if configured_names is not None and isinstance(url, str) and url.strip():
-        for other_name, other in ids.items():
-            if other_name in configured_names:
-                continue
-            entry = _usable_learned_entry(other)
-            if entry is not None and entry.get("url") == url.strip():
-                return entry, other_name, False
-    return None, None, False
+    if name not in ids:
+        return None, False
+    entry = _usable_learned_entry(ids[name])
+    if entry is None:
+        _warn_channel_ids_once(
+            path,
+            f"entry|{name}",
+            "[%s] The entry in %s has no valid channel_id; it is ignored and left as is, and this channel "
+            "resolves from its handle. Fix or delete the entry.",
+            name,
+            path,
+        )
+    return entry, True
+
+
+def _warn_learned_url_conflict(
+    ids: dict, name: str, url: object, live_id: str, live_title: str | None, path: Path
+) -> None:
+    """One WARNING when a NEW entry's url was learned under another name with a different id.
+
+    The signal for a renamed entry (which starts a new pin) or a handle now owned
+    by someone else; it assigns nothing. A same id under another name is silent.
+    """
+    if not isinstance(url, str) or not url.strip():
+        return
+    others = [
+        (other_name, entry)
+        for other_name, other in ids.items()
+        if other_name != name
+        and (entry := _usable_learned_entry(other)) is not None
+        and entry.get("url") == url.strip()
+        and valid_channel_id(entry["channel_id"]) != live_id
+    ]
+    if not others:
+        return
+    before = "; ".join(f"'{n}' as {e['channel_id']} ({e.get('title')})" for n, e in others)
+    old_id = others[0][1]["channel_id"]
+    log.warning(
+        "[%s] The url %s was learned before under %s, and now resolves to %s (%s), which is recorded for this "
+        "entry. If this entry was renamed, its old pin was %s: set channel_id: %s on the entry to keep following "
+        "that channel, and remove '%s' from %s. If a different creator now owns the handle, nothing to do.",
+        name,
+        url.strip(),
+        before,
+        live_id,
+        live_title,
+        old_id,
+        old_id,
+        name,
+        path,
+    )
 
 
 def resolve_channel_identity(
@@ -2164,13 +2161,12 @@ def resolve_channel_identity(
     *,
     dry_run: bool,
     detect_drift: bool = True,
-    configured_names: frozenset[str] | None = None,
 ) -> tuple[str | None, str | None]:
     """The ONE answer to "which channel id does this config entry fetch" (issue #312).
 
     Precedence: an explicit `channel_id:`, then a url that names a channel id
-    (`channel_id_in_url`), then the id learned in `_channels/ids.json` (by name,
-    else by stored url from a name no longer configured), then live handle resolution. An explicit pin makes no
+    (`channel_id_in_url`), then the id learned in `_channels/ids.json` (by config
+    `name` only), then live handle resolution. An explicit pin makes no
     lookup and never touches the state file. With a learned id the live lookup
     still runs as the drift detector (`detect_drift=True`, the scan and the
     headline digest): a different id is one WARNING and the KNOWN id is
@@ -2178,10 +2174,11 @@ def resolve_channel_identity(
     no channel, or raises a non-quota error, is one WARNING and the known id.
     A quota stop propagates. `detect_drift=False` (manual `--url` matching)
     returns a learned id with no call at all. An id resolved live with none
-    learned is recorded unless `dry_run`; a pin found by url is recorded under
-    the new name with the KNOWN id. `output_dir=None` means no state file and
-    `configured_names=None` means no url fallback (callers pass both halves of
-    `channel_ids_scope`). Returns `(channel_id, title)`; the title may be None.
+    learned is recorded unless `dry_run`, after one WARNING when its url was
+    learned under another name with a different id (a renamed entry starts a
+    new pin; `channel_id:` carries one across). `output_dir=None` means no
+    state file (callers pass `channel_ids_dir_for`'s answer). Returns
+    `(channel_id, title)`; the title may be None.
     """
     name = channel_cfg.get("name")
     url = channel_cfg.get("url")
@@ -2202,26 +2199,25 @@ def resolve_channel_identity(
         return in_url, None
 
     learned = None
-    carried_from = None
+    ids = None
     name_present = False
     if output_dir is not None:
         ids = load_learned_channel_ids(output_dir)
         if ids:
-            learned, carried_from, name_present = _find_learned_entry(
-                ids, name, url, _channel_ids_path(output_dir), configured_names
-            )
+            learned, name_present = _find_learned_entry(ids, name, _channel_ids_path(output_dir))
         elif ids is None:
             name_present = True  # unusable file: nothing is recorded this run
 
     if learned is None:
         live_id, live_title = get_channel_id(youtube, url)
-        if live_id and output_dir is not None and not dry_run and not name_present:
-            _record_learned_channel_id(output_dir, name, live_id, live_title, url)
+        if live_id and output_dir is not None and not name_present:
+            if ids:
+                _warn_learned_url_conflict(ids, name, url, live_id, live_title, _channel_ids_path(output_dir))
+            if not dry_run:
+                _record_learned_channel_id(output_dir, name, live_id, live_title, url)
         return live_id, live_title
 
     known_id, known_title = valid_channel_id(learned["channel_id"]), learned.get("title")
-    if carried_from is not None and not dry_run:
-        _record_learned_channel_id(output_dir, name, known_id, known_title, url, carried_from=carried_from)
     if not detect_drift:
         return known_id, known_title
     try:
@@ -9148,9 +9144,8 @@ def cmd_scan(args, config):
             continue
 
         # Resolve channel
-        ids_dir, configured_names = channel_ids_scope(ch, all_channels, output_dir)
         channel_id, channel_title = resolve_channel_identity(
-            youtube, ch, ids_dir, dry_run=args.dry_run, configured_names=configured_names
+            youtube, ch, channel_ids_dir_for(ch, all_channels, output_dir), dry_run=args.dry_run
         )
         if not channel_id:
             log.warning("[%s] Channel not found: %s", ch_name, ch_url)
@@ -16732,13 +16727,7 @@ def rank_unseen(unseen: list[dict], profile: dict | InterestModel) -> list[dict]
 # --- manual --url channel matching (issue #205) ----------------------------
 
 
-def _configured_channel_id(
-    youtube,
-    channel_config: dict,
-    cache: dict,
-    output_dir: Path | None = None,
-    configured_names: frozenset[str] | None = None,
-) -> str | None:
+def _configured_channel_id(youtube, channel_config: dict, cache: dict, output_dir: Path | None = None) -> str | None:
     """Resolve one configured channel to its `UC...` id, or None.
 
     Four things this must keep doing:
@@ -16766,7 +16755,7 @@ def _configured_channel_id(
       The cache key is everything the answer depends on (url, explicit
       `channel_id`, and the name when a state file is used), so two entries
       sharing a url but pinned differently never get each other's id. The
-      caller passes both halves of `channel_ids_scope`.
+      caller passes `channel_ids_dir_for`'s answer.
     """
     url = channel_config.get("url")
     if not _is_youtube_channel_source(url):
@@ -16777,9 +16766,7 @@ def _configured_channel_id(
     if key in cache:
         return cache[key]
     try:
-        ch_id, _ = resolve_channel_identity(
-            youtube, channel_config, output_dir, dry_run=False, detect_drift=False, configured_names=configured_names
-        )
+        ch_id, _ = resolve_channel_identity(youtube, channel_config, output_dir, dry_run=False, detect_drift=False)
     except Exception as e:  # one bad channel must not kill the run
         log.warning("Could not resolve channel id for %s: %s", url, describe_error_for_log(e))
         # Record that identity could not be ESTABLISHED, which is not the
@@ -16818,7 +16805,7 @@ def match_configured_channel(
     # abort a run started to transcribe one video.
     channels = configured_channels(config)
     for ch in channels:
-        if _configured_channel_id(youtube, ch, cache, *channel_ids_scope(ch, channels, output_dir)) == yt_channel_id:
+        if _configured_channel_id(youtube, ch, cache, channel_ids_dir_for(ch, channels, output_dir)) == yt_channel_id:
             # The name is guaranteed usable by the accessor, so the old
             # nameless-match branch (a `return None` that hid a real match one
             # row below it) is gone rather than left unreachable: a nameless
@@ -17131,9 +17118,8 @@ def render_headline_digest(youtube, config: dict, output_dir: Path, *, dry_run: 
     for channel in headline_channels:
         attempted += 1
         try:
-            ids_dir, configured_names = channel_ids_scope(channel, all_channels, output_dir)
             channel_id, channel_title = resolve_channel_identity(
-                youtube, channel, ids_dir, dry_run=dry_run, configured_names=configured_names
+                youtube, channel, channel_ids_dir_for(channel, all_channels, output_dir), dry_run=dry_run
             )
         except Exception as e:
             # Symmetric with the fetch path below: a quota-exhaustion at channel

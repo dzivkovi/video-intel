@@ -416,31 +416,56 @@ def test_cmd_scan_quota_stop_at_fetch_still_propagates(scan_env):
         vi.cmd_scan(_scan_args(), _scan_config())
 
 
-def test_cmd_scan_renamed_entry_keeps_pin_through_url_and_records_known_id_under_new_name(scan_env, caplog):
-    # Arrange: the entry was learned as "old"; the config now calls it "chan"; the handle belongs to a stranger.
+def _conflict_warnings(caplog) -> list[str]:
+    return [w for w in _warnings(caplog) if "was learned before under" in w]
+
+
+def test_cmd_scan_renamed_entry_whose_handle_moved_learns_live_id_and_warns_once(scan_env, caplog):
+    # Arrange: the entry was learned as "old"; the config now calls it "chan"; the handle resolves elsewhere.
     _seed_ids(scan_env.corpus, {"old": _learned(UC_A, "Original Creator", url=HANDLE_URL)})
+    old_entry = json.loads(_ids_path(scan_env.corpus).read_text(encoding="utf-8"))["old"]
     scan_env.youtube = FakeYouTube({"creator": UC_B})
 
     # Act
     with caplog.at_level(logging.INFO, logger="video_intel"):
         vi.cmd_scan(_scan_args(), _scan_config())
 
-    # Assert
-    assert scan_env.youtube.playlists_fetched == [_uploads(UC_A)]
-    assert FakeYouTube.video_of(UC_B) not in _written_ids(scan_env)
-    assert len([w for w in _warnings(caplog) if UC_B in w]) == 1
+    # Assert: a rename starts a new pin; the warning is the signal and names the old pin.
+    assert scan_env.youtube.playlists_fetched == [_uploads(UC_B)]
     data = json.loads(_ids_path(scan_env.corpus).read_text(encoding="utf-8"))
-    assert data["old"] == _learned(UC_A, "Original Creator", url=HANDLE_URL)
+    assert data["old"] == old_entry
+    assert data["chan"]["channel_id"] == UC_B
+    conflict = _conflict_warnings(caplog)
+    assert len(conflict) == 1
+    for needle in ("chan", HANDLE_URL, "'old'", UC_A, "Original Creator", UC_B, "Title B", f"channel_id: {UC_A}"):
+        assert needle in conflict[0]
+
+
+def test_cmd_scan_renamed_entry_same_channel_learns_under_new_name_without_warning(scan_env, caplog):
+    # Arrange
+    _seed_ids(scan_env.corpus, {"old": _learned(UC_A, url=HANDLE_URL)})
+    scan_env.youtube = FakeYouTube({"creator": UC_A})
+
+    # Act
+    with caplog.at_level(logging.INFO, logger="video_intel"):
+        vi.cmd_scan(_scan_args(), _scan_config())
+
+    # Assert
+    data = json.loads(_ids_path(scan_env.corpus).read_text(encoding="utf-8"))
     assert data["chan"]["channel_id"] == UC_A
-    assert data["chan"]["url"] == HANDLE_URL
-    carried = [m for m in _messages(caplog, logging.INFO) if "pin carried over from entry 'old' (same url)" in m]
-    assert len(carried) == 1 and UC_A in carried[0]
+    assert data["old"] == _learned(UC_A, url=HANDLE_URL)
+    assert _conflict_warnings(caplog) == []
 
 
-def test_cmd_scan_reused_url_under_a_still_configured_name_is_not_a_rename(scan_env, caplog):
-    # Arrange: creator A was learned at the handle and moved; the operator pointed A's entry at A's
-    # new url and added creator B, who now owns the old handle, under another name.
-    _seed_ids(scan_env.corpus, {"creator_a": _learned(UC_A, "Creator A", url=HANDLE_URL)})
+def test_cmd_scan_alias_entries_at_old_url_never_assign_their_id_to_the_new_owner(scan_env, caplog):
+    # Arrange: two stale entries for creator A at the old url, A's current entry at a new url,
+    # and a new entry B at the old url, which B now owns.
+    seeded = {
+        "a_alias1": _learned(UC_A, "Creator A", url=HANDLE_URL),
+        "a_alias2": _learned(UC_A, "Creator A", url=HANDLE_URL),
+        "creator_a": _learned(UC_A, "Creator A", url="https://www.youtube.com/@a_new"),
+    }
+    _seed_ids(scan_env.corpus, seeded)
     scan_env.youtube = FakeYouTube({"creator": UC_B, "a_new": UC_A})
     config = {
         "channels": [
@@ -457,37 +482,25 @@ def test_cmd_scan_reused_url_under_a_still_configured_name_is_not_a_rename(scan_
     assert scan_env.youtube.playlists_fetched == [_uploads(UC_A), _uploads(UC_B)]
     assert FakeYouTube.video_of(UC_B) in _written_ids(scan_env)
     data = json.loads(_ids_path(scan_env.corpus).read_text(encoding="utf-8"))
-    assert data["creator_a"] == _learned(UC_A, "Creator A", url=HANDLE_URL)
+    assert {k: data[k] for k in seeded} == seeded
     assert data["creator_b"]["channel_id"] == UC_B
-    assert not [w for w in _warnings(caplog) if "creator_b" in w and "changed owner" in w]
-    assert not [m for m in _messages(caplog, logging.INFO) if "carried over" in m]
+    conflict = _conflict_warnings(caplog)
+    assert len(conflict) == 1
+    assert "creator_b" in conflict[0] and "'a_alias1'" in conflict[0] and "'a_alias2'" in conflict[0]
 
 
-def test_resolve_channel_identity_without_configured_names_makes_no_url_fallback(tmp_path):
-    # Arrange: a renamed-looking entry, but the caller did not say which names are configured.
-    _seed_ids(tmp_path, {"old": _learned(UC_A, url=HANDLE_URL)})
-    youtube = FakeYouTube({"creator": UC_B})
-
-    # Act
-    channel_id, _ = vi.resolve_channel_identity(youtube, {"name": "chan", "url": HANDLE_URL}, tmp_path, dry_run=False)
-
-    # Assert
-    assert channel_id == UC_B
-    data = json.loads(_ids_path(tmp_path).read_text(encoding="utf-8"))
-    assert data["chan"]["channel_id"] == UC_B
-    assert data["old"] == _learned(UC_A, url=HANDLE_URL)
-
-
-def test_cmd_scan_renamed_entry_on_dry_run_records_nothing(scan_env):
+def test_cmd_scan_renamed_entry_on_dry_run_warns_and_writes_nothing(scan_env, caplog):
     # Arrange
     _seed_ids(scan_env.corpus, {"old": _learned(UC_A, url=HANDLE_URL)})
     before = _ids_path(scan_env.corpus).read_bytes()
-    scan_env.youtube = FakeYouTube({"creator": UC_A})
+    scan_env.youtube = FakeYouTube({"creator": UC_B})
 
     # Act
-    vi.cmd_scan(_scan_args(dry_run=True), _scan_config())
+    with caplog.at_level(logging.INFO, logger="video_intel"):
+        vi.cmd_scan(_scan_args(dry_run=True), _scan_config())
 
     # Assert
+    assert len(_conflict_warnings(caplog)) == 1
     assert _ids_path(scan_env.corpus).read_bytes() == before
 
 
