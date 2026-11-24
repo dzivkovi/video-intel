@@ -1549,3 +1549,68 @@ class TestRefresh:
         out = capsys.readouterr().out
         assert "--refresh" in out
         assert harness.client.calls == [] and harness.clients == []
+
+
+class TestAFailedRefreshLeavesNoStaleRoll:
+    """Under --refresh a cell's old entry goes before the attempt, so a failure leaves it absent."""
+
+    ARGV = ("--candidate", NEW, "--incumbent", OLD, "--fixtures", "fx1", "--rolls", "3")
+
+    @staticmethod
+    def _fail_candidate_call(monkeypatch, which: set[int]) -> None:
+        """Raise on the n-th candidate call of the run (main runs a candidate's rolls in order)."""
+        real = model_eval.v.call_gemini
+        seen = {"n": 0}
+
+        def flaky(client, types, uri, prompt, model, *args, **kwargs):
+            if model == NEW:
+                seen["n"] += 1
+                if seen["n"] in which:
+                    raise TimeoutError("slow")
+            return real(client, types, uri, prompt, model, *args, **kwargs)
+
+        monkeypatch.setattr(model_eval.v, "call_gemini", flaky)
+
+    def test_run_one_refresh_failure_leaves_the_cell_absent(self, tmp_path, no_override, monkeypatch):
+        scratch = tmp_path / "raw"
+        scratch.mkdir()
+        model_eval.run_one(FakeClient(_envelope([START, START + 30])), genai_types, FX, NEW, None, SEG, scratch, roll=2)
+        key = model_eval.cache_key(
+            FX, NEW, model_eval.bundled_prompt(), 2, SEG, model_eval.request_settings(genai_types, NEW, None)
+        )
+        stem = model_eval.cache_stem("fx1", NEW, model_eval.BUNDLED, 2)
+        assert model_eval.cached_cell(scratch, stem, key, model_eval.BUNDLED, 2) is not None
+        self._fail_candidate_call(monkeypatch, {1})
+
+        row = model_eval.run_one(FakeClient("x"), genai_types, FX, NEW, None, SEG, scratch, roll=2, refresh=True)
+
+        assert row["error"].startswith("TimeoutError")
+        assert model_eval.cached_cell(scratch, stem, key, model_eval.BUNDLED, 2) is None
+        assert not any(scratch.glob(f"{stem}*json"))
+
+    def test_after_a_failed_refresh_a_plain_run_regenerates_only_the_failed_roll(self, harness, tmp_path, monkeypatch):
+        model_eval.main(list(self.ARGV))
+        real = model_eval.v.call_gemini
+        self._fail_candidate_call(monkeypatch, {2})
+
+        model_eval.main([*self.ARGV, "--refresh"])
+
+        card = (tmp_path / "cards" / f"{NEW}.md").read_text(encoding="utf-8")
+        assert "- R1 no hard fail in any roll: FAIL" in card
+        monkeypatch.setattr(model_eval.v, "call_gemini", real)
+        harness.client.calls.clear()
+
+        model_eval.main(list(self.ARGV))
+
+        assert harness.client.calls == [NEW], "only roll 2 is missing; the stale older roll was not replayed"
+
+    def test_after_a_failed_refresh_a_still_failing_run_does_not_pass(self, harness, tmp_path, monkeypatch):
+        model_eval.main(list(self.ARGV))
+        self._fail_candidate_call(monkeypatch, {2, 4})
+
+        model_eval.main([*self.ARGV, "--refresh"])
+        model_eval.main(list(self.ARGV))
+
+        card = (tmp_path / "cards" / f"{NEW}.md").read_text(encoding="utf-8")
+        assert "- R1 no hard fail in any roll: FAIL" in card
+        assert "Overall: **PASS**" not in card

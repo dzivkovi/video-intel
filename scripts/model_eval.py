@@ -478,6 +478,12 @@ def _write_atomic(path: Path, data: bytes) -> None:
     os.replace(tmp, path)
 
 
+def invalidate_cached_cell(scratch: Path, stem: str) -> None:
+    """Remove one cell's cache entry, usage file first (a raw file without its usage file is a miss)."""
+    for suffix in (".usage.json", ".json"):
+        (scratch / f"{stem}{suffix}").unlink(missing_ok=True)
+
+
 def write_cached_cell(scratch: Path, stem: str, raw: str, usage: dict, key: dict) -> None:
     """Store one cell so a crash at any point leaves the old entry, or a miss, never a mix (issue #292 review).
 
@@ -509,7 +515,8 @@ def run_one(
 ) -> dict:
     """One roll of one (fixture, model, prompt) cell. Cached on disk so a re-run costs nothing.
 
-    ``refresh`` generates the cell again and replaces its cache entry.
+    ``refresh`` removes the cell's cache entry first, then generates it again,
+    so after a refresh run every cell is freshly cached or absent, never stale.
     """
     # Resolved BEFORE the cache check: a card re-rendered from a warm cache must
     # still say which prompt is active, or a cached rerun under an override
@@ -520,6 +527,10 @@ def run_one(
     key = cache_key(fx, model, prompt, roll, seg, request_settings(types, model, thinking))
     wall = None
     arm_fields = {"prompt_label": prompt.label, "roll": roll}
+    if refresh:
+        # Invalidated BEFORE the attempt: a refresh that fails must leave the
+        # cell absent, never the older roll a later plain run would replay.
+        invalidate_cached_cell(scratch, stem)
     hit = None if refresh else cached_cell(scratch, stem, key, prompt.label, roll)
     if hit:
         raw, usage, cache_state = hit
