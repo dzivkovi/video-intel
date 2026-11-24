@@ -2883,6 +2883,33 @@ def resolve_local_file_identity(
 _VIDEO_ID_CACHE: dict[str, dict[str, str]] = {}
 
 
+def _read_meta_or_skip(meta_path: Path) -> dict | None:
+    """The meta as a dict for a reader-side loop, or None after one WARNING (issue #313).
+
+    Reader-side and strict: a damaged file is skipped, never quarantined, never
+    rewritten, and no identity is invented from it (``_read_meta_best_effort``
+    is the writer-side helper). Bytes first, then decode + parse, catching
+    ``(ValueError, OSError)`` so a write torn mid-multibyte-character
+    (``UnicodeDecodeError``) is skipped like invalid JSON (issue #124). Two
+    shape guards: the top level must be an object, and a ``video_id`` that is
+    present must be a string. A meta with no ``video_id`` (or a null one)
+    passes through unchanged.
+    """
+    try:
+        data = json.loads(meta_path.read_bytes().decode("utf-8"))
+    except (ValueError, OSError) as exc:
+        log.warning("Skipping unreadable meta.json (%s): %s", type(exc).__name__, meta_path)
+        return None
+    if not isinstance(data, dict):
+        log.warning("Skipping meta.json whose top level is %s, not an object: %s", type(data).__name__, meta_path)
+        return None
+    vid = data.get("video_id")
+    if vid is not None and not isinstance(vid, str):
+        log.warning("Skipping meta.json whose video_id is %s, not a string: %s", type(vid).__name__, meta_path)
+        return None
+    return data
+
+
 def _load_video_id_index(channel_dir: Path) -> dict[str, str]:
     """Return {video_id: prefix} for all meta.json files in channel_dir.
 
@@ -2896,9 +2923,8 @@ def _load_video_id_index(channel_dir: Path) -> dict[str, str]:
     index: dict[str, str] = {}
     if channel_dir.exists():
         for meta_path in sorted(channel_dir.glob("*.meta.json"), key=lambda p: p.name):
-            try:
-                data = json.loads(meta_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
+            data = _read_meta_or_skip(meta_path)
+            if data is None:
                 continue
             vid = data.get("video_id")
             if vid:
@@ -9396,10 +9422,8 @@ def cmd_scan(args, config):
                     mindmap_path = find_mindmap_source(channel_dir_for_concepts, prefix)
                     if not mindmap_path:
                         continue
-                    try:
-                        meta = json.loads(meta_file.read_text(encoding="utf-8"))
-                    except json.JSONDecodeError:
-                        log.warning("Skipping malformed meta.json: %s", meta_file)
+                    meta = _read_meta_or_skip(meta_file)
+                    if meta is None:
                         continue
                     if is_skipped_meta(meta, mode="concepts"):
                         continue
@@ -11337,7 +11361,9 @@ def cmd_concepts(args, config):
             if not mindmap_path:
                 continue
 
-            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            meta = _read_meta_or_skip(meta_file)
+            if meta is None:
+                continue
             video = {
                 "video_id": meta.get("video_id", ""),
                 "url": meta.get("video_url", ""),
