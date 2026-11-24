@@ -2883,6 +2883,57 @@ def resolve_local_file_identity(
 _VIDEO_ID_CACHE: dict[str, dict[str, str]] = {}
 
 
+#: Paths already warned about by ``_warn_damaged_meta_once`` in this process
+#: (issue #313). ``record_alt_title_if_rotated`` drops the channel's index after
+#: every write, so without this one damaged file warned once per rotation.
+_DAMAGED_META_WARNED: set[str] = set()
+
+#: What the scan does with a video whose meta is damaged (issue #313).
+DAMAGED_META_LEFT_ALONE = "scan and concepts leave this video alone until the meta is repaired or deleted"
+
+
+def _damaged_meta_shape(meta_path: Path) -> tuple[dict | None, str | None]:
+    """``(meta, None)`` for a usable meta, or ``(None, shape)`` naming how it is damaged (issue #313).
+
+    Reader-side and strict: nothing is quarantined or rewritten, and no
+    identity is invented from the file (``_read_meta_best_effort`` is the
+    writer-side helper). Bytes first, then decode + parse, catching
+    ``(ValueError, OSError)`` so a write torn mid-multibyte-character
+    (``UnicodeDecodeError``) is caught like invalid JSON (issue #124). Two
+    shape guards: the top level must be an object, and a ``video_id`` that is
+    present must be a string. A meta with no ``video_id`` (or a null one)
+    passes through unchanged.
+    """
+    try:
+        data = json.loads(meta_path.read_bytes().decode("utf-8"))
+    except (ValueError, OSError) as exc:
+        return None, f"unreadable: {type(exc).__name__}"
+    if not isinstance(data, dict):
+        return None, f"top level is {type(data).__name__}, not an object"
+    vid = data.get("video_id")
+    if vid is not None and not isinstance(vid, str):
+        return None, f"video_id is {type(vid).__name__}, not a string"
+    return data, None
+
+
+def _warn_damaged_meta_once(meta_path: Path, shape: str, consequence: str) -> None:
+    """One WARNING per damaged meta path per process, naming the shape and the consequence."""
+    key = str(meta_path)
+    if key in _DAMAGED_META_WARNED:
+        return
+    _DAMAGED_META_WARNED.add(key)
+    log.warning("Damaged meta.json (%s): %s; %s.", shape, meta_path, consequence)
+
+
+def _read_meta_or_skip(meta_path: Path) -> dict | None:
+    """The meta as a dict for a reader-side caller, or None after the one WARNING (issue #313)."""
+    data, shape = _damaged_meta_shape(meta_path)
+    if shape is not None:
+        _warn_damaged_meta_once(meta_path, shape, DAMAGED_META_LEFT_ALONE)
+        return None
+    return data
+
+
 def _load_video_id_index(channel_dir: Path) -> dict[str, str]:
     """Return {video_id: prefix} for all meta.json files in channel_dir.
 
@@ -2896,13 +2947,25 @@ def _load_video_id_index(channel_dir: Path) -> dict[str, str]:
     index: dict[str, str] = {}
     if channel_dir.exists():
         for meta_path in sorted(channel_dir.glob("*.meta.json"), key=lambda p: p.name):
-            try:
-                data = json.loads(meta_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                continue
-            vid = data.get("video_id")
+            prefix = meta_path.name.removesuffix(".meta.json")
+            data, shape = _damaged_meta_shape(meta_path)
+            if shape is not None:
+                # Identity from the HEALTHY sibling transcript header (the same
+                # parser repair-metas uses), never from the damaged file. No
+                # transcript, or a non-YouTube source: the meta stays unindexed.
+                identity = _identity_from_transcript_header(channel_dir / f"{prefix}.transcript.md")
+                vid = identity["video_id"] if identity else None
+                if vid:
+                    consequence = f"indexed as {vid} from the sibling transcript header; {DAMAGED_META_LEFT_ALONE}"
+                else:
+                    consequence = (
+                        "not indexed (no sibling transcript header with a YouTube id), so a rotated title "
+                        f"is processed again; otherwise {DAMAGED_META_LEFT_ALONE}"
+                    )
+                _warn_damaged_meta_once(meta_path, shape, consequence)
+            else:
+                vid = data.get("video_id")
             if vid:
-                prefix = meta_path.name.removesuffix(".meta.json")
                 # First-wins over a SORTED walk (issue #276): the first meta in
                 # sorted FILE NAME order claiming this video_id is the prevention
                 # path's canonical, the same on every run instead of whatever the
@@ -4760,16 +4823,22 @@ def is_processed(
     missing meta.json and for genuinely new videos.
     """
     channel_dir = output_dir / channel_name
+    prefix = resolve_video_prefix(channel_dir, video)
+    return _mode_artifact_present(channel_dir, prefix, mode, any_variant=any_variant)
 
+
+def resolve_video_prefix(channel_dir: Path, video: dict) -> str:
+    """The on-disk prefix for ``video``: the video-id index first, the title-computed prefix as fallback.
+
+    The ONE resolution rule shared by ``is_processed`` and ``is_skipped``
+    (issue #313), so a rotated title finds the same meta in both.
+    """
     vid = video.get("video_id")
     if vid:
-        index = _load_video_id_index(channel_dir)
-        existing_prefix = index.get(vid)
+        existing_prefix = _load_video_id_index(channel_dir).get(vid)
         if existing_prefix:
-            return _mode_artifact_present(channel_dir, existing_prefix, mode, any_variant=any_variant)
-
-    prefix = video_file_prefix(video)
-    return _mode_artifact_present(channel_dir, prefix, mode, any_variant=any_variant)
+            return existing_prefix
+    return video_file_prefix(video)
 
 
 #: Modes `_mode_artifact_present` knows how to resolve to a file. "scan" and
@@ -4870,9 +4939,10 @@ def record_alt_title_if_rotated(
         return False
 
     meta_path = channel_dir / f"{existing_prefix}.meta.json"
-    try:
-        data = json.loads(meta_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+    # Reader-side (issue #313): a damaged meta indexed through its transcript
+    # header is never written to here.
+    data = _read_meta_or_skip(meta_path)
+    if data is None:
         return False
 
     if data.get("title") == new_title:
@@ -4897,14 +4967,18 @@ def is_skipped(output_dir, channel_name, video, mode: str | None = None) -> bool
     Backward compatible: callers without `mode=` get "any skip" semantics
     (the pre-issue-42 behavior).
     """
-    prefix = video_file_prefix(video)
-    meta_path = output_dir / channel_name / f"{prefix}.meta.json"
+    # Same resolution as is_processed (issue #313): a rotated title reads the
+    # meta the index already knows, not a file named after the new title.
+    channel_dir = output_dir / channel_name
+    meta_path = channel_dir / f"{resolve_video_prefix(channel_dir, video)}.meta.json"
     if not meta_path.exists():
         return False
-    try:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return False
+    # A damaged meta skips EVERY mode (issue #313): the paid step's writer
+    # would quarantine and replace it, losing `alt_titles` and the operator's
+    # `skip_modes`, so the video waits until the meta is repaired or deleted.
+    meta = _read_meta_or_skip(meta_path)
+    if meta is None:
+        return True
     return is_skipped_meta(meta, mode=mode)
 
 
@@ -9396,10 +9470,8 @@ def cmd_scan(args, config):
                     mindmap_path = find_mindmap_source(channel_dir_for_concepts, prefix)
                     if not mindmap_path:
                         continue
-                    try:
-                        meta = json.loads(meta_file.read_text(encoding="utf-8"))
-                    except json.JSONDecodeError:
-                        log.warning("Skipping malformed meta.json: %s", meta_file)
+                    meta = _read_meta_or_skip(meta_file)
+                    if meta is None:
                         continue
                     if is_skipped_meta(meta, mode="concepts"):
                         continue
@@ -11337,7 +11409,9 @@ def cmd_concepts(args, config):
             if not mindmap_path:
                 continue
 
-            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            meta = _read_meta_or_skip(meta_file)
+            if meta is None:
+                continue
             video = {
                 "video_id": meta.get("video_id", ""),
                 "url": meta.get("video_url", ""),
