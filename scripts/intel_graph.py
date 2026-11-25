@@ -50,7 +50,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from timestamp_utils import timestamped_url
-from video_intel import chunk_transcript, load_config
+from video_intel import _read_concepts_or_skip, _read_meta_or_skip, chunk_transcript, load_config
 
 log = logging.getLogger("intel_graph")
 
@@ -299,14 +299,12 @@ def _load_corpus_txn(con, output_dir: Path, concept_rows: list[tuple]) -> dict[s
             meta_path = channel_dir / f"{prefix}.meta.json"
             meta = {}
             if meta_path.exists():
-                try:
-                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
-                    log.warning("unreadable meta for %s/%s", channel, prefix)
-            try:
-                cdata = json.loads(concepts_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                log.warning("unreadable concepts.json for %s/%s - skipped", channel, prefix)
+                # The one meta classifier and warn-once memo (issue #319).
+                meta = _read_meta_or_skip(meta_path, "loaded with the concepts.json identity only") or {}
+            # The one concepts reader (issue #319): a failed read, invalid JSON,
+            # a torn file or a non-object top level all skip with one WARNING.
+            cdata = _read_concepts_or_skip(concepts_path, "the intel_graph loader skips this video")
+            if cdata is None:
                 continue
             video_id = meta.get("video_id") or cdata.get("video_id")
             if not video_id:
@@ -343,6 +341,8 @@ def _load_corpus_txn(con, output_dir: Path, concept_rows: list[tuple]) -> dict[s
             prompt_version = f"concepts@{cdata.get('source_prompt', 'unknown')}"
             extracted_at = meta.get("processed") or datetime.now(UTC).isoformat()
             for row in cdata.get("concepts", []):
+                if not isinstance(row, dict):
+                    continue  # a non-object entry (e.g. null) is skipped, as build_taxonomy does
                 phrase = normalize_phrase(row.get("as_mentioned") or "")
                 concept_id = row.get("concept_id") or ""
                 if not phrase or not concept_id:

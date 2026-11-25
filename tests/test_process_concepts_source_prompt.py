@@ -54,14 +54,28 @@ STEP3_READ_ERROR = "simulated failure in the step-3 meta read"
 
 
 def _raise_on_step3_read(monkeypatch, meta_path: Path) -> None:
-    """Make `_read_meta_or_skip` raise for this meta only (other readers untouched)."""
-    real = vi._read_meta_or_skip
+    """Make `_read_meta_or_skip` raise for this meta, but only once Step 2 has finished.
 
-    def read(path):
-        if Path(path) == meta_path:
+    The raise is armed by the step-2 bookkeeping `find_mindmap_source` lookup
+    (both paths run it right after the mind-map step, before Step 3), so earlier
+    reads of the same meta, such as the `--file` sibling-meta read in identity
+    resolution (issue #319), still reach the real function. Every argument is
+    forwarded unchanged.
+    """
+    real_read = vi._read_meta_or_skip
+    real_find = vi.find_mindmap_source
+    armed = []
+
+    def find_then_arm(*args, **kwargs):
+        armed.append(True)
+        return real_find(*args, **kwargs)
+
+    def read(path, *args, **kwargs):
+        if armed and Path(path) == meta_path:
             raise RuntimeError(STEP3_READ_ERROR)
-        return real(path)
+        return real_read(path, *args, **kwargs)
 
+    monkeypatch.setattr(vi, "find_mindmap_source", find_then_arm)
     monkeypatch.setattr(vi, "_read_meta_or_skip", read)
 
 

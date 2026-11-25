@@ -16,6 +16,7 @@ import contextlib
 import csv
 import dataclasses
 import functools
+import glob
 import hashlib
 import itertools
 import json
@@ -3035,8 +3036,14 @@ def infer_channel_from_file_path(input_path: Path, output_dir: Path, config: dic
     return candidate if candidate in configured else None
 
 
-def _find_canonical_meta_by_video_id(channel_dir: Path, video_id: str) -> Path | None:
+def _find_canonical_meta_by_video_id(channel_dir: Path, video_id: str) -> tuple[Path | None, list[Path]]:
     """Search a channel folder for a .meta.json whose 'video_id' matches.
+
+    Returns ``(canonical, damaged)``: the claimant (or None) and the metas
+    skipped because their CONTENT is unusable (issue #319). An empty
+    ``damaged`` means no claimant could have been missed by a damaged file;
+    the caller refuses to proceed on "no claimant" when it is not empty
+    (the issue #277 principle: an incomplete walk proves nothing).
 
     Per plan F11 uniqueness invariant, at most one such file should exist per
     {channel, video_id}. If more than one is found, emit a WARNING log (the
@@ -3047,12 +3054,20 @@ def _find_canonical_meta_by_video_id(channel_dir: Path, video_id: str) -> Path |
     pick.
     """
     if not channel_dir.exists() or not video_id:
-        return None
+        return None, []
     matches: list[Path] = []
+    damaged: list[Path] = []
+    consequence = "not considered as the canonical meta for a local ingest"
     for meta_file in sorted(channel_dir.glob("*.meta.json")):
         try:
-            meta = json.loads(meta_file.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+            meta = _read_meta_or_skip(meta_file, consequence, raise_on_os_error=True)
+        except OSError as exc:
+            # A failed READ keeps skipping as before #319 and is NOT counted as
+            # damaged: a transient read failure must not block a local ingest.
+            _warn_damaged_meta_once(meta_file, f"unreadable: {type(exc).__name__}", consequence)
+            continue
+        if meta is None:
+            damaged.append(meta_file)
             continue
         if meta.get("video_id") == video_id:
             matches.append(meta_file)
@@ -3065,7 +3080,7 @@ def _find_canonical_meta_by_video_id(channel_dir: Path, video_id: str) -> Path |
             [m.name for m in matches],
             matches[0].name,
         )
-    return matches[0] if matches else None
+    return (matches[0] if matches else None), damaged
 
 
 def _adoptable_channel_stem_meta(meta_path: Path, *, stem: str, args, channel_name: str | None) -> bool:
@@ -3161,10 +3176,9 @@ def resolve_local_file_identity(
         ):
             sibling_meta = channel_stem_meta
     if sibling_meta.exists():
-        try:
-            meta = json.loads(sibling_meta.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            meta = {}
+        meta = (
+            _read_meta_or_skip(sibling_meta, "identity resolution continues without it", raise_on_os_error=True) or {}
+        )
         if meta:
             flag_video_id = getattr(args, "video_id", None)
             flag_title = getattr(args, "title", None)
@@ -3206,7 +3220,22 @@ def resolve_local_file_identity(
         candidate_video_id = stem
 
     if candidate_video_id and channel_dir is not None:
-        canonical = _find_canonical_meta_by_video_id(channel_dir, candidate_video_id)
+        canonical, damaged = _find_canonical_meta_by_video_id(channel_dir, candidate_video_id)
+        if canonical is None and damaged:
+            # Issue #319: a damaged meta may be this video's canonical one, so
+            # "no claimant" is unproven. Stop before any upload or paid call
+            # rather than ingest it again under a second prefix.
+            log.error(
+                "%s: no readable meta.json in %s claims video_id %s, and %d damaged meta.json file(s) "
+                "were skipped: %s. One of them may be this video's canonical meta. "
+                "Repair or delete them, then run again.",
+                input_path.name,
+                channel_dir,
+                candidate_video_id,
+                len(damaged),
+                ", ".join(p.name for p in damaged),
+            )
+            sys.exit(1)
         if canonical is not None:
             canonical_meta = json.loads(canonical.read_text(encoding="utf-8"))
             canonical_prefix = canonical.name[: -len(".meta.json")]
@@ -3325,53 +3354,104 @@ def resolve_local_file_identity(
 _VIDEO_ID_CACHE: dict[str, dict[str, str]] = {}
 
 
-#: Paths already warned about by ``_warn_damaged_meta_once`` in this process
-#: (issue #313). ``record_alt_title_if_rotated`` drops the channel's index after
-#: every write, so without this one damaged file warned once per rotation.
+#: Paths already warned about by ``_warn_damaged_file_once`` in this process:
+#: damaged meta.json files (issue #313) and concepts.json files (issue #319).
+#: ``record_alt_title_if_rotated`` drops the channel's index after every write,
+#: so without this one damaged file warned once per rotation.
 _DAMAGED_META_WARNED: set[str] = set()
 
 #: What the scan does with a video whose meta is damaged (issue #313).
 DAMAGED_META_LEFT_ALONE = "scan and concepts leave this video alone until the meta is repaired or deleted"
 
 
-def _damaged_meta_shape(meta_path: Path) -> tuple[dict | None, str | None]:
-    """``(meta, None)`` for a usable meta, or ``(None, shape)`` naming how it is damaged (issue #313).
+def _damaged_json_object(path: Path, *, raise_on_os_error: bool = False) -> tuple[dict | None, str | None]:
+    """``(data, None)`` for a JSON file whose top level is an object, or ``(None, shape)`` (issues #313, #319).
 
     Reader-side and strict: nothing is quarantined or rewritten, and no
     identity is invented from the file (``_read_meta_best_effort`` is the
     writer-side helper). Bytes first, then decode + parse, catching
     ``(ValueError, OSError)`` so a write torn mid-multibyte-character
-    (``UnicodeDecodeError``) is caught like invalid JSON (issue #124). Two
-    shape guards: the top level must be an object, and a ``video_id`` that is
-    present must be a string. A meta with no ``video_id`` (or a null one)
-    passes through unchanged.
+    (``UnicodeDecodeError``) is caught like invalid JSON (issue #124). The
+    one classifier for meta.json and concepts.json reads.
+
+    ``raise_on_os_error=True`` propagates a failed READ instead of reporting
+    it: the bytes may be intact (issue #124), so a site whose outcome for an
+    ``OSError`` was a raise keeps that outcome (issue #319).
     """
     try:
-        data = json.loads(meta_path.read_bytes().decode("utf-8"))
-    except (ValueError, OSError) as exc:
+        data = json.loads(path.read_bytes().decode("utf-8"))
+    except OSError as exc:
+        if raise_on_os_error:
+            raise
+        return None, f"unreadable: {type(exc).__name__}"
+    except ValueError as exc:
         return None, f"unreadable: {type(exc).__name__}"
     if not isinstance(data, dict):
         return None, f"top level is {type(data).__name__}, not an object"
+    return data, None
+
+
+def _damaged_meta_shape(meta_path: Path, *, raise_on_os_error: bool = False) -> tuple[dict | None, str | None]:
+    """``(meta, None)`` for a usable meta, or ``(None, shape)`` naming how it is damaged (issue #313).
+
+    ``_damaged_json_object`` plus one meta-specific guard: a ``video_id``
+    that is present must be a string. A meta with no ``video_id`` (or a null
+    one) passes through unchanged.
+    """
+    data, shape = _damaged_json_object(meta_path, raise_on_os_error=raise_on_os_error)
+    if shape is not None:
+        return None, shape
     vid = data.get("video_id")
     if vid is not None and not isinstance(vid, str):
         return None, f"video_id is {type(vid).__name__}, not a string"
     return data, None
 
 
-def _warn_damaged_meta_once(meta_path: Path, shape: str, consequence: str) -> None:
-    """One WARNING per damaged meta path per process, naming the shape and the consequence."""
-    key = str(meta_path)
+def _warn_damaged_file_once(path: Path, kind: str, shape: str, consequence: str) -> None:
+    """One WARNING per damaged file path per process, naming the shape and the consequence."""
+    key = str(path)
     if key in _DAMAGED_META_WARNED:
         return
     _DAMAGED_META_WARNED.add(key)
-    log.warning("Damaged meta.json (%s): %s; %s.", shape, meta_path, consequence)
+    log.warning("Damaged %s (%s): %s; %s.", kind, shape, path, consequence)
 
 
-def _read_meta_or_skip(meta_path: Path) -> dict | None:
-    """The meta as a dict for a reader-side caller, or None after the one WARNING (issue #313)."""
-    data, shape = _damaged_meta_shape(meta_path)
+def _warn_damaged_meta_once(meta_path: Path, shape: str, consequence: str) -> None:
+    """One WARNING per damaged meta path per process, naming the shape and the consequence."""
+    _warn_damaged_file_once(meta_path, "meta.json", shape, consequence)
+
+
+def _read_meta_or_skip(
+    meta_path: Path, consequence: str = DAMAGED_META_LEFT_ALONE, *, raise_on_os_error: bool = False
+) -> dict | None:
+    """The meta as a dict for a reader-side caller, or None after the one WARNING (issues #313, #319).
+
+    ``consequence`` names what the calling site does with the skipped file.
+    ``raise_on_os_error`` as in ``_damaged_json_object``.
+    """
+    data, shape = _damaged_meta_shape(meta_path, raise_on_os_error=raise_on_os_error)
     if shape is not None:
-        _warn_damaged_meta_once(meta_path, shape, DAMAGED_META_LEFT_ALONE)
+        _warn_damaged_meta_once(meta_path, shape, consequence)
+        return None
+    return data
+
+
+def _read_concepts_or_skip(concepts_path: Path, consequence: str, *, raise_on_os_error: bool = False) -> dict | None:
+    """A concepts.json as a dict whose ``concepts`` is a list, or None after the one WARNING (issue #319).
+
+    The concepts sibling of ``_read_meta_or_skip``: the same classifier and
+    warn-once memo, plus the non-list ``concepts`` check from
+    ``accumulate_concepts_into_taxonomy``'s order (read, top level, list; the
+    caller skips a non-object entry). A missing ``concepts`` key reads as
+    empty. ``raise_on_os_error`` as in ``_damaged_json_object``.
+    """
+    data, shape = _damaged_json_object(concepts_path, raise_on_os_error=raise_on_os_error)
+    if shape is None:
+        concepts = data.get("concepts", [])
+        if not isinstance(concepts, list):
+            shape = f"`concepts` is {type(concepts).__name__}, not a list"
+    if shape is not None:
+        _warn_damaged_file_once(concepts_path, "concepts.json", shape, consequence)
         return None
     return data
 
@@ -8846,18 +8926,33 @@ def build_taxonomy(output_dir: Path) -> dict:
     file_count = 0
 
     for concepts_file in output_dir.rglob("*.concepts.json"):
-        file_count += 1
-        data = json.loads(concepts_file.read_text(encoding="utf-8"))
+        # A failed read raises (issue #319): a taxonomy silently missing this
+        # file's concepts would make later scans re-mint them as duplicates.
+        channel = concepts_file.parent.name
+        data = _read_concepts_or_skip(
+            concepts_file,
+            "its concepts are missing from taxonomy.json until the file is regenerated: "
+            f"delete it and run `concepts --channel {_shell_arg(channel)}`",
+            raise_on_os_error=True,
+        )
+        if data is None:
+            continue
+        file_count += 1  # files that contributed, not files found
         video_id = data.get("video_id", "")
 
         # Try to find published date from sibling meta.json
         meta_file = concepts_file.with_suffix("").with_suffix(".meta.json")
         published = None
         if meta_file.exists():
-            meta = json.loads(meta_file.read_text(encoding="utf-8"))
-            published = meta.get("published")
+            meta = _read_meta_or_skip(
+                meta_file, "taxonomy-build counts its concepts without a published date", raise_on_os_error=True
+            )
+            if meta is not None:
+                published = meta.get("published")
 
         for concept in data.get("concepts", []):
+            if not isinstance(concept, dict):
+                continue
             cid = concept.get("concept_id", "")
             if not cid:
                 continue
@@ -12066,15 +12161,28 @@ def cmd_mark_skip(args, config) -> None:
     video_id = video_id_match.group(1)
 
     found: list[Path] = []
+    damaged: list[Path] = []
     if output_dir.exists():
         for meta_path in output_dir.glob("*/*.meta.json"):
-            try:
-                meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
+            meta = _read_meta_or_skip(meta_path, "mark-skip does not consider it", raise_on_os_error=True)
+            if meta is None:
+                damaged.append(meta_path)
                 continue
             if meta.get("video_id") == video_id:
                 found.append(meta_path)
 
+    if not found and damaged:
+        # Issue #319: the target may be one of the damaged metas, so "run a
+        # scan so the meta exists" would be the wrong advice.
+        log.error(
+            "No readable meta.json found for video_id %s under %s, and %d damaged meta.json file(s) were "
+            "skipped: %s. The target may be one of them: repair or delete it, then re-run mark-skip.",
+            video_id,
+            output_dir,
+            len(damaged),
+            ", ".join(f"{p.parent.name}/{p.name}" for p in sorted(damaged)),
+        )
+        sys.exit(1)
     if not found:
         log.error(
             "No meta.json found for video_id %s under %s. "
@@ -13864,6 +13972,34 @@ _MODE_ARTIFACT_PATTERNS: dict[str, tuple[str, ...]] = {
 }
 
 
+def _owned_glob(channel_dir: Path, prefix: str, template: str) -> list[Path]:
+    """Files in ``channel_dir`` matching ``template`` that BELONG to ``prefix`` (issue #319).
+
+    ``template`` is an unformatted pattern such as ``"{prefix}.mindmap.*.md"``:
+    the prefix is escaped here, in one place, so only the artifact suffix keeps
+    its wildcards (a prefix ``talk[1]`` never matches ``talk1.*``).
+
+    The one ownership rule for the dedupe and prune-shorts apply paths: a file
+    belongs to the LONGEST prefix ``Q`` for which ``Q.meta.json`` exists in the
+    folder and the file name starts with ``Q + "."``. Name-based, so it needs
+    no meta parsing and treats damaged and healthy metas alike: a glob for
+    ``talk.*`` never reaches ``talk.notes.mindmap.md`` while
+    ``talk.notes.meta.json`` exists. A file with no meta of its own (the
+    translate-bcs ``.en.srt`` siblings) keeps belonging to the prefix it shares.
+    Names are compared under the platform's case rule (``os.path.normcase``),
+    the same rule its glob matches with.
+    """
+    escaped = glob.escape(prefix)
+    nc = os.path.normcase
+    meta_suffix = nc(".meta.json")
+    longer = [nc(m.name).removesuffix(meta_suffix) for m in channel_dir.glob(f"{escaped}.*.meta.json")]
+    return [
+        p
+        for p in channel_dir.glob(template.format(prefix=escaped))
+        if not any(nc(p.name).startswith(f"{q}.") for q in longer)
+    ]
+
+
 def _dedupe_meta_is_severe(meta_data: dict) -> bool:
     """Whether one dedupe-group member's transcript carries a severe quality
     flag, for canonical selection (issue #159).
@@ -13986,7 +14122,7 @@ def _move_missing_mode_artifacts(
         primary_pattern = patterns[0] if patterns else None
         primary_moved = False
         for pattern in patterns:
-            for src in channel_dir.glob(pattern.format(prefix=loser_prefix)):
+            for src in _owned_glob(channel_dir, loser_prefix, pattern):
                 suffix = src.name[len(loser_prefix) :]
                 dst = channel_dir / f"{canonical_prefix}{suffix}"
                 if dst.exists():
@@ -14077,7 +14213,7 @@ def _modes_present_on_disk(channel_dir: Path, prefix: str) -> set[str]:
     present: set[str] = set()
     for mode, patterns in _MODE_ARTIFACT_PATTERNS.items():
         for pattern in patterns:
-            if any(channel_dir.glob(pattern.format(prefix=prefix))):
+            if _owned_glob(channel_dir, prefix, pattern):
                 present.add(mode)
                 break
     return present
@@ -14203,7 +14339,7 @@ def _apply_dedupe_group(
             continue
         loser_prefix = loser_path.name.removesuffix(".meta.json")
         preserved = blocked_paths_by_loser.get(loser_path, set())
-        for sibling in channel_dir.glob(f"{loser_prefix}.*"):
+        for sibling in _owned_glob(channel_dir, loser_prefix, "{prefix}.*"):
             if sibling in preserved:
                 continue
             sibling.unlink()
@@ -14217,9 +14353,8 @@ def _scan_duplicate_groups(channel_dir: Path) -> dict[str, list[tuple[Path, dict
     if not channel_dir.exists():
         return {}
     for meta_path in channel_dir.glob("*.meta.json"):
-        try:
-            data = json.loads(meta_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+        data = _read_meta_or_skip(meta_path, "dedupe puts it in no group, so none of its artifacts is deleted")
+        if data is None:
             continue
         vid = data.get("video_id")
         if vid:
@@ -14339,9 +14474,8 @@ def _collect_short_candidates(channel_dir: Path, youtube) -> list[tuple[Path, di
     metas: list[tuple[Path, dict]] = []
     needs_lookup: list[str] = []
     for meta_path in sorted(channel_dir.glob("*.meta.json")):
-        try:
-            data = json.loads(meta_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+        data = _read_meta_or_skip(meta_path, "prune-shorts does not treat it as a Shorts candidate")
+        if data is None:
             continue
         vid = data.get("video_id")
         if not vid:
@@ -14385,7 +14519,7 @@ def _apply_prune_shorts(
     for meta_path, _data, _seconds in candidates:
         prefix = meta_path.name.removesuffix(".meta.json")
         for pattern in PRUNE_SHORTS_DELETION_PATTERNS:
-            for path in channel_dir.glob(pattern.format(prefix=prefix)):
+            for path in _owned_glob(channel_dir, prefix, pattern):
                 path.unlink()
                 deleted += 1
     if candidates:
@@ -14395,7 +14529,7 @@ def _apply_prune_shorts(
 
 def _count_artifacts_for_prefix(channel_dir: Path, prefix: str) -> int:
     """Count files matching PRUNE_SHORTS_DELETION_PATTERNS for one prefix."""
-    return sum(1 for pattern in PRUNE_SHORTS_DELETION_PATTERNS for _ in channel_dir.glob(pattern.format(prefix=prefix)))
+    return sum(len(_owned_glob(channel_dir, prefix, pattern)) for pattern in PRUNE_SHORTS_DELETION_PATTERNS)
 
 
 def cmd_prune_shorts(args, config):
