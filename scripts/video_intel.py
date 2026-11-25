@@ -2409,15 +2409,23 @@ class _GoogleApiClientKeyFilter(logging.Filter):
     response: ...``) before this code sees the error. `main()` installs this on
     the root handlers. It touches only records whose logger name starts with
     ``googleapiclient``, masks through `redact_api_key`, and never raises or drops a record.
+    A record that cannot be formatted gets a fixed text with its arguments withheld:
+    left as is, the handler's own error report would print the raw arguments.
     """
+
+    UNFORMATTABLE = "googleapiclient log record could not be formatted; arguments withheld"
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
-            if record.name.startswith("googleapiclient"):
-                record.msg = redact_api_key(record.getMessage())
-                record.args = ()
+            if not record.name.startswith("googleapiclient"):
+                return True
         except Exception:
-            pass
+            return True
+        try:
+            record.msg = redact_api_key(record.getMessage())
+        except Exception:
+            record.msg = self.UNFORMATTABLE
+        record.args = ()
         return True
 
 

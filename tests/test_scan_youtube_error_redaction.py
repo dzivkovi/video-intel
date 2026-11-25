@@ -18,6 +18,7 @@ case).
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import logging
 import os
@@ -481,3 +482,29 @@ def test_google_api_client_key_filter_leaves_other_loggers_untouched():
     assert kept is True
     assert record.msg == "value %s"
     assert record.args is args
+
+
+def test_google_api_client_key_filter_withholds_args_of_an_unformattable_record_through_a_real_handler(capsys):
+    # Arrange: a real handler with the filter attached the way main() attaches it.
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.addFilter(vi._GoogleApiClientKeyFilter())
+    logger = logging.getLogger("googleapiclient.http")
+    old_propagate, old_level = logger.propagate, logger.level
+    logger.addHandler(handler)
+    logger.propagate = False
+    logger.setLevel(logging.WARNING)
+
+    # Act: two placeholders, one argument carrying the key.
+    try:
+        logger.warning("%s and %s", f"https://example.invalid/v?key={SECRET}")
+    finally:
+        logger.removeHandler(handler)
+        logger.propagate, logger.level = old_propagate, old_level
+
+    # Assert
+    captured = capsys.readouterr()
+    assert SECRET not in stream.getvalue()
+    assert SECRET not in captured.err
+    assert SECRET not in captured.out
+    assert vi._GoogleApiClientKeyFilter.UNFORMATTABLE in stream.getvalue()
