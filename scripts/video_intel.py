@@ -11710,6 +11710,9 @@ def _cmd_process_impl(args, config):
         log.error("Mindmap source unresolvable: %s", exc)
         sys.exit(1)
 
+    # Issue #315: the one prompt name this run's mind-map writer is handed; also
+    # the concepts fallback below when that writer wrote.
+    mindmap_writer_prompt_name: str | None = None
     if skip_mindmap:
         mindmap_status = "skipped (skip_modes)"
         log.info("  Step 2/3: mindmap [%s]: %s", prefix, mindmap_status)
@@ -11719,6 +11722,7 @@ def _cmd_process_impl(args, config):
     else:
         log.info("  Step 2/3: mindmap (source=%s)", resolved_source)
         if resolved_source == "transcript":
+            mindmap_writer_prompt_name = "mindmap-from-transcript"
             # Cheap text-only call against the on-disk transcript. No file_uri needed.
             _, mindmap_status = process_mindmap(
                 client,
@@ -11728,7 +11732,7 @@ def _cmd_process_impl(args, config):
                 model,
                 output_dir,
                 channel_name or "",
-                prompt_name="mindmap-from-transcript",
+                prompt_name=mindmap_writer_prompt_name,
                 force=mindmap_force,
                 prefix=prefix,
                 channel_dir_override=channel_dir,
@@ -11736,6 +11740,8 @@ def _cmd_process_impl(args, config):
                 transcript_path=transcript_path,
             )
         else:
+            mindmap_writer_prompt_name = prompt_name
+
             # Legacy mindmap-from-video fallback. Watches the same upload.
             def _mindmap_call(uri):
                 return process_mindmap(
@@ -11746,7 +11752,7 @@ def _cmd_process_impl(args, config):
                     model,
                     output_dir,
                     channel_name or "",
-                    prompt_name=prompt_name,
+                    prompt_name=mindmap_writer_prompt_name,
                     force=mindmap_force,
                     prefix=prefix,
                     channel_dir_override=channel_dir,
@@ -11812,9 +11818,12 @@ def _cmd_process_impl(args, config):
         mindmap_text = mindmap_path.read_text(encoding="utf-8")
         taxonomy = load_taxonomy(output_dir)
         # Issue #315: the prompt the mind map's writer recorded, read after Step 2
-        # from the same meta_path that writer used; the resolved name only as fallback.
+        # from the same meta_path that writer used. Fallback: the name this run's
+        # mind-map writer was handed when it wrote, else the resolved name.
+        wrote_mindmap = mindmap_writer_prompt_name is not None and scan_status_wrote_artifact(mindmap_status)
         source_prompt = concepts_source_prompt(
-            _read_meta_or_skip(meta_path) if meta_path.exists() else None, prompt_name
+            _read_meta_or_skip(meta_path) if meta_path.exists() else None,
+            mindmap_writer_prompt_name if wrote_mindmap else prompt_name,
         )
         _, concepts_status = process_concepts(
             client,

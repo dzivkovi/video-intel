@@ -504,6 +504,42 @@ class TestProcessFile:
         assert len(damaged) == 1
         assert str(meta_path) in damaged[0].getMessage()
 
+    def test_process_file_when_mindmap_written_from_transcript_and_meta_torn_falls_back_to_writers_prompt(
+        self, gemini, tmp_path, caplog, monkeypatch
+    ):
+        """The fallback is the name THIS run's mind-map writer used when it
+        wrote, not the config name, which provably did not produce that file."""
+        # Arrange
+        mp4, channel_dir, meta_path = _seed_file(tmp_path, meta=_file_meta(prompt=PROMPT_A), mindmap=False)
+        real_writer = vi.process_mindmap
+        writer_prompts: list[str] = []
+
+        def spy_writer(*args, **kwargs):
+            writer_prompts.append(kwargs["prompt_name"])
+            return real_writer(*args, **kwargs)
+
+        real_find = vi.find_mindmap_source
+
+        def find_then_tear(channel_dir_arg, prefix):
+            meta_path.write_bytes(_torn_bytes())
+            return real_find(channel_dir_arg, prefix)
+
+        monkeypatch.setattr(vi, "process_mindmap", spy_writer)
+        monkeypatch.setattr(vi, "find_mindmap_source", find_then_tear)
+
+        # Act
+        with caplog.at_level(logging.WARNING, logger=vi.log.name):
+            rc = _run(_args(file=str(mp4)), _config(tmp_path, "auto"))
+
+        # Assert
+        assert rc == 0
+        assert gemini == ["mindmap", "concepts"], "the mind map must have been written from the transcript"
+        assert len(writer_prompts) == 1
+        recorded = _concepts(channel_dir, FILE_PREFIX)["source_prompt"]
+        assert recorded == writer_prompts[0]
+        assert recorded != PROMPT_B
+        assert len([r for r in caplog.records if "Damaged meta.json" in r.getMessage()]) == 1
+
 
 # ---------------------------------------------------------------------------
 # The helper itself
