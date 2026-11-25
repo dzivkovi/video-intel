@@ -9600,7 +9600,7 @@ def cmd_scan(args, config):
                         _fmt_hms(duration_s),
                         _fmt_hms(captions_over),
                     )
-                    per_video_source[video_file_prefix(v)] = TRANSCRIPT_SOURCE_YT_CAPTIONS
+                    per_video_source[resolve_video_prefix(output_dir / ch_name, v)] = TRANSCRIPT_SOURCE_YT_CAPTIONS
                     transcript_videos.append(v)
                     continue
                 if duration_s is not None and duration_s > threshold:
@@ -9648,7 +9648,9 @@ def cmd_scan(args, config):
                     # video the issue #227 duration gate already sent to
                     # yt-captions (process_transcript takes that branch before
                     # it ever reads the livestream flag) pays no probe either.
-                    v_prefix = video_file_prefix(v)
+                    # Issue #314: the prefix the filters above resolved, so a
+                    # rotated title writes next to its existing meta.
+                    v_prefix = resolve_video_prefix(output_dir / _ch_name, v)
                     v_source = _per_video_source.get(v_prefix, _source_default)
                     return _scan_transcribe_one(
                         client=client,
@@ -9720,11 +9722,12 @@ def cmd_scan(args, config):
             # same set the mindmap loop would have used, so --force keeps its
             # pre-#226 concepts behavior on a channel that still has mindmaps
             # on disk from before it was flipped to `none`.
-            touched_prefixes = {video_file_prefix(v) for v in new_videos}
+            touched_prefixes = {resolve_video_prefix(output_dir / ch_name, v) for v in new_videos}
         elif not new_videos:
             log.info("  All mind maps up to date.")
         else:
-            touched_prefixes = {video_file_prefix(v) for v in new_videos}
+            # Issue #314: the same resolved prefix the mindmap writer is handed.
+            touched_prefixes = {resolve_video_prefix(output_dir / ch_name, v) for v in new_videos}
             # Issue #54: per-video source resolution. Transcripts from Step 1
             # are now on disk (or absent if the threshold/skip filter rejected
             # them); resolve_mindmap_source() picks transcript vs video accordingly.
@@ -9743,7 +9746,9 @@ def cmd_scan(args, config):
                 _transcript_prompt_text=mindmap_from_transcript_prompt,
                 _transcript_results=transcript_results,
             ):
-                v_prefix = video_file_prefix(v)
+                # Issue #314: one resolved prefix for the checks below AND both
+                # process_mindmap calls (prefix=), so writer and checker agree.
+                v_prefix = resolve_video_prefix(_channel_dir, v)
                 v_transcript_path = _channel_dir / f"{v_prefix}.transcript.md"
                 transcript_available = v_transcript_path.exists()
                 # Issue #157 containment: a severe-flagged transcript is
@@ -9796,6 +9801,7 @@ def cmd_scan(args, config):
                         _ch_name,
                         prompt_name="mindmap-from-transcript",
                         force=args.force,
+                        prefix=v_prefix,
                         source="transcript",
                         transcript_path=v_transcript_path,
                     )
@@ -9810,6 +9816,7 @@ def cmd_scan(args, config):
                     _ch_name,
                     prompt_name=_video_prompt_name,
                     force=args.force,
+                    prefix=v_prefix,
                     source="video",
                     # Issue #249: same per-channel budget as the transcript call,
                     # bound as a default like the transcript closure's `_timeout`.
