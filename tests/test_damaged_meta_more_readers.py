@@ -1156,3 +1156,81 @@ def test_intel_graph_load_corpus_when_concepts_list_holds_null_loads_the_valid_e
     # Assert
     rows = con.execute("SELECT artifact_id, concept_id FROM has_concept").fetchall()
     assert [(r[0], r[1]) for r in rows] == [(HEALTHY_VID, "c1")]
+
+
+# ---------------------------------------------------------------------------
+# _owned_glob: the prefix is literal, and names compare under the platform's case rule
+# ---------------------------------------------------------------------------
+
+
+def _filesystem_is_case_insensitive(path) -> bool:
+    probe = path / "CaseProbe.txt"
+    probe.write_text("x", encoding="utf-8")
+    try:
+        return (path / "caseprobe.txt").exists()
+    finally:
+        probe.unlink()
+
+
+def test_cmd_dedupe_apply_when_loser_prefix_has_glob_characters_sweeps_only_its_own_files(corpus):
+    # Arrange: loser `talk[1]` and canonical `winner`, beside another video `talk1` that an
+    # unescaped `talk[1].*` would match.
+    channel_dir = corpus / CHANNEL
+    _write_meta(channel_dir, "talk[1]", video_id=HEALTHY_VID, title="Old", processed="2026-10-01T00:00:00")
+    (channel_dir / "talk[1].mindmap.md").write_text(MINDMAP, encoding="utf-8")
+    _write_meta(channel_dir, "winner", video_id=HEALTHY_VID, title="New", processed="2026-10-05T00:00:00")
+    _write_meta(channel_dir, "talk1", video_id="othvid00007", title="Other video")
+    (channel_dir / "talk1.mindmap.md").write_text(MINDMAP, encoding="utf-8")
+    other_before = _snapshot(channel_dir, "talk1")
+
+    # Act
+    video_intel.cmd_dedupe(argparse.Namespace(channel=None, apply=True), _channels_config())
+
+    # Assert: the loser's meta and mind map are gone; the other video is untouched.
+    assert not (channel_dir / "talk[1].meta.json").exists()
+    assert not (channel_dir / "talk[1].mindmap.md").exists()
+    assert _snapshot(channel_dir, "talk1") == other_before
+
+
+@pytest.mark.parametrize("apply", [False, True], ids=["dry_run", "apply"])
+def test_cmd_prune_shorts_when_short_prefix_has_glob_characters_touches_only_its_own_files(prune_env, caplog, apply):
+    # Arrange: the Short `clip[ab]`, beside a long video `clipa` that an unescaped `clip[ab].*` would match.
+    channel_dir = prune_env / CHANNEL
+    _write_meta(channel_dir, "clip[ab]", video_id=HEALTHY_VID, title="Short", duration_seconds=30)
+    (channel_dir / "clip[ab].mindmap.md").write_text(MINDMAP, encoding="utf-8")
+    _write_meta(channel_dir, "clipa", video_id="othvid00007", title="Long", duration_seconds=600)
+    (channel_dir / "clipa.mindmap.md").write_text(MINDMAP, encoding="utf-8")
+    (channel_dir / "clipa.transcript.md").write_text("# Transcript\n", encoding="utf-8")  # so a wrong count shows
+    other_before = _snapshot(channel_dir, "clipa")
+
+    # Act
+    with caplog.at_level(logging.INFO):
+        video_intel.cmd_prune_shorts(argparse.Namespace(channel=None, apply=apply), _channels_config())
+
+    # Assert
+    assert "Summary: 1 Shorts, 2 artifacts" in caplog.text
+    assert (channel_dir / "clip[ab].meta.json").exists() is (not apply)
+    assert (channel_dir / "clip[ab].mindmap.md").exists() is (not apply)
+    assert _snapshot(channel_dir, "clipa") == other_before
+
+
+def test_cmd_dedupe_apply_when_neighbour_files_differ_in_case_keeps_them(corpus):
+    # Arrange: `talk.notes.meta.json` owns `TALK.NOTES.transcript.md` on a case-insensitive filesystem.
+    channel_dir = corpus / CHANNEL
+    channel_dir.mkdir(parents=True)
+    if not _filesystem_is_case_insensitive(channel_dir):
+        pytest.skip("the filesystem is case-sensitive, so the mixed-case name is a different file")
+    _write_meta(channel_dir, "talk", video_id=HEALTHY_VID, title="Old", processed="2026-10-01T00:00:00")
+    (channel_dir / "talk.mindmap.md").write_text(MINDMAP, encoding="utf-8")
+    _write_meta(channel_dir, "winner", video_id=HEALTHY_VID, title="New", processed="2026-10-05T00:00:00")
+    _write_meta(channel_dir, "talk.notes", video_id="nbrvid00009", title="Neighbour")
+    neighbour_file = channel_dir / "TALK.NOTES.transcript.md"
+    neighbour_file.write_text("# neighbour transcript\n", encoding="utf-8")
+
+    # Act
+    video_intel.cmd_dedupe(argparse.Namespace(channel=None, apply=True), _channels_config())
+
+    # Assert
+    assert not (channel_dir / "talk.meta.json").exists()
+    assert neighbour_file.read_text(encoding="utf-8") == "# neighbour transcript\n"
+    assert (channel_dir / "talk.notes.meta.json").exists()

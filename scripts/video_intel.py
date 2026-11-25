@@ -16,6 +16,7 @@ import contextlib
 import csv
 import dataclasses
 import functools
+import glob
 import hashlib
 import itertools
 import json
@@ -13971,8 +13972,12 @@ _MODE_ARTIFACT_PATTERNS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _owned_glob(channel_dir: Path, prefix: str, pattern: str) -> list[Path]:
-    """Files in ``channel_dir`` matching ``pattern`` that BELONG to ``prefix`` (issue #319).
+def _owned_glob(channel_dir: Path, prefix: str, template: str) -> list[Path]:
+    """Files in ``channel_dir`` matching ``template`` that BELONG to ``prefix`` (issue #319).
+
+    ``template`` is an unformatted pattern such as ``"{prefix}.mindmap.*.md"``:
+    the prefix is escaped here, in one place, so only the artifact suffix keeps
+    its wildcards (a prefix ``talk[1]`` never matches ``talk1.*``).
 
     The one ownership rule for the dedupe and prune-shorts apply paths: a file
     belongs to the LONGEST prefix ``Q`` for which ``Q.meta.json`` exists in the
@@ -13981,9 +13986,18 @@ def _owned_glob(channel_dir: Path, prefix: str, pattern: str) -> list[Path]:
     ``talk.*`` never reaches ``talk.notes.mindmap.md`` while
     ``talk.notes.meta.json`` exists. A file with no meta of its own (the
     translate-bcs ``.en.srt`` siblings) keeps belonging to the prefix it shares.
+    Names are compared under the platform's case rule (``os.path.normcase``),
+    the same rule its glob matches with.
     """
-    longer = [m.name.removesuffix(".meta.json") for m in channel_dir.glob(f"{prefix}.*.meta.json")]
-    return [p for p in channel_dir.glob(pattern) if not any(p.name.startswith(f"{q}.") for q in longer)]
+    escaped = glob.escape(prefix)
+    nc = os.path.normcase
+    meta_suffix = nc(".meta.json")
+    longer = [nc(m.name).removesuffix(meta_suffix) for m in channel_dir.glob(f"{escaped}.*.meta.json")]
+    return [
+        p
+        for p in channel_dir.glob(template.format(prefix=escaped))
+        if not any(nc(p.name).startswith(f"{q}.") for q in longer)
+    ]
 
 
 def _dedupe_meta_is_severe(meta_data: dict) -> bool:
@@ -14108,7 +14122,7 @@ def _move_missing_mode_artifacts(
         primary_pattern = patterns[0] if patterns else None
         primary_moved = False
         for pattern in patterns:
-            for src in _owned_glob(channel_dir, loser_prefix, pattern.format(prefix=loser_prefix)):
+            for src in _owned_glob(channel_dir, loser_prefix, pattern):
                 suffix = src.name[len(loser_prefix) :]
                 dst = channel_dir / f"{canonical_prefix}{suffix}"
                 if dst.exists():
@@ -14199,7 +14213,7 @@ def _modes_present_on_disk(channel_dir: Path, prefix: str) -> set[str]:
     present: set[str] = set()
     for mode, patterns in _MODE_ARTIFACT_PATTERNS.items():
         for pattern in patterns:
-            if _owned_glob(channel_dir, prefix, pattern.format(prefix=prefix)):
+            if _owned_glob(channel_dir, prefix, pattern):
                 present.add(mode)
                 break
     return present
@@ -14325,7 +14339,7 @@ def _apply_dedupe_group(
             continue
         loser_prefix = loser_path.name.removesuffix(".meta.json")
         preserved = blocked_paths_by_loser.get(loser_path, set())
-        for sibling in _owned_glob(channel_dir, loser_prefix, f"{loser_prefix}.*"):
+        for sibling in _owned_glob(channel_dir, loser_prefix, "{prefix}.*"):
             if sibling in preserved:
                 continue
             sibling.unlink()
@@ -14505,7 +14519,7 @@ def _apply_prune_shorts(
     for meta_path, _data, _seconds in candidates:
         prefix = meta_path.name.removesuffix(".meta.json")
         for pattern in PRUNE_SHORTS_DELETION_PATTERNS:
-            for path in _owned_glob(channel_dir, prefix, pattern.format(prefix=prefix)):
+            for path in _owned_glob(channel_dir, prefix, pattern):
                 path.unlink()
                 deleted += 1
     if candidates:
@@ -14515,10 +14529,7 @@ def _apply_prune_shorts(
 
 def _count_artifacts_for_prefix(channel_dir: Path, prefix: str) -> int:
     """Count files matching PRUNE_SHORTS_DELETION_PATTERNS for one prefix."""
-    return sum(
-        len(_owned_glob(channel_dir, prefix, pattern.format(prefix=prefix)))
-        for pattern in PRUNE_SHORTS_DELETION_PATTERNS
-    )
+    return sum(len(_owned_glob(channel_dir, prefix, pattern)) for pattern in PRUNE_SHORTS_DELETION_PATTERNS)
 
 
 def cmd_prune_shorts(args, config):
