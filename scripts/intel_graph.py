@@ -50,7 +50,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from timestamp_utils import timestamped_url
-from video_intel import chunk_transcript, load_config
+from video_intel import _read_meta_or_skip, chunk_transcript, load_config
 
 log = logging.getLogger("intel_graph")
 
@@ -299,10 +299,8 @@ def _load_corpus_txn(con, output_dir: Path, concept_rows: list[tuple]) -> dict[s
             meta_path = channel_dir / f"{prefix}.meta.json"
             meta = {}
             if meta_path.exists():
-                try:
-                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
-                    log.warning("unreadable meta for %s/%s", channel, prefix)
+                # The one meta classifier and warn-once memo (issue #319).
+                meta = _read_meta_or_skip(meta_path, "loaded with the concepts.json identity only") or {}
             try:
                 cdata = json.loads(concepts_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
