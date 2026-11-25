@@ -437,7 +437,8 @@ def _export(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return EXIT_REFUSED
-    out_dir = args.out or args.atlas.resolve().parent.parent / EXPORT_DIRNAME
+    # Beside the folder the atlas path names (the folder the lock is keyed on), even when atlas.json is a file link.
+    out_dir = args.out or atlas_render.atlas_folder(args.atlas).parent / EXPORT_DIRNAME
     rows, dropped = select_rows(atlas.get("rows") or [], policy)
     dropped_visibility: list[str] = []
     if args.no_verify_public:

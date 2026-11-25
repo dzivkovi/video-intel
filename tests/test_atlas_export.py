@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import atlas_export as ax
 import atlas_render as ar
-from test_atlas_render import _directory_link
+from test_atlas_render import _directory_link, _file_link
 from test_corpus_lock_cli import Holder
 
 import corpus_lock
@@ -527,6 +527,36 @@ class TestCorpusLock:
         assert exc.value.code == corpus_lock.EXIT_CORPUS_BUSY
         assert paid == []
         assert not (root / "_atlas-export").exists()
+
+    def test_atlas_export_of_a_file_linked_atlas_writes_into_and_waits_on_the_corpus(
+        self, corpus, tmp_path, monkeypatch, corpus_lock_state_dir
+    ):
+        # Arrange: the private atlas.json links to a cache outside the corpus.
+        root, atlas, _ = corpus
+        cached = tmp_path / "cache" / "atlas.json"
+        cached.parent.mkdir(parents=True)
+        cached.write_bytes(atlas.read_bytes())
+        atlas.unlink()
+        _file_link(atlas, cached)
+        paid: list[tuple] = []
+        real_fetch = ax.fetch_privacy_status
+        monkeypatch.setattr(ax, "fetch_privacy_status", lambda *a: paid.append(a) or real_fetch(*a))
+        monkeypatch.setattr(corpus_lock, "DEFAULT_WAIT", False)
+        holder = Holder(corpus_lock_state_dir, tmp_path / "sync", root)
+
+        # Act / Assert: refused while the corpus is held, nothing paid, nothing written.
+        try:
+            with pytest.raises(SystemExit) as exc:
+                run(corpus)
+        finally:
+            holder.release()
+        assert exc.value.code == corpus_lock.EXIT_CORPUS_BUSY
+        assert paid == []
+
+        # Act / Assert: once free, the bundle lands in the corpus, beside the link, not beside the cache.
+        assert run(corpus) == 0
+        assert (root / "_atlas-export" / "atlas.json").is_file()
+        assert not (tmp_path / "_atlas-export").exists()
 
     def test_atlas_export_normal_run_takes_and_releases_the_lock(self, corpus, monkeypatch):
         root, _, _ = corpus

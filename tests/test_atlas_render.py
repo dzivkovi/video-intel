@@ -313,6 +313,25 @@ def _directory_link(link: Path, target: Path) -> Path:
     return link
 
 
+def _file_link(link: Path, target: Path) -> Path:
+    """A file symlink, or skip: Windows refuses one without Developer Mode or elevation."""
+    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.symlink(target, link)
+    except OSError as exc:
+        pytest.skip(f"this platform cannot create a file symlink here: {exc}")
+    return link
+
+
+def _corpus_with_linked_atlas(tmp_path: Path) -> tuple[Path, Path]:
+    """`corpus/_atlas/atlas.json` as a file link to an atlas cached outside the corpus."""
+    cached = tmp_path / "cache" / "atlas.json"
+    cached.parent.mkdir(parents=True)
+    cached.write_text(json.dumps(tiny_atlas()), encoding="utf-8")
+    corpus = tmp_path / "corpus"
+    return corpus, _file_link(corpus / "_atlas" / "atlas.json", cached)
+
+
 def _corpus_atlas(tmp_path: Path) -> tuple[Path, Path]:
     corpus = tmp_path / "corpus"
     atlas = corpus / "_atlas" / "atlas.json"
@@ -388,6 +407,50 @@ class TestCorpusLock:
 
         # Assert
         assert found == Path(os.path.realpath(corpus))
+
+    def test_atlas_render_of_a_file_linked_atlas_waits_on_the_corpus_it_writes_into(
+        self, tmp_path, monkeypatch, corpus_lock_state_dir
+    ):
+        # Arrange: atlas.json links out of the corpus, but catalog.html is written beside the link.
+        corpus, atlas = _corpus_with_linked_atlas(tmp_path)
+        monkeypatch.setattr(corpus_lock, "DEFAULT_WAIT", False)
+        holder = Holder(corpus_lock_state_dir, tmp_path / "sync", corpus)
+
+        # Act
+        try:
+            with pytest.raises(SystemExit) as exc:
+                ar.main(["--atlas", str(atlas)])
+        finally:
+            holder.release()
+
+        # Assert
+        assert exc.value.code == corpus_lock.EXIT_CORPUS_BUSY
+        assert not (atlas.parent / ar.CATALOG_FILENAME).exists()
+        assert ar.corpus_for_atlas(ar.output_path(ar.build_parser().parse_args(["--atlas", str(atlas)]))) == Path(
+            os.path.realpath(corpus)
+        )
+
+    def test_atlas_render_keys_the_lock_on_where_it_writes(self, tmp_path, monkeypatch, corpus_lock_state_dir):
+        # Arrange: an atlas outside any corpus, rendered with --out into a held corpus's _atlas folder.
+        atlas = tmp_path / "examples" / "catalog" / "atlas.json"
+        atlas.parent.mkdir(parents=True)
+        atlas.write_text(json.dumps(tiny_atlas()), encoding="utf-8")
+        corpus = tmp_path / "corpus"
+        out = corpus / "_atlas" / ar.CATALOG_FILENAME
+        out.parent.mkdir(parents=True)
+        monkeypatch.setattr(corpus_lock, "DEFAULT_WAIT", False)
+        holder = Holder(corpus_lock_state_dir, tmp_path / "sync", corpus)
+
+        # Act
+        try:
+            with pytest.raises(SystemExit) as exc:
+                ar.main(["--atlas", str(atlas), "--out", str(out)])
+        finally:
+            holder.release()
+
+        # Assert
+        assert exc.value.code == corpus_lock.EXIT_CORPUS_BUSY
+        assert not out.exists()
 
     def test_atlas_render_through_a_link_waits_on_the_real_corpus(self, tmp_path, monkeypatch, corpus_lock_state_dir):
         # Arrange: the real corpus is held; the atlas is opened through a link outside it.

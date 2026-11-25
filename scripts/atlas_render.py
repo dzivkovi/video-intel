@@ -142,18 +142,29 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def corpus_for_atlas(atlas: Path) -> Path | None:
-    """The corpus an atlas file belongs to: the parent of its `_atlas` folder, else None.
+def atlas_folder(path: Path) -> Path:
+    """The real folder a file path lands in: only the DIRECTORY is resolved, never the file.
+
+    A write to `<folder>/<name>` lands in this folder even when `<name>` is a
+    file link pointing elsewhere, and a folder reached through a directory link
+    or junction resolves to the real one.
+    """
+    return Path(os.path.realpath(Path(os.path.abspath(path)).parent))
+
+
+def corpus_for_atlas(path: Path) -> Path | None:
+    """The corpus a file in an `_atlas` folder belongs to: the parent of that folder, else None.
 
     The one rule for which corpus lock (issue #303) `atlas_render.py` and
-    `atlas_export.py` take; None means the atlas is not in a corpus and no lock is taken.
+    `atlas_export.py` take, keyed on where they WRITE: the render passes its
+    output file, the export the private atlas whose sibling folder it writes.
+    None means the write does not land in a corpus and no lock is taken.
     """
     # Imported here, not at module level: the folder name has one definition in
     # atlas_build, and importing it only when a run asks keeps this module light.
     import atlas_build
 
-    # realpath, not abspath: an atlas reached through a link or junction keys on the real corpus.
-    folder = Path(os.path.realpath(atlas)).parent
+    folder = atlas_folder(path)
     if os.path.normcase(folder.name) != os.path.normcase(atlas_build.ATLAS_DIRNAME):
         return None
     return folder.parent
@@ -161,10 +172,15 @@ def corpus_for_atlas(atlas: Path) -> Path | None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    corpus = corpus_for_atlas(args.atlas)
+    corpus = corpus_for_atlas(output_path(args))
     lock = contextlib.nullcontext() if corpus is None else corpus_lock.hold_for_cli(corpus, command="atlas_render")
     with lock:
         return _render(args)
+
+
+def output_path(args: argparse.Namespace) -> Path:
+    """Where the page is written: `--out`, else `catalog.html` beside the atlas path as given."""
+    return args.out or args.atlas.with_name(CATALOG_FILENAME)
 
 
 def _render(args: argparse.Namespace) -> int:
@@ -176,7 +192,7 @@ def _render(args: argparse.Namespace) -> int:
     except (OSError, ValueError) as exc:
         print(f"{GENERATOR_NAME}: {exc}", file=sys.stderr)
         return EXIT_REFUSED
-    out = args.out or args.atlas.with_name(CATALOG_FILENAME)
+    out = output_path(args)
     try:
         write_atomic(out, html)
     except (SystemExit, OSError) as exc:
