@@ -9419,6 +9419,15 @@ def cmd_scan(args, config):
                 log.info("    %s - %s", v["published"], v["title"])
             continue
 
+        # Issue #314: every writer and checker below takes its prefix from this
+        # one mapping, resolved here on the main thread after the alt-title
+        # pre-pass - the value is_processed/is_skipped saw. Workers never read
+        # the video-id index: a worker's error writer can drop the cache, and a
+        # rebuild racing a half-written meta would lose that video's entry.
+        channel_prefixes: dict[str, str] = {
+            v["video_id"]: resolve_video_prefix(output_dir / ch_name, v) for v in videos
+        }
+
         prompt_name = ch.get("prompt") or config.get("default_prompt", DEFAULT_PROMPT_NAME)
         prompt_text = load_prompt(prompt_name)
 
@@ -9600,7 +9609,7 @@ def cmd_scan(args, config):
                         _fmt_hms(duration_s),
                         _fmt_hms(captions_over),
                     )
-                    per_video_source[resolve_video_prefix(output_dir / ch_name, v)] = TRANSCRIPT_SOURCE_YT_CAPTIONS
+                    per_video_source[channel_prefixes[v["video_id"]]] = TRANSCRIPT_SOURCE_YT_CAPTIONS
                     transcript_videos.append(v)
                     continue
                 if duration_s is not None and duration_s > threshold:
@@ -9632,6 +9641,7 @@ def cmd_scan(args, config):
                     # closure below, so the worker never reads a loop variable
                     # the channel loop has since moved on from.
                     _per_video_source: dict = per_video_source,
+                    _prefixes: dict = channel_prefixes,
                     _source_default: str = transcript_source,
                     _prompt: str = transcript_prompt,
                     _ch_name: str = ch_name,
@@ -9648,9 +9658,9 @@ def cmd_scan(args, config):
                     # video the issue #227 duration gate already sent to
                     # yt-captions (process_transcript takes that branch before
                     # it ever reads the livestream flag) pays no probe either.
-                    # Issue #314: the prefix the filters above resolved, so a
-                    # rotated title writes next to its existing meta.
-                    v_prefix = resolve_video_prefix(output_dir / _ch_name, v)
+                    # Issue #314: the prefix resolved once on the main thread,
+                    # so a rotated title writes next to its existing meta.
+                    v_prefix = _prefixes[v["video_id"]]
                     v_source = _per_video_source.get(v_prefix, _source_default)
                     return _scan_transcribe_one(
                         client=client,
@@ -9722,12 +9732,12 @@ def cmd_scan(args, config):
             # same set the mindmap loop would have used, so --force keeps its
             # pre-#226 concepts behavior on a channel that still has mindmaps
             # on disk from before it was flipped to `none`.
-            touched_prefixes = {resolve_video_prefix(output_dir / ch_name, v) for v in new_videos}
+            touched_prefixes = {channel_prefixes[v["video_id"]] for v in new_videos}
         elif not new_videos:
             log.info("  All mind maps up to date.")
         else:
             # Issue #314: the same resolved prefix the mindmap writer is handed.
-            touched_prefixes = {resolve_video_prefix(output_dir / ch_name, v) for v in new_videos}
+            touched_prefixes = {channel_prefixes[v["video_id"]] for v in new_videos}
             # Issue #54: per-video source resolution. Transcripts from Step 1
             # are now on disk (or absent if the threshold/skip filter rejected
             # them); resolve_mindmap_source() picks transcript vs video accordingly.
@@ -9745,10 +9755,11 @@ def cmd_scan(args, config):
                 _video_prompt_name=prompt_name,
                 _transcript_prompt_text=mindmap_from_transcript_prompt,
                 _transcript_results=transcript_results,
+                _prefixes=channel_prefixes,
             ):
-                # Issue #314: one resolved prefix for the checks below AND both
-                # process_mindmap calls (prefix=), so writer and checker agree.
-                v_prefix = resolve_video_prefix(_channel_dir, v)
+                # Issue #314: one prefix, resolved on the main thread, for the
+                # checks below AND both process_mindmap calls (prefix=).
+                v_prefix = _prefixes[v["video_id"]]
                 v_transcript_path = _channel_dir / f"{v_prefix}.transcript.md"
                 transcript_available = v_transcript_path.exists()
                 # Issue #157 containment: a severe-flagged transcript is

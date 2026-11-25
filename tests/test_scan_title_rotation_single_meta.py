@@ -17,6 +17,8 @@ independently of anything the scan passes around.
 from __future__ import annotations
 
 import argparse
+import ast
+import inspect
 import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -99,11 +101,19 @@ def _video(title: str) -> dict:
     }
 
 
-def _scan(fetched: list[dict], title: str, *, force: bool = False, **channel_knobs) -> None:
+def _scan(
+    fetched: list[dict],
+    title: str,
+    *,
+    force: bool = False,
+    videos: list[dict] | None = None,
+    top_level: dict | None = None,
+    **channel_knobs,
+) -> None:
     """One scan, as its own process would see it: the index cache starts empty."""
     video_intel._invalidate_video_id_cache()
-    fetched[:] = [_video(title)]
-    config = {"channels": [{"name": "chan", "url": "chan", **channel_knobs}]}
+    fetched[:] = videos if videos is not None else [_video(title)]
+    config = {**(top_level or {}), "channels": [{"name": "chan", "url": "chan", **channel_knobs}]}
     args = argparse.Namespace(channel=None, since=None, force=force, dry_run=False, model=None)
     video_intel.cmd_scan(args, config)
 
@@ -237,3 +247,110 @@ def test_cmd_scan_force_rotated_title_mindmap_source_none_re_extracts_concepts_o
     assert json.loads(concepts_path.read_text(encoding="utf-8"))["concepts"][0]["concept_id"] == "c1"
     assert (channel_dir / f"{OLD_PREFIX}.transcript.md").exists()
     _assert_single_meta_under_old_prefix(channel_dir)
+
+
+def test_cmd_scan_parallel_rotated_and_new_video_each_keep_one_meta_under_expected_prefix(scan_env):
+    # Arrange: a rotated video (mind map under the old title) and a brand-new one, two workers.
+    channel_dir, fetched, calls = scan_env
+    _scan(fetched, OLD_TITLE)
+    second = {**_video("A second talk"), "video_id": "vid002", "url": "https://www.youtube.com/watch?v=vid002"}
+    second_prefix = video_intel.video_file_prefix(second)
+
+    # Act
+    _scan(fetched, NEW_TITLE, videos=[_video(NEW_TITLE), second], top_level={"max_parallel": 2}, auto_transcript="all")
+
+    # Assert
+    assert calls["transcript"] == 2
+    assert (channel_dir / f"{OLD_PREFIX}.transcript.md").exists()
+    _assert_single_meta_under_old_prefix(channel_dir)
+    second_metas = [
+        p.name
+        for p in channel_dir.glob("*.meta.json")
+        if json.loads(p.read_text(encoding="utf-8")).get("video_id") == "vid002"
+    ]
+    assert second_metas == [f"{second_prefix}.meta.json"]
+    assert (channel_dir / f"{second_prefix}.transcript.md").exists()
+    assert (channel_dir / f"{second_prefix}.mindmap.md").exists()
+
+
+def test_cmd_scan_rotated_title_severe_transcript_mindmap_takes_video_path_under_existing_prefix(scan_env):
+    # Arrange: transcript under the old prefix, flagged severe in its meta, no mind map yet.
+    channel_dir, fetched, calls = scan_env
+    _scan(fetched, OLD_TITLE, auto_transcript="all", auto_mindmap="none")
+    meta_path = channel_dir / f"{OLD_PREFIX}.meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["transcript_quality_flags"] = ["monolithic_severe"]
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+    # Act
+    _scan(fetched, NEW_TITLE, auto_transcript="all")
+
+    # Assert: the severity read saw the old prefix's meta, so the corrupt transcript was not used.
+    assert calls["mindmap_video"] == 1
+    assert calls["mindmap_text"] == 0
+    assert (channel_dir / f"{OLD_PREFIX}.mindmap.md").exists()
+    _assert_single_meta_under_old_prefix(channel_dir)
+
+
+def test_cmd_scan_rotated_livestream_transcript_error_suppresses_video_mindmap(scan_env, monkeypatch):
+    # Arrange: an earlier run left only a meta under the old title; the video is a livestream VOD.
+    channel_dir, fetched, calls = scan_env
+    channel_dir.mkdir(parents=True)
+    old_meta = {**_video(OLD_TITLE), "video_url": _video(OLD_TITLE)["url"], "channel": "chan"}
+    (channel_dir / f"{OLD_PREFIX}.meta.json").write_text(json.dumps(old_meta), encoding="utf-8")
+    monkeypatch.setattr(
+        video_intel, "fetch_preflight_status", lambda _yt, ids: {i: {"was_livestream": True} for i in ids}
+    )
+    monkeypatch.setattr(video_intel, "fetch_english_captions", lambda _vid, **_kw: None)
+    real_call_gemini = video_intel.call_gemini
+
+    def transcript_fails(client, types, media_uri, prompt, model, **kw):
+        if kw.get("response_json"):
+            raise RuntimeError("400 INVALID_ARGUMENT")
+        return real_call_gemini(client, types, media_uri, prompt, model, **kw)
+
+    monkeypatch.setattr(video_intel, "call_gemini", transcript_fails)
+
+    # Act
+    _scan(fetched, NEW_TITLE, auto_transcript="all")
+
+    # Assert: the transcript error was found under the old prefix, so no video mind map was paid for.
+    assert calls["mindmap_video"] == 0
+    assert not list(channel_dir.glob("*.mindmap*.md"))
+    meta = _assert_single_meta_under_old_prefix(channel_dir)
+    assert "400 INVALID_ARGUMENT" in meta["last_error"]
+
+
+# ---------------------------------------------------------------------------
+# Workers never resolve: the closures read the one mapping built on the main thread
+# ---------------------------------------------------------------------------
+
+_RESOLVERS = {"resolve_video_prefix", "video_file_prefix", "_load_video_id_index"}
+_CLOSURES = {"_transcribe_with_lazy_probe", "_build_mindmap_call"}
+
+
+def _cmd_scan_node() -> ast.FunctionDef:
+    tree = ast.parse(inspect.getsource(video_intel))
+    return next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "cmd_scan")
+
+
+def _called_names(node: ast.AST) -> set[str]:
+    return {c.func.id for c in ast.walk(node) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
+
+
+def _closures() -> dict[str, ast.FunctionDef]:
+    return {n.name: n for n in ast.walk(_cmd_scan_node()) if isinstance(n, ast.FunctionDef) and n.name in _CLOSURES}
+
+
+def test_cmd_scan_worker_closures_call_no_prefix_resolver():
+    closures = _closures()
+
+    assert set(closures) == _CLOSURES
+    for name, node in closures.items():
+        assert _called_names(node) & _RESOLVERS == set(), name
+
+
+def test_cmd_scan_resolver_walk_sees_the_main_thread_resolution_and_closure_calls():
+    # Companion: the walk finds calls at all, so the check above cannot pass vacuously.
+    assert "resolve_video_prefix" in _called_names(_cmd_scan_node())
+    assert {"_scan_transcribe_one", "process_mindmap"} <= set().union(*(_called_names(n) for n in _closures().values()))
