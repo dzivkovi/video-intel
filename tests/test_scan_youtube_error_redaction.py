@@ -40,8 +40,9 @@ UC_A = "UC" + "A" * 22
 UC_B = "UC" + "B" * 22
 ENRICH_PART = "contentDetails"
 PREFLIGHT_PART = "snippet,status,liveStreamingDetails"
-SHORTS_STEP = "classifying Shorts"
-PREFLIGHT_STEP = "pre-flight metadata check"
+SHORTS_STEP = "Could not classify Shorts"
+PREFLIGHT_STEP = "Pre-flight metadata check failed"
+LOOKUP_STEP = "Could not resolve the channel"
 
 
 def _http_error(status: int, reason: str | None, path: str = "videos") -> vi.HttpError:
@@ -81,14 +82,21 @@ class FakeYouTube:
 
     def __init__(self):
         self.fail: dict[tuple[str, str], Exception] = {}
+        self.lookup: dict[str, object] = {}
         self.dead: dict[str, Exception] = {}
         self.playlists_fetched: list[str] = []
         self.videos_calls: list[tuple[str, str]] = []
         self.published = (datetime.now(UTC) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     def channels(self):
-        def handler(**_kwargs):
-            raise AssertionError("an explicit channel_id makes no handle lookup")
+        def handler(part, forHandle=None, id=None):
+            key = forHandle or id
+            if key not in self.lookup:
+                raise AssertionError("an explicit channel_id makes no handle lookup")
+            answer = self.lookup[key]
+            if isinstance(answer, Exception):
+                raise answer
+            return {"items": [{"id": answer, "snippet": {"title": f"Title {answer[2]}"}}]}
 
         return _Resource(handler)
 
@@ -165,18 +173,16 @@ def _args(*, dry_run=False):
     return argparse.Namespace(channel=None, since=None, force=False, dry_run=dry_run, model=None)
 
 
-def _config() -> dict:
-    return {
-        "channels": [
-            {"name": "chan_a", "url": "https://youtube.com/@a", "channel_id": UC_A},
-            {"name": "chan_b", "url": "https://youtube.com/@b", "channel_id": UC_B},
-        ]
-    }
+def _config(*, a_handle_only=False) -> dict:
+    chan_a = {"name": "chan_a", "url": "https://youtube.com/@a"}
+    if not a_handle_only:
+        chan_a["channel_id"] = UC_A
+    return {"channels": [chan_a, {"name": "chan_b", "url": "https://youtube.com/@b", "channel_id": UC_B}]}
 
 
-def _run(env, caplog, *, dry_run=False):
+def _run(env, caplog, *, dry_run=False, a_handle_only=False):
     with caplog.at_level(logging.DEBUG), caplog.at_level(logging.DEBUG, logger="video_intel"):
-        return vi.cmd_scan(_args(dry_run=dry_run), _config())
+        return vi.cmd_scan(_args(dry_run=dry_run), _config(a_handle_only=a_handle_only))
 
 
 def _assert_secret_nowhere(caplog, capsys):
@@ -268,22 +274,99 @@ def test_cmd_scan_429_quota_reason_at_site_keeps_the_quota_outcome(scan_env, cap
     _assert_secret_nowhere(caplog, capsys)
 
 
-def test_cmd_scan_dry_run_error_at_enrich_warns_without_failed_summary_and_previews_next_channel(
-    scan_env, caplog, capsys
+@pytest.mark.parametrize(("part", "step"), SITES)
+def test_cmd_scan_dry_run_error_at_site_warns_without_failed_summary_and_previews_next_channel(
+    scan_env, caplog, capsys, part, step
 ):
     # Arrange
-    scan_env.youtube.fail[("vid_A", ENRICH_PART)] = _http_error(500, "backendError")
+    scan_env.youtube.fail[("vid_A", part)] = _http_error(500, "backendError")
 
     # Act
     _run(scan_env, caplog, dry_run=True)
 
     # Assert
-    assert len(_step_warnings(caplog, SHORTS_STEP)) == 1
+    assert len(_step_warnings(caplog, step)) == 1
     assert not _has_failed_block(caplog)
-    assert ("vid_B", ENRICH_PART) in scan_env.youtube.videos_calls
+    assert ("vid_B", part) in scan_env.youtube.videos_calls
     assert any("Talk vid_B" in m for m in _messages(caplog, logging.INFO))
     assert scan_env.written == []
     _assert_secret_nowhere(caplog, capsys)
+
+
+LOOKUP_ERRORS = [
+    pytest.param(lambda: _http_error(500, "backendError", path="channels"), id="http-500"),
+    pytest.param(lambda: _http_error(403, "keyInvalid", path="channels"), id="http-403-non-quota"),
+    pytest.param(_transport_error, id="transport"),
+]
+
+
+@pytest.mark.parametrize("error_factory", LOOKUP_ERRORS)
+def test_cmd_scan_lookup_error_with_no_known_id_warns_once_records_failure_and_reaches_next_channel(
+    scan_env, caplog, capsys, error_factory
+):
+    # Arrange: chan_a is handle-only with no learned id, so there is nothing to fall back on.
+    scan_env.youtube.lookup["a"] = error_factory()
+
+    # Act
+    result = _run(scan_env, caplog, a_handle_only=True)
+
+    # Assert
+    assert result is None
+    assert scan_env.youtube.playlists_fetched == ["UU" + UC_B[2:]]
+    assert "vid_B" in {vid for _, vid in scan_env.written}
+    warnings = _step_warnings(caplog, LOOKUP_STEP)
+    assert len(warnings) == 1
+    assert "chan_a" in warnings[0] and "https://youtube.com/@a" in warnings[0]
+    assert len(_failed_lines(caplog, "chan_a")) == 1
+    assert "Done." in _messages(caplog, logging.INFO)
+    assert not (scan_env.corpus / "_channels" / "ids.json").exists()
+    _assert_secret_nowhere(caplog, capsys)
+
+
+def test_cmd_scan_dry_run_lookup_error_warns_without_failed_summary_and_previews_next_channel(scan_env, caplog, capsys):
+    # Arrange
+    scan_env.youtube.lookup["a"] = _http_error(500, "backendError", path="channels")
+
+    # Act
+    _run(scan_env, caplog, dry_run=True, a_handle_only=True)
+
+    # Assert
+    assert len(_step_warnings(caplog, LOOKUP_STEP)) == 1
+    assert not _has_failed_block(caplog)
+    assert any("Talk vid_B" in m for m in _messages(caplog, logging.INFO))
+    _assert_secret_nowhere(caplog, capsys)
+
+
+def test_cmd_scan_quota_stop_at_lookup_with_no_known_id_exits_1_with_one_error(scan_env, caplog, capsys):
+    # Arrange
+    scan_env.youtube.lookup["a"] = _http_error(403, "quotaExceeded", path="channels")
+
+    # Act
+    with pytest.raises(SystemExit) as exc:
+        _run(scan_env, caplog, a_handle_only=True)
+
+    # Assert
+    assert exc.value.code == 1
+    errors = _messages(caplog, logging.ERROR)
+    assert len(errors) == 1 and "quotaExceeded" in errors[0]
+    assert not _step_warnings(caplog, LOOKUP_STEP)
+    assert scan_env.youtube.playlists_fetched == []
+    _assert_secret_nowhere(caplog, capsys)
+
+
+def test_cmd_scan_malformed_explicit_channel_id_keeps_its_own_skip(scan_env, caplog):
+    # Arrange: resolve_channel_identity's designed outcome (one ERROR, no lookup) never reaches the guard.
+    config = _config()
+    config["channels"][0]["channel_id"] = "not-a-channel-id"
+
+    # Act
+    with caplog.at_level(logging.DEBUG, logger="video_intel"):
+        vi.cmd_scan(_args(), config)
+
+    # Assert
+    assert any("is not a YouTube channel id" in m for m in _messages(caplog, logging.ERROR))
+    assert not _step_warnings(caplog, LOOKUP_STEP)
+    assert scan_env.youtube.playlists_fetched == ["UU" + UC_B[2:]]
 
 
 def test_cmd_scan_quota_stop_at_uploads_fetch_exits_1_with_one_error_and_no_raw_http_error(scan_env, caplog, capsys):
@@ -311,7 +394,7 @@ def test_cmd_scan_wrapper_lets_a_non_http_error_propagate_unchanged(scan_env, mo
     def explode(*_a, **_kw):
         raise boom
 
-    monkeypatch.setattr(vi, "resolve_channel_identity", explode)
+    monkeypatch.setattr(vi, "validate_channel_knobs", explode)
 
     # Act
     with pytest.raises(RuntimeError) as exc:
@@ -356,3 +439,45 @@ def test_main_masks_the_key_in_googleapiclient_log_records(tmp_path):
     assert "key=REDACTED" in output
     assert SECRET not in output
     assert "key=VISIBLE_OTHER" in output
+
+
+def _record(name: str, msg: str, args) -> logging.LogRecord:
+    return logging.LogRecord(name, logging.WARNING, __file__, 1, msg, args, None)
+
+
+def test_google_api_client_key_filter_masks_key_in_library_record():
+    # Arrange
+    record = _record("googleapiclient.http", "Invalid JSON content from response: %s", (f"x?key={SECRET}&a=1",))
+
+    # Act
+    kept = vi._GoogleApiClientKeyFilter().filter(record)
+
+    # Assert
+    assert kept is True
+    assert SECRET not in record.getMessage()
+    assert "key=REDACTED" in record.getMessage()
+
+
+def test_google_api_client_key_filter_survives_mismatched_args():
+    # Arrange: two placeholders and one arg, so formatting the message raises TypeError.
+    record = _record("googleapiclient.http", "%s and %s", ("only-one",))
+
+    # Act
+    kept = vi._GoogleApiClientKeyFilter().filter(record)
+
+    # Assert
+    assert kept is True
+
+
+def test_google_api_client_key_filter_leaves_other_loggers_untouched():
+    # Arrange
+    args = (f"key={SECRET}",)
+    record = _record("other.lib", "value %s", args)
+
+    # Act
+    kept = vi._GoogleApiClientKeyFilter().filter(record)
+
+    # Assert
+    assert kept is True
+    assert record.msg == "value %s"
+    assert record.args is args

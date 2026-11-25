@@ -9048,11 +9048,13 @@ def log_scan_index_recipe(channels: list[str], index_state: str | None, output_d
 def cmd_scan(args, config):
     """Scan channels for new videos and generate mind maps.
 
-    Issue #320: an HttpError that leaves the scan (a quota stop at channel
-    resolution or at the uploads fetch, issue #312) would print its string, and
-    with it the request URL holding the API key, as a traceback. It is ONE ERROR
-    through `describe_error_for_log` and exit 1 instead. Only HttpError is
-    caught: any other exception keeps its traceback.
+    Issue #320: a YouTube quota stop at channel resolution or at the uploads
+    fetch ends the scan on purpose (issue #312); as a traceback it would print
+    the HttpError's string, whose request URL holds the API key. It is ONE ERROR
+    through `describe_error_for_log` and exit 1 instead. Every other YouTube
+    error in the body is caught per channel, so a quota stop is the only
+    HttpError expected here. Only HttpError is caught: a non-HttpError that
+    escapes the body (a code bug) keeps its traceback.
     """
     try:
         return _cmd_scan_impl(args, config)
@@ -9193,10 +9195,24 @@ def _cmd_scan_impl(args, config):
                 errors.append((ch_name, ch_name, f"error: {SINCE_OPT_OUT_MISUSE_MESSAGE}"))
             continue
 
-        # Resolve channel
-        channel_id, channel_title = resolve_channel_identity(
-            youtube, ch, channel_ids_dir_for(ch, all_channels, output_dir), dry_run=args.dry_run
-        )
+        # Resolve channel. Issue #320: a lookup that raises with no known id to
+        # fall back on (resolve_channel_identity handles the known-id case
+        # itself) skips this channel like the #312 fetch guard below; a quota
+        # stop still stops the scan (cmd_scan logs it).
+        try:
+            channel_id, channel_title = resolve_channel_identity(
+                youtube, ch, channel_ids_dir_for(ch, all_channels, output_dir), dry_run=args.dry_run
+            )
+        except Exception as e:
+            if _is_youtube_quota_stop(e):
+                raise
+            detail = describe_error_for_log(e)
+            log.warning(
+                "[%s] Could not resolve the channel for %s; skipping this channel this run: %s", ch_name, ch_url, detail
+            )
+            if not args.dry_run:
+                errors.append((ch_name, ch_name, f"error: {detail}"))
+            continue
         if not channel_id:
             log.warning("[%s] Channel not found: %s", ch_name, ch_url)
             continue
@@ -9305,9 +9321,7 @@ def _cmd_scan_impl(args, config):
                 log.error("  Re-run scan after quota resets (typically next midnight Pacific).")
                 continue
             detail = describe_error_for_log(e)
-            log.warning(
-                "[%s] YouTube error while classifying Shorts; skipping this channel this run: %s", ch_name, detail
-            )
+            log.warning("[%s] Could not classify Shorts; skipping this channel this run: %s", ch_name, detail)
             if not args.dry_run:
                 errors.append((ch_name, ch_name, f"error: {detail}"))
             continue
@@ -9332,7 +9346,7 @@ def _cmd_scan_impl(args, config):
                 continue
             detail = describe_error_for_log(e)
             log.warning(
-                "[%s] YouTube error during pre-flight metadata check; skipping this channel this run: %s",
+                "[%s] Pre-flight metadata check failed; skipping this channel this run: %s",
                 ch_name,
                 detail,
             )

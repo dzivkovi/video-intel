@@ -365,7 +365,7 @@ def test_cmd_scan_corrupt_state_file_warns_once_behaves_as_today_and_is_left_byt
     assert path.read_bytes() == before
 
 
-def test_cmd_scan_quota_stop_at_lookup_with_known_id_propagates(scan_env, caplog):
+def test_cmd_scan_quota_stop_at_lookup_with_known_id_stops_the_scan_with_exit_code_1(scan_env, caplog):
     # Arrange
     _seed_ids(scan_env.corpus, {"chan": _learned(UC_A)})
     body = json.dumps({"error": {"errors": [{"reason": "quotaExceeded"}]}}).encode("utf-8")
@@ -410,7 +410,7 @@ def test_cmd_scan_dead_known_id_warns_records_error_and_next_channel_is_processe
     assert any(r.getMessage() == "Done." for r in caplog.records)
 
 
-def test_cmd_scan_quota_stop_at_fetch_still_propagates(scan_env, caplog):
+def test_cmd_scan_quota_stop_at_fetch_stops_the_scan_with_exit_code_1(scan_env, caplog):
     # Arrange
     scan_env.youtube = FakeYouTube({"creator": UC_A})
     quota = _http(403, "quotaExceeded")
