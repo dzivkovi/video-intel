@@ -40,15 +40,18 @@ def _torn_bytes(body: dict) -> bytes:
     return full[:cut]
 
 
-#: The two shapes that crashed before #319. The list is non-empty on purpose:
-#: an empty list is falsy, and one reader (`if meta:`) passed it by accident.
+#: The two shapes that crashed before #319, plus invalid JSON (skipped before,
+#: now also with the one WARNING). The list is non-empty on purpose: an empty
+#: list is falsy, and one reader (`if meta:`) passed it by accident.
 DAMAGED_META = {
     "torn": _torn_bytes({"video_id": DAMAGED_VID}),
     "list": json.dumps([{"video_id": DAMAGED_VID}]).encode("utf-8"),
+    "invalid_json": b'{"video_id": "dmgvid00002", "title": ',
 }
 DAMAGED_CONCEPTS = {
     "torn": _torn_bytes({"video_id": DAMAGED_VID, "concepts": [{"concept_id": "c_damaged"}]}),
     "list": json.dumps([{"concept_id": "c_damaged"}]).encode("utf-8"),
+    "invalid_json": b'{"video_id": "dmgvid00002", "concepts": [',
 }
 SHAPES = sorted(DAMAGED_META)
 
@@ -217,6 +220,9 @@ def test_cmd_taxonomy_build_when_concepts_file_damaged_skips_it_and_keeps_health
     assert concepts["c1"]["first_seen"] == "2026-10-01"
     assert concepts["c1"]["video_count"] == 1
     _assert_one_warning_and_untouched(caplog, damaged, channel_dir, before)
+    warning = _warnings_naming(caplog, damaged)[0]
+    assert "missing from taxonomy.json until the file is regenerated" in warning
+    assert f"delete it and run `concepts --channel {CHANNEL}`" in warning
 
 
 def test_cmd_taxonomy_build_when_corpus_healthy_counts_every_concepts_file(corpus):
@@ -409,9 +415,12 @@ def test_cmd_mark_skip_when_target_meta_damaged_exits_not_found(corpus, caplog, 
     with caplog.at_level(logging.WARNING), pytest.raises(SystemExit) as excinfo:
         video_intel.cmd_mark_skip(_mark_skip_args(DAMAGED_VID), {})
 
-    # Assert: the existing not-found outcome, never a traceback, and nothing written anywhere.
+    # Assert: a not-found exit that names the damaged meta instead of telling the operator to scan.
     assert excinfo.value.code == 1
-    assert f"No meta.json found for video_id {DAMAGED_VID}" in caplog.text
+    assert f"No readable meta.json found for video_id {DAMAGED_VID}" in caplog.text
+    assert f"1 damaged meta.json file(s) were skipped: {CHANNEL}/{DAMAGED_PREFIX}.meta.json" in caplog.text
+    assert "The target may be one of them" in caplog.text
+    assert "Run scan or transcript --url first" not in caplog.text
     assert (channel_dir / f"{HEALTHY_PREFIX}.meta.json").read_bytes() == healthy_before
     _assert_one_warning_and_untouched(caplog, damaged, channel_dir, before)
 
@@ -657,3 +666,255 @@ def test_cmd_dedupe_when_a_meta_read_fails_skips_it_with_one_warning(corpus, unr
     assert unreadable_meta.exists() and (channel_dir / f"{DAMAGED_PREFIX}.mindmap.md").exists()
     warnings = _warnings_naming(caplog, unreadable_meta)
     assert len(warnings) == 1 and "PermissionError" in warnings[0]
+
+
+# ---------------------------------------------------------------------------
+# G2 with only a damaged canonical: refuse before any upload (issue #277 principle)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("command", ["process", "transcript"])
+@pytest.mark.parametrize("shape", SHAPES)
+def test_file_ingest_when_only_canonical_meta_damaged_exits_1_before_upload(
+    process_env, monkeypatch, caplog, shape, command
+):
+    # Arrange: the channel holds only a damaged meta; the local file is named by the id G2 looks up.
+    corpus, calls = process_env
+    channel_dir = corpus / CHANNEL
+    damaged = _write_damaged_meta(channel_dir, shape)
+    mp4 = channel_dir / f"{DAMAGED_VID}.mp4"
+    mp4.write_bytes(b"fake mp4 bytes")
+    listing_before = sorted(p.name for p in channel_dir.iterdir())
+    uploads = []
+    monkeypatch.setattr(video_intel, "upload_local_video", lambda _c, p: uploads.append(p) or "files/stub")
+    cmd = video_intel.cmd_process if command == "process" else video_intel.cmd_transcript
+
+    # Act
+    with caplog.at_level(logging.WARNING), pytest.raises(SystemExit) as excinfo:
+        cmd(_process_args(mp4), _channels_config())
+
+    # Assert: exit code 1, no upload, no paid call, nothing new on disk, the damaged file untouched.
+    assert excinfo.value.code == 1
+    assert uploads == []
+    assert calls == []
+    assert sorted(p.name for p in channel_dir.iterdir()) == listing_before
+    assert damaged.read_bytes() == DAMAGED_META[shape]
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert damaged.name in errors[0] and str(channel_dir) in errors[0]
+    assert "Repair or delete them, then run again" in errors[0]
+
+
+@pytest.mark.parametrize("shape", SHAPES)
+def test_file_ingest_when_rejected_stem_meta_is_damaged_and_stem_is_an_id_g2_exits_1_before_upload(
+    process_env, monkeypatch, caplog, tmp_path, shape
+):
+    # Arrange: a file outside the corpus with an id-shaped stem, a damaged stem-named meta in the
+    # channel folder, and --title/--date given. The adoption guard rejects the meta; G2 then refuses.
+    corpus, calls = process_env
+    channel_dir = corpus / CHANNEL
+    channel_dir.mkdir(parents=True)
+    stem_meta = channel_dir / f"{DAMAGED_VID}.meta.json"
+    stem_meta.write_bytes(DAMAGED_META[shape])
+    downloads = tmp_path / "Downloads"
+    downloads.mkdir()
+    mp4 = downloads / f"{DAMAGED_VID}.mp4"
+    mp4.write_bytes(b"fake mp4 bytes")
+    uploads = []
+    monkeypatch.setattr(video_intel, "upload_local_video", lambda _c, p: uploads.append(p) or "files/stub")
+    args = _process_args(mp4)
+    args.title, args.date = "Damaged talk", "2026-10-02"
+
+    # Act
+    with caplog.at_level(logging.WARNING), pytest.raises(SystemExit) as excinfo:
+        video_intel.cmd_process(args, _channels_config())
+
+    # Assert: the guard's discard WARNING, then G2's refusal, exit code 1, no upload, no paid call.
+    assert any(
+        r.levelno == logging.WARNING and stem_meta.name in r.getMessage() and "discarding it" in r.getMessage()
+        for r in caplog.records
+    )
+    assert excinfo.value.code == 1
+    assert uploads == []
+    assert calls == []
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1 and stem_meta.name in errors[0] and "Repair or delete them" in errors[0]
+
+
+def test_g2_when_only_canonical_meta_unreadable_keeps_skipping_and_does_not_block(tmp_path, unreadable, caplog):
+    # Arrange: a failed READ is not damaged content and must not block (it skips, as on origin/main).
+    channel_dir = tmp_path / CHANNEL
+    _write_healthy(channel_dir)
+    meta = channel_dir / f"{HEALTHY_PREFIX}.meta.json"
+    unreadable.add(str(meta))
+
+    # Act
+    with caplog.at_level(logging.WARNING):
+        result = video_intel._find_canonical_meta_by_video_id(channel_dir, HEALTHY_VID)
+
+    # Assert
+    assert result == (None, [])
+    warnings = _warnings_naming(caplog, meta)
+    assert len(warnings) == 1 and "PermissionError" in warnings[0]
+
+
+# ---------------------------------------------------------------------------
+# The recovery a skipped concepts file's WARNING prescribes actually works
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("shape", SHAPES)
+def test_damaged_concepts_recovery_delete_and_concepts_channel_restores_taxonomy(corpus, monkeypatch, caplog, shape):
+    # Arrange: a healthy video (meta + mind map) whose concepts.json is damaged; Gemini stubbed.
+    monkeypatch.setenv("GEMINI_API_KEY", "stub")
+    monkeypatch.setattr(video_intel, "require_gemini", lambda: (None, None))
+    monkeypatch.setattr(video_intel, "create_client", lambda *a, **k: object())
+    monkeypatch.setattr(video_intel, "load_prompt", lambda n: "PROMPT {{taxonomy}}")
+    restored = {"concepts": [{"concept_id": "c_restored", "preferred_label": "Restored"}]}
+    monkeypatch.setattr(video_intel, "call_gemini_text", lambda *a, **k: json.dumps(restored))
+    channel_dir = corpus / CHANNEL
+    _write_healthy(channel_dir, prompt="mindmap-knowledge")
+    damaged = channel_dir / f"{HEALTHY_PREFIX}.concepts.json"
+    damaged.write_bytes(DAMAGED_CONCEPTS[shape])
+    with caplog.at_level(logging.WARNING):
+        video_intel.cmd_taxonomy_build(argparse.Namespace(), {})
+    assert "c_restored" not in _taxonomy(corpus)["concepts"]
+    assert f"concepts --channel {CHANNEL}" in _warnings_naming(caplog, damaged)[0]
+
+    # Act: the prescribed recovery - delete the file, run concepts for the channel, rebuild.
+    damaged.unlink()
+    concepts_args = argparse.Namespace(channel=CHANNEL, force=False, model=None, dry_run=False, log_level="info")
+    video_intel.cmd_concepts(concepts_args, _channels_config())
+    video_intel.cmd_taxonomy_build(argparse.Namespace(), {})
+
+    # Assert
+    assert json.loads(damaged.read_text(encoding="utf-8"))["video_id"] == HEALTHY_VID
+    assert "c_restored" in _taxonomy(corpus)["concepts"]
+
+
+# ---------------------------------------------------------------------------
+# OSError keeps skipping at the skip sites (with the WARNING)
+# ---------------------------------------------------------------------------
+
+
+def test_cmd_prune_shorts_when_a_meta_read_fails_skips_it_with_one_warning(corpus, unreadable, monkeypatch, caplog):
+    # Arrange: two Shorts by cached duration; one meta cannot be read.
+    monkeypatch.setenv("YOUTUBE_API_KEY", "fake")
+    monkeypatch.setattr(video_intel, "require_youtube", lambda: lambda *_a, **_kw: MagicMock())
+    monkeypatch.setattr(video_intel, "enrich_with_durations", lambda _yt, ids: {i: None for i in ids})
+    monkeypatch.setattr(video_intel, "_is_youtube_short_url", lambda _vid: False)
+    channel_dir = corpus / CHANNEL
+    _write_healthy(channel_dir, duration_seconds=30)
+    _write_healthy(channel_dir, DAMAGED_PREFIX, video_id=DAMAGED_VID, duration_seconds=30)
+    unreadable_meta = channel_dir / f"{DAMAGED_PREFIX}.meta.json"
+    unreadable.add(str(unreadable_meta))
+
+    # Act
+    with caplog.at_level(logging.INFO):
+        video_intel.cmd_prune_shorts(argparse.Namespace(channel=None, apply=False), _channels_config())
+
+    # Assert
+    assert "Summary: 1 Shorts" in caplog.text
+    warnings = _warnings_naming(caplog, unreadable_meta)
+    assert len(warnings) == 1 and "PermissionError" in warnings[0]
+
+
+def test_cmd_process_file_when_a_neighbour_meta_read_fails_g2_still_finds_healthy(process_env, unreadable, caplog):
+    # Arrange
+    corpus, calls = process_env
+    channel_dir = corpus / CHANNEL
+    _write_healthy(channel_dir)
+    _write_healthy(channel_dir, DAMAGED_PREFIX, video_id=DAMAGED_VID)
+    unreadable_meta = channel_dir / f"{DAMAGED_PREFIX}.meta.json"
+    unreadable.add(str(unreadable_meta))
+    mp4 = channel_dir / f"{HEALTHY_VID}.mp4"
+    mp4.write_bytes(b"fake mp4 bytes")
+
+    # Act
+    with caplog.at_level(logging.WARNING):
+        _run_process(_process_args(mp4))
+
+    # Assert
+    assert sorted(calls) == [("mindmap", HEALTHY_PREFIX), ("transcript", HEALTHY_PREFIX)]
+    warnings = _warnings_naming(caplog, unreadable_meta)
+    assert len(warnings) == 1 and "PermissionError" in warnings[0]
+
+
+@pytest.mark.parametrize("which", ["meta", "concepts"])
+def test_intel_graph_load_corpus_when_a_read_fails_skips_as_before(corpus, unreadable, caplog, which):
+    # Arrange
+    duckdb = pytest.importorskip("duckdb")
+    import intel_graph
+
+    channel_dir = corpus / CHANNEL
+    _seed_healthy_concepts(channel_dir)
+    _write_healthy(channel_dir, DAMAGED_PREFIX, video_id=DAMAGED_VID, title="Second talk")
+    _write_concepts(channel_dir, DAMAGED_PREFIX, DAMAGED_VID, [{"concept_id": "c2", "as_mentioned": "other"}])
+    target = channel_dir / f"{DAMAGED_PREFIX}.{which}.json"
+    unreadable.add(str(target))
+    con = duckdb.connect(":memory:")
+
+    # Act
+    with caplog.at_level(logging.WARNING):
+        intel_graph.load_corpus(con, corpus)
+
+    # Assert: an unreadable meta loads the video with its concepts identity; an unreadable concepts file skips it.
+    rows = dict(con.execute("SELECT artifact_id, title FROM artifacts").fetchall())
+    expected = {HEALTHY_VID: "Healthy talk"}
+    if which == "meta":
+        expected[DAMAGED_VID] = DAMAGED_PREFIX
+    assert rows == expected
+    warnings = _warnings_naming(caplog, target)
+    assert len(warnings) == 1 and "PermissionError" in warnings[0]
+
+
+# ---------------------------------------------------------------------------
+# intel_graph: the concepts read beside the meta read
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("shape", SHAPES)
+def test_intel_graph_load_corpus_when_concepts_damaged_skips_that_video(corpus, caplog, shape):
+    # Arrange
+    duckdb = pytest.importorskip("duckdb")
+    import intel_graph
+
+    channel_dir = corpus / CHANNEL
+    _seed_healthy_concepts(channel_dir)
+    _write_healthy(channel_dir, DAMAGED_PREFIX, video_id=DAMAGED_VID)
+    damaged = channel_dir / f"{DAMAGED_PREFIX}.concepts.json"
+    damaged.write_bytes(DAMAGED_CONCEPTS[shape])
+    before = _damaged_siblings(channel_dir)
+    con = duckdb.connect(":memory:")
+
+    # Act
+    with caplog.at_level(logging.WARNING):
+        intel_graph.load_corpus(con, corpus)
+
+    # Assert
+    rows = dict(con.execute("SELECT artifact_id, title FROM artifacts").fetchall())
+    assert rows == {HEALTHY_VID: "Healthy talk"}
+    _assert_one_warning_and_untouched(caplog, damaged, channel_dir, before)
+
+
+# ---------------------------------------------------------------------------
+# A concepts.json with no `concepts` key reads as empty
+# ---------------------------------------------------------------------------
+
+
+def test_cmd_taxonomy_build_when_concepts_key_missing_reads_empty_counts_file_no_warning(corpus, caplog):
+    # Arrange
+    channel_dir = corpus / CHANNEL
+    _seed_healthy_concepts(channel_dir)
+    no_key = channel_dir / f"{DAMAGED_PREFIX}.concepts.json"
+    no_key.write_text(json.dumps({"video_id": DAMAGED_VID}), encoding="utf-8")
+
+    # Act
+    with caplog.at_level(logging.WARNING):
+        video_intel.cmd_taxonomy_build(argparse.Namespace(), {})
+
+    # Assert
+    taxonomy = _taxonomy(corpus)
+    assert sorted(taxonomy["concepts"]) == ["c1"]
+    assert taxonomy["built_from"] == 2
+    assert _warnings_naming(caplog, no_key) == []

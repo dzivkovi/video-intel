@@ -3035,8 +3035,14 @@ def infer_channel_from_file_path(input_path: Path, output_dir: Path, config: dic
     return candidate if candidate in configured else None
 
 
-def _find_canonical_meta_by_video_id(channel_dir: Path, video_id: str) -> Path | None:
+def _find_canonical_meta_by_video_id(channel_dir: Path, video_id: str) -> tuple[Path | None, list[Path]]:
     """Search a channel folder for a .meta.json whose 'video_id' matches.
+
+    Returns ``(canonical, damaged)``: the claimant (or None) and the metas
+    skipped because their CONTENT is unusable (issue #319). An empty
+    ``damaged`` means no claimant could have been missed by a damaged file;
+    the caller refuses to proceed on "no claimant" when it is not empty
+    (the issue #277 principle: an incomplete walk proves nothing).
 
     Per plan F11 uniqueness invariant, at most one such file should exist per
     {channel, video_id}. If more than one is found, emit a WARNING log (the
@@ -3047,11 +3053,20 @@ def _find_canonical_meta_by_video_id(channel_dir: Path, video_id: str) -> Path |
     pick.
     """
     if not channel_dir.exists() or not video_id:
-        return None
+        return None, []
     matches: list[Path] = []
+    damaged: list[Path] = []
+    consequence = "not considered as the canonical meta for a local ingest"
     for meta_file in sorted(channel_dir.glob("*.meta.json")):
-        meta = _read_meta_or_skip(meta_file, "not considered as the canonical meta for a local ingest")
+        try:
+            meta = _read_meta_or_skip(meta_file, consequence, raise_on_os_error=True)
+        except OSError as exc:
+            # A failed READ keeps skipping as before #319 and is NOT counted as
+            # damaged: a transient read failure must not block a local ingest.
+            _warn_damaged_meta_once(meta_file, f"unreadable: {type(exc).__name__}", consequence)
+            continue
         if meta is None:
+            damaged.append(meta_file)
             continue
         if meta.get("video_id") == video_id:
             matches.append(meta_file)
@@ -3064,7 +3079,7 @@ def _find_canonical_meta_by_video_id(channel_dir: Path, video_id: str) -> Path |
             [m.name for m in matches],
             matches[0].name,
         )
-    return matches[0] if matches else None
+    return (matches[0] if matches else None), damaged
 
 
 def _adoptable_channel_stem_meta(meta_path: Path, *, stem: str, args, channel_name: str | None) -> bool:
@@ -3204,7 +3219,22 @@ def resolve_local_file_identity(
         candidate_video_id = stem
 
     if candidate_video_id and channel_dir is not None:
-        canonical = _find_canonical_meta_by_video_id(channel_dir, candidate_video_id)
+        canonical, damaged = _find_canonical_meta_by_video_id(channel_dir, candidate_video_id)
+        if canonical is None and damaged:
+            # Issue #319: a damaged meta may be this video's canonical one, so
+            # "no claimant" is unproven. Stop before any upload or paid call
+            # rather than ingest it again under a second prefix.
+            log.error(
+                "%s: no readable meta.json in %s claims video_id %s, and %d damaged meta.json file(s) "
+                "were skipped: %s. One of them may be this video's canonical meta. "
+                "Repair or delete them, then run again.",
+                input_path.name,
+                channel_dir,
+                candidate_video_id,
+                len(damaged),
+                ", ".join(p.name for p in damaged),
+            )
+            sys.exit(1)
         if canonical is not None:
             canonical_meta = json.loads(canonical.read_text(encoding="utf-8"))
             canonical_prefix = canonical.name[: -len(".meta.json")]
@@ -3323,9 +3353,10 @@ def resolve_local_file_identity(
 _VIDEO_ID_CACHE: dict[str, dict[str, str]] = {}
 
 
-#: Paths already warned about by ``_warn_damaged_meta_once`` in this process
-#: (issue #313). ``record_alt_title_if_rotated`` drops the channel's index after
-#: every write, so without this one damaged file warned once per rotation.
+#: Paths already warned about by ``_warn_damaged_file_once`` in this process:
+#: damaged meta.json files (issue #313) and concepts.json files (issue #319).
+#: ``record_alt_title_if_rotated`` drops the channel's index after every write,
+#: so without this one damaged file warned once per rotation.
 _DAMAGED_META_WARNED: set[str] = set()
 
 #: What the scan does with a video whose meta is damaged (issue #313).
@@ -8896,8 +8927,12 @@ def build_taxonomy(output_dir: Path) -> dict:
     for concepts_file in output_dir.rglob("*.concepts.json"):
         # A failed read raises (issue #319): a taxonomy silently missing this
         # file's concepts would make later scans re-mint them as duplicates.
+        channel = concepts_file.parent.name
         data = _read_concepts_or_skip(
-            concepts_file, "it contributes no concepts to taxonomy.json", raise_on_os_error=True
+            concepts_file,
+            "its concepts are missing from taxonomy.json until the file is regenerated: "
+            f"delete it and run `concepts --channel {_shell_arg(channel)}`",
+            raise_on_os_error=True,
         )
         if data is None:
             continue
@@ -12125,14 +12160,28 @@ def cmd_mark_skip(args, config) -> None:
     video_id = video_id_match.group(1)
 
     found: list[Path] = []
+    damaged: list[Path] = []
     if output_dir.exists():
         for meta_path in output_dir.glob("*/*.meta.json"):
             meta = _read_meta_or_skip(meta_path, "mark-skip does not consider it", raise_on_os_error=True)
             if meta is None:
+                damaged.append(meta_path)
                 continue
             if meta.get("video_id") == video_id:
                 found.append(meta_path)
 
+    if not found and damaged:
+        # Issue #319: the target may be one of the damaged metas, so "run a
+        # scan so the meta exists" would be the wrong advice.
+        log.error(
+            "No readable meta.json found for video_id %s under %s, and %d damaged meta.json file(s) were "
+            "skipped: %s. The target may be one of them: repair or delete it, then re-run mark-skip.",
+            video_id,
+            output_dir,
+            len(damaged),
+            ", ".join(f"{p.parent.name}/{p.name}" for p in sorted(damaged)),
+        )
+        sys.exit(1)
     if not found:
         log.error(
             "No meta.json found for video_id %s under %s. "

@@ -1270,8 +1270,9 @@ class TestChannelDirStemMetaAdoptionConflictGuard:
         assert identity["meta_path"] == channel_dir / "session-two.meta.json"
 
     def test_unreadable_candidate_is_rejected_not_adopted(self, tmp_path):
-        channel_dir, mp4 = self._layout(tmp_path)
-        (channel_dir / "session-two.meta.json").write_text("{not json", encoding="utf-8")
+        # Not id-shaped on purpose: an 11-character stem runs G2, which refuses over the damaged meta (issue #319).
+        channel_dir, mp4 = self._layout(tmp_path, stem="session-two-recording")
+        (channel_dir / "session-two-recording.meta.json").write_text("{not json", encoding="utf-8")
         args = _make_args(title="Session Two Talk", date="2026-08-31")
         identity = resolve_local_file_identity(mp4, channel_name="everyinc", channel_dir=channel_dir, args=args)
         assert identity["prefix"] == "2026-08-31-session-two-talk"
