@@ -8658,6 +8658,21 @@ class ConceptsPromptCache:
         self.name = None
 
 
+def concepts_source_prompt(meta: dict | None, fallback: str | None = None) -> str | None:
+    """The prompt a concepts.json names as its source (issue #315): the one definition.
+
+    The mind map the concepts are read from was written by `process_mindmap`,
+    which records its prompt in meta.json, so that record wins whenever it is a
+    non-empty string. Otherwise ``fallback``: the scan and `concepts` loops pass
+    none (``process_concepts`` then stamps "unknown"); the two `process` paths
+    pass the name they resolved this run.
+    """
+    prompt = meta.get("prompt") if isinstance(meta, dict) else None
+    if isinstance(prompt, str) and prompt:
+        return prompt
+    return fallback
+
+
 def process_concepts(
     client,
     types,
@@ -9931,7 +9946,7 @@ def cmd_scan(args, config):
                         "title": meta.get("title", prefix),
                         "published": meta.get("published", ""),
                     }
-                    concept_candidates.append((synthetic_video, mindmap_path, prefix, meta.get("prompt")))
+                    concept_candidates.append((synthetic_video, mindmap_path, prefix, concepts_source_prompt(meta)))
 
             if concept_candidates:
                 log.info("  Extracting concepts (%d videos)...", len(concept_candidates))
@@ -11275,6 +11290,12 @@ def _cmd_process_url(args, config):
     try:
         mindmap_text = mindmap_path.read_text(encoding="utf-8")
         taxonomy = load_taxonomy(output_dir)
+        # Issue #315: the prompt the mind map's writer recorded, read after Step 2
+        # from that writer's own meta path; the derived name only as fallback.
+        source_prompt = concepts_source_prompt(
+            _read_meta_or_skip(transcript_meta_path) if transcript_meta_path.exists() else None,
+            concepts_prompt_name,
+        )
         concepts_prefix, concepts_status = process_concepts(
             client,
             types,
@@ -11285,7 +11306,7 @@ def _cmd_process_url(args, config):
             output_dir,
             channel_name,
             source_file=mindmap_path.name,
-            source_prompt=concepts_prompt_name,
+            source_prompt=source_prompt,
             force=args.force,
             prefix=prefix,
         )
@@ -11515,9 +11536,10 @@ def _cmd_process_impl(args, config):
             "title": video["title"],
             "published": video["published"],
             "model": model,
-            "prompt": prompt_name,
             "transcript_source": "local_file",
         }
+        # Issue #315: no `prompt` here. It describes the mind map on disk, and only
+        # the mind-map writer stamps it, after it has written the file.
         if channel_name and "published_source" in identity:
             identity_fields["published_source"] = identity["published_source"]
         if start_offset is not None or end_offset is not None:
@@ -11688,6 +11710,9 @@ def _cmd_process_impl(args, config):
         log.error("Mindmap source unresolvable: %s", exc)
         sys.exit(1)
 
+    # Issue #315: the one prompt name this run's mind-map writer is handed; also
+    # the concepts fallback below when that writer wrote.
+    mindmap_writer_prompt_name: str | None = None
     if skip_mindmap:
         mindmap_status = "skipped (skip_modes)"
         log.info("  Step 2/3: mindmap [%s]: %s", prefix, mindmap_status)
@@ -11697,6 +11722,7 @@ def _cmd_process_impl(args, config):
     else:
         log.info("  Step 2/3: mindmap (source=%s)", resolved_source)
         if resolved_source == "transcript":
+            mindmap_writer_prompt_name = "mindmap-from-transcript"
             # Cheap text-only call against the on-disk transcript. No file_uri needed.
             _, mindmap_status = process_mindmap(
                 client,
@@ -11706,7 +11732,7 @@ def _cmd_process_impl(args, config):
                 model,
                 output_dir,
                 channel_name or "",
-                prompt_name="mindmap-from-transcript",
+                prompt_name=mindmap_writer_prompt_name,
                 force=mindmap_force,
                 prefix=prefix,
                 channel_dir_override=channel_dir,
@@ -11714,6 +11740,8 @@ def _cmd_process_impl(args, config):
                 transcript_path=transcript_path,
             )
         else:
+            mindmap_writer_prompt_name = prompt_name
+
             # Legacy mindmap-from-video fallback. Watches the same upload.
             def _mindmap_call(uri):
                 return process_mindmap(
@@ -11724,7 +11752,7 @@ def _cmd_process_impl(args, config):
                     model,
                     output_dir,
                     channel_name or "",
-                    prompt_name=prompt_name,
+                    prompt_name=mindmap_writer_prompt_name,
                     force=mindmap_force,
                     prefix=prefix,
                     channel_dir_override=channel_dir,
@@ -11789,6 +11817,14 @@ def _cmd_process_impl(args, config):
     try:
         mindmap_text = mindmap_path.read_text(encoding="utf-8")
         taxonomy = load_taxonomy(output_dir)
+        # Issue #315: the prompt the mind map's writer recorded, read after Step 2
+        # from the same meta_path that writer used. Fallback: the name this run's
+        # mind-map writer was handed when it wrote, else the resolved name.
+        wrote_mindmap = mindmap_writer_prompt_name is not None and scan_status_wrote_artifact(mindmap_status)
+        source_prompt = concepts_source_prompt(
+            _read_meta_or_skip(meta_path) if meta_path.exists() else None,
+            mindmap_writer_prompt_name if wrote_mindmap else prompt_name,
+        )
         _, concepts_status = process_concepts(
             client,
             types,
@@ -11799,7 +11835,7 @@ def _cmd_process_impl(args, config):
             output_dir,
             channel_name,
             source_file=mindmap_path.name,
-            source_prompt=prompt_name,
+            source_prompt=source_prompt,
             force=args.force,
             prefix=prefix,
         )
@@ -11879,7 +11915,7 @@ def cmd_concepts(args, config):
             # on every locally-recovered artifact - writing the concepts file (and a
             # stub meta) under a prefix none of its siblings use. cmd_scan's concepts
             # loop already threads this through; see issue #144.
-            to_process.append((ch_name, video, mindmap_path, meta.get("prompt"), prefix))
+            to_process.append((ch_name, video, mindmap_path, concepts_source_prompt(meta), prefix))
 
     if not to_process:
         log.info("All concepts up to date.")
