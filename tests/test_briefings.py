@@ -459,6 +459,34 @@ def test_cmd_briefings_does_not_overwrite_same_day(tmp_path):
     assert len(files) == 2  # first briefing preserved, second suffixed
 
 
+def test_exclusive_create_survives_a_race_between_check_and_write(tmp_path, monkeypatch):
+    """Issue #303: briefings takes no lock, so a name that was free at check time must never clobber a file."""
+    from datetime import UTC, datetime
+    from pathlib import Path
+
+    import video_intel as vi
+
+    # Arrange: an earlier same-day briefing exists, and every existence check in `_briefings/`
+    # says "absent" (the window a concurrent run lands in between a check and a write).
+    _write_video(tmp_path / "natebjones", "2026-06-20-x", video_id="v1", published="2026-06-20", concepts=[])
+    briefings_dir = tmp_path / "_briefings"
+    briefings_dir.mkdir()
+    today = datetime.now(UTC).date().isoformat()
+    earlier = briefings_dir / f"{today}-catch-up-unseen.md"
+    earlier.write_bytes(b"earlier briefing bytes")
+    real_exists = Path.exists
+    monkeypatch.setattr(Path, "exists", lambda self, **kw: False if self.parent == briefings_dir else real_exists(self))
+
+    # Act
+    vi.cmd_briefings(
+        SimpleNamespace(unseen=True, dry_run=False, since="3650d", until=None), {"output_dir": str(tmp_path)}
+    )
+
+    # Assert
+    assert earlier.read_bytes() == b"earlier briefing bytes"
+    assert real_exists(briefings_dir / f"{today}-catch-up-unseen-2.md")
+
+
 def test_rank_unseen_tolerates_list_interest_concepts():
     """A hand-edited profile with interest_concepts as a list must not crash."""
     from video_intel import rank_unseen

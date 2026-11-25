@@ -334,7 +334,8 @@ class TestTitleOnlyParityIsFrozen:
 
 
 class TestBackupRunsBeforeRender:
-    def test_order(self, monkeypatch, tmp_path):
+    @staticmethod
+    def _run(monkeypatch, tmp_path, *, dry_run):
         _stub_headline_fetch(monkeypatch, [{"video_id": "v1", "title": "MCP deep dive", "published": "2026-07-01"}])
         monkeypatch.setattr("video_intel.require_youtube", lambda: lambda *a, **k: object())
         monkeypatch.setenv("YOUTUBE_API_KEY", "fake")
@@ -347,8 +348,19 @@ class TestBackupRunsBeforeRender:
             return real_render(*a, **k)
 
         monkeypatch.setattr("video_intel.render_headline_digest", _render)
-        vi.cmd_headlines(SimpleNamespace(dry_run=True), _headline_config(tmp_path))
-        assert events == ["backup", "render"]
+        vi.cmd_headlines(SimpleNamespace(dry_run=dry_run), _headline_config(tmp_path))
+        return events
+
+    def test_order(self, monkeypatch, tmp_path):
+        assert self._run(monkeypatch, tmp_path, dry_run=False) == ["backup", "render"]
+
+    def test_dry_run_renders_without_backup(self, monkeypatch, tmp_path):
+        # Issue #303: a preview writes nothing, snapshot included.
+        assert self._run(monkeypatch, tmp_path, dry_run=True) == ["render"]
+
+    @pytest.mark.parametrize(("dry_run", "backups"), [(True, 0), (False, 1)])
+    def test_headlines_dry_run_skips_its_own_snapshot(self, monkeypatch, tmp_path, dry_run, backups):
+        assert self._run(monkeypatch, tmp_path, dry_run=dry_run).count("backup") == backups
 
 
 class TestNoFlaggedChannelMessage:

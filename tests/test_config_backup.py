@@ -20,6 +20,7 @@ import inspect
 import pathlib
 import re
 import textwrap
+from types import SimpleNamespace
 
 import pytest
 
@@ -664,3 +665,33 @@ class TestUnparseableRegistrations:
         is caught immediately rather than silently dodging both extractors."""
         module_src = inspect.getsource(video_intel)
         assert _unparseable_registrations(module_src) == []
+
+
+class TestScanDryRunSnapshot:
+    """Issue #303: `scan --dry-run` writes nothing, so cmd_scan's own snapshot call is skipped on a preview."""
+
+    @pytest.mark.parametrize(("dry_run", "backups"), [(True, 0), (False, 1)])
+    def test_scan_dry_run_skips_its_own_snapshot(self, monkeypatch, tmp_path, dry_run, backups):
+        # Arrange: the real cmd_scan, every paid boundary stubbed, one channel that fetches nothing.
+        calls = []
+        fetches = []
+        monkeypatch.setenv("GEMINI_API_KEY", "fake")
+        monkeypatch.setenv("YOUTUBE_API_KEY", "fake")
+        monkeypatch.setattr(video_intel, "require_gemini", lambda: (None, None))
+        monkeypatch.setattr(video_intel, "require_youtube", lambda: lambda *a, **kw: None)
+        monkeypatch.setattr(video_intel, "create_client", lambda *a, **kw: None)
+        monkeypatch.setattr(video_intel, "fetch_channel_videos", lambda *a, **kw: fetches.append(a) or [])
+        monkeypatch.setattr(video_intel, "render_headline_digest", lambda *a, **kw: [])
+        monkeypatch.setattr(video_intel, "backup_config_if_changed", lambda out: calls.append(out))
+        config = {
+            "output_dir": str(tmp_path),
+            "channels": [{"name": "alpha", "url": "https://www.youtube.com/@alpha", "channel_id": "UC" + "a" * 22}],
+        }
+        args = SimpleNamespace(dry_run=dry_run, channel=None, force=False, since=None, model=None)
+
+        # Act
+        video_intel.cmd_scan(args, config)
+
+        # Assert: the scan really ran to its fetch, and snapshotted only on a real run.
+        assert fetches, "the stubbed scan must reach its fetch"
+        assert len(calls) == backups

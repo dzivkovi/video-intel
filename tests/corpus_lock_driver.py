@@ -15,10 +15,13 @@ process's `acquired` timestamp is a valid ordering check.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import sys
 import time
+import traceback
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
@@ -105,6 +108,146 @@ def _mode_probe_loop(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# `main` mode (issue #303 Phase B): a real `video_intel.main()` in a child
+# process, with every paid boundary stubbed and the config read from a scratch
+# file. The helpers below are also imported by the in-process CLI tests, so the
+# stubs and the config reader have one definition.
+# ---------------------------------------------------------------------------
+
+FAKE_KEYS = {"GEMINI_API_KEY": "fake-gemini", "YOUTUBE_API_KEY": "fake-youtube", "VOYAGE_API_KEY": "fake-voyage"}
+
+
+def make_load_config(vi, cfg_path: Path, temp_root: Path, on_load=None):
+    """A `load_config` that re-reads the scratch config file on every call (so edits are real).
+
+    It sets `_LAST_RESOLVED_PATH` so the real snapshot copies the scratch file,
+    and refuses any config whose corpus is not under `temp_root`: a plugin-local
+    config would otherwise win the precedence chain and name a live corpus.
+    """
+    import yaml
+
+    def _load_config():
+        raw = Path(cfg_path).read_bytes()
+        config = yaml.safe_load(raw)
+        output_dir = Path(config["output_dir"])
+        if not os.path.realpath(output_dir).startswith(os.path.realpath(temp_root)):
+            raise SystemExit(f"refusing a corpus outside the test temp folder: {output_dir}")
+        vi._LAST_RESOLVED_PATH = Path(cfg_path)
+        if on_load is not None:
+            on_load(raw)
+        return config
+
+    return _load_config
+
+
+class FakeVoyage:
+    """Voyage client stand-in: `embed` is the paid boundary; `on_embed` observes each call."""
+
+    def __init__(self, on_embed=None) -> None:
+        self.on_embed = on_embed
+
+    def client(self):
+        return self
+
+    def embed(self, texts, *_a, **_kw):
+        texts = list(texts)
+        if self.on_embed is not None:
+            self.on_embed()
+        return SimpleNamespace(embeddings=[[float(len(t) % 7), 0.5, 0.25, 0.125] for t in texts])
+
+
+def install_paid_stubs(vi, setattr_, paid, voyage: FakeVoyage | None = None) -> None:
+    """Stub every paid boundary a locking command can reach; `paid(name)` observes each call.
+
+    `setattr_` is `monkeypatch.setattr` in-process and the builtin `setattr` in a child.
+    """
+    setattr_(vi, "require_gemini", lambda: (None, None))
+    setattr_(vi, "require_youtube", lambda: lambda *a, **kw: None)
+
+    def _create_client(*_a, **_kw):
+        paid("create_client")
+
+    def _fetch_channel_videos(*_a, **_kw):
+        paid("fetch_channel_videos")
+        return []
+
+    setattr_(vi, "create_client", _create_client)
+    setattr_(vi, "fetch_channel_videos", _fetch_channel_videos)
+    setattr_(vi, "render_headline_digest", lambda *a, **kw: [])
+    voyage = voyage or FakeVoyage(on_embed=lambda: paid("voyage-embed"))
+    setattr_(vi, "require_voyageai", lambda: SimpleNamespace(Client=voyage.client))
+
+
+def _pausing(sync: Path, name: str, func):
+    """Wrap `func`: record `pause-entered`, create `<name>.paused`, wait for `<name>.release`, then run it."""
+
+    def _wrapper(*a, **kw):
+        _event(sync, name, "pause-entered")
+        _touch(sync / f"{name}.paused")
+        _wait_for_release(sync, name, RELEASE_POLL_SECONDS)
+        _event(sync, name, "last-protected")
+        return func(*a, **kw)
+
+    return _wrapper
+
+
+def _mode_main(args: argparse.Namespace) -> int:
+    import video_intel as vi
+
+    sync, name = args.sync, args.name
+    os.environ.update(FAKE_KEYS)
+    corpus_lock.WAIT_POLL_SECONDS = 0.05  # a waiter notices a release quickly; the wait logic is unchanged
+
+    def _record_load(raw: bytes) -> None:
+        _event(sync, name, f"load-config {hashlib.sha256(raw).hexdigest()[:12]}")
+
+    config = make_load_config(vi, args.config, args.temp_root)()
+    assert Path(vi.resolve_output_dir(config, create=False)).resolve().is_relative_to(args.temp_root.resolve())
+    vi.load_config = make_load_config(vi, args.config, args.temp_root, on_load=_record_load)
+
+    def _paid(boundary: str) -> None:
+        _event(sync, name, f"paid {boundary}")
+
+    voyage = FakeVoyage(on_embed=lambda: _paid("voyage-embed"))
+    install_paid_stubs(vi, setattr, _paid, voyage)
+
+    # Every dispatch target records `entered` before it runs.
+    for attr in [a for a in dir(vi) if a.startswith("cmd_")]:
+        real = getattr(vi, attr)
+
+        def _entered(*a, _real=real, _attr=attr, **kw):
+            _event(sync, name, f"entered {_attr}")
+            return _real(*a, **kw)
+
+        setattr(vi, attr, _entered)
+
+    if args.pause_at == "voyage-embed":
+        first = {"done": False}
+
+        def _embed_pause() -> None:
+            _paid("voyage-embed")
+            if not first["done"]:
+                first["done"] = True
+                _pausing(sync, name, lambda: None)()
+
+        voyage.on_embed = _embed_pause
+    elif args.pause_at:
+        setattr(vi, args.pause_at, _pausing(sync, name, getattr(vi, args.pause_at)))
+
+    sys.argv = ["video_intel.py", *args.argv]
+    code = 0
+    try:
+        vi.main()
+    except SystemExit as e:
+        code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+    except BaseException:
+        traceback.print_exc()
+        code = 1
+    _event(sync, name, f"exit {code}")
+    return code
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--state-dir", type=Path, required=True)
@@ -119,11 +262,24 @@ def main(argv: list[str] | None = None) -> int:
     loop = sub.add_parser("probe-loop")
     loop.add_argument("--corpus", required=True)
     loop.add_argument("--seconds", type=float, default=30.0)
+    main_mode = sub.add_parser("main")
+    main_mode.add_argument("--config", type=Path, required=True)
+    main_mode.add_argument("--temp-root", type=Path, required=True)
+    main_mode.add_argument("--pause-at", default="")
+    main_mode.add_argument("argv", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
+    if args.mode == "main" and args.argv[:1] == ["--"]:
+        args.argv = args.argv[1:]
 
     state_dir = args.state_dir
     corpus_lock.lock_state_dir = lambda: state_dir
-    modes = {"hold": _mode_hold, "try": _mode_try, "probe-hold": _mode_probe_hold, "probe-loop": _mode_probe_loop}
+    modes = {
+        "hold": _mode_hold,
+        "try": _mode_try,
+        "probe-hold": _mode_probe_hold,
+        "probe-loop": _mode_probe_loop,
+        "main": _mode_main,
+    }
     return modes[args.mode](args)
 
 
