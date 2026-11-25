@@ -35,6 +35,7 @@ from pathlib import Path
 
 import pytest
 import wiki_concepts as wc
+from test_corpus_lock_cli import Holder
 from wiki_concepts import (
     MOC_BASENAME,
     build_co_occurrence,
@@ -51,6 +52,8 @@ from wiki_concepts import (
     skipped_file_count,
     write_pages,
 )
+
+import corpus_lock
 
 # ---------------------------------------------------------------------------
 # Fixture helpers - build a synthetic corpus tree on disk
@@ -929,3 +932,44 @@ class TestRenderingIsVideoIdNormalized:
         canonical = wc.canonical_channel_by_video(mentions["shared.thing"])
         assert len(canonical) == 3
         assert canonical["dup-vid"] == "alpha"
+
+
+# ---------------------------------------------------------------------------
+# Issue #303: the corpus lock at the command-line entry point
+# ---------------------------------------------------------------------------
+
+
+class TestCorpusLock:
+    def test_wiki_concepts_refuses_while_the_corpus_is_held_without_reading_or_paying(
+        self, tmp_path, monkeypatch, corpus_lock_state_dir
+    ):
+        corpus = _build_stable_corpus(tmp_path)
+        reads: list[tuple] = []
+        monkeypatch.setattr(wc, "build_pages", lambda *a, **kw: reads.append(a) or {})
+        monkeypatch.setattr(corpus_lock, "DEFAULT_WAIT", False)
+        monkeypatch.setattr(sys, "argv", ["wiki_concepts.py", "--corpus", str(corpus)])
+        holder = Holder(corpus_lock_state_dir, tmp_path / "sync", corpus)
+        try:
+            with pytest.raises(SystemExit) as exc:
+                wc.main()
+        finally:
+            holder.release()
+        assert exc.value.code == corpus_lock.EXIT_CORPUS_BUSY
+        assert reads == []
+        assert not (corpus / "_wiki").exists()
+
+    def test_wiki_concepts_normal_run_takes_and_releases_the_lock(self, tmp_path, monkeypatch):
+        corpus = _build_stable_corpus(tmp_path)
+        depths: list[int] = []
+        real = wc.build_pages
+
+        def _spy(corpus_arg, *a, **kw):
+            depths.append(corpus_lock.held_depth(corpus_arg))
+            return real(corpus_arg, *a, **kw)
+
+        monkeypatch.setattr(wc, "build_pages", _spy)
+        monkeypatch.setattr(sys, "argv", ["wiki_concepts.py", "--corpus", str(corpus)])
+        wc.main()
+        assert depths == [1]
+        assert corpus_lock.held_depth(corpus) == 0
+        assert (corpus / "_wiki" / "concept-pages" / f"{MOC_BASENAME}.md").is_file()

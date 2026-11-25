@@ -50,6 +50,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import re
 import sys
@@ -167,7 +168,18 @@ def main() -> int:
     args = ap.parse_args()
     logging.basicConfig(level=args.log_level.upper(), format="%(levelname)-7s %(message)s")
 
-    output_dir = vi.resolve_output_dir(vi.load_config())
+    config = vi.load_config()
+    # The corpus lock (issue #303), unless --dry-run (which restores nothing). A
+    # run that waited continues with the re-read config, or exits 1 when it
+    # names another corpus now.
+    lock = (
+        contextlib.nullcontext(config) if args.dry_run else vi.hold_corpus_lock(config, command="remediation_restore")
+    )
+    with lock as config:
+        return _restore_all(args, vi.resolve_output_dir(config))
+
+
+def _restore_all(args: argparse.Namespace, output_dir: Path) -> int:
     findings = find_regressions(output_dir)
     if not findings:
         log.info("No speech-loss regressions found.")

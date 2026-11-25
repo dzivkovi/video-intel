@@ -20,6 +20,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import atlas_export as ax
 import atlas_render as ar
+from test_atlas_render import _directory_link, _file_link
+from test_corpus_lock_cli import Holder
+
+import corpus_lock
 
 PUBLIC_CH = "publicchan"
 PRIVATE_CH = "CANARY_channel_zeta"
@@ -472,3 +476,99 @@ class TestDeterminism:
             (root / "_atlas-export" / "catalog.html").read_bytes(),
         )
         assert first == second
+
+
+# ---------------------------------------------------------------------------
+# Issue #303: the corpus lock at the command-line entry point, taken before
+# the atlas is read and before the paid visibility call.
+# ---------------------------------------------------------------------------
+
+
+class TestCorpusLock:
+    def test_atlas_export_refuses_while_the_corpus_is_held_without_reading_or_paying(
+        self, corpus, tmp_path, monkeypatch, corpus_lock_state_dir
+    ):
+        root, _, _ = corpus
+        reads: list[tuple] = []
+        paid: list[tuple] = []
+        monkeypatch.setattr(ar, "load_atlas", lambda *a: reads.append(a) or private_atlas())
+        monkeypatch.setattr(ax, "fetch_privacy_status", lambda *a: paid.append(a) or {})
+        monkeypatch.setattr(corpus_lock, "DEFAULT_WAIT", False)
+        holder = Holder(corpus_lock_state_dir, tmp_path / "sync", root)
+        try:
+            with pytest.raises(SystemExit) as exc:
+                run(corpus)
+        finally:
+            holder.release()
+        assert exc.value.code == corpus_lock.EXIT_CORPUS_BUSY
+        assert reads == []
+        assert paid == []
+        assert not (root / "_atlas-export").exists()
+
+    def test_atlas_export_through_a_link_waits_on_the_real_corpus(
+        self, corpus, tmp_path, monkeypatch, corpus_lock_state_dir
+    ):
+        # Arrange: the real corpus is held; the atlas is opened through a link outside it.
+        root, atlas, policy = corpus
+        link = _directory_link(tmp_path / "elsewhere" / "view", atlas.parent)
+        paid: list[tuple] = []
+        monkeypatch.setattr(ax, "fetch_privacy_status", lambda *a: paid.append(a) or {})
+        monkeypatch.setattr(corpus_lock, "DEFAULT_WAIT", False)
+        holder = Holder(corpus_lock_state_dir, tmp_path / "sync", root)
+
+        # Act
+        try:
+            with pytest.raises(SystemExit) as exc:
+                run((root, link / atlas.name, policy))
+        finally:
+            holder.release()
+
+        # Assert
+        assert exc.value.code == corpus_lock.EXIT_CORPUS_BUSY
+        assert paid == []
+        assert not (root / "_atlas-export").exists()
+
+    def test_atlas_export_of_a_file_linked_atlas_writes_into_and_waits_on_the_corpus(
+        self, corpus, tmp_path, monkeypatch, corpus_lock_state_dir
+    ):
+        # Arrange: the private atlas.json links to a cache outside the corpus.
+        root, atlas, _ = corpus
+        cached = tmp_path / "cache" / "atlas.json"
+        cached.parent.mkdir(parents=True)
+        cached.write_bytes(atlas.read_bytes())
+        atlas.unlink()
+        _file_link(atlas, cached)
+        paid: list[tuple] = []
+        real_fetch = ax.fetch_privacy_status
+        monkeypatch.setattr(ax, "fetch_privacy_status", lambda *a: paid.append(a) or real_fetch(*a))
+        monkeypatch.setattr(corpus_lock, "DEFAULT_WAIT", False)
+        holder = Holder(corpus_lock_state_dir, tmp_path / "sync", root)
+
+        # Act / Assert: refused while the corpus is held, nothing paid, nothing written.
+        try:
+            with pytest.raises(SystemExit) as exc:
+                run(corpus)
+        finally:
+            holder.release()
+        assert exc.value.code == corpus_lock.EXIT_CORPUS_BUSY
+        assert paid == []
+
+        # Act / Assert: once free, the bundle lands in the corpus, beside the link, not beside the cache.
+        assert run(corpus) == 0
+        assert (root / "_atlas-export" / "atlas.json").is_file()
+        assert not (tmp_path / "_atlas-export").exists()
+
+    def test_atlas_export_normal_run_takes_and_releases_the_lock(self, corpus, monkeypatch):
+        root, _, _ = corpus
+        depths: list[int] = []
+        real = ax.fetch_privacy_status
+
+        def _spy(*a):
+            depths.append(corpus_lock.held_depth(root))
+            return real(*a)
+
+        monkeypatch.setattr(ax, "fetch_privacy_status", _spy)
+        assert run(corpus) == 0
+        assert depths == [1]
+        assert corpus_lock.held_depth(root) == 0
+        assert (root / "_atlas-export" / "atlas.json").is_file()

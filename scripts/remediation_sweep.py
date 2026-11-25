@@ -51,6 +51,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import os
@@ -400,9 +401,16 @@ def main() -> int:
     logging.basicConfig(level=args.log_level.upper(), format="%(levelname)-7s %(message)s")
 
     config = vi.load_config()
-    output_dir = vi.resolve_output_dir(config)
-    log.info("Corpus: %s", output_dir)
+    log.info("Corpus: %s", vi.resolve_output_dir(config, create=False))
+    # The corpus lock (issue #303), unless --dry-run (which writes nothing). A
+    # run that waited continues with the re-read config, or exits 1 when it
+    # names another corpus now.
+    lock = contextlib.nullcontext(config) if args.dry_run else vi.hold_corpus_lock(config, command="remediation_sweep")
+    with lock as config:
+        return _sweep(args, vi.resolve_output_dir(config))
 
+
+def _sweep(args: argparse.Namespace, output_dir: Path) -> int:
     rows = collect_rows(output_dir, args.channel)
     log.info("Found %d transcript(s).", len(rows))
     if not rows:

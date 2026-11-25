@@ -413,6 +413,8 @@ def test_main_masks_the_key_in_googleapiclient_log_records(tmp_path):
         import logging, sys
         sys.path.insert(0, {str(Path(vi.__file__).parent)!r})
         import video_intel as vi
+        from pathlib import Path
+        vi.corpus_lock.lock_state_dir = lambda: Path({str(tmp_path / "locks")!r})  # never the real folder (#303)
 
         def fake_status(args, config):
             logging.getLogger("googleapiclient.http").warning(

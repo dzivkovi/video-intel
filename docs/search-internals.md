@@ -255,12 +255,7 @@ Three limits worth knowing:
   non-zero and names the channel and the `index --force` recovery. A vector-dimension
   change is checked for explicitly beforehand, because that is the one drift the
   column-name check cannot see.
-- **Concurrency is untested.** Two sequential scoped runs on different channels
-  compose. Two *concurrent* runs rely on lance's optimistic-concurrency commit path,
-  which this project has not exercised; the standing convention is one agent per
-  worktree. A scoped run racing a full run can duplicate or briefly drop one channel,
-  recoverable with `index --force` - still strictly better than the pre-fix behaviour,
-  where the same race lost the whole table.
+- **Two runs on one machine never overlap.** Every `index` run takes the corpus lock, so a second run on the same machine waits for the first instead of racing it, and two sequential scoped runs on different channels compose. Two machines writing one shared index would still race through lance's optimistic-concurrency commit path, which this project has not exercised: a scoped run racing a full run there can duplicate or briefly drop one channel, recoverable with `index --force`. Run index writes from one machine at a time.
 
 Under scoped semantics `--channel X --force` means "re-embed X" and never drops the
 table; a whole-corpus `--force` is `index --force` with no `--channel`. A scoped run

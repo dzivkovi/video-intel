@@ -13,6 +13,11 @@ Standard library only, under the same import firebreak as `atlas_build.py`
 (issue #152): nothing here imports the curate stack. The renderer reads the
 atlas file and the template beside this script, never the corpus.
 
+When the atlas sits in a corpus `_atlas` folder, the run takes that corpus's
+lock (issue #303, `corpus_lock`); anywhere else (the committed demo under
+`examples/catalog`) it takes none. A scan re-enters this `main` in-process
+while it holds the lock, which the lock's per-process re-entrancy allows.
+
 Ownership follows `atlas_build.check_ownership` and `wiki_concepts.write_pages`:
 an existing output file is replaced only when it carries this renderer's
 `<meta name="generator">` marker; anything else is refused before any write.
@@ -21,11 +26,14 @@ an existing output file is replaced only when it carries this renderer's
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
 import time
 from pathlib import Path
+
+import corpus_lock
 
 GENERATOR_NAME = "atlas_render.py"
 ATLAS_GENERATOR_NAME = "atlas_build.py"
@@ -134,8 +142,50 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def atlas_folder(path: Path) -> Path:
+    """The real folder a file path lands in: only the DIRECTORY is resolved, never the file.
+
+    A write to `<folder>/<name>` lands in this folder even when `<name>` is a
+    file link pointing elsewhere, and a folder reached through a directory link
+    or junction resolves to the real one.
+    """
+    # realpath on the parent as written, never abspath first: abspath collapses `..` lexically,
+    # and on POSIX `<link>/..` must resolve through the link to the real folder.
+    return Path(os.path.realpath(Path(path).parent))
+
+
+def corpus_for_atlas(path: Path) -> Path | None:
+    """The corpus a file in an `_atlas` folder belongs to: the parent of that folder, else None.
+
+    The one rule for which corpus lock (issue #303) `atlas_render.py` and
+    `atlas_export.py` take, keyed on where they WRITE: the render passes its
+    output file, the export the private atlas whose sibling folder it writes.
+    None means the write does not land in a corpus and no lock is taken.
+    """
+    # Imported here, not at module level: the folder name has one definition in
+    # atlas_build, and importing it only when a run asks keeps this module light.
+    import atlas_build
+
+    folder = atlas_folder(path)
+    if os.path.normcase(folder.name) != os.path.normcase(atlas_build.ATLAS_DIRNAME):
+        return None
+    return folder.parent
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    corpus = corpus_for_atlas(output_path(args))
+    lock = contextlib.nullcontext() if corpus is None else corpus_lock.hold_for_cli(corpus, command="atlas_render")
+    with lock:
+        return _render(args)
+
+
+def output_path(args: argparse.Namespace) -> Path:
+    """Where the page is written: `--out`, else `catalog.html` beside the atlas path as given."""
+    return args.out or args.atlas.with_name(CATALOG_FILENAME)
+
+
+def _render(args: argparse.Namespace) -> int:
     started = time.perf_counter()
     try:
         atlas = load_atlas(args.atlas)
@@ -144,7 +194,7 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError) as exc:
         print(f"{GENERATOR_NAME}: {exc}", file=sys.stderr)
         return EXIT_REFUSED
-    out = args.out or args.atlas.with_name(CATALOG_FILENAME)
+    out = output_path(args)
     try:
         write_atomic(out, html)
     except (SystemExit, OSError) as exc:

@@ -7,6 +7,7 @@ nothing is stubbed. The template under test is the shipped one.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -18,6 +19,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import atlas_render as ar
+from test_corpus_lock_cli import Holder
+
+import corpus_lock
 
 OPEN_TAG = '<script type="application/json" id="atlas-data">'
 HOSTILE_TITLE = "Break </script><!--<script> out & <b>bold</b> https://evil.example"
@@ -289,3 +293,223 @@ class TestDeterminism:
     def test_the_page_uses_lf_line_endings(self, atlas_path):
         raw = rendered(atlas_path)
         assert "\r" not in raw
+
+
+# ---------------------------------------------------------------------------
+# Issue #303: the corpus lock at the command-line entry point. The renderer
+# locks only when the atlas sits in a corpus `_atlas` folder.
+# ---------------------------------------------------------------------------
+
+
+def _directory_link(link: Path, target: Path) -> Path:
+    """A directory link: a junction on Windows (no admin rights needed), a symlink elsewhere."""
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        link.symlink_to(target, target_is_directory=True)
+    return link
+
+
+def _file_link(link: Path, target: Path) -> Path:
+    """A file symlink, or skip: Windows refuses one without Developer Mode or elevation."""
+    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.symlink(target, link)
+    except OSError as exc:
+        pytest.skip(f"this platform cannot create a file symlink here: {exc}")
+    return link
+
+
+def _corpus_with_linked_atlas(tmp_path: Path) -> tuple[Path, Path]:
+    """`corpus/_atlas/atlas.json` as a file link to an atlas cached outside the corpus."""
+    cached = tmp_path / "cache" / "atlas.json"
+    cached.parent.mkdir(parents=True)
+    cached.write_text(json.dumps(tiny_atlas()), encoding="utf-8")
+    corpus = tmp_path / "corpus"
+    return corpus, _file_link(corpus / "_atlas" / "atlas.json", cached)
+
+
+def _corpus_atlas(tmp_path: Path) -> tuple[Path, Path]:
+    corpus = tmp_path / "corpus"
+    atlas = corpus / "_atlas" / "atlas.json"
+    atlas.parent.mkdir(parents=True)
+    atlas.write_text(json.dumps(tiny_atlas()), encoding="utf-8")
+    return corpus, atlas
+
+
+class TestCorpusLock:
+    def test_atlas_render_refuses_while_the_corpus_is_held_without_reading_or_paying(
+        self, tmp_path, monkeypatch, corpus_lock_state_dir
+    ):
+        corpus, atlas = _corpus_atlas(tmp_path)
+        reads: list[tuple] = []
+        monkeypatch.setattr(ar, "load_atlas", lambda *a: reads.append(a) or tiny_atlas())
+        monkeypatch.setattr(corpus_lock, "DEFAULT_WAIT", False)
+        holder = Holder(corpus_lock_state_dir, tmp_path / "sync", corpus)
+        try:
+            with pytest.raises(SystemExit) as exc:
+                ar.main(["--atlas", str(atlas)])
+        finally:
+            holder.release()
+        assert exc.value.code == corpus_lock.EXIT_CORPUS_BUSY
+        assert reads == []
+        assert not (atlas.parent / ar.CATALOG_FILENAME).exists()
+
+    def test_atlas_render_normal_run_takes_and_releases_the_lock(self, tmp_path, monkeypatch):
+        corpus, atlas = _corpus_atlas(tmp_path)
+        depths: list[int] = []
+        real = ar.load_atlas
+
+        def _spy(path):
+            depths.append(corpus_lock.held_depth(corpus))
+            return real(path)
+
+        monkeypatch.setattr(ar, "load_atlas", _spy)
+        assert ar.main(["--atlas", str(atlas)]) == 0
+        assert depths == [1]
+        assert corpus_lock.held_depth(corpus) == 0
+        assert (atlas.parent / ar.CATALOG_FILENAME).is_file()
+
+    def test_atlas_render_outside_an_atlas_folder_takes_no_lock(self, tmp_path, monkeypatch, corpus_lock_state_dir):
+        # The committed demo layout: an atlas in a folder that is not `_atlas`.
+        # The folder two levels up is held, so a renderer that keyed on it
+        # would refuse instead of rendering.
+        atlas = tmp_path / "examples" / "catalog" / "atlas.json"
+        atlas.parent.mkdir(parents=True)
+        atlas.write_text(json.dumps(tiny_atlas()), encoding="utf-8")
+        monkeypatch.setattr(corpus_lock, "DEFAULT_WAIT", False)
+        holder = Holder(corpus_lock_state_dir, tmp_path / "sync", atlas.parent.parent)
+        try:
+            code = ar.main(["--atlas", str(atlas)])
+        finally:
+            holder.release()
+        assert code == 0
+        assert (atlas.parent / ar.CATALOG_FILENAME).is_file()
+        assert ar.corpus_for_atlas(atlas) is None
+
+    def test_corpus_for_atlas_names_the_folder_above_atlas(self, tmp_path):
+        corpus, atlas = _corpus_atlas(tmp_path)
+        assert ar.corpus_for_atlas(atlas) == Path(os.path.realpath(corpus))
+
+    @pytest.mark.parametrize("link_name", ["view", "_atlas"], ids=["link-not-named-atlas", "link-named-atlas"])
+    def test_corpus_for_atlas_through_a_link_keys_on_the_real_corpus(self, tmp_path, link_name):
+        # Arrange: the atlas folder reached through a directory link (a junction on Windows).
+        corpus, atlas = _corpus_atlas(tmp_path)
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        link = _directory_link(elsewhere / link_name, atlas.parent)
+
+        # Act
+        found = ar.corpus_for_atlas(link / atlas.name)
+
+        # Assert
+        assert found == Path(os.path.realpath(corpus))
+
+    def test_atlas_render_of_a_file_linked_atlas_waits_on_the_corpus_it_writes_into(
+        self, tmp_path, monkeypatch, corpus_lock_state_dir
+    ):
+        # Arrange: atlas.json links out of the corpus, but catalog.html is written beside the link.
+        corpus, atlas = _corpus_with_linked_atlas(tmp_path)
+        monkeypatch.setattr(corpus_lock, "DEFAULT_WAIT", False)
+        holder = Holder(corpus_lock_state_dir, tmp_path / "sync", corpus)
+
+        # Act
+        try:
+            with pytest.raises(SystemExit) as exc:
+                ar.main(["--atlas", str(atlas)])
+        finally:
+            holder.release()
+
+        # Assert
+        assert exc.value.code == corpus_lock.EXIT_CORPUS_BUSY
+        assert not (atlas.parent / ar.CATALOG_FILENAME).exists()
+        assert ar.corpus_for_atlas(ar.output_path(ar.build_parser().parse_args(["--atlas", str(atlas)]))) == Path(
+            os.path.realpath(corpus)
+        )
+
+    def test_atlas_render_keys_the_lock_on_where_it_writes(self, tmp_path, monkeypatch, corpus_lock_state_dir):
+        # Arrange: an atlas outside any corpus, rendered with --out into a held corpus's _atlas folder.
+        atlas = tmp_path / "examples" / "catalog" / "atlas.json"
+        atlas.parent.mkdir(parents=True)
+        atlas.write_text(json.dumps(tiny_atlas()), encoding="utf-8")
+        corpus = tmp_path / "corpus"
+        out = corpus / "_atlas" / ar.CATALOG_FILENAME
+        out.parent.mkdir(parents=True)
+        monkeypatch.setattr(corpus_lock, "DEFAULT_WAIT", False)
+        holder = Holder(corpus_lock_state_dir, tmp_path / "sync", corpus)
+
+        # Act
+        try:
+            with pytest.raises(SystemExit) as exc:
+                ar.main(["--atlas", str(atlas), "--out", str(out)])
+        finally:
+            holder.release()
+
+        # Assert
+        assert exc.value.code == corpus_lock.EXIT_CORPUS_BUSY
+        assert not out.exists()
+
+    def test_atlas_render_through_a_link_waits_on_the_real_corpus(self, tmp_path, monkeypatch, corpus_lock_state_dir):
+        # Arrange: the real corpus is held; the atlas is opened through a link outside it.
+        corpus, atlas = _corpus_atlas(tmp_path)
+        link = _directory_link(tmp_path / "elsewhere" / "view", atlas.parent)
+        monkeypatch.setattr(corpus_lock, "DEFAULT_WAIT", False)
+        holder = Holder(corpus_lock_state_dir, tmp_path / "sync", corpus)
+
+        # Act
+        try:
+            with pytest.raises(SystemExit) as exc:
+                ar.main(["--atlas", str(link / atlas.name)])
+        finally:
+            holder.release()
+
+        # Assert
+        assert exc.value.code == corpus_lock.EXIT_CORPUS_BUSY
+        assert not (atlas.parent / ar.CATALOG_FILENAME).exists()
+
+    def test_scan_rebuild_reenters_render_without_waiting(self, tmp_path):
+        # The end-of-scan rebuild calls `atlas_render.main` in-process while
+        # the scan holds the lock: the renderer re-enters (depth 2), never waits.
+        import threading
+
+        import video_intel as vi
+
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        result: dict = {}
+
+        def _target() -> None:
+            try:
+                with corpus_lock.hold(corpus, command="scan", wait=False):
+                    result["state"] = vi.rebuild_free_derived_layers(corpus, {"output_dir": str(corpus)})
+                    result["depth_after"] = corpus_lock.held_depth(corpus)
+            except BaseException as e:  # surfaced below, never swallowed
+                result["error"] = e
+
+        thread = threading.Thread(target=_target, daemon=True)
+        thread.start()
+        thread.join(20)
+        assert not thread.is_alive(), "the rebuild did not finish within 20 s under the scan's lock"
+        if "error" in result:
+            raise result["error"]
+        assert result["depth_after"] == 1
+        assert corpus_lock.held_depth(corpus) == 0
+        assert (corpus / "_atlas" / ar.CATALOG_FILENAME).is_file()
+
+
+@pytest.mark.skipif(
+    os.name == "nt", reason="Windows resolves `..` lexically, so a link followed by `..` cannot reach another folder"
+)
+def test_atlas_folder_resolves_dotdot_through_a_directory_link(tmp_path):
+    corpus = tmp_path / "data" / "corpus"
+    (corpus / "_atlas").mkdir(parents=True)
+    (corpus / "channel").mkdir()
+    view = tmp_path / "view"
+    os.symlink(corpus / "channel", view, target_is_directory=True)
+
+    folder = ar.atlas_folder(view / ".." / "_atlas" / "atlas.json")
+
+    assert folder == Path(os.path.realpath(corpus / "_atlas"))

@@ -11,8 +11,8 @@ prints one counts-only line:
 Contracts this module keeps:
 
 * **Import weight.** Module-level imports are the standard library plus
-  `corpus_walk`, `timestamp_utils` and `wiki_concepts`, all three stdlib-only
-  at import. Never import `video_intel`, `intel_graph`, `yaml` or any
+  `corpus_lock`, `corpus_walk`, `timestamp_utils` and `wiki_concepts`, all
+  four stdlib-only at import. Never import `video_intel`, `intel_graph`, `yaml` or any
   third-party package here. PyYAML loads only when the briefing front-matter
   reader runs, never on `import atlas_build`.
 * **Explicit projection.** Rows are built field by field in `ROW_KEYS` order,
@@ -53,6 +53,7 @@ from urllib.parse import urlsplit
 
 from wiki_concepts import mindmap_headings, parse_mindmap_timestamps
 
+import corpus_lock
 from corpus_walk import (
     CONCEPTS_SUFFIX,
     HEALTHY_TRANSCRIPT_STATUSES,
@@ -801,7 +802,10 @@ def main(argv: list[str] | None = None) -> int:
         sys.exit(f"corpus not found: {corpus}")
     out_dir = args.out.resolve() if args.out else corpus / ATLAS_DIRNAME
     index_dir = args.index_dir.expanduser().resolve() if args.index_dir else corpus / SEARCH_INDEX_DIRNAME
-    code, _ = build_catalog(corpus, out_dir, index_dir, args.generated_at)
+    # The corpus lock (issue #303), always: the build reads corpus state even
+    # when --out points elsewhere. A scan calls build_catalog, not this main.
+    with corpus_lock.hold_for_cli(corpus, command="atlas_build"):
+        code, _ = build_catalog(corpus, out_dir, index_dir, args.generated_at)
     return code
 
 

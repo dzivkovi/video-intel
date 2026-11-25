@@ -173,6 +173,28 @@ class TestWriteNuggetBrief:
         p3 = write_nugget_brief(out_dir, "q", "b3", [_hit()], today=date(2026, 8, 22))
         assert p3 == out_dir / "_briefings" / "nuggets" / "2026-08-22-q-3.md"
 
+    def test_exclusive_create_survives_a_race_between_check_and_write(self, tmp_path, monkeypatch):
+        """Issue #303: a run that finds no file at check time must still never clobber one written since."""
+        # Arrange: an earlier brief exists, and every existence check in the nuggets folder says "absent"
+        # (the window a concurrent run lands in between a check and a write).
+        from pathlib import Path
+
+        out_dir = tmp_path / "corpus"
+        nuggets = out_dir / "_briefings" / "nuggets"
+        nuggets.mkdir(parents=True)
+        earlier = nuggets / "2026-08-22-same-query.md"
+        earlier.write_bytes(b"earlier brief bytes")
+        real_exists = Path.exists
+        monkeypatch.setattr(Path, "exists", lambda self, **kw: False if self.parent == nuggets else real_exists(self))
+
+        # Act
+        written = write_nugget_brief(out_dir, "same query", "later brief", [_hit()], today=date(2026, 8, 22))
+
+        # Assert
+        assert earlier.read_bytes() == b"earlier brief bytes"
+        assert written == nuggets / "2026-08-22-same-query-2.md"
+        assert "later brief" in written.read_text(encoding="utf-8")
+
     def test_different_day_reuses_the_base_name(self, tmp_path):
         out_dir = tmp_path / "corpus"
         write_nugget_brief(out_dir, "q", "b1", [_hit()], today=date(2026, 8, 22))

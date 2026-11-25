@@ -31,7 +31,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -55,6 +55,12 @@ from youtube_captions import (
     captions_failure_is_refusal,
     fetch_english_captions,
 )
+
+import corpus_lock
+
+# Issue #303: the corpus lock's "busy" exit code, re-exported so callers and
+# tests name one constant.
+from corpus_lock import EXIT_CORPUS_BUSY  # noqa: F401 - re-export
 
 # Reader primitives moved to the stdlib-only corpus_walk module (issue #260)
 # and re-exported here, so every existing caller and test still resolves them
@@ -617,6 +623,124 @@ CONFIG_BACKUP_COMMANDS = frozenset(
         "headlines",
     }
 )
+
+
+# Issue #303: one lock per corpus. The lock set is DERIVED from the backup set
+# plus `profile init` (which writes `_briefings/` but snapshots nothing), never
+# restated. `tests/test_corpus_lock_cli.py` classifies every registered
+# subcommand against these two tables.
+CORPUS_LOCK_EXTRA = frozenset({"profile init"})
+CORPUS_LOCK_COMMANDS = CONFIG_BACKUP_COMMANDS | CORPUS_LOCK_EXTRA
+
+
+def _preview_on_dry_run(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "dry_run", False))
+
+
+def _preview_without_apply(args: argparse.Namespace) -> bool:
+    return not getattr(args, "apply", False)
+
+
+# Command -> the argparse condition under which a run of it writes nothing
+# (a preview); None = the command always writes. A preview takes no lock and
+# writes no config snapshot.
+CORPUS_LOCK_PREVIEW: dict[str, Callable[[argparse.Namespace], bool] | None] = {
+    "scan": _preview_on_dry_run,
+    "mindmap": None,
+    "transcript": None,
+    "process": None,
+    "concepts": _preview_on_dry_run,
+    "taxonomy-build": None,
+    "topics-build": _preview_on_dry_run,
+    "index": None,
+    "repair-metas": _preview_without_apply,
+    "assess-transcripts": _preview_without_apply,
+    "repair-timestamps": _preview_without_apply,
+    "backfill-descriptions": _preview_without_apply,
+    "backfill-durations": _preview_without_apply,
+    "dedupe": _preview_without_apply,
+    "prune-shorts": _preview_without_apply,
+    "mark-skip": None,
+    "headlines": _preview_on_dry_run,
+    "profile init": None,
+}
+
+
+def lock_command_name(args: argparse.Namespace) -> str:
+    """The lock-table name of a run: `profile init` / `profile show` for profile, else the subcommand."""
+    if args.command == "profile":
+        return f"profile {args.profile_action}"
+    return args.command
+
+
+def is_preview_run(args: argparse.Namespace) -> bool:
+    predicate = CORPUS_LOCK_PREVIEW.get(lock_command_name(args))
+    return predicate is not None and predicate(args)
+
+
+def run_takes_corpus_lock(args: argparse.Namespace) -> bool:
+    """THE one predicate: does this run take the corpus lock (and, for backup commands, snapshot)?"""
+    return lock_command_name(args) in CORPUS_LOCK_COMMANDS and not is_preview_run(args)
+
+
+@contextlib.contextmanager
+def hold_corpus_lock(config: dict, *, command: str, **lock_kwargs) -> Iterator[dict]:
+    """Take the corpus lock for the corpus `config` names; yield the config to run with (issue #303).
+
+    The one wrapper for every command-line writer that resolves its corpus
+    from the config (`main()`, `remediation_sweep.py`, `remediation_restore.py`).
+    The corpus identity is frozen BEFORE acquisition and the lock is taken for
+    that frozen path. A run that waited re-reads the config and compares the
+    refreshed identity with the frozen one, so a config edit or a junction
+    retargeted during the wait exits 1 with nothing written.
+    `lock_kwargs` go to `corpus_lock.hold_for_cli`.
+    """
+    frozen = corpus_lock.canonical_path(resolve_output_dir(config, create=False))
+    with corpus_lock.hold_for_cli(frozen, command=command, **lock_kwargs) as acquired:
+        if acquired.waited:
+            config = load_config()
+            if corpus_lock.canonical_path(resolve_output_dir(config, create=False)) != frozen:
+                log.error(
+                    "The config changed while this command waited and now names a different corpus. "
+                    "Nothing was written; run the command again."
+                )
+                sys.exit(1)
+        yield config
+
+
+def note_running_writer(args: argparse.Namespace, output_dir: Path) -> None:
+    """One probe for a run that takes no lock; one WARNING line when a writer is running. Never raises."""
+    details = corpus_lock.probe_writer(output_dir)
+    if details is None:
+        return
+    message = (
+        f"A writing command is running on this corpus: {corpus_lock.describe_holder(details)}. "
+        "Results reflect the corpus as it is now; re-run after it finishes for the complete picture."
+    )
+    if args.command == "nugget" or (args.command == "search" and getattr(args, "vector", False)):
+        message += (
+            " Search results come from the search index, which a scan does not update, so they match what "
+            "you would get before the scan; new videos become searchable after index --incremental."
+        )
+    log.warning(message)
+
+
+def write_new_numbered_file(directory: Path, base_name: str, content: str, suffix: str = ".md") -> Path:
+    """Write `content` to a NEW file `<base><suffix>`, else `<base>-2<suffix>`, `-3`, ... (issue #303).
+
+    Exclusive create, so two runs racing for one name can never clobber each
+    other: the check and the write are one OS call.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    counter = 1
+    while True:
+        path = directory / f"{base_name}{'' if counter == 1 else f'-{counter}'}{suffix}"
+        try:
+            with open(path, "x", encoding="utf-8") as fh:
+                fh.write(content)
+            return path
+        except FileExistsError:
+            counter += 1
 
 
 def _config_bytes_declare_channels(raw: bytes) -> bool | None:
@@ -9192,7 +9316,9 @@ def _cmd_scan_impl(args, config):
     # point of record: whatever config produced this run's corpus changes is
     # now recoverable. Placed above every fetch and every write on purpose -
     # a backup taken after a scan mutated the corpus documents the wrong state.
-    backup_config_if_changed(output_dir)
+    # A dry run writes nothing, snapshot included (issue #303).
+    if not args.dry_run:
+        backup_config_if_changed(output_dir)
     model = resolve_model(args, config)
     max_parallel = config.get("max_parallel", 10)
 
@@ -14759,16 +14885,9 @@ def write_nugget_brief(
         today = datetime.now(UTC).date()
     query = " ".join(query.split())
     nuggets_dir = output_dir / BRIEFINGS_DIR_NAME / NUGGETS_SUBDIR_NAME
-    nuggets_dir.mkdir(parents=True, exist_ok=True)
     base_name = f"{today.isoformat()}-{nugget_brief_slug(query)}"
-    out_path = nuggets_dir / f"{base_name}.md"
-    counter = 2
-    while out_path.exists():
-        out_path = nuggets_dir / f"{base_name}-{counter}.md"
-        counter += 1
     content = render_nugget_brief_markdown(query, response_text, hits, today=today, topic=topic)
-    out_path.write_text(content, encoding="utf-8")
-    return out_path
+    return write_new_numbered_file(nuggets_dir, base_name, content)
 
 
 def cmd_nugget(args, config):
@@ -17504,7 +17623,9 @@ def cmd_headlines(args, config):
     output_dir = resolve_output_dir(config)
     # Before the render, like scan: the seen-state this run advances is scan
     # state, and the channel list that produced it must be on record first.
-    backup_config_if_changed(output_dir)
+    # A dry run advances nothing, so it writes no snapshot either (issue #303).
+    if not args.dry_run:
+        backup_config_if_changed(output_dir)
     try:
         rendered = render_headline_digest(youtube, config, output_dir, dry_run=args.dry_run)
     except HeadlineDigestAllFailed:
@@ -17762,16 +17883,11 @@ def cmd_briefings(args, config):
         return
 
     content = render_unseen_briefing(ranked, profile, lower=lower, upper=upper, today=today)
-    briefings_dir.mkdir(parents=True, exist_ok=True)
     # Never overwrite an earlier same-day briefing: doing so would drop its
     # video_ids from the seen-coverage record and re-surface those videos later.
-    base_name = f"{today.isoformat()}-catch-up-unseen"
-    out_path = briefings_dir / f"{base_name}.md"
-    counter = 2
-    while out_path.exists():
-        out_path = briefings_dir / f"{base_name}-{counter}.md"
-        counter += 1
-    out_path.write_text(content, encoding="utf-8")
+    # Exclusive create (issue #303): briefings takes no corpus lock, so two
+    # runs racing for one name must not clobber each other.
+    out_path = write_new_numbered_file(briefings_dir, f"{today.isoformat()}-catch-up-unseen", content)
     print(f"Wrote catch-up briefing: {out_path} ({len(ranked)} videos)")
 
     # --pdf is purely additive: the Markdown above stays the canonical
@@ -18725,6 +18841,14 @@ Examples:
             "Applies to: scan, mindmap, transcript, concepts."
         ),
     )
+    parser.add_argument(
+        "--no-wait",
+        action="store_true",
+        help=(
+            "When another command is already writing to this corpus, exit at once with code 4 "
+            "instead of waiting. Ignored by commands that only read."
+        ),
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # scan command
@@ -19367,86 +19491,111 @@ Examples:
     # the cached= / prompt= / total= token counts.
     logging.getLogger("gemini_common").setLevel(configured_level)
     config = load_config()
-    # Mandatory config snapshot before any corpus-mutating command runs. `scan`
-    # also calls this itself (immediately before its first fetch, which is the
-    # precise point of record); the content compare makes the second call a
-    # no-op. Two call sites is deliberate belt-and-braces: a library caller
-    # invoking cmd_scan directly still gets the snapshot, and a config edit
-    # followed by `process --url` instead of a scan is still captured.
-    # Read-only commands (search, status, profile show) are excluded so they
-    # keep their zero-side-effect promise. `nugget` is also excluded despite
-    # persisting a brief (issue #147 guardrail 3) - its write is additive-only
-    # under `_briefings/nuggets/` and never touches channel config or scan
-    # state, and it is reachable from the globally installed search skill
-    # where the resolved config is channel-less; see the comment on
-    # CONFIG_BACKUP_COMMANDS for why snapshotting it would be actively harmful.
-    if args.command in CONFIG_BACKUP_COMMANDS:
-        try:
-            backup_config_if_changed(resolve_output_dir(config))
-        except Exception as e:  # never let the snapshot block real work
-            log.warning("Config backup skipped (%s: %s).", type(e).__name__, e)
-    # Resolve per-step model overrides once, before any command dispatch, so
-    # every Gemini-calling step in this run reads one consistent decision.
-    _STEP_MODELS.update(resolve_step_models(args, config))
-    if _STEP_MODELS:
-        log.info(
-            "Per-step models: %s (base: %s)",
-            ", ".join(f"{k}={v}" for k, v in sorted(_STEP_MODELS.items())),
-            resolve_model(args, config),
+    # Issue #303: one lock per corpus. Everything above this line reads only
+    # the config (never corpus state); the lock is taken before the snapshot
+    # and before any cmd_* reads the corpus, and held through dispatch and
+    # the topic-stamp flush. Readers and previews take no lock and wait for
+    # nobody; they probe once and say so when a writer is running.
+    output_dir = resolve_output_dir(config, create=False)
+    takes_lock = run_takes_corpus_lock(args)
+    lock = (
+        hold_corpus_lock(
+            config,
+            command=lock_command_name(args),
+            channel=getattr(args, "channel", None),
+            wait=not args.no_wait,
+            report=log.warning,
+            error=log.error,
         )
+        if takes_lock
+        else contextlib.nullcontext(config)
+    )
+    # A run that waited gets the config re-read after acquisition.
+    with lock as config:
+        if not takes_lock:
+            note_running_writer(args, output_dir)
+        # Mandatory config snapshot before any corpus-mutating command runs. `scan`
+        # also calls this itself (immediately before its first fetch, which is the
+        # precise point of record); the content compare makes the second call a
+        # no-op. Two call sites is deliberate belt-and-braces: a library caller
+        # invoking cmd_scan directly still gets the snapshot, and a config edit
+        # followed by `process --url` instead of a scan is still captured.
+        # Read-only commands (search, status, profile show) are excluded so they
+        # keep their zero-side-effect promise. `nugget` is also excluded despite
+        # persisting a brief (issue #147 guardrail 3) - its write is additive-only
+        # under `_briefings/nuggets/` and never touches channel config or scan
+        # state, and it is reachable from the globally installed search skill
+        # where the resolved config is channel-less; see the comment on
+        # CONFIG_BACKUP_COMMANDS for why snapshotting it would be actively harmful.
+        # A preview run (`--dry-run`, or no `--apply`) writes nothing, snapshot
+        # included (issue #303).
+        if args.command in CONFIG_BACKUP_COMMANDS and not is_preview_run(args):
+            try:
+                backup_config_if_changed(resolve_output_dir(config))
+            except Exception as e:  # never let the snapshot block real work
+                log.warning("Config backup skipped (%s: %s).", type(e).__name__, e)
+        # Resolve per-step model overrides once, before any command dispatch, so
+        # every Gemini-calling step in this run reads one consistent decision.
+        _STEP_MODELS.update(resolve_step_models(args, config))
+        if _STEP_MODELS:
+            log.info(
+                "Per-step models: %s (base: %s)",
+                ", ".join(f"{k}={v}" for k, v in sorted(_STEP_MODELS.items())),
+                resolve_model(args, config),
+            )
 
-    # Issue #146: a --topic stamp registered by a command whose meta.json did
-    # not exist yet is applied here, in ONE place, from a finally - so it
-    # survives a deliberate-skip early return and the EXIT_PARTIAL exit as
-    # readily as a clean run. Provenance the operator asked for must not
-    # depend on how the pipeline happened to end.
-    try:
-        if args.command == "scan":
-            cmd_scan(args, config)
-        elif args.command == "mindmap":
-            cmd_mindmap(args, config)
-        elif args.command == "transcript":
-            cmd_transcript(args, config)
-        elif args.command == "process":
-            cmd_process(args, config)
-        elif args.command == "concepts":
-            cmd_concepts(args, config)
-        elif args.command == "taxonomy-build":
-            cmd_taxonomy_build(args, config)
-        elif args.command == "topics-build":
-            cmd_topics_build(args, config)
-        elif args.command == "search":
-            cmd_search(args, config)
-        elif args.command == "index":
-            cmd_index(args, config)
-        elif args.command == "nugget":
-            cmd_nugget(args, config)
-        elif args.command == "status":
-            cmd_status(args, config)
-        elif args.command == "backfill-descriptions":
-            cmd_backfill_descriptions(args, config)
-        elif args.command == "backfill-durations":
-            cmd_backfill_durations(args, config)
-        elif args.command == "repair-metas":
-            cmd_repair_metas(args, config)
-        elif args.command == "assess-transcripts":
-            cmd_assess_transcripts(args, config)
-        elif args.command == "repair-timestamps":
-            cmd_repair_timestamps(args, config)
-        elif args.command == "dedupe":
-            cmd_dedupe(args, config)
-        elif args.command == "prune-shorts":
-            cmd_prune_shorts(args, config)
-        elif args.command == "mark-skip":
-            cmd_mark_skip(args, config)
-        elif args.command == "headlines":
-            cmd_headlines(args, config)
-        elif args.command == "briefings":
-            cmd_briefings(args, config)
-        elif args.command == "profile":
-            cmd_profile(args, config)
-    finally:
-        flush_topic_stamps()
+        # Issue #146: a --topic stamp registered by a command whose meta.json did
+        # not exist yet is applied here, in ONE place, from a finally - so it
+        # survives a deliberate-skip early return and the EXIT_PARTIAL exit as
+        # readily as a clean run. Provenance the operator asked for must not
+        # depend on how the pipeline happened to end.
+        try:
+            if args.command == "scan":
+                cmd_scan(args, config)
+            elif args.command == "mindmap":
+                cmd_mindmap(args, config)
+            elif args.command == "transcript":
+                cmd_transcript(args, config)
+            elif args.command == "process":
+                cmd_process(args, config)
+            elif args.command == "concepts":
+                cmd_concepts(args, config)
+            elif args.command == "taxonomy-build":
+                cmd_taxonomy_build(args, config)
+            elif args.command == "topics-build":
+                cmd_topics_build(args, config)
+            elif args.command == "search":
+                cmd_search(args, config)
+            elif args.command == "index":
+                cmd_index(args, config)
+            elif args.command == "nugget":
+                cmd_nugget(args, config)
+            elif args.command == "status":
+                cmd_status(args, config)
+            elif args.command == "backfill-descriptions":
+                cmd_backfill_descriptions(args, config)
+            elif args.command == "backfill-durations":
+                cmd_backfill_durations(args, config)
+            elif args.command == "repair-metas":
+                cmd_repair_metas(args, config)
+            elif args.command == "assess-transcripts":
+                cmd_assess_transcripts(args, config)
+            elif args.command == "repair-timestamps":
+                cmd_repair_timestamps(args, config)
+            elif args.command == "dedupe":
+                cmd_dedupe(args, config)
+            elif args.command == "prune-shorts":
+                cmd_prune_shorts(args, config)
+            elif args.command == "mark-skip":
+                cmd_mark_skip(args, config)
+            elif args.command == "headlines":
+                cmd_headlines(args, config)
+            elif args.command == "briefings":
+                cmd_briefings(args, config)
+            elif args.command == "profile":
+                cmd_profile(args, config)
+        finally:
+            flush_topic_stamps()
 
 
 if __name__ == "__main__":

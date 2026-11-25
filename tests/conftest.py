@@ -157,6 +157,26 @@ def no_shorts_probe():
         yield
 
 
+@pytest.fixture(autouse=True)
+def corpus_lock_state_dir(tmp_path):
+    """Pin the corpus lock's state folder to this test's temp folder (issue #303).
+
+    Every corpus lock file a test creates lands under `tmp_path / "locks"`,
+    never in the real user-state folder. Every function in `corpus_lock`
+    looks `lock_state_dir` up at call time, so this one swap reaches them all.
+    Yields the path so subprocess helpers can hand it to a child process.
+
+    Like `no_premiere_probe`, deliberately does NOT request `monkeypatch`.
+    """
+    import corpus_lock
+
+    state_dir = tmp_path / "locks"
+    saved = corpus_lock.lock_state_dir
+    corpus_lock.lock_state_dir = lambda: state_dir
+    yield state_dir
+    corpus_lock.lock_state_dir = saved
+
+
 @pytest.fixture
 def shorts_probe_pin():
     """The pin's context manager, for the test that runs two lifecycles."""
