@@ -8658,6 +8658,21 @@ class ConceptsPromptCache:
         self.name = None
 
 
+def concepts_source_prompt(meta: dict | None, fallback: str | None = None) -> str | None:
+    """The prompt a concepts.json names as its source (issue #315): the one definition.
+
+    The mind map the concepts are read from was written by `process_mindmap`,
+    which records its prompt in meta.json, so that record wins whenever it is a
+    non-empty string. Otherwise ``fallback``: the scan and `concepts` loops pass
+    none (``process_concepts`` then stamps "unknown"); the two `process` paths
+    pass the name they resolved this run.
+    """
+    prompt = meta.get("prompt") if isinstance(meta, dict) else None
+    if isinstance(prompt, str) and prompt:
+        return prompt
+    return fallback
+
+
 def process_concepts(
     client,
     types,
@@ -9931,7 +9946,7 @@ def cmd_scan(args, config):
                         "title": meta.get("title", prefix),
                         "published": meta.get("published", ""),
                     }
-                    concept_candidates.append((synthetic_video, mindmap_path, prefix, meta.get("prompt")))
+                    concept_candidates.append((synthetic_video, mindmap_path, prefix, concepts_source_prompt(meta)))
 
             if concept_candidates:
                 log.info("  Extracting concepts (%d videos)...", len(concept_candidates))
@@ -11275,6 +11290,12 @@ def _cmd_process_url(args, config):
     try:
         mindmap_text = mindmap_path.read_text(encoding="utf-8")
         taxonomy = load_taxonomy(output_dir)
+        # Issue #315: the prompt the mind map's writer recorded, read after Step 2
+        # from that writer's own meta path; the derived name only as fallback.
+        source_prompt = concepts_source_prompt(
+            _read_meta_or_skip(transcript_meta_path) if transcript_meta_path.exists() else None,
+            concepts_prompt_name,
+        )
         concepts_prefix, concepts_status = process_concepts(
             client,
             types,
@@ -11285,7 +11306,7 @@ def _cmd_process_url(args, config):
             output_dir,
             channel_name,
             source_file=mindmap_path.name,
-            source_prompt=concepts_prompt_name,
+            source_prompt=source_prompt,
             force=args.force,
             prefix=prefix,
         )
@@ -11515,9 +11536,12 @@ def _cmd_process_impl(args, config):
             "title": video["title"],
             "published": video["published"],
             "model": model,
-            "prompt": prompt_name,
             "transcript_source": "local_file",
         }
+        # Issue #315: `prompt` describes the mind map on disk. Stamp it only when
+        # this run writes the mind map; otherwise the recorded prompt stays.
+        if needs_mindmap:
+            identity_fields["prompt"] = prompt_name
         if channel_name and "published_source" in identity:
             identity_fields["published_source"] = identity["published_source"]
         if start_offset is not None or end_offset is not None:
@@ -11789,6 +11813,11 @@ def _cmd_process_impl(args, config):
     try:
         mindmap_text = mindmap_path.read_text(encoding="utf-8")
         taxonomy = load_taxonomy(output_dir)
+        # Issue #315: the prompt the mind map's writer recorded, read after Step 2
+        # from the same meta_path that writer used; the resolved name only as fallback.
+        source_prompt = concepts_source_prompt(
+            _read_meta_or_skip(meta_path) if meta_path.exists() else None, prompt_name
+        )
         _, concepts_status = process_concepts(
             client,
             types,
@@ -11799,7 +11828,7 @@ def _cmd_process_impl(args, config):
             output_dir,
             channel_name,
             source_file=mindmap_path.name,
-            source_prompt=prompt_name,
+            source_prompt=source_prompt,
             force=args.force,
             prefix=prefix,
         )
@@ -11879,7 +11908,7 @@ def cmd_concepts(args, config):
             # on every locally-recovered artifact - writing the concepts file (and a
             # stub meta) under a prefix none of its siblings use. cmd_scan's concepts
             # loop already threads this through; see issue #144.
-            to_process.append((ch_name, video, mindmap_path, meta.get("prompt"), prefix))
+            to_process.append((ch_name, video, mindmap_path, concepts_source_prompt(meta), prefix))
 
     if not to_process:
         log.info("All concepts up to date.")
