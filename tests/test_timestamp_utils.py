@@ -361,6 +361,7 @@ class TestStandaloneScriptImportIsolation:
             "atlas_build",
             "atlas_render",
             "atlas_export",
+            "corpus_lock",
         ],
     )
     def test_import_succeeds_with_heavy_deps_blocked(self, module):
@@ -460,6 +461,31 @@ class TestStandaloneScriptImportIsolation:
         assert result.returncode == 0, result.stderr
         assert "OK" in result.stdout
         assert "yaml pulled: False" in result.stdout
+
+    def test_corpus_lock_imports_only_the_standard_library(self):
+        """Issue #303 R1: the corpus lock is taken by video_intel.py and by the
+        standalone scripts alike, so importing it must load nothing but the
+        standard library (no video_intel, no third-party package)."""
+        child_script = textwrap.dedent("""
+            import sys
+            before = set(sys.modules)
+            import corpus_lock
+            new_top_level = {name.split('.')[0] for name in set(sys.modules) - before}
+            print('OK')
+            print('non-stdlib:', sorted(new_top_level - set(sys.stdlib_module_names) - {'corpus_lock'}))
+            print('corpus_lock loaded:', 'corpus_lock' in new_top_level)
+            """)
+        result = subprocess.run(
+            [sys.executable, "-c", child_script],
+            cwd=str(pathlib.Path(__file__).resolve().parent.parent / "scripts"),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "OK" in result.stdout
+        assert "non-stdlib: []" in result.stdout
+        assert "corpus_lock loaded: True" in result.stdout
 
     def test_corpus_walk_has_no_non_stdlib_import_at_module_body_level(self):
         """Static twin of the subprocess check: every import that runs at
