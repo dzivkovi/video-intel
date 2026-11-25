@@ -149,7 +149,9 @@ def atlas_folder(path: Path) -> Path:
     file link pointing elsewhere, and a folder reached through a directory link
     or junction resolves to the real one.
     """
-    return Path(os.path.realpath(Path(os.path.abspath(path)).parent))
+    # realpath on the parent as written, never abspath first: abspath collapses `..` lexically,
+    # and on POSIX `<link>/..` must resolve through the link to the real folder.
+    return Path(os.path.realpath(Path(path).parent))
 
 
 def corpus_for_atlas(path: Path) -> Path | None:

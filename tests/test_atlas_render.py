@@ -498,3 +498,18 @@ class TestCorpusLock:
         assert result["depth_after"] == 1
         assert corpus_lock.held_depth(corpus) == 0
         assert (corpus / "_atlas" / ar.CATALOG_FILENAME).is_file()
+
+
+@pytest.mark.skipif(
+    os.name == "nt", reason="Windows resolves `..` lexically, so a link followed by `..` cannot reach another folder"
+)
+def test_atlas_folder_resolves_dotdot_through_a_directory_link(tmp_path):
+    corpus = tmp_path / "data" / "corpus"
+    (corpus / "_atlas").mkdir(parents=True)
+    (corpus / "channel").mkdir()
+    view = tmp_path / "view"
+    os.symlink(corpus / "channel", view, target_is_directory=True)
+
+    folder = ar.atlas_folder(view / ".." / "_atlas" / "atlas.json")
+
+    assert folder == Path(os.path.realpath(corpus / "_atlas"))
