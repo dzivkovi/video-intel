@@ -568,7 +568,7 @@ class TestConceptsSourcePromptHelper:
 # ---------------------------------------------------------------------------
 
 HELPER = "concepts_source_prompt"
-EXPECTED_CALLERS = {"cmd_scan", "cmd_concepts", "_cmd_process_url", "_cmd_process_impl"}
+EXPECTED_CALLERS = {"_cmd_scan_impl", "cmd_concepts", "_cmd_process_url", "_cmd_process_impl"}
 
 
 def _is_helper_call(node: ast.AST) -> bool:
