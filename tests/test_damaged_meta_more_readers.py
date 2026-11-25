@@ -918,3 +918,241 @@ def test_cmd_taxonomy_build_when_concepts_key_missing_reads_empty_counts_file_no
     assert sorted(taxonomy["concepts"]) == ["c1"]
     assert taxonomy["built_from"] == 2
     assert _warnings_naming(caplog, no_key) == []
+
+
+# ---------------------------------------------------------------------------
+# Ownership: an apply path never reaches a dot-extended neighbour's files (issue #319)
+# ---------------------------------------------------------------------------
+
+#: Who sits beside the healthy video: nobody, a damaged meta, or a healthy meta of another video.
+NEIGHBOURS = ["damaged", "healthy"]
+
+
+def _write_meta(channel_dir, prefix, **fields):
+    channel_dir.mkdir(parents=True, exist_ok=True)
+    path = channel_dir / f"{prefix}.meta.json"
+    path.write_text(json.dumps(fields), encoding="utf-8")
+    return path
+
+
+def _write_neighbour(channel_dir, prefix, kind, **healthy_fields):
+    """A neighbour meta whose prefix dot-extends another video's; returns its files' bytes."""
+    if kind == "damaged":
+        (channel_dir / f"{prefix}.meta.json").write_bytes(DAMAGED_META["torn"])
+    else:
+        _write_meta(channel_dir, prefix, video_id="nbrvid00009", title="Neighbour", **healthy_fields)
+    return channel_dir
+
+
+def _snapshot(channel_dir, prefix):
+    """Bytes of every file whose name starts with ``prefix + "."``."""
+    return {p.name: p.read_bytes() for p in sorted(channel_dir.glob(f"{prefix}.*"))}
+
+
+@pytest.mark.parametrize("apply", [False, True], ids=["dry_run", "apply"])
+@pytest.mark.parametrize("neighbour", NEIGHBOURS)
+def test_cmd_dedupe_when_loser_prefix_is_dot_extended_by_neighbour_keeps_neighbour_files(
+    corpus, caplog, neighbour, apply
+):
+    # Arrange: duplicates `talk` (loser) and `winner` (canonical), and `talk.notes` with its own artifacts.
+    channel_dir = corpus / CHANNEL
+    _write_meta(channel_dir, "talk", video_id=HEALTHY_VID, title="Old title", processed="2026-10-01T00:00:00")
+    (channel_dir / "talk.mindmap.md").write_text(MINDMAP, encoding="utf-8")
+    _write_meta(channel_dir, "winner", video_id=HEALTHY_VID, title="New title", processed="2026-10-05T00:00:00")
+    (channel_dir / "winner.mindmap.md").write_text(MINDMAP, encoding="utf-8")
+    _write_neighbour(channel_dir, "talk.notes", neighbour)
+    (channel_dir / "talk.notes.transcript.md").write_text("# Transcript\n", encoding="utf-8")
+    (channel_dir / "talk.notes.mindmap.md").write_text(MINDMAP, encoding="utf-8")
+    neighbour_before = _snapshot(channel_dir, "talk.notes")
+
+    # Act
+    with caplog.at_level(logging.INFO):
+        video_intel.cmd_dedupe(argparse.Namespace(channel=None, apply=apply), _channels_config())
+
+    # Assert: the group was handled; the neighbour's meta and artifacts are byte-identical.
+    assert "Summary: 1 group(s), 1 excess file(s)" in caplog.text
+    assert (channel_dir / "talk.meta.json").exists() is (not apply)
+    assert (channel_dir / "talk.mindmap.md").exists() is (not apply)
+    assert _snapshot(channel_dir, "talk.notes") == neighbour_before
+
+
+@pytest.mark.parametrize("neighbour", NEIGHBOURS)
+def test_cmd_dedupe_apply_when_moving_a_mode_never_moves_a_neighbours_file(corpus, neighbour):
+    # Arrange: canonical `winner` lacks the mind map; loser `talk` has it, and `talk.mindmap.notes`
+    # owns `talk.mindmap.notes.transcript.md`, which the `{prefix}.mindmap.*.md` pattern also matches.
+    channel_dir = corpus / CHANNEL
+    _write_meta(
+        channel_dir,
+        "talk",
+        video_id=HEALTHY_VID,
+        title="Old",
+        processed="2026-10-01T00:00:00",
+        modes_completed=["scan"],
+    )
+    (channel_dir / "talk.mindmap.md").write_text("# loser mind map\n", encoding="utf-8")
+    _write_meta(channel_dir, "winner", video_id=HEALTHY_VID, title="New", processed="2026-10-05T00:00:00")
+    _write_neighbour(channel_dir, "talk.mindmap.notes", neighbour)
+    (channel_dir / "talk.mindmap.notes.transcript.md").write_text("# neighbour transcript\n", encoding="utf-8")
+    neighbour_before = _snapshot(channel_dir, "talk.mindmap.notes")
+
+    # Act
+    video_intel.cmd_dedupe(argparse.Namespace(channel=None, apply=True), _channels_config())
+
+    # Assert: the loser's mind map moved; the neighbour's file did not.
+    assert (channel_dir / "winner.mindmap.md").read_text(encoding="utf-8") == "# loser mind map\n"
+    assert not (channel_dir / "winner.mindmap.notes.transcript.md").exists()
+    assert _snapshot(channel_dir, "talk.mindmap.notes") == neighbour_before
+
+
+@pytest.mark.parametrize("neighbour", NEIGHBOURS)
+def test_cmd_dedupe_apply_when_neighbour_file_matches_canonical_pattern_still_rescues_loser_mode(corpus, neighbour):
+    # Arrange: canonical `talk` claims the mind map but has none on disk; `talk.mindmap.notes`'s
+    # `talk.mindmap.notes.transcript.md` must not count as the canonical's mind map, or the loser's
+    # real mind map is swept instead of moved.
+    channel_dir = corpus / CHANNEL
+    _write_meta(
+        channel_dir,
+        "talk",
+        video_id=HEALTHY_VID,
+        title="New",
+        processed="2026-10-05T00:00:00",
+        modes_completed=["scan"],
+    )
+    _write_meta(
+        channel_dir,
+        "winner",
+        video_id=HEALTHY_VID,
+        title="Old",
+        processed="2026-10-01T00:00:00",
+        modes_completed=["scan"],
+    )
+    (channel_dir / "winner.mindmap.md").write_text("# the only mind map\n", encoding="utf-8")
+    _write_neighbour(channel_dir, "talk.mindmap.notes", neighbour)
+    (channel_dir / "talk.mindmap.notes.transcript.md").write_text("# neighbour transcript\n", encoding="utf-8")
+    neighbour_before = _snapshot(channel_dir, "talk.mindmap.notes")
+
+    # Act
+    video_intel.cmd_dedupe(argparse.Namespace(channel=None, apply=True), _channels_config())
+
+    # Assert
+    assert (channel_dir / "talk.mindmap.md").read_text(encoding="utf-8") == "# the only mind map\n"
+    assert _snapshot(channel_dir, "talk.mindmap.notes") == neighbour_before
+
+
+def test_cmd_dedupe_apply_when_no_overlap_behaves_as_before(corpus, caplog):
+    # Arrange: the control - no dot-extended neighbour.
+    channel_dir = corpus / CHANNEL
+    _write_meta(
+        channel_dir,
+        "talk",
+        video_id=HEALTHY_VID,
+        title="Old",
+        processed="2026-10-01T00:00:00",
+        modes_completed=["scan"],
+    )
+    (channel_dir / "talk.mindmap.md").write_text("# loser mind map\n", encoding="utf-8")
+    (channel_dir / "talk.en.srt").write_text("1\n", encoding="utf-8")  # no meta of its own: belongs to `talk`
+    _write_meta(channel_dir, "winner", video_id=HEALTHY_VID, title="New", processed="2026-10-05T00:00:00")
+
+    # Act
+    with caplog.at_level(logging.INFO):
+        video_intel.cmd_dedupe(argparse.Namespace(channel=None, apply=True), _channels_config())
+
+    # Assert
+    assert "Summary: 1 group(s), 1 excess file(s) cleaned up." in caplog.text
+    assert sorted(p.name for p in channel_dir.iterdir()) == ["winner.meta.json", "winner.mindmap.md"]
+
+
+@pytest.fixture
+def prune_env(monkeypatch, corpus):
+    monkeypatch.setenv("YOUTUBE_API_KEY", "fake")
+    monkeypatch.setattr(video_intel, "require_youtube", lambda: lambda *_a, **_kw: MagicMock())
+    monkeypatch.setattr(video_intel, "enrich_with_durations", lambda _yt, ids: {i: None for i in ids})
+    monkeypatch.setattr(video_intel, "_is_youtube_short_url", lambda _vid: False)
+    return corpus
+
+
+def _seed_short(channel_dir):
+    _write_meta(channel_dir, "talk", video_id=HEALTHY_VID, title="Short", duration_seconds=30)
+    (channel_dir / "talk.mindmap.md").write_text(MINDMAP, encoding="utf-8")
+
+
+#: (neighbour prefix, the Short's own files the ownership rule leaves to `talk`). With the neighbour
+#: exactly `talk.mindmap` (the reproduced shape) the name `talk.mindmap.md` starts with
+#: `talk.mindmap.`, so the rule gives it to the neighbour: it is kept and not counted.
+PRUNE_OVERLAPS = [
+    ("talk.mindmap", ["talk.meta.json"]),
+    ("talk.mindmap.notes", ["talk.meta.json", "talk.mindmap.md"]),
+]
+
+
+@pytest.mark.parametrize("apply", [False, True], ids=["dry_run", "apply"])
+@pytest.mark.parametrize(("nbr_prefix", "own_files"), PRUNE_OVERLAPS, ids=["talk.mindmap", "talk.mindmap.notes"])
+@pytest.mark.parametrize("neighbour", NEIGHBOURS)
+def test_cmd_prune_shorts_when_short_prefix_is_dot_extended_by_neighbour_keeps_neighbour_files(
+    prune_env, caplog, neighbour, nbr_prefix, own_files, apply
+):
+    # Arrange: the Short `talk`, and a neighbour (a long video, or damaged) owning
+    # `<nbr>.transcript.md`, which the `{prefix}.mindmap.*.md` pattern also matches.
+    channel_dir = prune_env / CHANNEL
+    _seed_short(channel_dir)
+    _write_neighbour(channel_dir, nbr_prefix, neighbour, duration_seconds=600)
+    (channel_dir / f"{nbr_prefix}.transcript.md").write_text("# neighbour transcript\n", encoding="utf-8")
+    neighbour_before = _snapshot(channel_dir, nbr_prefix)
+
+    # Act
+    with caplog.at_level(logging.INFO):
+        video_intel.cmd_prune_shorts(argparse.Namespace(channel=None, apply=apply), _channels_config())
+
+    # Assert: the count names only the files the rule gives to `talk`, and only they are deleted.
+    assert f"Summary: 1 Shorts, {len(own_files)} artifacts" in caplog.text
+    for name in own_files:
+        assert (channel_dir / name).exists() is (not apply)
+    assert _snapshot(channel_dir, nbr_prefix) == neighbour_before
+
+
+@pytest.mark.parametrize("apply", [False, True], ids=["dry_run", "apply"])
+def test_cmd_prune_shorts_when_no_overlap_behaves_as_before(prune_env, caplog, apply):
+    # Arrange: the control - the Short plus a translate-bcs sibling, which is not on the allowlist.
+    channel_dir = prune_env / CHANNEL
+    _seed_short(channel_dir)
+    (channel_dir / "talk.transcript.md").write_text("# Transcript\n", encoding="utf-8")
+    (channel_dir / "talk.en.srt").write_text("1\n", encoding="utf-8")
+
+    # Act
+    with caplog.at_level(logging.INFO):
+        video_intel.cmd_prune_shorts(argparse.Namespace(channel=None, apply=apply), _channels_config())
+
+    # Assert
+    assert "Summary: 1 Shorts, 3 artifacts" in caplog.text
+    remaining = sorted(p.name for p in channel_dir.iterdir())
+    expected = ["talk.en.srt"] if apply else ["talk.en.srt", "talk.meta.json", "talk.mindmap.md", "talk.transcript.md"]
+    assert remaining == expected
+
+
+# ---------------------------------------------------------------------------
+# intel_graph: a non-object entry in a concepts list is skipped
+# ---------------------------------------------------------------------------
+
+
+def test_intel_graph_load_corpus_when_concepts_list_holds_null_loads_the_valid_entry(corpus):
+    # Arrange
+    duckdb = pytest.importorskip("duckdb")
+    import intel_graph
+
+    channel_dir = corpus / CHANNEL
+    _write_healthy(channel_dir)
+    _write_concepts(
+        channel_dir,
+        HEALTHY_PREFIX,
+        HEALTHY_VID,
+        [None, {"concept_id": "c1", "preferred_label": "Thing", "as_mentioned": "thing", "confidence": 1.0}],
+    )
+    con = duckdb.connect(":memory:")
+
+    # Act
+    intel_graph.load_corpus(con, corpus)
+
+    # Assert
+    rows = con.execute("SELECT artifact_id, concept_id FROM has_concept").fetchall()
+    assert [(r[0], r[1]) for r in rows] == [(HEALTHY_VID, "c1")]

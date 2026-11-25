@@ -341,6 +341,8 @@ def _load_corpus_txn(con, output_dir: Path, concept_rows: list[tuple]) -> dict[s
             prompt_version = f"concepts@{cdata.get('source_prompt', 'unknown')}"
             extracted_at = meta.get("processed") or datetime.now(UTC).isoformat()
             for row in cdata.get("concepts", []):
+                if not isinstance(row, dict):
+                    continue  # a non-object entry (e.g. null) is skipped, as build_taxonomy does
                 phrase = normalize_phrase(row.get("as_mentioned") or "")
                 concept_id = row.get("concept_id") or ""
                 if not phrase or not concept_id:

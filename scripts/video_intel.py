@@ -13971,6 +13971,21 @@ _MODE_ARTIFACT_PATTERNS: dict[str, tuple[str, ...]] = {
 }
 
 
+def _owned_glob(channel_dir: Path, prefix: str, pattern: str) -> list[Path]:
+    """Files in ``channel_dir`` matching ``pattern`` that BELONG to ``prefix`` (issue #319).
+
+    The one ownership rule for the dedupe and prune-shorts apply paths: a file
+    belongs to the LONGEST prefix ``Q`` for which ``Q.meta.json`` exists in the
+    folder and the file name starts with ``Q + "."``. Name-based, so it needs
+    no meta parsing and treats damaged and healthy metas alike: a glob for
+    ``talk.*`` never reaches ``talk.notes.mindmap.md`` while
+    ``talk.notes.meta.json`` exists. A file with no meta of its own (the
+    translate-bcs ``.en.srt`` siblings) keeps belonging to the prefix it shares.
+    """
+    longer = [m.name.removesuffix(".meta.json") for m in channel_dir.glob(f"{prefix}.*.meta.json")]
+    return [p for p in channel_dir.glob(pattern) if not any(p.name.startswith(f"{q}.") for q in longer)]
+
+
 def _dedupe_meta_is_severe(meta_data: dict) -> bool:
     """Whether one dedupe-group member's transcript carries a severe quality
     flag, for canonical selection (issue #159).
@@ -14093,7 +14108,7 @@ def _move_missing_mode_artifacts(
         primary_pattern = patterns[0] if patterns else None
         primary_moved = False
         for pattern in patterns:
-            for src in channel_dir.glob(pattern.format(prefix=loser_prefix)):
+            for src in _owned_glob(channel_dir, loser_prefix, pattern.format(prefix=loser_prefix)):
                 suffix = src.name[len(loser_prefix) :]
                 dst = channel_dir / f"{canonical_prefix}{suffix}"
                 if dst.exists():
@@ -14184,7 +14199,7 @@ def _modes_present_on_disk(channel_dir: Path, prefix: str) -> set[str]:
     present: set[str] = set()
     for mode, patterns in _MODE_ARTIFACT_PATTERNS.items():
         for pattern in patterns:
-            if any(channel_dir.glob(pattern.format(prefix=prefix))):
+            if _owned_glob(channel_dir, prefix, pattern.format(prefix=prefix)):
                 present.add(mode)
                 break
     return present
@@ -14310,7 +14325,7 @@ def _apply_dedupe_group(
             continue
         loser_prefix = loser_path.name.removesuffix(".meta.json")
         preserved = blocked_paths_by_loser.get(loser_path, set())
-        for sibling in channel_dir.glob(f"{loser_prefix}.*"):
+        for sibling in _owned_glob(channel_dir, loser_prefix, f"{loser_prefix}.*"):
             if sibling in preserved:
                 continue
             sibling.unlink()
@@ -14490,7 +14505,7 @@ def _apply_prune_shorts(
     for meta_path, _data, _seconds in candidates:
         prefix = meta_path.name.removesuffix(".meta.json")
         for pattern in PRUNE_SHORTS_DELETION_PATTERNS:
-            for path in channel_dir.glob(pattern.format(prefix=prefix)):
+            for path in _owned_glob(channel_dir, prefix, pattern.format(prefix=prefix)):
                 path.unlink()
                 deleted += 1
     if candidates:
@@ -14500,7 +14515,10 @@ def _apply_prune_shorts(
 
 def _count_artifacts_for_prefix(channel_dir: Path, prefix: str) -> int:
     """Count files matching PRUNE_SHORTS_DELETION_PATTERNS for one prefix."""
-    return sum(1 for pattern in PRUNE_SHORTS_DELETION_PATTERNS for _ in channel_dir.glob(pattern.format(prefix=prefix)))
+    return sum(
+        len(_owned_glob(channel_dir, prefix, pattern.format(prefix=prefix)))
+        for pattern in PRUNE_SHORTS_DELETION_PATTERNS
+    )
 
 
 def cmd_prune_shorts(args, config):
