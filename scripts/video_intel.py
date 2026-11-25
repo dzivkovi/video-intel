@@ -11538,10 +11538,8 @@ def _cmd_process_impl(args, config):
             "model": model,
             "transcript_source": "local_file",
         }
-        # Issue #315: `prompt` describes the mind map on disk. Stamp it only when
-        # this run writes the mind map; otherwise the recorded prompt stays.
-        if needs_mindmap:
-            identity_fields["prompt"] = prompt_name
+        # Issue #315: no `prompt` here. It describes the mind map on disk, and only
+        # the mind-map writer stamps it, after it has written the file.
         if channel_name and "published_source" in identity:
             identity_fields["published_source"] = identity["published_source"]
         if start_offset is not None or end_offset is not None:

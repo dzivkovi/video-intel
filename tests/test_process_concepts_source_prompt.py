@@ -39,6 +39,32 @@ URL_VIDEO = {"video_id": VIDEO_ID, "title": "A Talk", "published": "2026-08-12"}
 FILE_PREFIX = "talk"
 
 
+TRANSCRIPT_JSON = json.dumps({"transcripts": [{"start": "00:01", "voice": 1, "text": "Hello there."}]})
+#: A healthy ten-minute transcript (the `--url` stubs report 600 s), so the quality
+#: guard leaves it usable and the `auto` resolver builds the mind map from it.
+URL_TRANSCRIPT_JSON = json.dumps(
+    {
+        "transcripts": [
+            {"start": f"{s // 60:02d}:{s % 60:02d}", "voice": 1, "text": f"Point number {s // 10} about the topic."}
+            for s in range(0, 600, 10)
+        ]
+    }
+)
+STEP3_READ_ERROR = "simulated failure in the step-3 meta read"
+
+
+def _raise_on_step3_read(monkeypatch, meta_path: Path) -> None:
+    """Make `_read_meta_or_skip` raise for this meta only (other readers untouched)."""
+    real = vi._read_meta_or_skip
+
+    def read(path):
+        if Path(path) == meta_path:
+            raise RuntimeError(STEP3_READ_ERROR)
+        return real(path)
+
+    monkeypatch.setattr(vi, "_read_meta_or_skip", read)
+
+
 def _torn_bytes() -> bytes:
     """A meta whose Cyrillic title is cut in the middle of a two-byte character."""
     full = json.dumps({"video_id": VIDEO_ID, "title": "Привет мир"}, ensure_ascii=False).encode()
@@ -175,7 +201,11 @@ class TestProcessUrl:
         assert gemini == ["concepts"], "the mind-map step must have been skipped as already done"
         assert _concepts(channel_dir, prefix)["source_prompt"] == PROMPT_A
 
-    def test_process_url_when_mindmap_built_this_run_records_the_writers_prompt(self, gemini, tmp_path):
+    def test_process_url_control_when_mindmap_built_this_run_records_the_writers_prompt(self, gemini, tmp_path):
+        """CONTROL, not a discriminator: on `--url` the name the command derives
+        for a mind map it writes this run is the same string the writer records,
+        so this passes with or without the meta read. The discriminating case is
+        `test_process_url_when_force_rebuilds_over_prompt_a_records_the_writers_prompt`."""
         # Arrange
         prefix = vi.video_file_prefix(URL_VIDEO)
         channel_dir = tmp_path / CHANNEL
@@ -189,6 +219,47 @@ class TestProcessUrl:
         assert gemini == ["mindmap", "concepts"]
         recorded = json.loads(meta_path.read_text(encoding="utf-8"))["prompt"]
         assert _concepts(channel_dir, prefix)["source_prompt"] == recorded
+
+    def test_process_url_when_force_rebuilds_over_prompt_a_records_the_writers_prompt(
+        self, gemini, tmp_path, monkeypatch
+    ):
+        """Discriminates WHEN the meta is read: a read taken before the mind-map
+        step would see A; the read after it sees what the writer just recorded."""
+        # Arrange
+        prefix = vi.video_file_prefix(URL_VIDEO)
+        channel_dir = tmp_path / CHANNEL
+        meta_path = _seed(channel_dir, prefix, meta=_url_meta(prompt=PROMPT_A), mindmap=True)
+        monkeypatch.setattr(vi, "call_gemini", lambda *_a, **_k: URL_TRANSCRIPT_JSON)
+
+        # Act
+        rc = _run(_url_args(force=True), _config(tmp_path, "auto"))
+
+        # Assert
+        assert rc == 0
+        assert "mindmap" in gemini, "the mind map must have been rebuilt this run"
+        recorded = json.loads(meta_path.read_text(encoding="utf-8"))["prompt"]
+        assert recorded != PROMPT_A
+        assert _concepts(channel_dir, prefix)["source_prompt"] == recorded
+
+    def test_process_url_when_meta_read_raises_records_concepts_error_and_exits_partial(
+        self, gemini, tmp_path, monkeypatch
+    ):
+        """The step-3 meta read sits inside the step-3 `try` (issue #173 rule)."""
+        # Arrange
+        prefix = vi.video_file_prefix(URL_VIDEO)
+        channel_dir = tmp_path / CHANNEL
+        meta_path = _seed(channel_dir, prefix, meta=_url_meta(prompt=PROMPT_A), mindmap=True)
+        _raise_on_step3_read(monkeypatch, meta_path)
+
+        # Act
+        rc = _run(_url_args(), _config(tmp_path, "video"))
+
+        # Assert
+        assert rc == vi.EXIT_PARTIAL
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        assert meta["concepts_status"] == f"error: {STEP3_READ_ERROR}"
+        assert meta["last_error"] == f"concepts: {STEP3_READ_ERROR}"
+        assert not (channel_dir / f"{prefix}.concepts.json").exists()
 
     def test_process_url_when_meta_records_no_prompt_falls_back_to_resolved_name(self, gemini, tmp_path):
         # Arrange
@@ -304,10 +375,7 @@ class TestProcessFile:
         (channel_dir / f"{FILE_PREFIX}.transcript.md").unlink()
         uploads: list[Path] = []
         monkeypatch.setattr(vi, "upload_local_video", lambda _c, p: uploads.append(p) or "files/stub-upload")
-        transcript_json = json.dumps(
-            {"transcripts": [{"timestamp": "00:00:01", "speaker": "Speaker", "text": "hello there."}]}
-        )
-        monkeypatch.setattr(vi, "call_gemini", lambda *_a, **_k: transcript_json)
+        monkeypatch.setattr(vi, "call_gemini", lambda *_a, **_k: TRANSCRIPT_JSON)
 
         # Act
         rc = _run(_args(file=str(mp4)), _config(tmp_path, "video"))
@@ -319,6 +387,61 @@ class TestProcessFile:
         assert json.loads(meta_path.read_text(encoding="utf-8"))["prompt"] == PROMPT_A
         assert _concepts(channel_dir, FILE_PREFIX)["source_prompt"] == PROMPT_A
 
+    def test_process_file_when_force_and_mindmap_source_none_keeps_prompt_a(self, gemini, tmp_path, monkeypatch):
+        """`--force` re-runs the transcript (so the identity write happens) while
+        the mind-map step is skipped by config: the old mind map stays, and so
+        must the prompt that produced it."""
+        # Arrange
+        mp4, channel_dir, meta_path = _seed_file(tmp_path, meta=_file_meta(prompt=PROMPT_A), mindmap=True)
+        monkeypatch.setattr(vi, "call_gemini", lambda *_a, **_k: TRANSCRIPT_JSON)
+
+        # Act
+        rc = _run(_args(file=str(mp4), force=True), _config(tmp_path, "none"))
+
+        # Assert
+        assert rc == 0
+        assert "mindmap" not in gemini
+        assert json.loads(meta_path.read_text(encoding="utf-8"))["prompt"] == PROMPT_A
+        assert _concepts(channel_dir, FILE_PREFIX)["source_prompt"] == PROMPT_A
+
+    def test_process_file_when_force_and_mindmap_call_raises_keeps_prompt_a(self, gemini, tmp_path, monkeypatch):
+        """`--force` where the mind-map Gemini call fails: the old mind map stays
+        on disk, so the meta keeps naming the prompt that produced it."""
+        # Arrange
+        mp4, channel_dir, meta_path = _seed_file(tmp_path, meta=_file_meta(prompt=PROMPT_A), mindmap=True)
+        monkeypatch.setattr(vi, "call_gemini", lambda *_a, **_k: TRANSCRIPT_JSON)
+
+        def mindmap_fails(_client, _types, text, _model, **_kw):
+            raise RuntimeError("simulated mind-map Gemini failure")
+
+        monkeypatch.setattr(vi, "call_gemini_text", mindmap_fails)
+
+        # Act
+        rc = _run(_args(file=str(mp4), force=True), _config(tmp_path, "auto"))
+
+        # Assert
+        assert rc == 1, "a mind-map failure is a hard failure on process --file"
+        assert (channel_dir / f"{FILE_PREFIX}.mindmap.md").read_text(encoding="utf-8") == MINDMAP
+        assert json.loads(meta_path.read_text(encoding="utf-8"))["prompt"] == PROMPT_A
+
+    def test_process_file_when_meta_read_raises_records_concepts_error_and_exits_partial(
+        self, gemini, tmp_path, monkeypatch
+    ):
+        """The step-3 meta read sits inside the step-3 `try` (issue #173 rule)."""
+        # Arrange
+        mp4, channel_dir, meta_path = _seed_file(tmp_path, meta=_file_meta(prompt=PROMPT_A), mindmap=True)
+        _raise_on_step3_read(monkeypatch, meta_path)
+
+        # Act
+        rc = _run(_args(file=str(mp4)), _config(tmp_path, "video"))
+
+        # Assert
+        assert rc == vi.EXIT_PARTIAL
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        assert meta["concepts_status"] == f"error: {STEP3_READ_ERROR}"
+        assert meta["last_error"] == f"concepts: {STEP3_READ_ERROR}"
+        assert not (channel_dir / f"{FILE_PREFIX}.concepts.json").exists()
+
     def test_process_file_when_mindmap_and_transcript_need_work_records_the_writers_prompt(
         self, gemini, tmp_path, monkeypatch
     ):
@@ -329,10 +452,7 @@ class TestProcessFile:
             tmp_path, meta=_file_meta(prompt=PROMPT_A, modes_completed=["identity"]), mindmap=False
         )
         (channel_dir / f"{FILE_PREFIX}.transcript.md").unlink()
-        transcript_json = json.dumps(
-            {"transcripts": [{"timestamp": "00:00:01", "speaker": "Speaker", "text": "hello there."}]}
-        )
-        monkeypatch.setattr(vi, "call_gemini", lambda *_a, **_k: transcript_json)
+        monkeypatch.setattr(vi, "call_gemini", lambda *_a, **_k: TRANSCRIPT_JSON)
 
         # Act
         rc = _run(_args(file=str(mp4)), _config(tmp_path, "auto"))
@@ -416,7 +536,14 @@ EXPECTED_CALLERS = {"cmd_scan", "cmd_concepts", "_cmd_process_url", "_cmd_proces
 
 
 def _is_helper_call(node: ast.AST) -> bool:
-    return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == HELPER
+    """A call to the helper whose meta argument is not a literal ``None`` (that
+    shape would pass the fallback straight through and bypass the record)."""
+    if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == HELPER):
+        return False
+    meta_args = node.args[:1] + [k.value for k in node.keywords if k.arg == "meta"]
+    if not meta_args:
+        return False
+    return not any(isinstance(a, ast.Constant) and a.value is None for a in meta_args)
 
 
 def _tuple_index(target: ast.AST, name: str) -> int | None:
@@ -432,35 +559,58 @@ def _tuple_index(target: ast.AST, name: str) -> int | None:
     return None
 
 
+def _iterated_list_name(iter_node: ast.AST) -> str | None:
+    """The list a for loop walks: ``rows`` or ``enumerate(rows, ...)``."""
+    if isinstance(iter_node, ast.Call) and isinstance(iter_node.func, ast.Name) and iter_node.func.id == "enumerate":
+        iter_node = iter_node.args[0] if iter_node.args else None
+    return iter_node.id if isinstance(iter_node, ast.Name) else None
+
+
 def _name_is_bound_from_helper(fn: ast.FunctionDef, name: str) -> bool:
-    """True when ``name`` is assigned the helper's result directly, or is unpacked
-    by a for loop from tuples whose element at that position is the helper's result
-    (the scan and concepts loops carry it on a candidate tuple)."""
-    positions = set()
+    """True when every binding of ``name`` carries the helper's result: a direct
+    assignment from the helper, or a for loop unpacking tuples where EVERY tuple
+    appended to the walked list has the helper's result at that position (the scan
+    and concepts loops carry it on a candidate tuple)."""
+    bindings = 0
     for node in ast.walk(fn):
         if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == name for t in node.targets):
             if not _is_helper_call(node.value):
                 return False
-            positions.add("assign")
+            bindings += 1
         elif isinstance(node, ast.For):
             idx = _tuple_index(node.target, name)
-            if idx is not None:
-                positions.add(idx)
-    if not positions:
-        return False
-    tuple_positions = {p for p in positions if p != "assign"}
-    if not tuple_positions:
-        return True
-    appended = [
-        node.args[0]
-        for node in ast.walk(fn)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "append"
-        and node.args
-        and isinstance(node.args[0], ast.Tuple)
-    ]
-    return all(any(len(t.elts) > idx and _is_helper_call(t.elts[idx]) for t in appended) for idx in tuple_positions)
+            if idx is None:
+                continue
+            list_name = _iterated_list_name(node.iter)
+            if list_name is None:
+                return False
+            appended = [
+                call.args[0]
+                for call in ast.walk(fn)
+                if isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "append"
+                and isinstance(call.func.value, ast.Name)
+                and call.func.value.id == list_name
+                and call.args
+            ]
+            if not appended:
+                return False
+            for row in appended:
+                if not (isinstance(row, ast.Tuple) and len(row.elts) > idx and _is_helper_call(row.elts[idx])):
+                    return False
+            bindings += 1
+    return bindings > 0
+
+
+def _source_prompt_bypass(fn: ast.FunctionDef, call: ast.Call) -> str | None:
+    """None when the call's ``source_prompt=`` is the helper's result, else why not."""
+    value = {k.arg: k.value for k in call.keywords}.get("source_prompt")
+    if value is None:
+        return "no source_prompt= argument"
+    if _is_helper_call(value) or (isinstance(value, ast.Name) and _name_is_bound_from_helper(fn, value.id)):
+        return None
+    return f"source_prompt={ast.unparse(value)}"
 
 
 def _process_concepts_calls() -> list[tuple[str, ast.Call, ast.FunctionDef]]:
@@ -477,16 +627,11 @@ def _process_concepts_calls() -> list[tuple[str, ast.Call, ast.FunctionDef]]:
 
 class TestOneDefinitionDriftGuard:
     def test_every_process_concepts_call_when_walked_takes_the_helpers_result(self):
-        offenders = []
-        for fn_name, call, fn in _process_concepts_calls():
-            kw = {k.arg: k.value for k in call.keywords}
-            value = kw.get("source_prompt")
-            if value is None:
-                offenders.append(f"{fn_name}: no source_prompt= argument")
-            elif not (
-                _is_helper_call(value) or (isinstance(value, ast.Name) and _name_is_bound_from_helper(fn, value.id))
-            ):
-                offenders.append(f"{fn_name}: source_prompt={ast.unparse(value)}")
+        offenders = [
+            f"{fn_name}: {why}"
+            for fn_name, call, fn in _process_concepts_calls()
+            if (why := _source_prompt_bypass(fn, call)) is not None
+        ]
         assert not offenders, f"process_concepts callers that bypass {HELPER}: {offenders}"
 
     def test_the_walk_when_run_finds_every_named_caller(self):
@@ -494,16 +639,47 @@ class TestOneDefinitionDriftGuard:
         found = {fn_name for fn_name, _call, _fn in _process_concepts_calls()}
         assert found >= EXPECTED_CALLERS, f"the walk missed callers: {sorted(EXPECTED_CALLERS - found)}"
 
-    def test_the_binding_check_when_given_a_private_read_rejects_it(self):
-        """The guard must be able to fail: a private `meta.get("prompt")` is not the helper."""
+    @pytest.mark.parametrize(
+        "body",
+        [
+            # a private read assigned to a name
+            "    p = meta.get('prompt')\n    process_concepts(source_prompt=p)\n",
+            # a private read carried on a candidate tuple
+            "    rows = []\n    rows.append((1, meta.get('prompt')))\n"
+            "    for _x, q in rows:\n        process_concepts(source_prompt=q)\n",
+            # one tuple carries the helper, a second tuple on the same list does not
+            "    rows = []\n    rows.append((1, concepts_source_prompt(meta)))\n"
+            "    rows.append((2, meta.get('prompt')))\n"
+            "    for _x, q in rows:\n        process_concepts(source_prompt=q)\n",
+            # the helper with a literal None meta passes the fallback straight through
+            "    process_concepts(source_prompt=concepts_source_prompt(None, name))\n",
+            "    p = concepts_source_prompt(None, name)\n    process_concepts(source_prompt=p)\n",
+        ],
+        ids=["private-assign", "private-tuple", "second-tuple-bypass", "none-meta-direct", "none-meta-assign"],
+    )
+    def test_the_guard_when_given_a_bypass_shape_rejects_it(self, body):
+        """The guard must be able to fail on every bypass shape a reviewer found."""
+        fn = ast.parse("def f(meta, name):\n" + body).body[0]
+        calls = [
+            n for n in ast.walk(fn) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "process_concepts"
+        ]
+        assert calls
+        assert all(_source_prompt_bypass(fn, c) is not None for c in calls)
+
+    def test_the_guard_when_given_the_accepted_shapes_passes_them(self):
+        """Positive control for the self-test: the shapes the module uses are accepted."""
         fn = ast.parse(
-            "def f(meta):\n"
-            "    p = meta.get('prompt')\n"
+            "def f(meta, name):\n"
+            "    process_concepts(source_prompt=concepts_source_prompt(meta, name))\n"
+            "    p = concepts_source_prompt(meta, name)\n"
             "    process_concepts(source_prompt=p)\n"
             "    rows = []\n"
-            "    rows.append((1, meta.get('prompt')))\n"
-            "    for _x, q in rows:\n"
+            "    rows.append((1, concepts_source_prompt(meta)))\n"
+            "    for _i, (_x, q) in enumerate(rows, 1):\n"
             "        process_concepts(source_prompt=q)\n"
         ).body[0]
-        assert not _name_is_bound_from_helper(fn, "p")
-        assert not _name_is_bound_from_helper(fn, "q")
+        calls = [
+            n for n in ast.walk(fn) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "process_concepts"
+        ]
+        assert len(calls) == 3
+        assert all(_source_prompt_bypass(fn, c) is None for c in calls)
