@@ -42,13 +42,8 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import caption_align
-import corpus_lock
 import httpx
 import yaml
-
-# Issue #303: the corpus lock's "busy" exit code, re-exported so callers and
-# tests name one constant.
-from corpus_lock import EXIT_CORPUS_BUSY  # noqa: F401 - re-export
 from googleapiclient.errors import HttpError
 from youtube_captions import (
     CAPTIONS_BLOCK_RECOVERY,
@@ -60,6 +55,12 @@ from youtube_captions import (
     captions_failure_is_refusal,
     fetch_english_captions,
 )
+
+import corpus_lock
+
+# Issue #303: the corpus lock's "busy" exit code, re-exported so callers and
+# tests name one constant.
+from corpus_lock import EXIT_CORPUS_BUSY  # noqa: F401 - re-export
 
 # Reader primitives moved to the stdlib-only corpus_walk module (issue #260)
 # and re-exported here, so every existing caller and test still resolves them

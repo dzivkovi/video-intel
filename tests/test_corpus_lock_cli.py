@@ -21,13 +21,13 @@ import threading
 import time
 from pathlib import Path
 
-import corpus_lock
 import pytest
 import yaml
 from corpus_lock_driver import install_paid_stubs, make_load_config
 from test_config_backup import _registered_commands
 from test_nugget_persistence import _FakeClient, _hit
 
+import corpus_lock
 import video_intel as vi
 
 DRIVER = Path(__file__).resolve().parent / "corpus_lock_driver.py"

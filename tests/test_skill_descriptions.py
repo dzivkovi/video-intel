@@ -97,6 +97,10 @@ CURATE_TRIGGERS = [
     "repair wall of text transcript",
     "fix transcript timestamps",
     "every search hit jumps to the same moment",
+    # The corpus lock (issue #303): a waiting or fail-fast writer is a curate question.
+    "another command is already running",
+    "is a scan still running",
+    "fail fast if the corpus",
 ]
 
 

@@ -417,7 +417,7 @@ python scripts/video_intel.py scan --channel natebjones
 # Override lookback window
 python scripts/video_intel.py scan --since 30d
 
-# Preview what would be scanned (no API calls)
+# Preview a scan: no Gemini calls, nothing written (it still reads the YouTube API)
 python scripts/video_intel.py scan --dry-run
 
 # Transcribe a specific video (channel auto-detected from config)
@@ -547,6 +547,16 @@ python scripts/video_intel.py index --channel <affected-channel>   # re-embeds t
 ```
 
 `index --channel` re-embeds one channel and leaves every other channel's rows alone; plain `index` re-embeds the whole corpus. To make newly scanned videos searchable, use `index --incremental` (what `scan` prints): it embeds only transcripts the index does not hold as they are on disk, so adding one talk to a large channel embeds that talk's chunks, not the channel's. An index built before content hashes were stored sees new videos only until one full `index --force`.
+
+### Running two commands at once
+
+Every command that writes to the corpus takes one lock per corpus first, so two writing commands never interleave their writes. When a second writing command starts while another one runs, it waits in line: it prints `Waiting for the corpus lock: ` with the running command, its channel, PID and start time, repeats that every three minutes, and continues on its own when the first one finishes. Ctrl-C while it waits exits 130 with nothing written. To fail fast instead of waiting, put `--no-wait` before the subcommand; the command then exits with code 4 and writes nothing:
+
+```bash
+python scripts/video_intel.py --no-wait taxonomy-build
+```
+
+Previews never wait and never write: `--dry-run`, and the maintenance commands without `--apply`. Readers (`search`, `status`, `profile show`) and `nugget` and `briefings` never wait either; when a writer is running they print one line naming it, because their answer reflects the corpus as it is at that moment. A writer that is killed frees the lock within seconds. The lock lives on the local machine, so on a cloud-synced corpus only one machine at a time should run writing commands. The standalone catalog and wiki scripts (`atlas_build.py`, `atlas_render.py` and `atlas_export.py` on a corpus catalog, `wiki_concepts.py`, `remediation_sweep.py` and `remediation_restore.py` when they write) take the same lock and always wait. Details and edge cases: [`docs/troubleshooting.md`](docs/troubleshooting.md#a-command-waits-for-the-corpus-lock).
 
 ### Catch-up briefings (Markdown + PDF)
 

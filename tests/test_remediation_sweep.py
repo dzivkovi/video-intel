@@ -24,6 +24,9 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import remediation_sweep as sweep  # noqa: E402
+from test_corpus_lock_cli import Holder  # noqa: E402
+
+import corpus_lock  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # 1. parse_dialogue_entries
@@ -265,6 +268,74 @@ class TestCollectRows:
             (ch / "2026-01-01-vid.transcript.md").write_text("[00:00] hi\n", encoding="utf-8")
         rows = sweep.collect_rows(tmp_path, only_channel="demo1")
         assert {r["channel"] for r in rows} == {"demo1"}
+
+
+# ---------------------------------------------------------------------------
+# Issue #303: the corpus lock at the command-line entry point (not on --dry-run)
+# ---------------------------------------------------------------------------
+
+
+def _sweep_corpus(tmp_path: Path) -> Path:
+    corpus = tmp_path / "corpus"
+    ch = corpus / "demo"
+    ch.mkdir(parents=True)
+    (ch / "2026-01-01-vid.transcript.md").write_text('[00:00] SPEAKER: "hi"' + chr(10), encoding="utf-8")
+    _write_meta(ch / "2026-01-01-vid.meta.json", video_id="vid001", title="T", duration_seconds=60)
+    return corpus
+
+
+def _run_sweep(monkeypatch, corpus: Path, *argv: str) -> int:
+    monkeypatch.setattr(sweep.vi, "load_config", lambda: {"output_dir": str(corpus)})
+    monkeypatch.setattr(sys, "argv", ["remediation_sweep.py", *argv])
+    return sweep.main()
+
+
+class TestCorpusLock:
+    def test_remediation_sweep_refuses_while_the_corpus_is_held_without_reading_or_paying(
+        self, tmp_path, monkeypatch, corpus_lock_state_dir
+    ):
+        corpus = _sweep_corpus(tmp_path)
+        reads: list[tuple] = []
+        paid: list[tuple] = []
+        monkeypatch.setattr(sweep, "collect_rows", lambda *a: reads.append(a) or [])
+        monkeypatch.setattr(sweep, "fill_durations_from_youtube", lambda *a: paid.append(a) or 0)
+        monkeypatch.setattr(corpus_lock, "DEFAULT_WAIT", False)
+        holder = Holder(corpus_lock_state_dir, tmp_path / "sync", corpus)
+        try:
+            with pytest.raises(SystemExit) as exc:
+                _run_sweep(monkeypatch, corpus)
+        finally:
+            holder.release()
+        assert exc.value.code == corpus_lock.EXIT_CORPUS_BUSY
+        assert reads == []
+        assert paid == []
+        assert not (corpus / "_reports").exists()
+
+    def test_remediation_sweep_dry_run_takes_no_lock(self, tmp_path, monkeypatch, corpus_lock_state_dir):
+        corpus = _sweep_corpus(tmp_path)
+        monkeypatch.setattr(corpus_lock, "DEFAULT_WAIT", False)
+        holder = Holder(corpus_lock_state_dir, tmp_path / "sync", corpus)
+        try:
+            code = _run_sweep(monkeypatch, corpus, "--dry-run", "--no-fetch")
+        finally:
+            holder.release()
+        assert code == 0
+        assert not (corpus / "_reports").exists()
+
+    def test_remediation_sweep_normal_run_takes_and_releases_the_lock(self, tmp_path, monkeypatch):
+        corpus = _sweep_corpus(tmp_path)
+        depths: list[int] = []
+        real = sweep.collect_rows
+
+        def _spy(output_dir, *a):
+            depths.append(corpus_lock.held_depth(output_dir))
+            return real(output_dir, *a)
+
+        monkeypatch.setattr(sweep, "collect_rows", _spy)
+        assert _run_sweep(monkeypatch, corpus, "--no-fetch") == 0
+        assert depths == [1]
+        assert corpus_lock.held_depth(corpus) == 0
+        assert list((corpus / "_reports").glob("*-remediation-sweep.md"))
 
 
 if __name__ == "__main__":

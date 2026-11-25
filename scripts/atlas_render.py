@@ -13,6 +13,11 @@ Standard library only, under the same import firebreak as `atlas_build.py`
 (issue #152): nothing here imports the curate stack. The renderer reads the
 atlas file and the template beside this script, never the corpus.
 
+When the atlas sits in a corpus `_atlas` folder, the run takes that corpus's
+lock (issue #303, `corpus_lock`); anywhere else (the committed demo under
+`examples/catalog`) it takes none. A scan re-enters this `main` in-process
+while it holds the lock, which the lock's per-process re-entrancy allows.
+
 Ownership follows `atlas_build.check_ownership` and `wiki_concepts.write_pages`:
 an existing output file is replaced only when it carries this renderer's
 `<meta name="generator">` marker; anything else is refused before any write.
@@ -21,11 +26,14 @@ an existing output file is replaced only when it carries this renderer's
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
 import time
 from pathlib import Path
+
+import corpus_lock
 
 GENERATOR_NAME = "atlas_render.py"
 ATLAS_GENERATOR_NAME = "atlas_build.py"
@@ -134,8 +142,31 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def corpus_for_atlas(atlas: Path) -> Path | None:
+    """The corpus an atlas file belongs to: the parent of its `_atlas` folder, else None.
+
+    The one rule for which corpus lock (issue #303) `atlas_render.py` and
+    `atlas_export.py` take; None means the atlas is not in a corpus and no lock is taken.
+    """
+    # Imported here, not at module level: the folder name has one definition in
+    # atlas_build, and importing it only when a run asks keeps this module light.
+    import atlas_build
+
+    folder = Path(os.path.abspath(atlas)).parent
+    if os.path.normcase(folder.name) != os.path.normcase(atlas_build.ATLAS_DIRNAME):
+        return None
+    return folder.parent
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    corpus = corpus_for_atlas(args.atlas)
+    lock = contextlib.nullcontext() if corpus is None else corpus_lock.hold_for_cli(corpus, command="atlas_render")
+    with lock:
+        return _render(args)
+
+
+def _render(args: argparse.Namespace) -> int:
     started = time.perf_counter()
     try:
         atlas = load_atlas(args.atlas)

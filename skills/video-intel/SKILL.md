@@ -49,7 +49,10 @@ description: >
   "refresh the corpus catalog", "what is in my corpus as one file",
   "render the catalog page", "open my catalog in the browser", "show me
   my corpus as a page", "export a public catalog", "make a shareable
-  subset of the catalog", "make the public demo catalog".
+  subset of the catalog", "make the public demo catalog",
+  "another command is already running", "is a scan still running",
+  "the command is waiting for another command", "fail fast if the corpus
+  is busy".
   Requires GEMINI_API_KEY, YOUTUBE_API_KEY, and
   `channels:` configured in config.yaml - this skill must run from the
   plugin repo checkout, not a globally-installed cache. Calls Gemini as
@@ -77,7 +80,8 @@ Three layers, designed as a narrowing funnel.
    state is always recoverable. It is automatic and content-compared: nothing
    is written when the config has not changed, and a dated snapshot is never
    overwritten. Do NOT hand-copy the config as a separate step; that habit is
-   what this replaces. Every other corpus-mutating command does the same. For each
+   what this replaces. Every other corpus-mutating command does the same
+   (previews such as `--dry-run` write no snapshot). For each
    video, in this order: (a) Gemini multimodal transcript reading frames +
    audio + on-screen text; (b) mindmap built from that transcript via a
    text-only Gemini call (~10× cheaper than reading video, no 10800-frame
@@ -261,6 +265,17 @@ run `transcript` and `mindmap` per video, then one `concepts --channel X`
 per channel at the end. With `auto_transcript: none`: 1 expensive
 mindmap-from-video call (legacy path, used when no transcript is on disk).
 Wait for the user's go-ahead before running the real scan.
+
+## When another command is already running
+
+Every command that writes to the corpus takes one lock per corpus before it reads or writes anything. A second writing command on the same corpus waits in line and logs `Waiting for the corpus lock: ` with the running command, its channel, PID and start time; it continues on its own when the first one finishes, and Ctrl-C while it waits exits 130 with nothing written.
+
+- When the user asks "is a scan still running" or a command seems stuck on that line, tell them which command it is waiting for (the line names it) and that it will continue by itself. A hung writer keeps the queue waiting until it is stopped; the lock frees within seconds once that process ends.
+- When the user wants fail-fast instead of waiting, offer `--no-wait` before the subcommand, for example `python scripts/video_intel.py --no-wait taxonomy-build`. It exits with code 4 and writes nothing when another writer runs. The standalone scripts (`atlas_build.py`, `atlas_render.py`, `atlas_export.py`, `wiki_concepts.py`, `remediation_sweep.py`, `remediation_restore.py`) have no such flag and always wait.
+- Do not start a second writing command to "speed things up": it only queues behind the first. Run independent work after it, or in another corpus.
+- Previews always run at once: `--dry-run`, and the maintenance commands without `--apply`, take no lock and write nothing. `search`, `status`, `nugget`, `briefings` and `profile show` never wait either; while a writer runs they print one line naming it.
+- Exit 1 with `Corpus lock unavailable (...)` means the lock system itself failed; the message names the path. Nothing was written.
+- The lock is local to this machine: on a cloud-synced corpus, run writing commands from one machine at a time.
 
 ## When processing fails
 

@@ -27,7 +27,7 @@ python scripts/video_intel.py scan
 # Scan one channel
 python scripts/video_intel.py scan --channel natebjones
 
-# Preview what would be scanned (no API calls)
+# Preview a scan (no Gemini, no writes)
 python scripts/video_intel.py scan --dry-run
 
 # Override lookback window

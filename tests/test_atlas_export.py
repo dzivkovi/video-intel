@@ -20,6 +20,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import atlas_export as ax
 import atlas_render as ar
+from test_corpus_lock_cli import Holder
+
+import corpus_lock
 
 PUBLIC_CH = "publicchan"
 PRIVATE_CH = "CANARY_channel_zeta"
@@ -472,3 +475,46 @@ class TestDeterminism:
             (root / "_atlas-export" / "catalog.html").read_bytes(),
         )
         assert first == second
+
+
+# ---------------------------------------------------------------------------
+# Issue #303: the corpus lock at the command-line entry point, taken before
+# the atlas is read and before the paid visibility call.
+# ---------------------------------------------------------------------------
+
+
+class TestCorpusLock:
+    def test_atlas_export_refuses_while_the_corpus_is_held_without_reading_or_paying(
+        self, corpus, tmp_path, monkeypatch, corpus_lock_state_dir
+    ):
+        root, _, _ = corpus
+        reads: list[tuple] = []
+        paid: list[tuple] = []
+        monkeypatch.setattr(ar, "load_atlas", lambda *a: reads.append(a) or private_atlas())
+        monkeypatch.setattr(ax, "fetch_privacy_status", lambda *a: paid.append(a) or {})
+        monkeypatch.setattr(corpus_lock, "DEFAULT_WAIT", False)
+        holder = Holder(corpus_lock_state_dir, tmp_path / "sync", root)
+        try:
+            with pytest.raises(SystemExit) as exc:
+                run(corpus)
+        finally:
+            holder.release()
+        assert exc.value.code == corpus_lock.EXIT_CORPUS_BUSY
+        assert reads == []
+        assert paid == []
+        assert not (root / "_atlas-export").exists()
+
+    def test_atlas_export_normal_run_takes_and_releases_the_lock(self, corpus, monkeypatch):
+        root, _, _ = corpus
+        depths: list[int] = []
+        real = ax.fetch_privacy_status
+
+        def _spy(*a):
+            depths.append(corpus_lock.held_depth(root))
+            return real(*a)
+
+        monkeypatch.setattr(ax, "fetch_privacy_status", _spy)
+        assert run(corpus) == 0
+        assert depths == [1]
+        assert corpus_lock.held_depth(root) == 0
+        assert (root / "_atlas-export" / "atlas.json").is_file()

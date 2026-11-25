@@ -24,8 +24,10 @@ import pathlib
 import re
 
 import pytest
+from test_corpus_lock_cli import Holder
 
 import atlas_build as ab
+import corpus_lock
 from timestamp_utils import timestamp_tolerance
 
 ROW_KEYS = [
@@ -1064,8 +1066,12 @@ class TestAtomicity:
     def test_replace_failure_removes_the_temp(self, tmp_path, capsys, monkeypatch):
         corpus, before = self._seed(tmp_path, capsys)
         calls = []
+        real_replace = ab.os.replace
 
         def fail_replace(src, dst):
+            if pathlib.Path(dst).parent != corpus / "_atlas":
+                # The corpus lock's holder-details write (issue #303) shares `os`.
+                return real_replace(src, dst)
             calls.append((pathlib.Path(src), pathlib.Path(dst)))
             raise OSError("replace failed")
 
@@ -1285,3 +1291,43 @@ class TestDocumentedFlagsExist:
         assert found == [["--corpus", "<dir>", "--bogus"]]
         assert "--bogus" not in _parser_flags()
         assert {"--corpus", "--out", "--generated-at"} <= _parser_flags()
+
+
+# ---------------------------------------------------------------------------
+# Issue #303: the corpus lock at the command-line entry point
+# ---------------------------------------------------------------------------
+
+
+class TestCorpusLock:
+    def test_atlas_build_refuses_while_the_corpus_is_held_without_reading_or_paying(
+        self, tmp_path, monkeypatch, corpus_lock_state_dir
+    ):
+        corpus = _happy_corpus(tmp_path)
+        reads: list[tuple] = []
+        monkeypatch.setattr(ab, "build_catalog", lambda *a, **kw: reads.append(a) or (0, ab.INDEX_ABSENT))
+        monkeypatch.setattr(corpus_lock, "DEFAULT_WAIT", False)
+        holder = Holder(corpus_lock_state_dir, tmp_path / "sync", corpus)
+        try:
+            with pytest.raises(SystemExit) as exc:
+                ab.main(["--corpus", str(corpus)])
+        finally:
+            holder.release()
+        assert exc.value.code == corpus_lock.EXIT_CORPUS_BUSY
+        assert reads == []
+        assert not _atlas_path(corpus).exists()
+
+    def test_atlas_build_normal_run_takes_and_releases_the_lock(self, tmp_path, monkeypatch, capsys):
+        corpus = _happy_corpus(tmp_path)
+        depths: list[int] = []
+        real = ab.build_catalog
+
+        def _spy(corpus_arg, *a, **kw):
+            depths.append(corpus_lock.held_depth(corpus_arg))
+            return real(corpus_arg, *a, **kw)
+
+        monkeypatch.setattr(ab, "build_catalog", _spy)
+        code, _ = _run_main(capsys, corpus)
+        assert code == 0
+        assert depths == [1]
+        assert corpus_lock.held_depth(corpus) == 0
+        assert _atlas_path(corpus).is_file()

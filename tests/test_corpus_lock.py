@@ -23,8 +23,9 @@ import threading
 import time
 from pathlib import Path
 
-import corpus_lock
 import pytest
+
+import corpus_lock
 
 # Captured at collection time, before the autouse fixture swaps it per test.
 _REAL_LOCK_STATE_DIR = corpus_lock.lock_state_dir

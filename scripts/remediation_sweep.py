@@ -51,6 +51,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import os
@@ -62,6 +63,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import corpus_lock
 import video_intel as vi
 
 log = logging.getLogger("remediation_sweep")
@@ -402,7 +404,15 @@ def main() -> int:
     config = vi.load_config()
     output_dir = vi.resolve_output_dir(config)
     log.info("Corpus: %s", output_dir)
+    # The corpus lock (issue #303), unless --dry-run (which writes nothing).
+    lock = (
+        contextlib.nullcontext() if args.dry_run else corpus_lock.hold_for_cli(output_dir, command="remediation_sweep")
+    )
+    with lock:
+        return _sweep(args, output_dir)
 
+
+def _sweep(args: argparse.Namespace, output_dir: Path) -> int:
     rows = collect_rows(output_dir, args.channel)
     log.info("Found %d transcript(s).", len(rows))
     if not rows:

@@ -19,11 +19,11 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
-import corpus_lock
 import pytest
 import yaml
 from corpus_lock_driver import FakeVoyage
 
+import corpus_lock
 import video_intel as vi
 
 DRIVER = Path(__file__).resolve().parent / "corpus_lock_driver.py"

@@ -25,6 +25,7 @@ inside `load_policy`, like `corpus_walk.parse_front_matter`; the API call uses
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import hashlib
 import json
@@ -37,6 +38,8 @@ import urllib.request
 from pathlib import Path
 
 import atlas_render
+
+import corpus_lock
 
 GENERATOR_NAME = "atlas_export.py"
 GENERATOR_VERSION = "2"
@@ -403,6 +406,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    # The corpus lock (issue #303) is taken before the atlas is read and before
+    # the paid visibility call, by the same rule as atlas_render.py.
+    corpus = atlas_render.corpus_for_atlas(args.atlas)
+    lock = contextlib.nullcontext() if corpus is None else corpus_lock.hold_for_cli(corpus, command="atlas_export")
+    with lock:
+        return _export(args)
+
+
+def _export(args: argparse.Namespace) -> int:
     try:
         atlas = atlas_render.load_atlas(args.atlas)
         if atlas.get("generator") != SOURCE_GENERATOR:

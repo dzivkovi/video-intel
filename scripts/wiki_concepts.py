@@ -42,6 +42,7 @@ from pathlib import Path
 
 from wiki_atlas import slugify
 
+import corpus_lock
 from corpus_walk import CONCEPTS_SUFFIX, META_SUFFIX, MINDMAP_SUFFIX, frontmatter_value
 from timestamp_utils import TIMESTAMP_TOKEN_PATTERN, parse_time_to_seconds, timestamped_url
 
@@ -793,8 +794,10 @@ def main() -> None:
         sys.exit(f"corpus not found: {corpus}")
     out_dir = (args.out.resolve()) if args.out else (corpus / "_wiki" / "concept-pages")
 
-    pages = build_pages(corpus, top_n=args.top)
-    write_pages(pages, out_dir)
+    # The corpus lock (issue #303), held from the first corpus read to the last write.
+    with corpus_lock.hold_for_cli(corpus, command="wiki_concepts"):
+        pages = build_pages(corpus, top_n=args.top)
+        write_pages(pages, out_dir)
     concept_pages = len(pages) - 1  # everything but the MOC page
     skipped = skipped_file_count()
     print(

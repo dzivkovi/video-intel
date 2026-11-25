@@ -50,6 +50,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import re
 import sys
@@ -57,6 +58,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import corpus_lock
 import video_intel as vi
 
 log = logging.getLogger("remediation_restore")
@@ -168,6 +170,17 @@ def main() -> int:
     logging.basicConfig(level=args.log_level.upper(), format="%(levelname)-7s %(message)s")
 
     output_dir = vi.resolve_output_dir(vi.load_config())
+    # The corpus lock (issue #303), unless --dry-run (which restores nothing).
+    lock = (
+        contextlib.nullcontext()
+        if args.dry_run
+        else corpus_lock.hold_for_cli(output_dir, command="remediation_restore")
+    )
+    with lock:
+        return _restore_all(args, output_dir)
+
+
+def _restore_all(args: argparse.Namespace, output_dir: Path) -> int:
     findings = find_regressions(output_dir)
     if not findings:
         log.info("No speech-loss regressions found.")

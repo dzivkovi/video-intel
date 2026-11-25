@@ -407,7 +407,7 @@ class TestStandaloneScriptImportIsolation:
         child_script = textwrap.dedent("""
             import sys, importlib.abc
             OWN = {'atlas_build', 'corpus_walk', 'timestamp_utils', 'wiki_concepts',
-                   'wiki_atlas', 'lead_lag_report', 'lead_lag_viz'}
+                   'wiki_atlas', 'lead_lag_report', 'lead_lag_viz', 'corpus_lock'}
             ALLOWED = set(sys.stdlib_module_names) | OWN
 
             class Blocker(importlib.abc.MetaPathFinder):
