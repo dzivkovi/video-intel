@@ -8,6 +8,7 @@ plus cmd integration in one place).
 """
 
 import json
+import logging
 from pathlib import Path
 
 import httpx
@@ -522,10 +523,11 @@ class TestCmdScanSkipShorts:
         # Sanity: enrich was called twice (both channels got their candidate-list pass).
         assert enrich_state["n"] == 2
 
-    def test_quota_exceeded_uses_canonical_reason_field_not_substring(self, tmp_path, monkeypatch):
+    def test_quota_exceeded_uses_canonical_reason_field_not_substring(self, tmp_path, monkeypatch, caplog):
         """The quota detection reads `error.errors[*].reason` from the response
         body, not a substring of str(e). A misleading message that mentions
-        'quotaExceeded' but with a non-quota reason must NOT trigger abort."""
+        'quotaExceeded' but with a non-quota reason must NOT take the quota path:
+        it is a non-quota error, recorded in the FAILED summary (issue #320)."""
         from unittest.mock import MagicMock
 
         videos = [{"video_id": "vA", "title": "a", "published": "2026-04-15"}]
@@ -544,10 +546,14 @@ class TestCmdScanSkipShorts:
         monkeypatch.setattr(vi, "enrich_with_durations", red_herring_enrich)
 
         config = {"output_dir": str(tmp_path), "channels": [{"name": "ch", "url": "https://example.com/ch"}]}
-        # Non-quota 403 must propagate, NOT be silently swallowed by the quota-abort path.
-        with pytest.raises(vi.HttpError):
+        # Non-quota 403 must NOT be silently swallowed by the quota-abort path:
+        # since issue #320 it is a WARNING plus a FAILED entry, not a re-raise.
+        with caplog.at_level(logging.INFO, logger="video_intel"):
             vi.cmd_scan(_scan_args(), config)
         assert captured["processed"] == []
+        messages = [r.getMessage() for r in caplog.records]
+        assert not any("quota exhausted" in m for m in messages)
+        assert any(m.startswith("  [ch] ch: error: HTTP 403 reason=forbidden") for m in messages)
 
     def test_empty_video_list_skips_enrich_call(self, tmp_path, monkeypatch):
         enrich_calls = {"n": 0}

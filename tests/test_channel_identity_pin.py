@@ -365,16 +365,20 @@ def test_cmd_scan_corrupt_state_file_warns_once_behaves_as_today_and_is_left_byt
     assert path.read_bytes() == before
 
 
-def test_cmd_scan_quota_stop_at_lookup_with_known_id_propagates(scan_env):
+def test_cmd_scan_quota_stop_at_lookup_with_known_id_stops_the_scan_with_exit_code_1(scan_env, caplog):
     # Arrange
     _seed_ids(scan_env.corpus, {"chan": _learned(UC_A)})
     body = json.dumps({"error": {"errors": [{"reason": "quotaExceeded"}]}}).encode("utf-8")
-    quota = vi.HttpError(MagicMock(status=403, reason="Forbidden"), body, uri="https://example.invalid/channels")
+    quota = vi.HttpError(
+        MagicMock(status=403, reason="Forbidden"), body, uri="https://example.invalid/channels?key=SECRET_PIN"
+    )
     scan_env.youtube = FakeYouTube({"creator": quota})
 
-    # Act / Assert
-    with pytest.raises(vi.HttpError):
+    # Act / Assert: the scan still stops, as one log-safe ERROR and exit 1 (issue #320).
+    with caplog.at_level(logging.INFO, logger="video_intel"), pytest.raises(SystemExit) as exc:
         vi.cmd_scan(_scan_args(), _scan_config())
+    assert exc.value.code == 1
+    assert "SECRET_PIN" not in caplog.text
     assert scan_env.youtube.playlists_fetched == []
 
 
@@ -406,14 +410,18 @@ def test_cmd_scan_dead_known_id_warns_records_error_and_next_channel_is_processe
     assert any(r.getMessage() == "Done." for r in caplog.records)
 
 
-def test_cmd_scan_quota_stop_at_fetch_still_propagates(scan_env):
+def test_cmd_scan_quota_stop_at_fetch_stops_the_scan_with_exit_code_1(scan_env, caplog):
     # Arrange
     scan_env.youtube = FakeYouTube({"creator": UC_A})
-    scan_env.youtube.dead[_uploads(UC_A)] = _http(403, "quotaExceeded")
+    quota = _http(403, "quotaExceeded")
+    quota.uri = "https://example.invalid/x?key=SECRET_PIN"
+    scan_env.youtube.dead[_uploads(UC_A)] = quota
 
-    # Act / Assert
-    with pytest.raises(vi.HttpError):
+    # Act / Assert: the scan still stops, as one log-safe ERROR and exit 1 (issue #320).
+    with caplog.at_level(logging.INFO, logger="video_intel"), pytest.raises(SystemExit) as exc:
         vi.cmd_scan(_scan_args(), _scan_config())
+    assert exc.value.code == 1
+    assert "SECRET_PIN" not in caplog.text
 
 
 def _conflict_warnings(caplog) -> list[str]:

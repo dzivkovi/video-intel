@@ -53,7 +53,7 @@ SOURCE = (REPO / "scripts" / "video_intel.py").read_text(encoding="utf-8")
 # that reader was DELETED rather than normalized.
 EXPECTED_READERS = {
     "validate_channel_knobs",  # the scan --dry-run preflight
-    "cmd_scan",  # the mindmap step
+    "_cmd_scan_impl",  # the mindmap step
     "_cmd_mindmap_impl",  # mindmap --url and --file
     "_cmd_process_url",
     "_cmd_process_impl",  # process --file
@@ -215,7 +215,7 @@ class TestWhatEachCommandActuallyLoads:
                 line = src_lines[call.lineno - 1]
                 if '.get("prompt")' in line:
                     consults_channel.add(fn_name)
-        assert consults_channel == {"validate_channel_knobs", "cmd_scan"}, (
+        assert consults_channel == {"validate_channel_knobs", "_cmd_scan_impl"}, (
             "the set of readers honoring a per-channel `prompt:` changed. If a manual "
             "command GAINED it, that is the #127-family fix and this assertion should "
             f"widen deliberately. Found: {sorted(consults_channel)}"

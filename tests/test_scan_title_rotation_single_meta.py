@@ -331,7 +331,7 @@ _CLOSURES = {"_transcribe_with_lazy_probe", "_build_mindmap_call"}
 
 def _cmd_scan_node() -> ast.FunctionDef:
     tree = ast.parse(inspect.getsource(video_intel))
-    return next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "cmd_scan")
+    return next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_cmd_scan_impl")
 
 
 def _called_names(node: ast.AST) -> set[str]:

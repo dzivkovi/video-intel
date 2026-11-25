@@ -330,7 +330,7 @@ class TestManualUrlPathsHonorTheTimeoutKnob:
         # Issue #249 added the two mindmap-from-video resolvers (`mindmap --file`
         # and `process --file`); the three transcript sites are unchanged.
         assert _timeout_callers() == {
-            "cmd_scan",
+            "_cmd_scan_impl",
             "_cmd_transcript_impl",
             "_cmd_process_url",
             "_cmd_mindmap_impl",
