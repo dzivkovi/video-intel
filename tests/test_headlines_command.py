@@ -235,7 +235,7 @@ def _enclosing_callers(tree, callee):
 class TestHeadlinesParityWithScan:
     def test_render_headline_digest_has_exactly_scan_and_headlines_callers(self):
         callers = _enclosing_callers(_module_tree(), "render_headline_digest")
-        assert callers == {"cmd_scan", "cmd_headlines"}
+        assert callers == {"_cmd_scan_impl", "cmd_headlines"}
 
     def test_walk_finds_something(self):
         # companion: the walker sees a known call, so an empty result above cannot pass silently
@@ -376,4 +376,4 @@ class TestHeadlinesNeverNamesGemini:
             assert "render_headline_digest" not in callers, name
 
     def test_walk_is_not_vacuous(self):
-        assert "cmd_scan" in _enclosing_callers(_module_tree(), "create_client")
+        assert "_cmd_scan_impl" in _enclosing_callers(_module_tree(), "create_client")

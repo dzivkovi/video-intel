@@ -300,7 +300,12 @@ class TestEveryVideoMindmapCallSitePassesTheBudget:
         video_sites = [(n, c) for n, c in _process_mindmap_call_sites() if _is_video_source(c)]
         missing = [(n, c.lineno) for n, c in video_sites if "timeout_seconds" not in _kw(c)]
         assert not missing, f"video-source process_mindmap calls without timeout_seconds: {missing}"
-        assert {n for n, _ in video_sites} == {"cmd_scan", "_cmd_mindmap_impl", "_cmd_process_url", "_cmd_process_impl"}
+        assert {n for n, _ in video_sites} == {
+            "_cmd_scan_impl",
+            "_cmd_mindmap_impl",
+            "_cmd_process_url",
+            "_cmd_process_impl",
+        }
 
     def test_transcript_source_calls_do_not_pass_it(self):
         transcript_sites = [(n, c) for n, c in _process_mindmap_call_sites() if not _is_video_source(c)]

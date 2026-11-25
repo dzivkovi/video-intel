@@ -319,7 +319,7 @@ EXPECTED_STRICTNESS = {
     # `strict=True` would sys.exit out of a backup helper.
     "_config_bytes_declare_channels": False,
     "require_channels_config": False,
-    "cmd_scan": True,
+    "_cmd_scan_impl": True,
     "cmd_concepts": True,
     "cmd_dedupe": True,
     "cmd_prune_shorts": True,

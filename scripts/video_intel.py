@@ -2402,6 +2402,25 @@ def describe_error_for_log(error: BaseException) -> str:
         return type(error).__name__
 
 
+class _GoogleApiClientKeyFilter(logging.Filter):
+    """Mask ``key=`` in records from the Google client library's own loggers (issue #320).
+
+    googleapiclient logs some error bodies itself (``Invalid JSON content from
+    response: ...``) before this code sees the error. `main()` installs this on
+    the root handlers. It touches only records whose logger name starts with
+    ``googleapiclient``, masks through `redact_api_key`, and never raises or drops a record.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            if record.name.startswith("googleapiclient"):
+                record.msg = redact_api_key(record.getMessage())
+                record.args = ()
+        except Exception:
+            pass
+        return True
+
+
 def _is_youtube_quota_stop(error: BaseException) -> bool:
     """A quota or rate-limit HttpError (403 or 429 with a quota reason): the headline digest stops early."""
     if not isinstance(error, HttpError):
@@ -9027,6 +9046,22 @@ def log_scan_index_recipe(channels: list[str], index_state: str | None, output_d
 
 
 def cmd_scan(args, config):
+    """Scan channels for new videos and generate mind maps.
+
+    Issue #320: an HttpError that leaves the scan (a quota stop at channel
+    resolution or at the uploads fetch, issue #312) would print its string, and
+    with it the request URL holding the API key, as a traceback. It is ONE ERROR
+    through `describe_error_for_log` and exit 1 instead. Only HttpError is
+    caught: any other exception keeps its traceback.
+    """
+    try:
+        return _cmd_scan_impl(args, config)
+    except HttpError as e:
+        log.error("Scan stopped by a YouTube API error: %s", describe_error_for_log(e))
+        sys.exit(1)
+
+
+def _cmd_scan_impl(args, config):
     """Scan channels for new videos and generate mind maps."""
     require_channels_config(config)
     errors = []
@@ -9183,7 +9218,7 @@ def cmd_scan(args, config):
 
         # Issue #312: a known id can name a deleted or emptied channel, so one
         # channel's failed fetch is a WARNING and a recorded error, never the end
-        # of the scan. A quota stop still propagates exactly as before.
+        # of the scan. A quota stop still stops the scan (cmd_scan logs it, #320).
         try:
             if is_selective:
                 log.info("  Selective mode: playlists=%s, keywords=%s", ch.get("playlists", []), ch.get("keywords", []))
@@ -9255,19 +9290,27 @@ def cmd_scan(args, config):
         # Always fetch durations so meta.json carries duration_seconds going
         # forward; the filter only applies when skip_shorts is true (default).
         # Quota-exhaustion: bail this channel cleanly instead of silently
-        # admitting Shorts the filter was supposed to drop.
+        # admitting Shorts the filter was supposed to drop. Any other error
+        # (issue #320) skips this channel with one log-safe WARNING and a FAILED
+        # entry: a re-raise printed the request URL, and the API key with it.
         skip_shorts = ch.get("skip_shorts", config.get("skip_shorts", True))
         try:
             durations = enrich_with_durations(youtube, [v["video_id"] for v in videos])
-        except HttpError as e:
-            if e.resp.status == 403 and _is_quota_exceeded(e):
+        except Exception as e:
+            if _is_youtube_quota_stop(e):
                 log.error(
                     "[%s] YouTube quota exhausted while classifying Shorts; aborting this channel.",
                     ch_name,
                 )
                 log.error("  Re-run scan after quota resets (typically next midnight Pacific).")
                 continue
-            raise
+            detail = describe_error_for_log(e)
+            log.warning(
+                "[%s] YouTube error while classifying Shorts; skipping this channel this run: %s", ch_name, detail
+            )
+            if not args.dry_run:
+                errors.append((ch_name, ch_name, f"error: {detail}"))
+            continue
         for v in videos:
             v["duration_iso"] = durations.get(v["video_id"])
 
@@ -9280,14 +9323,22 @@ def cmd_scan(args, config):
         # fail-out as durations.
         try:
             statuses = fetch_preflight_status(youtube, [v["video_id"] for v in videos])
-        except HttpError as e:
-            if e.resp.status == 403 and _is_quota_exceeded(e):
+        except Exception as e:
+            if _is_youtube_quota_stop(e):
                 log.error(
                     "[%s] YouTube quota exhausted during pre-flight metadata check; aborting this channel.",
                     ch_name,
                 )
                 continue
-            raise
+            detail = describe_error_for_log(e)
+            log.warning(
+                "[%s] YouTube error during pre-flight metadata check; skipping this channel this run: %s",
+                ch_name,
+                detail,
+            )
+            if not args.dry_run:
+                errors.append((ch_name, ch_name, f"error: {detail}"))
+            continue
         kept = []
         n_preflight = 0
         for v in videos:
@@ -19150,6 +19201,8 @@ Examples:
         format="%(asctime)s %(levelname)-7s %(message)s",
         datefmt="%H:%M:%S",
     )
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(_GoogleApiClientKeyFilter())
     configured_level = getattr(logging, args.log_level.upper())
     log.setLevel(configured_level)
     # gemini_common carries the usage_metadata observability logs introduced in

@@ -494,7 +494,7 @@ class TestScanSnapshotsBeforeMutating:
     """
 
     def test_backup_call_precedes_first_fetch_in_cmd_scan(self):
-        src = inspect.getsource(video_intel.cmd_scan)
+        src = inspect.getsource(video_intel._cmd_scan_impl)
         backup_at = src.find("backup_config_if_changed(")
         assert backup_at != -1, "cmd_scan must snapshot the config itself"
         fetch_positions = [
