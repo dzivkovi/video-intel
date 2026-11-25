@@ -7,6 +7,7 @@ nothing is stubbed. The template under test is the shipped one.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -300,6 +301,18 @@ class TestDeterminism:
 # ---------------------------------------------------------------------------
 
 
+def _directory_link(link: Path, target: Path) -> Path:
+    """A directory link: a junction on Windows (no admin rights needed), a symlink elsewhere."""
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        link.symlink_to(target, target_is_directory=True)
+    return link
+
+
 def _corpus_atlas(tmp_path: Path) -> tuple[Path, Path]:
     corpus = tmp_path / "corpus"
     atlas = corpus / "_atlas" / "atlas.json"
@@ -360,7 +373,39 @@ class TestCorpusLock:
 
     def test_corpus_for_atlas_names_the_folder_above_atlas(self, tmp_path):
         corpus, atlas = _corpus_atlas(tmp_path)
-        assert ar.corpus_for_atlas(atlas) == corpus
+        assert ar.corpus_for_atlas(atlas) == Path(os.path.realpath(corpus))
+
+    @pytest.mark.parametrize("link_name", ["view", "_atlas"], ids=["link-not-named-atlas", "link-named-atlas"])
+    def test_corpus_for_atlas_through_a_link_keys_on_the_real_corpus(self, tmp_path, link_name):
+        # Arrange: the atlas folder reached through a directory link (a junction on Windows).
+        corpus, atlas = _corpus_atlas(tmp_path)
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        link = _directory_link(elsewhere / link_name, atlas.parent)
+
+        # Act
+        found = ar.corpus_for_atlas(link / atlas.name)
+
+        # Assert
+        assert found == Path(os.path.realpath(corpus))
+
+    def test_atlas_render_through_a_link_waits_on_the_real_corpus(self, tmp_path, monkeypatch, corpus_lock_state_dir):
+        # Arrange: the real corpus is held; the atlas is opened through a link outside it.
+        corpus, atlas = _corpus_atlas(tmp_path)
+        link = _directory_link(tmp_path / "elsewhere" / "view", atlas.parent)
+        monkeypatch.setattr(corpus_lock, "DEFAULT_WAIT", False)
+        holder = Holder(corpus_lock_state_dir, tmp_path / "sync", corpus)
+
+        # Act
+        try:
+            with pytest.raises(SystemExit) as exc:
+                ar.main(["--atlas", str(link / atlas.name)])
+        finally:
+            holder.release()
+
+        # Assert
+        assert exc.value.code == corpus_lock.EXIT_CORPUS_BUSY
+        assert not (atlas.parent / ar.CATALOG_FILENAME).exists()
 
     def test_scan_rebuild_reenters_render_without_waiting(self, tmp_path):
         # The end-of-scan rebuild calls `atlas_render.main` in-process while

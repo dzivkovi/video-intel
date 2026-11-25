@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import atlas_export as ax
 import atlas_render as ar
+from test_atlas_render import _directory_link
 from test_corpus_lock_cli import Holder
 
 import corpus_lock
@@ -501,6 +502,29 @@ class TestCorpusLock:
             holder.release()
         assert exc.value.code == corpus_lock.EXIT_CORPUS_BUSY
         assert reads == []
+        assert paid == []
+        assert not (root / "_atlas-export").exists()
+
+    def test_atlas_export_through_a_link_waits_on_the_real_corpus(
+        self, corpus, tmp_path, monkeypatch, corpus_lock_state_dir
+    ):
+        # Arrange: the real corpus is held; the atlas is opened through a link outside it.
+        root, atlas, policy = corpus
+        link = _directory_link(tmp_path / "elsewhere" / "view", atlas.parent)
+        paid: list[tuple] = []
+        monkeypatch.setattr(ax, "fetch_privacy_status", lambda *a: paid.append(a) or {})
+        monkeypatch.setattr(corpus_lock, "DEFAULT_WAIT", False)
+        holder = Holder(corpus_lock_state_dir, tmp_path / "sync", root)
+
+        # Act
+        try:
+            with pytest.raises(SystemExit) as exc:
+                run((root, link / atlas.name, policy))
+        finally:
+            holder.release()
+
+        # Assert
+        assert exc.value.code == corpus_lock.EXIT_CORPUS_BUSY
         assert paid == []
         assert not (root / "_atlas-export").exists()
 

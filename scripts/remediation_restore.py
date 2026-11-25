@@ -58,7 +58,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import corpus_lock
 import video_intel as vi
 
 log = logging.getLogger("remediation_restore")
@@ -169,15 +168,15 @@ def main() -> int:
     args = ap.parse_args()
     logging.basicConfig(level=args.log_level.upper(), format="%(levelname)-7s %(message)s")
 
-    output_dir = vi.resolve_output_dir(vi.load_config())
-    # The corpus lock (issue #303), unless --dry-run (which restores nothing).
+    config = vi.load_config()
+    # The corpus lock (issue #303), unless --dry-run (which restores nothing). A
+    # run that waited continues with the re-read config, or exits 1 when it
+    # names another corpus now.
     lock = (
-        contextlib.nullcontext()
-        if args.dry_run
-        else corpus_lock.hold_for_cli(output_dir, command="remediation_restore")
+        contextlib.nullcontext(config) if args.dry_run else vi.hold_corpus_lock(config, command="remediation_restore")
     )
-    with lock:
-        return _restore_all(args, output_dir)
+    with lock as config:
+        return _restore_all(args, vi.resolve_output_dir(config))
 
 
 def _restore_all(args: argparse.Namespace, output_dir: Path) -> int:

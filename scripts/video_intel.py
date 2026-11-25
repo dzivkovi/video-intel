@@ -31,7 +31,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -681,6 +681,31 @@ def is_preview_run(args: argparse.Namespace) -> bool:
 def run_takes_corpus_lock(args: argparse.Namespace) -> bool:
     """THE one predicate: does this run take the corpus lock (and, for backup commands, snapshot)?"""
     return lock_command_name(args) in CORPUS_LOCK_COMMANDS and not is_preview_run(args)
+
+
+@contextlib.contextmanager
+def hold_corpus_lock(config: dict, *, command: str, **lock_kwargs) -> Iterator[dict]:
+    """Take the corpus lock for the corpus `config` names; yield the config to run with (issue #303).
+
+    The one wrapper for every command-line writer that resolves its corpus
+    from the config (`main()`, `remediation_sweep.py`, `remediation_restore.py`).
+    The corpus identity is frozen BEFORE acquisition and the lock is taken for
+    that frozen path. A run that waited re-reads the config and compares the
+    refreshed identity with the frozen one, so a config edit or a junction
+    retargeted during the wait exits 1 with nothing written.
+    `lock_kwargs` go to `corpus_lock.hold_for_cli`.
+    """
+    frozen = corpus_lock.canonical_path(resolve_output_dir(config, create=False))
+    with corpus_lock.hold_for_cli(frozen, command=command, **lock_kwargs) as acquired:
+        if acquired.waited:
+            config = load_config()
+            if corpus_lock.canonical_path(resolve_output_dir(config, create=False)) != frozen:
+                log.error(
+                    "The config changed while this command waited and now names a different corpus. "
+                    "Nothing was written; run the command again."
+                )
+                sys.exit(1)
+        yield config
 
 
 def note_running_writer(args: argparse.Namespace, output_dir: Path) -> None:
@@ -19474,8 +19499,8 @@ Examples:
     output_dir = resolve_output_dir(config, create=False)
     takes_lock = run_takes_corpus_lock(args)
     lock = (
-        corpus_lock.hold_for_cli(
-            output_dir,
+        hold_corpus_lock(
+            config,
             command=lock_command_name(args),
             channel=getattr(args, "channel", None),
             wait=not args.no_wait,
@@ -19483,18 +19508,10 @@ Examples:
             error=log.error,
         )
         if takes_lock
-        else contextlib.nullcontext(None)
+        else contextlib.nullcontext(config)
     )
-    with lock as acquired:
-        if acquired is not None and acquired.waited:
-            # The config may have changed while this run waited in line.
-            config = load_config()
-            if corpus_lock.corpus_key(resolve_output_dir(config, create=False)) != corpus_lock.corpus_key(output_dir):
-                log.error(
-                    "The config changed while this command waited and now names a different corpus. "
-                    "Nothing was written; run the command again."
-                )
-                sys.exit(1)
+    # A run that waited gets the config re-read after acquisition.
+    with lock as config:
         if not takes_lock:
             note_running_writer(args, output_dir)
         # Mandatory config snapshot before any corpus-mutating command runs. `scan`

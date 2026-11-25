@@ -154,7 +154,7 @@ Titles, synopsis headings, deep-link labels and concept labels are untrusted tex
 
 The build only replaces an `atlas.json` whose `generator` header is exactly `atlas_build.py`. If the existing file was written by another tool, has no `generator` key, is not a JSON object, or cannot be read, the build stops before reading the corpus and prints `refusing to overwrite <path>: it is <reason>, not atlas_build.py`. Nothing is changed. Move that file aside (it may be something you want to keep), or pass `--out` to a folder no other tool writes to, then run again.
 
-The write itself goes through a temporary `atlas.json.<pid>.tmp` in the same folder and one rename, so a crashed run leaves the previous catalog intact. A leftover temp of that exact shape is removed on a later run once it is more than an hour old; a younger one is left alone, and any other file in `_atlas/` is never touched. Do not run two builds of the same corpus at the same time: they write to the same `atlas.json`, and the last one to finish wins.
+The write itself goes through a temporary `atlas.json.<pid>.tmp` in the same folder and one rename, so a crashed run leaves the previous catalog intact. A leftover temp of that exact shape is removed on a later run once it is more than an hour old; a younger one is left alone, and any other file in `_atlas/` is never touched. Two builds of the same corpus on one machine never overlap: the second waits for the corpus lock and runs after the first. On a corpus synced across machines, build on one machine at a time: two machines write the same `atlas.json`, and the last one to finish wins.
 
 ## On a Google Drive mount
 

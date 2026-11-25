@@ -24,7 +24,7 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import remediation_sweep as sweep  # noqa: E402
-from test_corpus_lock_cli import Holder  # noqa: E402
+from test_corpus_lock_cli import Holder, run_waiting_writer  # noqa: E402
 
 import corpus_lock  # noqa: E402
 
@@ -336,6 +336,58 @@ class TestCorpusLock:
         assert depths == [1]
         assert corpus_lock.held_depth(corpus) == 0
         assert list((corpus / "_reports").glob("*-remediation-sweep.md"))
+
+    def test_remediation_sweep_exits_one_when_the_corpus_changed_while_it_waited(
+        self, tmp_path, monkeypatch, corpus_lock_state_dir
+    ):
+        # Arrange: the config names another corpus by the time the lock frees.
+        corpus = _sweep_corpus(tmp_path)
+        other = tmp_path / "other"
+        other.mkdir()
+        reads: list[tuple] = []
+        monkeypatch.setattr(sweep, "collect_rows", lambda *a: reads.append(a) or [])
+        configs = [{"output_dir": str(corpus)}]
+        loads: list[int] = []
+        monkeypatch.setattr(sweep.vi, "load_config", lambda: loads.append(1) or dict(configs[-1]))
+        monkeypatch.setattr(sys, "argv", ["remediation_sweep.py", "--no-fetch"])
+
+        # Act
+        outcome = run_waiting_writer(
+            monkeypatch,
+            corpus_lock_state_dir,
+            tmp_path / "sync",
+            corpus,
+            sweep.main,
+            lambda: configs.append({"output_dir": str(other)}),
+        )
+
+        # Assert
+        error = outcome.get("error")
+        assert isinstance(error, SystemExit) and error.code == 1, outcome
+        assert len(loads) == 2, "the config is re-read after the wait"
+        assert reads == []
+        assert not (corpus / "_reports").exists()
+        assert not (other / "_reports").exists()
+        assert corpus_lock.held_depth(corpus) == 0
+
+    def test_remediation_sweep_resolves_the_corpus_without_creating_it_before_the_lock(
+        self, tmp_path, monkeypatch, corpus_lock_state_dir
+    ):
+        # Arrange: the corpus folder does not exist and another process holds its lock.
+        corpus = tmp_path / "not-yet"
+        monkeypatch.setattr(corpus_lock, "DEFAULT_WAIT", False)
+        holder = Holder(corpus_lock_state_dir, tmp_path / "sync", corpus)
+
+        # Act
+        try:
+            with pytest.raises(SystemExit) as exc:
+                _run_sweep(monkeypatch, corpus, "--no-fetch")
+        finally:
+            holder.release()
+
+        # Assert
+        assert exc.value.code == corpus_lock.EXIT_CORPUS_BUSY
+        assert not corpus.exists(), "nothing, not even the corpus folder, is created before the lock"
 
 
 if __name__ == "__main__":

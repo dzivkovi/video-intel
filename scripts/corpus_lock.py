@@ -20,6 +20,7 @@ the OS releases both locks when the holding process ends.
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import hashlib
 import json
@@ -98,7 +99,7 @@ class CorpusBusy(Exception):
 class LockSystemError(Exception):
     """The lock system itself failed (not "held"): callers fail closed."""
 
-    def __init__(self, path: Path, error: OSError) -> None:
+    def __init__(self, path: str | os.PathLike[str], error: Exception) -> None:
         super().__init__(f"{path}: {error}")
         self.path = path
         self.error = error
@@ -106,6 +107,7 @@ class LockSystemError(Exception):
 
 class Acquired(NamedTuple):
     waited: bool
+    key: str  # the corpus key this acquisition holds; release by it, never by re-resolving the path
 
 
 @dataclass
@@ -114,6 +116,20 @@ class _Held:
     busy_fd: int
     depth: int
     paths: LockPaths
+
+
+class _Ticket:
+    """The key one acquisition published, so whoever started it can undo exactly that level.
+
+    Set in the same step that publishes the registry entry (or the re-entrant
+    increment), with no call in between: an interrupt lands either before
+    both (nothing to undo) or after both (undo through this ticket).
+    """
+
+    __slots__ = ("key",)
+
+    def __init__(self) -> None:
+        self.key: str | None = None
 
 
 _REGISTRY: dict[str, _Held] = {}
@@ -141,16 +157,28 @@ def lock_state_dir() -> Path:
     return Path.home() / ".local" / "state" / "video-intel" / "locks"
 
 
+def canonical_path(output_dir: str | os.PathLike[str]) -> str:
+    """The one spelling of a corpus path: links resolved, case folded where the OS folds it.
+
+    The corpus identity. A caller that must notice a corpus changing under it
+    (a config edit or a retargeted junction while it waited) computes this
+    once, before acquisition, and compares against that frozen value.
+    """
+    return os.path.normcase(os.path.realpath(os.fspath(output_dir)))
+
+
 def corpus_key(output_dir: str | os.PathLike[str]) -> str:
     """One key per corpus, whatever spelling of its path a caller uses."""
-    normalized = os.path.normcase(os.path.realpath(os.fspath(output_dir)))
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256(canonical_path(output_dir).encode("utf-8")).hexdigest()[:16]
+
+
+def _paths_for_key(key: str) -> LockPaths:
+    state = lock_state_dir()
+    return LockPaths(state / f"{key}.lock", state / f"{key}.busy", state / f"{key}.holder.json")
 
 
 def lock_paths(output_dir: str | os.PathLike[str]) -> LockPaths:
-    state = lock_state_dir()
-    key = corpus_key(output_dir)
-    return LockPaths(state / f"{key}.lock", state / f"{key}.busy", state / f"{key}.holder.json")
+    return _paths_for_key(corpus_key(output_dir))
 
 
 def describe_holder(details: dict | None) -> str:
@@ -276,19 +304,59 @@ def _poll_busy(fd: int, path: Path, report: Callable[[str], None]) -> None:
         _sleep(WAIT_POLL_SECONDS)
 
 
+def _run_all(steps: list[Callable[[], object]]) -> BaseException | None:
+    """Run every step even when an earlier one raises (an interrupt included); return the first failure."""
+    first_error: BaseException | None = None
+    for step in steps:
+        try:
+            step()
+        except BaseException as e:  # every remaining unlock and close must still run
+            if first_error is None:
+                first_error = e
+    return first_error
+
+
+def _close_quietly(fd: int) -> None:
+    try:
+        os.close(fd)
+    except OSError as e:
+        log.debug("Close raised: %s", e)
+
+
+def _unlock_quietly(fd: int) -> None:
+    try:
+        _platform_unlock(fd)
+    except OSError as e:
+        log.debug("Unlock raised: %s", e)
+
+
+def _publish(ticket: _Ticket, key: str, held: _Held) -> None:
+    with _REGISTRY_MUTEX:
+        _REGISTRY[key] = held
+        ticket.key = key
+
+
 def _acquire_os(
+    ticket: _Ticket,
+    key: str,
+    paths: LockPaths,
     output_dir: str | os.PathLike[str],
     command: str,
     channel: str | None,
     wait: bool,
     report: Callable[[str], None],
-) -> tuple[_Held, bool]:
-    """One transactional OS acquisition: on any failed or interrupted exit every descriptor is closed."""
-    paths = lock_paths(output_dir)
+) -> Acquired:
+    """One transactional OS acquisition, ending in the registry publication.
+
+    Until `_publish` has set the ticket, this frame owns every descriptor and
+    closes them all on any failed or interrupted exit (and removes a registry
+    entry an interrupted publication left behind). Once the ticket is set,
+    the registry owns them and whoever holds the ticket undoes the hold.
+    """
     opened: list[int] = []
     locked: list[int] = []
     wrote_holder = False
-    done = False
+    held: _Held | None = None
     try:
         try:
             os.makedirs(paths.lock.parent, exist_ok=True)
@@ -310,22 +378,27 @@ def _acquire_os(
         opened.append(busy_fd)
         _poll_busy(busy_fd, paths.busy, report)
         locked.append(busy_fd)
-        done = True
-        return _Held(lock_fd=lock_fd, busy_fd=busy_fd, depth=1, paths=paths), waited
-    finally:
-        if not done:
+        held = _Held(lock_fd=lock_fd, busy_fd=busy_fd, depth=1, paths=paths)
+        acquired = Acquired(waited=waited, key=key)
+        _publish(ticket, key, held)
+        return acquired
+    except BaseException:
+        if ticket.key is None:
+
+            def _unpublish() -> None:
+                with _REGISTRY_MUTEX:
+                    if held is not None and _REGISTRY.get(key) is held:
+                        del _REGISTRY[key]
+
+            steps: list[Callable[[], object]] = [_unpublish]
             if wrote_holder:
-                _remove_own_holder(paths)
-            for fd in reversed(locked):
-                try:
-                    _platform_unlock(fd)
-                except OSError as e:
-                    log.debug("Unlock during a failed acquisition raised: %s", e)
-            for fd in reversed(opened):
-                try:
-                    os.close(fd)
-                except OSError as e:
-                    log.debug("Close during a failed acquisition raised: %s", e)
+                steps.append(lambda: _remove_own_holder(paths))
+            steps += [lambda fd=fd: _unlock_quietly(fd) for fd in reversed(locked)]
+            steps += [lambda fd=fd: _close_quietly(fd) for fd in reversed(opened)]
+            secondary = _run_all(steps)
+            if secondary is not None:
+                log.debug("Cleanup after a failed acquisition raised: %r", secondary)
+        raise
 
 
 def _key_lock(key: str) -> threading.Lock:
@@ -334,6 +407,47 @@ def _key_lock(key: str) -> threading.Lock:
         if key_lock is None:
             key_lock = _KEY_LOCKS[key] = threading.Lock()
         return key_lock
+
+
+def _acquire_into(
+    ticket: _Ticket,
+    output_dir: str | os.PathLike[str],
+    *,
+    command: str,
+    channel: str | None = None,
+    wait: bool | None = None,
+    report: Callable[[str], None] = _stderr_line,
+) -> Acquired:
+    """The acquisition; sets `ticket.key` at the moment this call holds one more level."""
+    if wait is None:
+        wait = DEFAULT_WAIT
+    try:
+        key = corpus_key(output_dir)
+        paths = _paths_for_key(key)
+    except Exception as e:  # no home folder, an unusable path: fail closed, never a traceback
+        raise LockSystemError(output_dir, e) from e
+    # Held for the whole OS acquisition, waiting included: a second thread of
+    # this process blocks here, then finds the registry entry and only
+    # increments. Re-opening the file in-process would conflict with our own lock.
+    with _key_lock(key):
+        with _REGISTRY_MUTEX:
+            existing = _REGISTRY.get(key)
+            if existing is not None:
+                existing.depth += 1
+                ticket.key = key
+        if existing is not None:
+            return Acquired(waited=False, key=key)
+        return _acquire_os(ticket, key, paths, output_dir, command, channel, wait, report)
+
+
+def _undo(ticket: _Ticket) -> None:
+    """Roll back the level a ticket holds, for an acquisition that never reached its caller."""
+    if ticket.key is None:
+        return
+    try:
+        _release_key(ticket.key, ticket.key)
+    except BaseException as e:  # the original exception is the one that matters
+        log.debug("Rolling back an interrupted acquisition raised: %r", e)
 
 
 def acquire(
@@ -348,60 +462,58 @@ def acquire(
 
     Raises `CorpusBusy` when another process holds it and waiting is off, and
     `LockSystemError` when the lock system fails. `wait=None` reads
-    `DEFAULT_WAIT` at call time.
+    `DEFAULT_WAIT` at call time. An acquisition that raises, an interrupt
+    included, leaves no level held. Release with `release(output_dir,
+    key=acquired.key)`, or use `hold` / `hold_for_cli`, which do.
     """
-    if wait is None:
-        wait = DEFAULT_WAIT
-    key = corpus_key(output_dir)
-    # Held for the whole OS acquisition, waiting included: a second thread of
-    # this process blocks here, then finds the registry entry and only
-    # increments. Re-opening the file in-process would conflict with our own lock.
-    with _key_lock(key):
-        with _REGISTRY_MUTEX:
-            held = _REGISTRY.get(key)
-            if held is not None:
-                held.depth += 1
-                return Acquired(waited=False)
-        held, waited = _acquire_os(output_dir, command, channel, wait, report)
-        with _REGISTRY_MUTEX:
-            _REGISTRY[key] = held
-        return Acquired(waited=waited)
+    ticket = _Ticket()
+    try:
+        return _acquire_into(ticket, output_dir, command=command, channel=channel, wait=wait, report=report)
+    except BaseException:
+        _undo(ticket)
+        raise
 
 
 def _release_os(held: _Held) -> None:
-    _remove_own_holder(held.paths)
-    first_error: OSError | None = None
-    for step in (
-        lambda: _platform_unlock(held.busy_fd),
-        lambda: os.close(held.busy_fd),
-        lambda: _platform_unlock(held.lock_fd),
-        lambda: os.close(held.lock_fd),
-    ):
-        try:
-            step()
-        except OSError as e:
-            if first_error is None:
-                first_error = e
+    """Remove the holder details, then unlock and close both files, each attempted whatever the others raised."""
+    first_error = _run_all(
+        [
+            lambda: _remove_own_holder(held.paths),
+            lambda: _platform_unlock(held.busy_fd),
+            lambda: os.close(held.busy_fd),
+            lambda: _platform_unlock(held.lock_fd),
+            lambda: os.close(held.lock_fd),
+        ]
+    )
     if first_error is not None:
         raise first_error
 
 
-def release(output_dir: str | os.PathLike[str]) -> None:
-    """Drop one level of the hold; at depth zero unlock and close both files (never unlink them)."""
-    key = corpus_key(output_dir)
+def _release_key(key: str, label: object) -> None:
     with _key_lock(key):
         with _REGISTRY_MUTEX:
             held = _REGISTRY.get(key)
             if held is None:
-                raise RuntimeError(f"The corpus lock is not held for {os.fspath(output_dir)}")
+                raise RuntimeError(f"The corpus lock is not held for {label}")
             if held.depth > 1:
                 held.depth -= 1
                 return
         try:
             _release_os(held)
         finally:
+            # Every close was attempted, so nothing is held any more: the registry says so too.
             with _REGISTRY_MUTEX:
-                _REGISTRY.pop(key, None)
+                if _REGISTRY.get(key) is held:
+                    del _REGISTRY[key]
+
+
+def release(output_dir: str | os.PathLike[str], *, key: str | None = None) -> None:
+    """Drop one level of the hold; at depth zero unlock and close both files (never unlink them).
+
+    Pass `key=acquired.key` to release exactly what was acquired: re-resolving
+    the path would name another corpus if a link in it was retargeted meanwhile.
+    """
+    _release_key(key if key is not None else corpus_key(output_dir), os.fspath(output_dir))
 
 
 def held_depth(output_dir: str | os.PathLike[str]) -> int:
@@ -413,11 +525,14 @@ def held_depth(output_dir: str | os.PathLike[str]) -> int:
 
 @contextmanager
 def hold(output_dir: str | os.PathLike[str], **acquire_kwargs) -> Iterator[Acquired]:
-    acquired = acquire(output_dir, **acquire_kwargs)
+    ticket = _Ticket()
     try:
-        yield acquired
+        # Acquired inside the protected region: an interrupt between the
+        # acquisition and the body still releases through the ticket.
+        yield _acquire_into(ticket, output_dir, **acquire_kwargs)
     finally:
-        release(output_dir)
+        if ticket.key is not None:
+            _release_key(ticket.key, os.fspath(output_dir))
 
 
 @contextmanager
@@ -431,24 +546,26 @@ def hold_for_cli(
     error: Callable[[str], None] = _stderr_line,
 ) -> Iterator[Acquired]:
     """The one command-line wrapper: maps every acquisition failure to one line and an exit code."""
+    ticket = _Ticket()
     try:
-        acquired = acquire(output_dir, command=command, channel=channel, wait=wait, report=report)
-    except CorpusBusy as e:
-        error(
-            f"Another command is writing to this corpus: {describe_holder(e.details)}. "
-            "Exiting without writing anything (exit 4). Re-run when it finishes, or drop --no-wait to wait in line."
-        )
-        raise SystemExit(EXIT_CORPUS_BUSY) from None
-    except KeyboardInterrupt:
-        error("Interrupted while waiting for the corpus lock; nothing was written.")
-        raise SystemExit(130) from None
-    except LockSystemError as e:
-        error(f"Corpus lock unavailable ({e.path}: {e.error}). Nothing was written.")
-        raise SystemExit(1) from None
-    try:
+        try:
+            acquired = _acquire_into(ticket, output_dir, command=command, channel=channel, wait=wait, report=report)
+        except CorpusBusy as e:
+            error(
+                f"Another command is writing to this corpus: {describe_holder(e.details)}. "
+                "Exiting without writing anything (exit 4). Re-run when it finishes, or drop --no-wait to wait in line."
+            )
+            raise SystemExit(EXIT_CORPUS_BUSY) from None
+        except KeyboardInterrupt:
+            error("Interrupted while waiting for the corpus lock; nothing was written.")
+            raise SystemExit(130) from None
+        except LockSystemError as e:
+            error(f"Corpus lock unavailable ({e.path}: {e.error}). Nothing was written.")
+            raise SystemExit(1) from None
         yield acquired
     finally:
-        release(output_dir)
+        if ticket.key is not None:
+            _release_key(ticket.key, os.fspath(output_dir))
 
 
 def probe_writer(output_dir: str | os.PathLike[str]) -> dict | None:
@@ -474,6 +591,28 @@ def probe_writer(output_dir: str | os.PathLike[str]) -> dict | None:
                 # Another reader's probe can hold `.busy` for an instant: retry once.
                 time.sleep(_PROBE_RETRY_SECONDS)
         return _read_holder(paths.holder)
-    except OSError as e:
-        log.debug("Corpus lock probe failed: %s", e)
+    except Exception as e:  # a probe only informs: any failure means "no writer seen"
+        log.debug("Corpus lock probe failed: %r", e)
         return None
+
+
+def _after_fork_in_child() -> None:
+    """A forked child inherits copies of the parent's descriptors and registry: drop both, never unlock.
+
+    `os.close` only: on flock the parent's open file description keeps the
+    lock, while an unlock from the child would release the parent's lock.
+    The module mutexes may have been held by another parent thread at the
+    fork, so they are recreated.
+    """
+    global _REGISTRY, _KEY_LOCKS, _REGISTRY_MUTEX
+    for held in list(_REGISTRY.values()):
+        for fd in (held.busy_fd, held.lock_fd):
+            with contextlib.suppress(OSError):  # no logging here: a forked child should do the minimum
+                os.close(fd)
+    _REGISTRY = {}
+    _KEY_LOCKS = {}
+    _REGISTRY_MUTEX = threading.Lock()
+
+
+if not _IS_WINDOWS and hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork_in_child)

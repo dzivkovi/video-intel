@@ -152,7 +152,8 @@ def corpus_for_atlas(atlas: Path) -> Path | None:
     # atlas_build, and importing it only when a run asks keeps this module light.
     import atlas_build
 
-    folder = Path(os.path.abspath(atlas)).parent
+    # realpath, not abspath: an atlas reached through a link or junction keys on the real corpus.
+    folder = Path(os.path.realpath(atlas)).parent
     if os.path.normcase(folder.name) != os.path.normcase(atlas_build.ATLAS_DIRNAME):
         return None
     return folder.parent

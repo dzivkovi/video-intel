@@ -287,7 +287,7 @@ python "${CLAUDE_SKILL_DIR}/../../scripts/video_intel.py" search "discovery call
 
 ### When a writing command is running
 
-These commands never wait for a writer. When a scan or another writing command is running on the corpus, `search`, `nugget` and `status` log one line that starts `A writing command is running on this corpus: ` and names it, then answer as usual. Treat the answer as valid for the corpus as indexed at that moment, say so to the user, and suggest re-running after the writer finishes for the complete picture: search and `nugget` read the search index, which a scan does not update, so new videos become searchable only after `index --incremental`.
+These commands never wait for a writer. When a scan or another writing command is running on the corpus, `search`, `nugget` and `status` log one line that starts `A writing command is running on this corpus: ` and names it, then answer as usual. Treat the answer as valid for the corpus as indexed at that moment, say so to the user, and suggest re-running after the writer finishes for the complete picture: `search --vector` and `nugget` read the search index, which a scan does not update, so new videos become searchable only after `index --incremental`.
 
 ## When to Use This Skill vs video-intel (curate)
 

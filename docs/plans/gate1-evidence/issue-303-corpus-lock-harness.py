@@ -12,7 +12,8 @@ summary line; exits non-zero on any FAIL.
 
 Checks: contend, waiter proceeds after release, try-acquire refused while
 held, killed holder frees the lock, probe never blocks a try-acquire, and (POSIX
-only) a waiting child that receives a real SIGINT exits 130.
+only) a waiting child that receives a real SIGINT exits 130, and a forked child
+neither re-enters nor releases its parent's hold.
 """
 
 from __future__ import annotations
@@ -294,6 +295,36 @@ def check_sigint(parent: Parent, sync: Path, corpus: Path, cl) -> None:
         raise CheckFailed("B acquired the lock")
 
 
+def check_fork(parent: Parent, sync: Path, corpus: Path, cl) -> None:
+    cl.acquire(corpus, command="harness-parent", wait=False)
+    try:
+        pid = os.fork()
+        if pid == 0:  # the child: its acquire must be refused, never a re-entry
+            code = 1
+            try:
+                try:
+                    cl.acquire(corpus, command="harness-child", wait=False)
+                    code = 2
+                except cl.CorpusBusy:
+                    code = 0 if cl.held_depth(corpus) == 0 else 3
+            finally:
+                os._exit(code)
+        _, status = os.waitpid(pid, 0)
+        code = os.waitstatus_to_exitcode(status)
+        if code == 2:
+            raise CheckFailed("the forked child took or re-entered the lock while the parent held it")
+        if code != 0:
+            raise CheckFailed(f"the forked child exited {code}")
+        if cl.held_depth(corpus) != 1:
+            raise CheckFailed(f"the parent's depth is {cl.held_depth(corpus)} after the fork, expected 1")
+        if parent.run("try", sync, "T1", corpus) != cl.EXIT_CORPUS_BUSY:
+            raise CheckFailed("the parent lost its lock after the forked child exited")
+    finally:
+        cl.release(corpus)
+    if parent.run("try", sync, "T2", corpus) != 0:
+        raise CheckFailed("the lock was not free after the parent released it")
+
+
 CHECKS = [
     ("contend", check_contend),
     ("waiter-proceeds-after-release", check_waiter),
@@ -301,6 +332,7 @@ CHECKS = [
     ("killed-holder-frees-the-lock", check_killed_holder),
     ("probe-never-blocks-a-try-acquire", check_probe_never_blocks),
     ("sigint-while-waiting-exits-130", check_sigint),
+    ("fork-child-neither-reenters-nor-releases", check_fork),
 ]
 
 
@@ -318,6 +350,10 @@ def parent_main(state_dir: Path) -> int:
         for index, (name, check) in enumerate(CHECKS):
             if name.startswith("sigint") and os.name == "nt":
                 print(f"SKIP {name}: a real SIGINT to a waiting child is POSIX only")
+                skipped += 1
+                continue
+            if name.startswith("fork") and not hasattr(os, "fork"):
+                print(f"SKIP {name}: fork() is POSIX only")
                 skipped += 1
                 continue
             sync = work / f"{index}-sync"

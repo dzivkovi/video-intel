@@ -565,6 +565,75 @@ def test_config_change_to_another_corpus_while_waiting_exits_one(cli, holder, fa
     assert corpus_lock.held_depth(cli.corpus) == 0
 
 
+def test_corpus_retargeted_while_waiting_exits_one(cli, holder, fast_poll, tmp_path, caplog, monkeypatch):
+    # Arrange: the config text never changes, but once the wait began the same
+    # path resolves to another corpus (a junction retargeted during the wait).
+    depths = cli.record("taxonomy-build")
+    other = tmp_path / "other-corpus"
+    other.mkdir()
+    real_resolver = corpus_lock.canonical_path
+    retargeted = {"on": False}
+
+    def _resolver(path):
+        resolved = real_resolver(path)
+        if retargeted["on"] and resolved == real_resolver(cli.corpus):
+            return real_resolver(other)
+        return resolved
+
+    monkeypatch.setattr(corpus_lock, "canonical_path", _resolver)
+
+    # Act
+    thread, result = _run_in_thread(cli, ["taxonomy-build"])
+    _wait_for(lambda: "Waiting for the corpus lock: " in caplog.text, "the wait line")
+    retargeted["on"] = True
+    holder.release()
+    code = _join(thread, result)
+
+    # Assert
+    assert code == 1
+    assert (
+        "The config changed while this command waited and now names a different corpus. "
+        "Nothing was written; run the command again."
+    ) in [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert depths == []
+    assert cli.backups() == []
+    assert corpus_lock._REGISTRY == {}, "the lock is released by the key it was acquired under"
+
+
+def run_waiting_writer(monkeypatch, state_dir: Path, sync: Path, corpus: Path, main, while_waiting) -> dict:
+    """Run `main()` in a thread while another process holds `corpus`; call `while_waiting()` once it waits.
+
+    Returns `{"code": ...}` or `{"error": exc}`. Shared by the standalone-script tests.
+    """
+    waiting = threading.Event()
+    real_sleep = time.sleep
+
+    def _sleep(_seconds):
+        waiting.set()
+        real_sleep(POLL_SECONDS)
+
+    monkeypatch.setattr(corpus_lock, "_sleep", _sleep)
+    held = Holder(state_dir, sync, corpus)
+    outcome: dict = {}
+
+    def _target() -> None:
+        try:
+            outcome["code"] = main()
+        except BaseException as e:  # surfaced by the caller, never swallowed
+            outcome["error"] = e
+
+    thread = threading.Thread(target=_target, daemon=True)
+    thread.start()
+    try:
+        assert waiting.wait(BOUND_SECONDS), "the command never waited for the lock"
+        while_waiting()
+    finally:
+        held.release()
+    thread.join(BOUND_SECONDS)
+    assert not thread.is_alive(), f"the command did not finish within {BOUND_SECONDS} s"
+    return outcome
+
+
 def test_run_that_did_not_wait_loads_config_once(cli):
     cli.record("taxonomy-build")
 

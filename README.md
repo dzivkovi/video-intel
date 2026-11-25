@@ -520,8 +520,9 @@ python scripts/video_intel.py backfill-descriptions --apply --channel thenextnew
 # commands that turn the new durations into quality verdicts (corpus-wide unless
 # --channel is given). Videos YouTube no longer returns stay candidates and are
 # fetched again on every run. A transcript of only a segment, or of a trimmed
-# local file, gets the full published length. On a cloud-synced corpus, run
-# --apply while no scan is active.
+# local file, gets the full published length. On this machine --apply waits
+# for a running scan (the corpus lock); on a corpus synced across machines, run
+# --apply while no scan is active on another machine.
 python scripts/video_intel.py backfill-durations
 python scripts/video_intel.py backfill-durations --apply --channel mychannel
 

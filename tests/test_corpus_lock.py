@@ -603,6 +603,253 @@ def test_release_attempts_every_close_even_if_one_unlock_fails(children, corpus,
     assert children.try_exit(corpus) == 0
 
 
+class _InterruptingRegistry(dict):
+    """A registry whose publication is interrupted, before or after the entry is stored."""
+
+    def __init__(self, after_store: bool) -> None:
+        super().__init__()
+        self.after_store = after_store
+
+    def __setitem__(self, key, value):
+        if self.after_store:
+            super().__setitem__(key, value)
+        raise KeyboardInterrupt
+
+
+def _interrupt(*_args, **_kwargs):
+    raise KeyboardInterrupt
+
+
+@pytest.mark.parametrize(
+    "step",
+    [
+        "after_os_acquisition",
+        "building_held_record",
+        "registry_publication_before_store",
+        "registry_publication_after_store",
+        "after_registry_publication",
+    ],
+)
+def test_interrupt_anywhere_until_acquire_returns_leaves_the_lock_free(children, corpus, monkeypatch, step):
+    # Arrange: KeyboardInterrupt injected at one step between the OS locks and the return.
+    opened: list[int] = []
+    real_open = corpus_lock._open_lock_file
+
+    def tracking_open(path):
+        fd = real_open(path)
+        opened.append(fd)
+        return fd
+
+    monkeypatch.setattr(corpus_lock, "_open_lock_file", tracking_open)
+    if step == "after_os_acquisition":
+        real_poll_busy = corpus_lock._poll_busy
+
+        def poll_then_interrupt(*args):
+            real_poll_busy(*args)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(corpus_lock, "_poll_busy", poll_then_interrupt)
+    elif step == "building_held_record":
+        monkeypatch.setattr(corpus_lock, "_Held", _interrupt)
+    elif step.startswith("registry_publication"):
+        monkeypatch.setattr(corpus_lock, "_REGISTRY", _InterruptingRegistry(step.endswith("after_store")))
+    else:
+        real_publish = corpus_lock._publish
+
+        def publish_then_interrupt(*args):
+            real_publish(*args)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(corpus_lock, "_publish", publish_then_interrupt)
+
+    # Act
+    with pytest.raises(KeyboardInterrupt):
+        acquire_now(corpus)
+
+    # Assert: no registry entry, every descriptor closed, another process can take the lock.
+    assert dict(corpus_lock._REGISTRY) == {}
+    assert corpus_lock.held_depth(corpus) == 0
+    assert len(opened) == 2 and all(fd_is_closed(fd) for fd in opened), opened
+    monkeypatch.undo()
+    assert children.try_exit(corpus) == 0
+
+
+def test_interrupt_at_a_reentrant_acquisition_rolls_the_depth_back(children, corpus, monkeypatch):
+    # Arrange: held once; the re-entrant acquisition is interrupted after its increment.
+    acquire_now(corpus)
+    monkeypatch.setattr(corpus_lock, "Acquired", _interrupt)
+
+    # Act
+    with pytest.raises(KeyboardInterrupt):
+        acquire_now(corpus)
+
+    # Assert
+    monkeypatch.undo()
+    assert corpus_lock.held_depth(corpus) == 1
+    release_now(corpus)
+    assert corpus_lock.held_depth(corpus) == 0
+    assert children.try_exit(corpus) == 0
+
+
+@pytest.mark.parametrize("wrapper", ["hold", "hold_for_cli"])
+def test_interrupt_between_acquisition_and_body_still_releases(children, corpus, monkeypatch, wrapper):
+    # Arrange: the acquisition completes, then an interrupt lands before the body starts.
+    real_acquire_into = corpus_lock._acquire_into
+
+    def acquire_then_interrupt(*args, **kwargs):
+        real_acquire_into(*args, **kwargs)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(corpus_lock, "_acquire_into", acquire_then_interrupt)
+
+    def body():
+        if wrapper == "hold":
+            with corpus_lock.hold(corpus, command="scan", wait=False):
+                pytest.fail("the body must not run")
+        else:
+            with corpus_lock.hold_for_cli(corpus, command="scan", wait=False, error=lambda _l: None):
+                pytest.fail("the body must not run")
+
+    # Act
+    with pytest.raises((KeyboardInterrupt, SystemExit)) as exc:
+        run_bounded(body)
+
+    # Assert
+    if wrapper == "hold_for_cli":
+        assert exc.value.code == 130
+    assert corpus_lock.held_depth(corpus) == 0
+    monkeypatch.undo()
+    assert children.try_exit(corpus) == 0
+
+
+@pytest.mark.parametrize("step", ["holder_removal", "busy_unlock", "lock_unlock"])
+def test_interrupt_during_release_still_closes_everything(children, corpus, monkeypatch, step):
+    # Arrange
+    acquire_now(corpus)
+    held = corpus_lock._REGISTRY[corpus_lock.corpus_key(corpus)]
+    real_unlock = corpus_lock._platform_unlock
+    if step == "holder_removal":
+        monkeypatch.setattr(corpus_lock, "_remove_own_holder", _interrupt)
+    else:
+        target = held.busy_fd if step == "busy_unlock" else held.lock_fd
+
+        def unlock(fd):
+            if fd == target:
+                raise KeyboardInterrupt
+            real_unlock(fd)
+
+        monkeypatch.setattr(corpus_lock, "_platform_unlock", unlock)
+
+    # Act
+    with pytest.raises(KeyboardInterrupt):
+        release_now(corpus)
+
+    # Assert: every descriptor closed, the registry agrees, another process can take the lock.
+    assert fd_is_closed(held.busy_fd)
+    assert fd_is_closed(held.lock_fd)
+    assert corpus_lock.held_depth(corpus) == 0
+    monkeypatch.undo()
+    assert children.try_exit(corpus) == 0
+
+
+def test_hold_releases_the_key_it_acquired_even_if_the_path_moves(children, corpus, tmp_path, monkeypatch):
+    # Arrange: inside the body the corpus path starts resolving to another corpus.
+    other = tmp_path / "other"
+    other.mkdir()
+    real_resolver = corpus_lock.canonical_path
+    moved = {"on": False}
+
+    def resolver(path):
+        resolved = real_resolver(path)
+        return real_resolver(other) if moved["on"] and resolved == real_resolver(corpus) else resolved
+
+    monkeypatch.setattr(corpus_lock, "canonical_path", resolver)
+
+    def body():
+        with corpus_lock.hold(corpus, command="scan", wait=False):
+            moved["on"] = True
+        acquired = corpus_lock.acquire(corpus, command="scan", wait=False)
+        corpus_lock.release(corpus, key=acquired.key)
+
+    # Act
+    run_bounded(body)
+
+    # Assert
+    assert corpus_lock._REGISTRY == {}
+    monkeypatch.undo()
+    assert children.try_exit(corpus) == 0
+
+
+def test_lock_path_resolution_failure_is_a_lock_system_error(corpus, monkeypatch):
+    # Arrange: resolving the lock folder fails with something other than OSError.
+    def no_home():
+        raise RuntimeError("Could not determine home directory.")
+
+    monkeypatch.setattr(corpus_lock, "lock_state_dir", no_home)
+    errors: list[str] = []
+
+    def body():
+        with corpus_lock.hold_for_cli(corpus, command="scan", wait=False, error=errors.append):
+            pytest.fail("the body must not run when the lock paths cannot be resolved")
+
+    # Act
+    with pytest.raises(SystemExit) as exc:
+        run_bounded(body)
+
+    # Assert: one line, exit 1, never a traceback.
+    assert exc.value.code == 1
+    assert len(errors) == 1
+    assert errors[0].startswith("Corpus lock unavailable (")
+    assert "Could not determine home directory." in errors[0]
+    assert corpus_lock.held_depth(corpus) == 0
+
+
+def test_probe_never_raises_on_a_non_oserror_failure(corpus, monkeypatch, caplog):
+    # Arrange
+    caplog.set_level(logging.DEBUG, logger="corpus_lock")
+
+    def no_home():
+        raise RuntimeError("Could not determine home directory.")
+
+    monkeypatch.setattr(corpus_lock, "lock_state_dir", no_home)
+
+    # Act
+    result = corpus_lock.probe_writer(corpus)
+
+    # Assert
+    assert result is None
+    records = [r for r in caplog.records if r.name == "corpus_lock"]
+    assert records and all(r.levelno == logging.DEBUG for r in records)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="fork() exists only on POSIX")
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")  # fork() in a multi-threaded test process
+def test_forked_child_neither_reenters_nor_releases_the_parents_hold(children, corpus):
+    # Arrange
+    acquire_now(corpus)
+
+    # Act: the child tries to take the lock its parent holds.
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - runs in the child
+        code = 1
+        try:
+            try:
+                corpus_lock.acquire(corpus, command="child", wait=False)
+                code = 2  # acquired or re-entered: the bug
+            except corpus_lock.CorpusBusy:
+                code = 0 if corpus_lock.held_depth(corpus) == 0 else 3
+        finally:
+            os._exit(code)
+    _, status = os.waitpid(pid, 0)
+
+    # Assert: the child was refused, and the parent still holds after the child exited.
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert corpus_lock.held_depth(corpus) == 1
+    assert children.try_exit(corpus) == corpus_lock.EXIT_CORPUS_BUSY
+    release_now(corpus)
+    assert children.try_exit(corpus) == 0
+
+
 # --- death, leftovers and probes ---------------------------------------------
 
 
@@ -658,6 +905,46 @@ def test_probe_reports_running_writer_and_reads_details(children, corpus):
     assert corpus_lock.describe_holder(details).endswith("(last recorded)")
     children.release("A", holder)
     assert corpus_lock.probe_writer(corpus) is None
+
+
+def test_probe_never_opens_the_writer_lock_file(children, corpus, monkeypatch):
+    # Arrange: a real writer in another process, and every os.open of this process under a spy.
+    holder = children.start("A", "hold", corpus)
+    paths = corpus_lock.lock_paths(corpus)
+    opened: list[str] = []
+    real_open = os.open
+
+    def spy(path, *args, **kwargs):
+        opened.append(os.fspath(path))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", spy)
+
+    # Act
+    details = corpus_lock.probe_writer(corpus)
+    monkeypatch.undo()
+
+    # Assert: the probe saw the writer through .busy alone.
+    assert details is not None and details["pid"] == holder.pid
+    assert os.fspath(paths.busy) in opened, "the spy saw the probe's open"
+    assert os.fspath(paths.lock) not in opened
+    children.release("A", holder)
+
+
+def test_release_removes_only_its_own_holder_details(corpus):
+    paths = corpus_lock.lock_paths(corpus)
+
+    # A release removes the details its own acquisition wrote.
+    acquire_now(corpus)
+    assert json.loads(paths.holder.read_text(encoding="utf-8"))["pid"] == os.getpid()
+    release_now(corpus)
+    assert not paths.holder.exists()
+
+    # Details another process wrote are left alone.
+    acquire_now(corpus)
+    paths.holder.write_text(json.dumps({"command": "other", "pid": os.getpid() + 1}), encoding="utf-8")
+    release_now(corpus)
+    assert json.loads(paths.holder.read_text(encoding="utf-8"))["command"] == "other"
 
 
 def test_probe_without_any_files_creates_nothing(corpus, corpus_lock_state_dir):
